@@ -5,7 +5,34 @@
     <link>https://usemac.app/appcast.xml</link>
     <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
     <language>en</language>
-    <!-- Generated & signed automatically by scripts/release-dmg.sh (Sparkle 2 EdDSA) -->
+    <item>
+      <title>Version 0.6.0-beta.1</title>
+      <sparkle:version>60</sparkle:version>
+      <sparkle:shortVersionString>0.6.0-beta.1</sparkle:shortVersionString>
+      <sparkle:channel>beta</sparkle:channel>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 25 Nov 2026 23:43:27 GMT</pubDate>
+      <description><![CDATA[
+        <h3>What's New in UseMac 0.6.0 Beta 1</h3>
+        <ul>
+          <li>Agents work more reliably in the background: stable element ids, steps that find elements by what they are, background scrolling, and file pickers driven without taking focus.</li>
+          <li>Every step now says whether it changed anything, instead of a silent "ok".</li>
+          <li>Real keyboard and mouse input only goes to the app in front, so it can never land in the app you are using.</li>
+          <li>New filmstrip preview: the active tab large, the others as live thumbnails, with a clear cue when another one comes forward.</li>
+          <li>The preview never shows your own Chrome tabs, and Chrome tabs UseMac opened are closed when the task finishes.</li>
+          <li>Chrome Web Store and <code>chrome://</code> pages are handled with a native fallback.</li>
+        </ul>
+        <p>Turn off <b>Settings &gt; Software Updates &gt; Beta updates</b> to stay on stable releases only.</p>
+        <p>This is a beta. Please report problems at <a href="https://github.com/diegosquid/usemac/issues">github.com/diegosquid/usemac/issues</a>.</p>
+      ]]></description>
+      <enclosure
+        url="https://github.com/diegosquid/usemac/releases/download/v0.6.0-beta.1/usemac-0.6.0-beta.1-arm64.dmg"
+        sparkle:edSignature="B8JbC9IsS2X+9rRcIKVUOskEsYgEW4K1coKuq/3kEZzpmktveovGHlGUqUEVEsk9jiHLsq29DyYQ8IIQoHcFBg=="
+        length="7101149"
+        type="application/octet-stream"
+        sparkle:os="macos"
+      />
+    </item>
     <item>
       <title>Version 0.5.0</title>
       <sparkle:version>50</sparkle:version>
@@ -18,7 +45,7 @@
           <li>Continuous preview HUD lifecycle (<code>task_start</code> &rarr; <code>task_complete</code>) with calm glacier-blue rim and frosted completion overlay.</li>
           <li>Hybrid on-device Apple Vision OCR + MLX Qwen visual assistant (<code>ask</code>, <code>verify</code>, <code>describe</code>) cutting cloud vision tokens by 97%.</li>
           <li>Silent background MLX warmup on <code>task_start</code> for sub-second first visual queries.</li>
-          <li>Native Sparkle 2 automatic updates and Apple-notarized direct distribution.</li>
+          <li>Sparkle 2 update support and a drag-to-Applications DMG.</li>
         </ul>
       ]]></description>
       <enclosure

@@ -8,6 +8,9 @@ All notable changes to UseMac are documented here. The format follows
 
 A reliability pass on everything agents do in the background, and a new live preview.
 
+This beta is not notarized yet: the first time, open it with right-click > Open, or allow it in
+System Settings > Privacy & Security ("Open Anyway").
+
 ### Added
 
 - **Semantic targets.** Steps can name an element by what it is (`match`: role, title, value or text)
@@ -30,6 +33,9 @@ A reliability pass on everything agents do in the background, and a new live pre
   of the others, and makes it clear when another one comes to the front.
 - Per-command help in the CLI (`usemac help <command>`), new error codes with exit codes, and the new fields in
   the MCP tools and agent guides.
+- **Beta updates.** A "Beta updates" switch in Settings > Software Updates (on by default in beta builds).
+  Pre-releases are published in Sparkle's beta channel, so stable installs are never moved to a beta.
+  Updates are now signed with an EdDSA key.
 
 ### Changed
 
