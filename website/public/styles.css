@@ -2743,3 +2743,13 @@ button:focus-visible,
     transform: none;
   }
 }
+
+.trust-row a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.trust-row a:hover {
+  color: var(--text-light);
+}

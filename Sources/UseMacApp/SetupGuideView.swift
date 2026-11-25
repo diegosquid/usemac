@@ -451,30 +451,42 @@ public struct SetupGuideView: View {
             )
 
             VStack(spacing: 0) {
-                SetupRow(
-                    leading: { SetupNumberBadge(number: 1) },
-                    title: "Open the extensions page",
-                    detail: "In Chrome, turn on Developer mode at the top right."
-                ) {
-                    Button("Open Chrome") { appState.openChromeExtensionsPage() }
-                        .buttonStyle(SubtleOutlineButtonStyle())
-                }
-                InsetDivider(leading: 64)
-                SetupRow(
-                    leading: { SetupNumberBadge(number: 2) },
-                    title: "Load the UseMac extension",
-                    detail: "Click Load unpacked, press ⌘⇧G, paste the path and click Select."
-                ) {
-                    Button(copiedKey == "path" ? "Copied" : "Copy Path") {
-                        if appState.copyChromeExtensionPath() {
-                            flashCopied("path")
-                        }
+                if appState.chromeWebStoreExtensionId != nil {
+                    // Release builds that know the Chrome Web Store ID: one click, no Developer mode.
+                    SetupRow(
+                        leading: { SetupNumberBadge(number: 1) },
+                        title: "Add UseMac to Chrome",
+                        detail: "Opens the Chrome Web Store. Click Add to Chrome."
+                    ) {
+                        Button("Add to Chrome") { appState.installPublishedChromeExtension() }
+                            .buttonStyle(SubtleOutlineButtonStyle())
                     }
-                    .buttonStyle(SubtleOutlineButtonStyle())
+                } else {
+                    SetupRow(
+                        leading: { SetupNumberBadge(number: 1) },
+                        title: "Open the extensions page",
+                        detail: "In Chrome, turn on Developer mode at the top right."
+                    ) {
+                        Button("Open Chrome") { appState.openChromeExtensionsPage() }
+                            .buttonStyle(SubtleOutlineButtonStyle())
+                    }
+                    InsetDivider(leading: 64)
+                    SetupRow(
+                        leading: { SetupNumberBadge(number: 2) },
+                        title: "Load the UseMac extension",
+                        detail: "Click Load unpacked, press ⌘⇧G, paste the path and click Select."
+                    ) {
+                        Button(copiedKey == "path" ? "Copied" : "Copy Path") {
+                            if appState.copyChromeExtensionPath() {
+                                flashCopied("path")
+                            }
+                        }
+                        .buttonStyle(SubtleOutlineButtonStyle())
+                    }
                 }
                 InsetDivider(leading: 64)
                 SetupRow(
-                    leading: { SetupNumberBadge(number: 3) },
+                    leading: { SetupNumberBadge(number: appState.chromeWebStoreExtensionId != nil ? 2 : 3) },
                     title: "Pair it with this Mac",
                     detail: "Open the extension popup and paste the pairing key."
                 ) {
