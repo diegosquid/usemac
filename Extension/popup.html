@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>usemac Browser Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="card">
+      <header class="header">
+        <div class="brand">
+          <img src="icons/icon32.png" alt="" class="logo" />
+          <div class="brand-text">
+            <h1>usemac</h1>
+            <span id="versionText" class="version"></span>
+          </div>
+        </div>
+        <div
+          id="statusBadge"
+          class="status-badge status-disconnected"
+          role="status"
+          aria-live="polite"
+        >
+          <span id="statusDot" class="status-dot"></span>
+          <span id="statusText">usemac app not running</span>
+        </div>
+      </header>
+
+      <section class="field-group">
+        <div class="field-label-row">
+          <label for="profileInput" class="field-label">Profile name</label>
+          <span id="saveIndicator" class="save-indicator"></span>
+        </div>
+        <input
+          id="profileInput"
+          type="text"
+          class="text-input"
+          placeholder="e.g. Work"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <p class="hint-text">Agents use this name to pick this Chrome profile.</p>
+      </section>
+
+      <section class="field-group">
+        <div class="field-label-row">
+          <label for="pairingKeyInput" class="field-label">Pairing key</label>
+        </div>
+
+        <div id="pairingCollapsed" class="pairing-collapsed" hidden>
+          <span class="paired-text">Paired with usemac on this Mac</span>
+          <button id="changeKeyBtn" type="button" class="btn-link">Change key</button>
+        </div>
+
+        <div id="pairingExpanded" class="pairing-expanded">
+          <div class="pairing-input-row">
+            <input
+              id="pairingKeyInput"
+              type="password"
+              class="text-input"
+              placeholder="umk_…"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="pairBtn" type="button" class="btn-primary">Pair</button>
+          </div>
+          <p id="pairingError" class="error-text" role="alert" hidden></p>
+          <p class="hint-text">
+            In the usemac app, open Settings → General → Chrome Extension and click Copy pairing key.
+          </p>
+        </div>
+      </section>
+
+      <section class="field-group">
+        <div class="field-label-row">
+          <span class="field-label">Tabs under control</span>
+          <button id="stopAllBtn" type="button" class="btn-danger" disabled>Stop all</button>
+        </div>
+        <div id="tabsList" class="tabs-list" hidden></div>
+        <p id="tabsEmpty" class="empty-text">No tabs are being controlled.</p>
+      </section>
+
+      <footer class="footer">
+        <span id="endpointMeta" class="meta-text">127.0.0.1:49222</span>
+        <button id="reconnectBtn" type="button" class="btn-subtle">Reconnect</button>
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

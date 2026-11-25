@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>usemac Changelog</title>
+    <link>https://usemac.app/appcast.xml</link>
+    <description>Official automatic updates for usemac (macOS 15+ Apple Silicon).</description>
+    <language>en</language>
+    <!-- Generated & signed automatically by scripts/release-dmg.sh (Sparkle 2 EdDSA) -->
+    <item>
+      <title>Version 0.5.0</title>
+      <sparkle:version>50</sparkle:version>
+      <sparkle:shortVersionString>0.5.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 25 Nov 2026 15:00:00 +0000</pubDate>
+      <description><![CDATA[
+        <h3>What's New in usemac 0.5.0</h3>
+        <ul>
+          <li>Continuous preview HUD lifecycle (<code>task_start</code> &rarr; <code>task_complete</code>) with calm glacier-blue rim and frosted completion overlay.</li>
+          <li>Hybrid on-device Apple Vision OCR + MLX Qwen visual assistant (<code>ask</code>, <code>verify</code>, <code>describe</code>) cutting cloud vision tokens by 97%.</li>
+          <li>Silent background MLX warmup on <code>task_start</code> for sub-second first visual queries.</li>
+          <li>Native Sparkle 2 automatic updates and Apple-notarized direct distribution.</li>
+        </ul>
+      ]]></description>
+      <enclosure
+        url="https://usemac.app/downloads/usemac-0.5.0-arm64.dmg"
+        type="application/octet-stream"
+        sparkle:os="macos"
+      />
+    </item>
+  </channel>
+</rss>

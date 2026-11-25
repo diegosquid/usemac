@@ -1,0 +1,21 @@
+.build/
+.swiftpm/
+dist/
+*.xcodeproj
+*.xcworkspace
+.DS_Store
+DerivedData/
+
+# Local tooling state and build outputs
+.wrangler/
+node_modules/
+__pycache__/
+*.pyc
+website/public/downloads/*.dmg
+
+# Secrets and signing material
+.env
+.env.*
+*.p8
+*.p12
+*.pem

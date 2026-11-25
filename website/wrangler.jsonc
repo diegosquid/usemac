@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "usemac",
+  "compatibility_date": "2026-11-25",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./public",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    {
+      "pattern": "usemac.app",
+      "custom_domain": true
+    },
+    {
+      "pattern": "www.usemac.app",
+      "custom_domain": true
+    }
+  ]
+}

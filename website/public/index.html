@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>usemac — Computer Use, Rebuilt for Mac Speed</title>
+  <meta name="description" content="Native macOS background computer control for AI agents. Sub-millisecond Unix socket RPC, zero-focus Chrome automation, live corner HUD preview, and on-device Apple Silicon MLX vision." />
+  <meta property="og:title" content="usemac — Computer Use, Rebuilt for Mac Speed" />
+  <meta property="og:description" content="Zero-focus background automation for macOS & Chrome with live floating preview HUD and hybrid Apple Silicon MLX vision. 97% fewer vision tokens, 0.14 ms local IPC." />
+  <link rel="canonical" href="https://usemac.app/" />
+  <meta property="og:url" content="https://usemac.app/" />
+  <meta property="og:image" content="https://usemac.app/assets/og-image.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="theme-color" content="#07080b" />
+  <link rel="icon" type="image/png" href="/assets/favicon.png" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <a href="#main" class="skip-link">Skip to content</a>
+
+  <!-- Floating Studio Navbar -->
+  <header class="nav-wrap" id="navbar">
+    <nav class="nav">
+      <a href="#" class="brand">
+        <img src="/assets/usemac-icon.png" alt="usemac Command Knot logo" class="brand-icon" />
+        <span>usemac</span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#agents">Setup</a>
+        <a href="/privacy">Privacy</a>
+      </div>
+      <a href="/downloads/usemac-latest-arm64.dmg" download class="nav-cta">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download
+      </a>
+    </nav>
+  </header>
+
+  <main id="main">
+  <!-- Hero Section -->
+  <section class="hero">
+    <div class="hero-inner">
+      <div class="hero-pill">
+        <span class="hero-pill-dot"></span>
+        macOS 15+ &middot; Apple Silicon &middot; Zero-Focus
+      </div>
+
+      <h1 class="hero-title">
+        Computer use,<br />
+        <span class="hero-highlight">rebuilt for Mac speed.</span>
+      </h1>
+
+      <p class="hero-sub">
+        Your AI agents control real Mac apps and Chrome tabs quietly in the background &mdash; without stealing focus or burning vision tokens.
+      </p>
+
+      <div class="hero-actions">
+        <a href="/downloads/usemac-latest-arm64.dmg" download class="btn-primary">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.33c.64-.78 1.08-1.86.96-2.94-.93.04-2.06.62-2.72 1.4-.58.68-1.1 1.79-.96 2.84 1.04.08 2.09-.52 2.72-1.3"/></svg>
+          Download for Mac
+        </a>
+        <a href="#agents" class="btn-secondary">
+          Paste into your agent
+        </a>
+      </div>
+      <p class="hero-meta">6 MB &middot; macOS 15 or later &middot; Apple Silicon only</p>
+
+      <!-- Interactive Real macOS Desktop + Authentic Floating usemac HUD -->
+      <div class="stage-wrap">
+        <div class="stage-steps" role="group" aria-label="Demo steps">
+          <button type="button" class="stage-step active" data-step="0" aria-current="step"><span class="step-num">1</span> Open site</button>
+          <button type="button" class="stage-step" data-step="1"><span class="step-num">2</span> Fill form</button>
+          <button type="button" class="stage-step" data-step="2"><span class="step-num">3</span> Upload PDF</button>
+          <button type="button" class="stage-step" data-step="3"><span class="step-num">4</span> Submit</button>
+          <button type="button" class="stage-toggle" id="demoToggle">Pause demo</button>
+        </div>
+
+        <p class="sr-only">Animated demo: an agent in a terminal asks usemac to submit an expense, and a small floating preview shows Chrome filling the form in the background.</p>
+
+        <div class="mac-stage" aria-hidden="true">
+          <!-- Authentic macOS Studio Silk-Wave Wallpaper -->
+          <div class="mac-wallpaper" aria-hidden="true">
+            <svg class="wp-svg" viewBox="0 0 1200 680" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="wpSky" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stop-color="#0b1530" />
+                  <stop offset="42%" stop-color="#17346c" />
+                  <stop offset="76%" stop-color="#2b4c8c" />
+                  <stop offset="100%" stop-color="#182246" />
+                </linearGradient>
+                <radialGradient id="wpSun" cx="22%" cy="84%" r="58%">
+                  <stop offset="0%" stop-color="#fb923c" stop-opacity="0.72" />
+                  <stop offset="38%" stop-color="#f472b6" stop-opacity="0.42" />
+                  <stop offset="75%" stop-color="#6366f1" stop-opacity="0.16" />
+                  <stop offset="100%" stop-color="#0f172a" stop-opacity="0" />
+                </radialGradient>
+                <radialGradient id="wpAurora" cx="78%" cy="18%" r="52%">
+                  <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.62" />
+                  <stop offset="48%" stop-color="#3b82f6" stop-opacity="0.28" />
+                  <stop offset="100%" stop-color="#1e1b4b" stop-opacity="0" />
+                </radialGradient>
+                <linearGradient id="wpRibbon1" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.52" />
+                  <stop offset="50%" stop-color="#818cf8" stop-opacity="0.34" />
+                  <stop offset="100%" stop-color="#f472b6" stop-opacity="0.42" />
+                </linearGradient>
+                <linearGradient id="wpRibbon2" x1="100%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.46" />
+                  <stop offset="55%" stop-color="#3b82f6" stop-opacity="0.22" />
+                  <stop offset="100%" stop-color="#fb923c" stop-opacity="0.36" />
+                </linearGradient>
+                <linearGradient id="wpHill" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stop-color="#0f172a" stop-opacity="0.64" />
+                  <stop offset="52%" stop-color="#1e293b" stop-opacity="0.42" />
+                  <stop offset="100%" stop-color="#090d1a" stop-opacity="0.72" />
+                </linearGradient>
+                <filter id="wpBlur" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur stdDeviation="34" />
+                </filter>
+              </defs>
+              <rect width="1200" height="680" fill="url(#wpSky)" />
+              <rect width="1200" height="680" fill="url(#wpSun)" />
+              <rect width="1200" height="680" fill="url(#wpAurora)" />
+              <path d="M-120,420 C160,190 420,520 740,240 C940,65 1100,190 1320,90 L1320,680 L-120,680 Z" fill="url(#wpRibbon1)" filter="url(#wpBlur)" />
+              <path d="M-80,540 C240,340 500,170 810,360 C990,470 1120,310 1280,260 L1280,680 L-80,680 Z" fill="url(#wpRibbon2)" filter="url(#wpBlur)" />
+              <path d="M0,515 C260,440 490,565 780,475 C960,420 1090,465 1200,440 L1200,680 L0,680 Z" fill="url(#wpHill)" />
+            </svg>
+          </div>
+
+          <!-- Real Translucent macOS Menu Bar -->
+          <div class="mac-menubar">
+            <div class="mac-menubar-left">
+              <strong>Terminal</strong>
+              <span>Shell</span>
+              <span>Edit</span>
+              <span>View</span>
+              <span>Window</span>
+            </div>
+            <div class="mac-menubar-right">
+              <span class="menubar-usemac-badge working" id="menubarBadge">
+                <span class="menubar-pulse" id="menubarPulse"></span>
+                <span>&#x2318; usemac</span>
+              </span>
+              <svg class="mb-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1" fill="currentColor"/></svg>
+              <svg class="mb-icon" width="16" height="11" viewBox="0 0 26 14" fill="none"><rect x="1" y="2" width="21" height="10" rx="2.5" stroke="currentColor" stroke-width="1.5" opacity="0.82"/><rect x="3" y="4" width="15" height="6" rx="1.2" fill="currentColor"/><path d="M23.5 5.2v3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity="0.7"/></svg>
+              <span id="macClock">1:05 PM</span>
+            </div>
+          </div>
+
+          <div class="mac-desktop">
+            <!-- Authentic Claude Code macOS Terminal Window (main workspace on the left) -->
+            <div class="cc-window">
+              <div class="cc-titlebar">
+                <div class="traffic-lights">
+                  <span class="tl-red"></span>
+                  <span class="tl-yellow"></span>
+                  <span class="tl-green"></span>
+                </div>
+                <span class="cc-title">claude &mdash; ~/projects/acme</span>
+                <span class="cc-spacer"></span>
+              </div>
+
+              <div class="cc-body">
+                <!-- Authentic Claude Code Welcome Strip -->
+                <div class="cc-welcome">
+                  <div class="cc-mascot" aria-hidden="true">
+                    <svg width="38" height="24" viewBox="0 0 16 10" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">
+                      <rect x="2" y="0" width="12" height="8" fill="#d97757" />
+                      <rect x="0" y="4" width="2" height="2" fill="#d97757" />
+                      <rect x="14" y="4" width="2" height="2" fill="#d97757" />
+                      <rect x="4" y="2" width="1" height="2" fill="#141720" />
+                      <rect x="11" y="2" width="1" height="2" fill="#141720" />
+                      <rect x="3" y="8" width="1" height="2" fill="#d97757" />
+                      <rect x="5" y="8" width="1" height="2" fill="#d97757" />
+                      <rect x="10" y="8" width="1" height="2" fill="#d97757" />
+                      <rect x="12" y="8" width="1" height="2" fill="#d97757" />
+                    </svg>
+                  </div>
+                  <div class="cc-meta">
+                    <div><strong>Claude Code</strong> <span class="cc-dim">v2.1</span></div>
+                    <div class="cc-dim">Opus 4.6 &middot; ~/projects/acme</div>
+                  </div>
+                </div>
+
+                <!-- User Prompt calling /usemac -->
+                <div class="cc-prompt">
+                  <span class="cc-gt">&rsaquo;</span>
+                  <div class="cc-prompt-copy">
+                    <span class="slash-cmd">/usemac</span> submit my Q4 cloud expense ($480) on Acme Finance with receipt.pdf
+                  </div>
+                </div>
+
+                <!-- Clean Live Tool Calls -->
+                <div class="cc-stream" id="ccStream">
+                  <div class="cc-step" data-idx="0"><span class="cc-bullet"></span><span><strong>usemac</strong> &middot; Opening acme.app/expenses</span></div>
+                  <div class="cc-step" data-idx="1"><span class="cc-bullet"></span><span><strong>usemac</strong> &middot; Filling vendor &amp; amount</span></div>
+                  <div class="cc-step" data-idx="2"><span class="cc-bullet"></span><span><strong>usemac</strong> &middot; Uploading receipt-q4.pdf <span class="cc-dim">(no Finder)</span></span></div>
+                  <div class="cc-step" data-idx="3"><span class="cc-bullet"></span><span><strong>usemac</strong> &middot; Submitting expense</span></div>
+                </div>
+
+                <!-- Final Assistant Reply -->
+                <div class="cc-reply" id="claudeReply">
+                  <span class="cc-reply-dot">&#x2713;</span>
+                  <span>Done &mdash; submitted <strong>Expense #2048</strong> ($480.00, <code>receipt-q4.pdf</code>).</span>
+                </div>
+
+                <!-- Bottom Input Prompt -->
+                <div class="cc-input-bar">
+                  <span class="cc-gt">&rsaquo;</span>
+                  <span class="cc-input-hint" id="ccInputHint">Running in background&hellip;</span><span class="cc-caret"></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Compact Authentic Frameless Floating usemac HUD (smaller, real Chrome tab + full web app!) -->
+            <div class="usemac-hud" id="demoHud">
+              <div class="hud-surface">
+                <div class="hud-viewport-scale" id="demoWebPage">
+                  <!-- Real Miniature Chrome Tab Strip (with blue 'usemac' tab group!) + Omnibox -->
+                  <div class="mini-chrome-tabs">
+                    <span class="mc-group-pill">usemac</span>
+                    <div class="mc-tab active">
+                      <span class="mc-favicon"></span>
+                      <span>Acme Finance &mdash; Expenses</span>
+                      <span class="mc-x">&times;</span>
+                    </div>
+                    <div class="mc-tab">
+                      <span>Cloud Console</span>
+                    </div>
+                    <span class="mc-plus">+</span>
+                  </div>
+                  <div class="mini-chrome-bar">
+                    <span class="mc-nav-icons">&larr;&nbsp;&nbsp;&rarr;&nbsp;&nbsp;&#x21BB;</span>
+                    <div class="mc-omnibox">
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                      <span>app.acme.finance<strong>/expenses/new</strong></span>
+                    </div>
+                    <span class="mc-avatar-dot">D</span>
+                  </div>
+
+                  <!-- Real Full-Layout Miniature SaaS Web App (Sidebar + Content + Recent Table) -->
+                  <div class="mini-webapp">
+                    <aside class="mw-sidebar">
+                      <div class="mw-brand">
+                        <span class="app-logo"></span>
+                        <span>Acme</span>
+                      </div>
+                      <div class="mw-nav">
+                        <span>Overview</span>
+                        <span>Cards</span>
+                        <span class="active">Expenses</span>
+                        <span>Invoices</span>
+                        <span>Vendors</span>
+                        <span>Settings</span>
+                      </div>
+                    </aside>
+
+                    <div class="mw-main">
+                      <div class="mw-topbar">
+                        <span class="mw-crumb">Expenses &nbsp;&rsaquo;&nbsp; <strong>New expense</strong></span>
+                        <span class="app-cat-chip" id="catChip">Cloud &middot; Q4</span>
+                      </div>
+
+                      <!-- Form Card -->
+                      <div class="app-form" id="demoFormView">
+                        <div class="app-grid-2">
+                          <div class="app-field">
+                            <span class="app-label">Vendor</span>
+                            <div class="app-input" id="fieldVendor"><span id="textVendor"></span></div>
+                          </div>
+                          <div class="app-field">
+                            <span class="app-label">Amount</span>
+                            <div class="app-input mono" id="fieldAmount"><span id="textAmount"></span></div>
+                          </div>
+                        </div>
+
+                        <div class="app-field">
+                          <span class="app-label">Receipt</span>
+                          <div class="app-dropzone" id="fieldDropzone">
+                            <div class="drop-empty" id="dropEmpty">
+                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                              <span>Drop PDF receipt or browse</span>
+                            </div>
+                            <div class="drop-attached" id="dropAttached">
+                              <span class="pdf-tag">PDF</span>
+                              <span class="pdf-name">receipt-q4.pdf</span>
+                              <span class="pdf-size">412 KB</span>
+                              <span class="pdf-silent">No Finder</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div class="app-actions">
+                          <span class="mw-hint">Auto-approved under $1,000</span>
+                          <div class="app-submit-btn" id="btnSubmit">Submit expense</div>
+                        </div>
+                      </div>
+
+                      <!-- Recent Expenses Table Peeking Below (Real Website Depth!) -->
+                      <div class="mw-recent" id="demoRecentTable">
+                        <div class="mw-recent-head">
+                          <span>Recent expenses</span>
+                          <span>Status</span>
+                        </div>
+                        <div class="mw-recent-row">
+                          <span>AWS US-East &middot; Nov</span>
+                          <span class="mw-paid">Paid &middot; $312.00</span>
+                        </div>
+                        <div class="mw-recent-row">
+                          <span>Cloudflare Pro &middot; Nov</span>
+                          <span class="mw-paid">Paid &middot; $20.00</span>
+                        </div>
+                      </div>
+
+                      <!-- Submitted Confirmation View inside Webpage -->
+                      <div class="app-submitted" id="demoSubmittedView">
+                        <div class="sub-badge">&#x2713;</div>
+                        <div class="sub-title">Expense #2048 submitted</div>
+                        <div class="sub-meta">Oracle Cloud &middot; $480.00 &middot; receipt-q4.pdf</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Compact Obsidian Cursor + Auto-Fade Action Pill (1:1 crisp) -->
+                <div class="hud-cursor hidden" id="hudCursor">
+                  <span class="cursor-ripple" id="cursorRipple"></span>
+                  <svg class="cursor-arrow" viewBox="0 0 18 22" fill="none">
+                    <path d="M2 2L15.5 11.4L9.2 12.6L6.6 18.8L2 2Z" fill="#0C0F16" stroke="#FFFFFF" stroke-width="2" stroke-linejoin="round"/>
+                  </svg>
+                  <span class="cursor-pill" id="cursorPill">Typing</span>
+                </div>
+
+                <!-- Authentic Bottom Frosted Status Pill + Neutral Stop Button (1:1 crisp) -->
+                <div class="hud-footer">
+                  <div class="hud-status-pill">
+                    <span class="hud-spinner" id="hudSpinner"></span>
+                    <span id="hudStatusText">Opening acme.app…</span>
+                  </div>
+                  <button type="button" class="hud-stop-btn" id="hudStopBtn" tabindex="-1" aria-label="Stop or Replay preview">
+                    <span class="hud-stop-square" id="hudStopIcon"></span>
+                    <span id="hudStopLabel">Stop</span>
+                  </button>
+                </div>
+
+                <!-- Authentic Frosted White Completion Overlay + Mint Check (1:1 crisp) -->
+                <div class="hud-complete-overlay" id="hudCompleteOverlay">
+                  <div class="mint-check-badge">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                  </div>
+                  <div class="hud-complete-label" id="hudCompleteLabel">All done</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Authentic Frosted Glass macOS Dock -->
+            <div class="mac-dock" aria-hidden="true">
+              <div class="dock-item dock-finder" title="Finder">
+                <svg width="32" height="32" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+                  <defs>
+                    <linearGradient id="fBlue" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stop-color="#53a4ff" />
+                      <stop offset="100%" stop-color="#1565f2" />
+                    </linearGradient>
+                    <linearGradient id="fWhite" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stop-color="#ffffff" />
+                      <stop offset="100%" stop-color="#dbeafe" />
+                    </linearGradient>
+                  </defs>
+                  <rect width="64" height="64" fill="url(#fBlue)" />
+                  <path d="M35 0 C31 12 28.5 24 27.5 35.5 L34.5 35.5 C34 45 34.5 55 37 64 L64 64 L64 0 Z" fill="url(#fWhite)" />
+                  <path d="M35 0 C31 12 28.5 24 27.5 35.5 L34.5 35.5 C34 45 34.5 55 37 64" fill="none" stroke="rgba(15,23,42,0.16)" stroke-width="1.6" stroke-linejoin="round" />
+                  <rect x="17" y="18.5" width="4.2" height="9" rx="2.1" fill="#0f172a" />
+                  <rect x="42.8" y="18.5" width="4.2" height="9" rx="2.1" fill="#0f172a" />
+                  <path d="M15.5 42.5 C21.5 49.5 42.5 49.5 48.5 42.5" fill="none" stroke="#0f172a" stroke-width="3.6" stroke-linecap="round" />
+                </svg>
+              </div>
+              <div class="dock-item dock-chrome active-app" title="Chrome">
+                <svg width="32" height="32" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+                  <defs>
+                    <clipPath id="chromeClip">
+                      <circle cx="32" cy="32" r="23" />
+                    </clipPath>
+                  </defs>
+                  <rect width="64" height="64" fill="#ffffff" />
+                  <g clip-path="url(#chromeClip)">
+                    <circle cx="32" cy="32" r="23" fill="#34A853" />
+                    <path d="M12.37 20.01 A23 23 0 0 1 52.20 21 L32 21 L32 32 L22.47 37.50 Z" fill="#EA4335" />
+                    <path d="M52.20 21 A23 23 0 0 1 31.43 54.99 L41.53 37.50 L32 32 L32 21 Z" fill="#FBBC04" />
+                  </g>
+                  <circle cx="32" cy="32" r="11" fill="#ffffff" />
+                  <circle cx="32" cy="32" r="8.6" fill="#1A73E8" />
+                </svg>
+              </div>
+              <div class="dock-item dock-notes" title="Notes">
+                <span class="dock-notes-top"></span>
+                <span class="dock-notes-line"></span>
+                <span class="dock-notes-line short"></span>
+              </div>
+              <div class="dock-item dock-term active-app" title="Terminal">
+                <span>&gt;_</span>
+              </div>
+              <span class="dock-sep"></span>
+              <div class="dock-item dock-usemac active-app" title="usemac">
+                <img src="/assets/usemac-icon.png" alt="" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stage-caption">
+          <span>Stay inside Claude Code</span>
+          <span class="cap-dot">&middot;</span>
+          <span>Live mini-preview floats in the corner</span>
+          <span class="cap-dot">&middot;</span>
+          <span>Zero focus stolen &middot; Closes when done</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Unified Obsidian Studio Visual Bento -->
+  <section class="studio-band" id="features">
+    <div class="container">
+      <div class="studio-head reveal">
+        <h2>Built like a native Mac tool.</h2>
+        <p>Zero cloud VMs. Zero stolen windows. Pure native Swift &amp; Apple Silicon.</p>
+      </div>
+
+      <div class="studio-grid">
+        <!-- Card 1: Speed & On-Device Vision Visual -->
+        <div class="studio-card span-7 reveal">
+          <div class="artifact-well speed-well">
+            <div class="speed-metrics-top">
+              <div class="sm-stat">
+                <span class="sm-val">0.14<small>ms</small></span>
+                <span class="sm-lbl">Local Unix socket</span>
+              </div>
+              <div class="sm-divider"></div>
+              <div class="sm-stat">
+                <span class="sm-val sm-mint">&minus;97%</span>
+                <span class="sm-lbl">Vision tokens</span>
+              </div>
+              <div class="sm-divider"></div>
+              <div class="sm-stat">
+                <span class="sm-val">0.5<small>s</small></span>
+                <span class="sm-lbl">On-device MLX</span>
+              </div>
+            </div>
+
+            <div class="speed-bars">
+              <div class="sp-row">
+                <div class="sp-meta">
+                  <span>Screenshot-loop agent</span>
+                  <code>1,366 tokens &middot; 3.5s</code>
+                </div>
+                <div class="sp-track"><div class="sp-fill sp-old" style="width: 100%;"></div></div>
+              </div>
+              <div class="sp-row">
+                <div class="sp-meta">
+                  <span class="sp-hi">usemac + Local MLX</span>
+                  <code class="sp-hi">38 tokens &middot; 0.5s</code>
+                </div>
+                <div class="sp-track"><div class="sp-fill sp-new" style="width: 5.5%;"></div></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="studio-copy">
+            <h3>Milliseconds, not screenshot loops.</h3>
+            <p>Indexed DOM &amp; Accessibility trees plus optional on-device Apple Silicon vision replace slow cloud prints.</p>
+          </div>
+        </div>
+
+        <!-- Card 2: Real Chrome Tab Groups + Cross-Origin Iframes Visual -->
+        <div class="studio-card span-5 reveal">
+          <div class="artifact-well tabs-well">
+            <div class="art-chrome-strip">
+              <div class="art-tab muted">Gmail</div>
+              <div class="art-tab muted">Spotify</div>
+              <div class="art-group">
+                <span class="art-group-badge">usemac</span>
+                <div class="art-tab active">Oracle Cloud</div>
+                <div class="art-tab grouped">Stripe</div>
+              </div>
+            </div>
+            <div class="art-iframe-box">
+              <div class="art-iframe-head">
+                <span class="art-dot"></span>
+                <span>Cross-origin iframe (OOPIF)</span>
+                <span class="art-ok">@b1..@b48</span>
+              </div>
+              <div class="art-iframe-rows">
+                <span></span>
+                <span class="short"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="studio-copy">
+            <h3>Your real signed-in Chrome tabs.</h3>
+            <p>Organizes agent tabs into one clean group and reaches straight inside cross-origin iframes and data grids.</p>
+          </div>
+        </div>
+
+        <!-- Card 3: Zero-Finder Silent Upload Visual -->
+        <div class="studio-card span-5 reveal">
+          <div class="artifact-well upload-well">
+            <div class="art-upload-card">
+              <div class="art-file-row">
+                <span class="art-pdf">PDF</span>
+                <div class="art-file-info">
+                  <strong>receipt-q4.pdf</strong>
+                  <span>412 KB &middot; injected via CDP</span>
+                </div>
+                <span class="art-check">&#x2713;</span>
+              </div>
+              <div class="art-upload-tags">
+                <span class="art-tag-mint">0 Finder dialogs</span>
+                <span class="art-tag-dim">~/.ssh &amp; .env blocked</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="studio-copy">
+            <h3>Silent uploads, never pops Finder.</h3>
+            <p>Attaches local files directly into hidden web inputs while blocking sensitive credential paths by default.</p>
+          </div>
+        </div>
+
+        <!-- Card 4: Tactile Aluminum Keycaps + Interactive Kill Switch / Read-Only Mode -->
+        <div class="studio-card span-7 reveal">
+          <div class="artifact-well control-well">
+            <div class="keycap-row" aria-label="Global kill switch shortcut Shift Command Escape">
+              <kbd class="mac-key"><span>&#x21E7;</span></kbd>
+              <kbd class="mac-key"><span>&#x2318;</span></kbd>
+              <kbd class="mac-key wide"><span>esc</span></kbd>
+            </div>
+
+            <div class="mode-widget">
+              <div class="mode-seg" role="radiogroup" aria-label="Try governance modes">
+                <button type="button" class="mode-opt active" data-mode="autonomous" role="radio" aria-checked="true" tabindex="0">Autonomous</button>
+                <button type="button" class="mode-opt" data-mode="readonly" role="radio" aria-checked="false" tabindex="-1">Read-Only</button>
+                <button type="button" class="mode-opt" data-mode="paused" role="radio" aria-checked="false" tabindex="-1">Paused</button>
+              </div>
+              <div class="mode-status" id="modeStatus">
+                <span class="mode-dot active" id="modeDot"></span>
+                <span id="modeDesc">Agents running quietly in background</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="studio-copy">
+            <h3>Read-only audits &amp; instant kill switch.</h3>
+            <p>Lock ad accounts or production consoles to read-only, or tap <strong>&#x21E7;&#x2318;&#x238B;</strong> anytime to freeze every agent.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interactive "Paste into Your Agent" Setup Composer -->
+  <section class="studio-band setup-band" id="agents">
+    <div class="container">
+      <div class="studio-head reveal">
+        <h2>Set up in one paste.</h2>
+        <p>Pick your agent, copy the prompt, and let it install and verify everything for you.</p>
+      </div>
+
+      <div class="prompt-composer reveal">
+        <div class="agent-pills" role="tablist" aria-label="Choose your AI agent">
+          <button type="button" class="agent-pill active" id="tab-claude" data-agent="claude" role="tab" aria-selected="true" aria-controls="composerBody" tabindex="0">Claude Code</button>
+          <button type="button" class="agent-pill" id="tab-cursor" data-agent="cursor" role="tab" aria-selected="false" aria-controls="composerBody" tabindex="-1">Cursor</button>
+          <button type="button" class="agent-pill" id="tab-codex" data-agent="codex" role="tab" aria-selected="false" aria-controls="composerBody" tabindex="-1">Codex</button>
+          <button type="button" class="agent-pill" id="tab-antigravity" data-agent="antigravity" role="tab" aria-selected="false" aria-controls="composerBody" tabindex="-1">Antigravity</button>
+          <button type="button" class="agent-pill" id="tab-mcp" data-agent="mcp" role="tab" aria-selected="false" aria-controls="composerBody" tabindex="-1">MCP JSON</button>
+        </div>
+
+        <div class="composer-box">
+          <div class="composer-body" id="composerBody" role="tabpanel" aria-labelledby="tab-claude"></div>
+          <div class="composer-foot">
+            <button type="button" class="composer-alt" id="copyCliAlt">Copy terminal command instead</button>
+            <button type="button" class="composer-copy-btn" id="copyAgentPrompt">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              <span id="copyAgentLabel">Copy prompt for Claude Code</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Quiet Editorial Founder Note -->
+  <section class="note-band">
+    <div class="note-inner reveal">
+      <p>&ldquo;Computer use shouldn't hijack your mouse or burn thousands of tokens per click. It should feel like a quiet second pair of hands running at Mac speed.&rdquo;</p>
+      <span>Diego Macedo &middot; Creator of usemac</span>
+    </div>
+  </section>
+
+  <!-- Final Download CTA -->
+  <section class="download-band" id="download">
+    <div class="download-card reveal">
+      <img src="/assets/usemac-icon.png" alt="usemac app icon" class="download-icon" />
+      <h2>Ready for your Mac.</h2>
+      <p>~6 MB native Apple Silicon app + Chrome Bridge extension.</p>
+      <div class="hero-actions" style="margin-top: 0;">
+        <a href="/downloads/usemac-latest-arm64.dmg" download class="btn-primary" id="downloadDmgBtn">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download for Mac
+        </a>
+        <a href="#chrome-extension" class="btn-secondary" id="chromeStoreBtn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/><line x1="21.17" y1="8" x2="12" y2="8"/><line x1="3.95" y1="6.06" x2="8.54" y2="14"/><line x1="10.88" y1="21.94" x2="15.46" y2="14"/></svg>
+          Chrome Extension
+        </a>
+      </div>
+      <div class="install-steps">
+        <h3>After you download</h3>
+        <ol>
+          <li>Drag usemac to Applications and open it.</li>
+          <li>Allow Accessibility and Screen Recording when macOS asks.</li>
+          <li id="chrome-extension">Add the Chrome extension: open <code>chrome://extensions</code>, turn on Developer mode, click Load unpacked and choose <code>/Applications/usemac.app/Contents/Resources/chrome-extension</code>. Then paste the pairing key from usemac &rarr; Settings &rarr; General &rarr; Chrome Extension.</li>
+          <li>Paste the <a href="#agents">setup prompt</a> into your agent.</li>
+        </ol>
+      </div>
+      <div class="trust-row">
+        <span>Apple Notarized</span>
+        <span>&middot;</span>
+        <span>Auto-Updates</span>
+        <span>&middot;</span>
+        <span>Runs on your Mac</span>
+      </div>
+    </div>
+  </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div class="brand">
+        <img src="/assets/usemac-icon.png" alt="usemac icon" class="brand-icon" style="width:22px;height:22px;border-radius:6px;" />
+        <span>usemac</span>
+      </div>
+      <div class="footer-links">
+        <a href="/privacy">Privacy</a>
+        <a href="/appcast.xml">Appcast</a>
+        <a href="mailto:hello@usemac.app">Contact</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
