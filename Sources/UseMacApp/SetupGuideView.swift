@@ -463,10 +463,14 @@ public struct SetupGuideView: View {
                 SetupRow(
                     leading: { SetupNumberBadge(number: 2) },
                     title: "Load the UseMac extension",
-                    detail: "Click Load unpacked and choose the folder UseMac shows you."
+                    detail: "Click Load unpacked, press ⌘⇧G, paste the path and click Select."
                 ) {
-                    Button("Show Folder") { appState.revealChromeExtensionInFinder() }
-                        .buttonStyle(SubtleOutlineButtonStyle())
+                    Button(copiedKey == "path" ? "Copied" : "Copy Path") {
+                        if appState.copyChromeExtensionPath() {
+                            flashCopied("path")
+                        }
+                    }
+                    .buttonStyle(SubtleOutlineButtonStyle())
                 }
                 InsetDivider(leading: 64)
                 SetupRow(

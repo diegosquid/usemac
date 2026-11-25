@@ -647,13 +647,14 @@ public struct ControlCenterView: View {
         return SettingsGroup(title: "Chrome Extension") {
             if hasProfilesOrPending {
                 Button {
-                    appState.revealChromeExtensionInFinder()
+                    copyWithFeedback(feedbackKey: "extension-path-header") { appState.copyChromeExtensionPath() }
                 } label: {
-                    Text("Open Folder")
+                    Text(feedbackLabel(for: "extension-path-header", default: "Copy Extension Path"))
                         .font(.system(size: 11.5, weight: .regular))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .help("Copy the extension folder path, for Load unpacked (⌘⇧G) in chrome://extensions")
             }
         } content: {
             codexRow(
@@ -680,7 +681,7 @@ public struct ControlCenterView: View {
                     title: "UseMac Browser Bridge",
                     subtitle: appState.chromeWebStoreExtensionId != nil
                         ? "One-click install from Chrome Web Store for zero-focus background tabs."
-                        : "Load once in chrome://extensions (Developer mode -> Load unpacked) for zero-focus background tabs."
+                        : "In chrome://extensions, turn on Developer mode, click Load unpacked, press ⌘⇧G and paste the path."
                 ) {
                     HStack(spacing: 8) {
                         if appState.chromeWebStoreExtensionId != nil {
@@ -689,12 +690,12 @@ public struct ControlCenterView: View {
                             }
                             .buttonStyle(SubtleOutlineButtonStyle())
                         } else {
-                            Button("Show Folder") {
-                                appState.revealChromeExtensionInFinder()
+                            Button(feedbackLabel(for: "extension-path", default: "Copy Path")) {
+                                copyWithFeedback(feedbackKey: "extension-path") { appState.copyChromeExtensionPath() }
                             }
                             .buttonStyle(SubtleOutlineButtonStyle())
 
-                            Button("chrome://extensions") {
+                            Button("Open Chrome") {
                                 appState.openChromeExtensionsPage()
                             }
                             .buttonStyle(SubtleOutlineButtonStyle())
@@ -1243,11 +1244,20 @@ public struct ControlCenterView: View {
     }
 
     private func pairingKeyButtonLabel(for key: String) -> String {
-        pairingKeyFeedback[key] ?? "Copy key"
+        feedbackLabel(for: key, default: "Copy key")
+    }
+
+    private func feedbackLabel(for key: String, default defaultLabel: String) -> String {
+        pairingKeyFeedback[key] ?? defaultLabel
     }
 
     private func copyPairingKey(feedbackKey: String) {
-        let copied = appState.copyBridgePairingKey()
+        copyWithFeedback(feedbackKey: feedbackKey) { appState.copyBridgePairingKey() }
+    }
+
+    /// Runs a copy action and shows "Copied" (or "Unavailable") on its button for 1.5 s.
+    private func copyWithFeedback(feedbackKey: String, _ copy: () -> Bool) {
+        let copied = copy()
         let token = UUID()
         pairingKeyFeedback[feedbackKey] = copied ? "Copied" : "Unavailable"
         pairingKeyFeedbackTokens[feedbackKey] = token

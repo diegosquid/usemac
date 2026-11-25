@@ -319,14 +319,17 @@ public final class AppState: ObservableObject {
         }
     }
 
-    public func revealChromeExtensionInFinder() {
-        let dirURL = URL(fileURLWithPath: resolvedChromeExtensionDir, isDirectory: true)
-        let manifestURL = dirURL.appendingPathComponent("manifest.json")
-        if FileManager.default.fileExists(atPath: manifestURL.path) {
-            NSWorkspace.shared.activateFileViewerSelecting([manifestURL])
-        } else {
-            NSWorkspace.shared.open(dirURL)
+    /// Copies the bundled extension folder path, to paste into Chrome's Load unpacked dialog with ⌘⇧G.
+    @discardableResult
+    public func copyChromeExtensionPath() -> Bool {
+        let path = resolvedChromeExtensionDir
+        guard FileManager.default.fileExists(atPath: (path as NSString).appendingPathComponent("manifest.json")) else {
+            return false
         }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(path, forType: .string)
+        return true
     }
 
     public func openChromeExtensionsPage() {
