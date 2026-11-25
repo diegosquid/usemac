@@ -14,7 +14,9 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         _ height: Int,
         _ sourceBounds: ScreenRect?,
         _ sourceName: String,
-        _ isWindow: Bool
+        _ isWindow: Bool,
+        _ windowId: UInt32?,
+        _ pid: Int32?
     ) -> Void
 
     private enum StreamTargetKey: Equatable {
@@ -29,6 +31,16 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         let sourceBounds: ScreenRect?
         let sourceName: String
         let isWindow: Bool
+        let windowId: CGWindowID?
+        let pid: pid_t?
+    }
+
+    private enum Resolution {
+        case target(ResolvedTarget)
+        /// A target app is set but none of its windows can be shown right now (closed, not open yet, or only
+        /// helper windows). The last frame stays in the preview; the whole display is never shown instead.
+        case waitingForWindow
+        case none
     }
 
     private let lock = NSLock()
@@ -51,6 +63,15 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
     private var currentSourceBounds: ScreenRect?
     private var currentSourceName: String = "Screen"
     private var currentIsWindow: Bool = false
+    private var currentWindowID: CGWindowID?
+    /// Window the preview stays on for `pinnedPid` until the app's target window really changes.
+    private var pinnedWindowID: CGWindowID?
+    private var pinnedPid: pid_t?
+    /// App whose window the last frames came from (nil for a display stream).
+    private var lastStreamedPid: pid_t?
+    /// Set while a reconcile runs, so the metadata loop does not cancel a stream that is still starting.
+    private var reconcileToken: UInt64 = 0
+    private var runningReconcileToken: UInt64?
     private var lastEmittedStatus: LiveStreamStatus = .idle
 
     private var setupTask: Task<Void, Never>?
@@ -96,6 +117,13 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         }
     }
 
+    /// CGWindowID of the window being streamed (nil for a display stream or when nothing streams).
+    public var streamedWindowID: UInt32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentIsWindow ? currentWindowID : nil
+    }
+
     public override init() {
         super.init()
     }
@@ -103,6 +131,9 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
     public func start(mode: HUDStreamMode, targetApp: AppDescriptor?) {
         lock.lock()
         let wasActive = isActive
+        if mode != currentMode || targetApp?.pid != pinnedPid {
+            clearPinLocked()
+        }
         currentMode = mode
         currentTargetApp = targetApp
         if !wasActive {
@@ -123,6 +154,12 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
 
     public func updateTarget(mode: HUDStreamMode, targetApp: AppDescriptor?) {
         lock.lock()
+        let identityChanged = mode != currentMode
+            || targetApp?.pid != currentTargetApp?.pid
+            || targetApp?.windowId != currentTargetApp?.windowId
+        if mode != currentMode || targetApp?.pid != currentTargetApp?.pid {
+            clearPinLocked()
+        }
         currentMode = mode
         currentTargetApp = targetApp
         guard isActive else {
@@ -132,6 +169,9 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         let gen = generation
         lock.unlock()
 
+        // Window titles and bounds change with every tab and step. Only a new app, window id or mode needs a
+        // new window choice; the metadata loop follows focus changes inside the app and retries while waiting.
+        guard identityChanged else { return }
         scheduleReconcile(generation: gen)
     }
 
@@ -152,6 +192,10 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         currentSourceBounds = nil
         currentSourceName = "Screen"
         currentIsWindow = false
+        currentWindowID = nil
+        lastStreamedPid = nil
+        runningReconcileToken = nil
+        clearPinLocked()
         lock.unlock()
 
         if let oldStream {
@@ -199,6 +243,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         let bounds = currentSourceBounds
         let name = currentSourceName
         let isWindow = currentIsWindow
+        let windowId = currentIsWindow ? currentWindowID.map { UInt32($0) } : nil
         let pid = currentTargetApp?.pid ?? 0
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let shouldEmitThumb = (thumbHandler != nil && pid > 0 && nowNs &- lastThumbnailNs >= 450_000_000)
@@ -207,7 +252,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         }
         lock.unlock()
 
-        handler?(surfaceRef as AnyObject, width, height, bounds, name, isWindow)
+        handler?(surfaceRef as AnyObject, width, height, bounds, name, isWindow, windowId, pid > 0 ? pid : nil)
 
         if shouldEmitThumb, let thumbHandler {
             let ciImg = CIImage(cvPixelBuffer: pixelBuffer)
@@ -241,8 +286,20 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
             return
         }
         setupTask?.cancel()
+        reconcileToken &+= 1
+        let token = reconcileToken
+        runningReconcileToken = token
         setupTask = Task { [weak self] in
             await self?.reconcile(generation: gen)
+            self?.finishReconcile(token: token)
+        }
+        lock.unlock()
+    }
+
+    private func finishReconcile(token: UInt64) {
+        lock.lock()
+        if runningReconcileToken == token {
+            runningReconcileToken = nil
         }
         lock.unlock()
     }
@@ -265,6 +322,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         let existingStream = stream
         let existingKey = activeTargetKey
         let existingSize = activeSourceSize
+        let pinned = pinnedPid == targetApp?.pid ? pinnedWindowID : nil
         lock.unlock()
 
         if existingStream == nil {
@@ -281,14 +339,34 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
                 emitStatus(.permissionRequired)
                 ensurePermissionPolling(generation: gen)
             } else if existingStream == nil {
-                emitStatus(.idle)
+                if mode == .autoWindow, targetApp != nil {
+                    emitStatus(.connecting)
+                    syncMetadataTask(mode: mode, generation: gen)
+                } else {
+                    emitStatus(.idle)
+                }
             }
             return
         }
 
         guard isStillActive(generation: gen), !Task.isCancelled else { return }
 
-        guard let resolved = resolveTarget(in: shareable, mode: mode, targetApp: targetApp) else {
+        let resolved: ResolvedTarget
+        switch resolveTarget(in: shareable, mode: mode, targetApp: targetApp, pinnedWindowId: pinned) {
+        case .target(let target):
+            resolved = target
+        case .waitingForWindow:
+            stopCurrentStreamIfNeeded(generation: gen, keepMetadataLoop: true)
+            lock.lock()
+            let lastFrameIsTargetApp = lastStreamedPid != nil && lastStreamedPid == targetApp?.pid
+            lock.unlock()
+            // Same app: keep its last frame on screen while its window comes back. Another app: clear the
+            // preview rather than show the previous app's window under the new name. Either way, keep
+            // retrying from the metadata loop.
+            emitStatus(lastFrameIsTargetApp ? .connecting : .idle)
+            syncMetadataTask(mode: mode, generation: gen)
+            return
+        case .none:
             stopCurrentStreamIfNeeded(generation: gen)
             emitStatus(.idle)
             return
@@ -303,9 +381,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
                     lock.unlock()
                     return
                 }
-                currentSourceBounds = resolved.sourceBounds
-                currentSourceName = resolved.sourceName
-                currentIsWindow = resolved.isWindow
+                applySourceLocked(resolved)
                 let needsResizeUpdate = existingSize != resolved.sourceSize
                 if needsResizeUpdate {
                     activeSourceSize = resolved.sourceSize
@@ -328,9 +404,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
             }
             activeTargetKey = resolved.key
             activeSourceSize = resolved.sourceSize
-            currentSourceBounds = resolved.sourceBounds
-            currentSourceName = resolved.sourceName
-            currentIsWindow = resolved.isWindow
+            applySourceLocked(resolved)
             lock.unlock()
 
             do {
@@ -373,6 +447,10 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
             if !CGPreflightScreenCaptureAccess() {
                 emitStatus(.permissionRequired)
                 ensurePermissionPolling(generation: gen)
+            } else if resolved.isWindow {
+                // Keep the last frame and retry from the metadata loop instead of clearing the preview.
+                emitStatus(.connecting)
+                syncMetadataTask(mode: mode, generation: gen)
             } else {
                 emitStatus(.idle)
             }
@@ -394,9 +472,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         self.stream = newStream
         self.activeTargetKey = resolved.key
         self.activeSourceSize = resolved.sourceSize
-        self.currentSourceBounds = resolved.sourceBounds
-        self.currentSourceName = resolved.sourceName
-        self.currentIsWindow = resolved.isWindow
+        applySourceLocked(resolved)
         lock.unlock()
 
         if let supersededStream, supersededStream !== newStream {
@@ -410,16 +486,18 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
     private func resolveTarget(
         in shareable: SCShareableContent,
         mode: HUDStreamMode,
-        targetApp: AppDescriptor?
-    ) -> ResolvedTarget? {
+        targetApp: AppDescriptor?,
+        pinnedWindowId: CGWindowID?
+    ) -> Resolution {
         let selfPid = ProcessInfo.processInfo.processIdentifier
         let excludedApps = shareable.applications.filter { $0.processID == selfPid }
 
         if mode == .autoWindow {
-            guard let targetApp,
-                  targetApp.pid != selfPid,
-                  let win = selectWindow(for: targetApp, in: shareable.windows) else {
-                return nil
+            guard let targetApp, targetApp.pid != selfPid else {
+                return .none
+            }
+            guard let win = Self.selectWindow(for: targetApp, in: shareable.windows, pinnedWindowId: pinnedWindowId) else {
+                return Self.isRunning(pid: targetApp.pid) ? .waitingForWindow : .none
             }
             let filter = SCContentFilter(desktopIndependentWindow: win)
             let bounds = ScreenRect(
@@ -428,18 +506,20 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
                 width: Double(win.frame.size.width),
                 height: Double(win.frame.size.height)
             )
-            return ResolvedTarget(
+            return .target(ResolvedTarget(
                 key: .window(win.windowID),
                 filter: filter,
                 sourceSize: win.frame.size,
                 sourceBounds: bounds,
                 sourceName: targetApp.name,
-                isWindow: true
-            )
+                isWindow: true,
+                windowId: win.windowID,
+                pid: targetApp.pid
+            ))
         }
 
         guard let display = shareable.displays.first else {
-            return nil
+            return .none
         }
 
         let filter = SCContentFilter(
@@ -453,38 +533,79 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
             width: Double(display.width),
             height: Double(display.height)
         )
-        return ResolvedTarget(
+        return .target(ResolvedTarget(
             key: .display(display.displayID, mode),
             filter: filter,
             sourceSize: CGSize(width: display.width, height: display.height),
             sourceBounds: bounds,
             sourceName: "Screen",
-            isWindow: false
+            isWindow: false,
+            windowId: nil,
+            pid: nil
+        ))
+    }
+
+    /// Exact window by CGWindowID (the descriptor's `windowId`, else the app's AX focused window), kept pinned
+    /// while it exists. Titles are never compared: Chrome's AX title ("Page - Part of group X - Google Chrome -
+    /// Profile") never matches ScreenCaptureKit's ("Page"), and two windows can share a frame.
+    static func selectWindow(for app: AppDescriptor, in windows: [SCWindow], pinnedWindowId: CGWindowID?) -> SCWindow? {
+        let candidates = windows.compactMap(captureCandidate(from:))
+        let targets = WindowResolver.targetWindows(
+            pid: app.pid,
+            knownWindowId: app.windowId.map { CGWindowID($0) },
+            availableIds: Set(candidates.map(\.windowId))
+        )
+        guard let chosen = WindowResolver.chooseStreamWindow(
+            from: candidates,
+            pid: app.pid,
+            targets: targets,
+            pinnedWindowId: pinnedWindowId
+        ) else {
+            return nil
+        }
+        return windows.first { $0.windowID == chosen.windowId }
+    }
+
+    static func captureCandidate(from window: SCWindow) -> WindowResolver.CaptureCandidate? {
+        guard let pid = window.owningApplication?.processID else {
+            return nil
+        }
+        return WindowResolver.CaptureCandidate(
+            windowId: window.windowID,
+            pid: pid,
+            frame: window.frame,
+            layer: window.windowLayer,
+            isOnScreen: window.isOnScreen,
+            title: window.title
         )
     }
 
-    private func selectWindow(for app: AppDescriptor, in windows: [SCWindow]) -> SCWindow? {
-        let matching = windows.filter {
-            $0.owningApplication?.processID == app.pid
-                && $0.frame.width > 20
-                && $0.frame.height > 20
+    private static func isRunning(pid: pid_t) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid) else {
+            return false
         }
-        if let wantTitle = app.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !wantTitle.isEmpty {
-            if let exact = matching.first(where: { $0.title == wantTitle }) {
-                return exact
-            }
-            if let partial = matching.first(where: { ($0.title ?? "").localizedCaseInsensitiveContains(wantTitle) }) {
-                return partial
-            }
+        return !app.isTerminated
+    }
+
+    /// Caller holds `lock`.
+    private func applySourceLocked(_ resolved: ResolvedTarget) {
+        currentSourceBounds = resolved.sourceBounds
+        currentSourceName = resolved.sourceName
+        currentIsWindow = resolved.isWindow
+        currentWindowID = resolved.windowId
+        lastStreamedPid = resolved.pid
+        if let windowId = resolved.windowId, let pid = resolved.pid {
+            pinnedWindowID = windowId
+            pinnedPid = pid
+        } else {
+            clearPinLocked()
         }
-        if let onScreenTitled = matching.first(where: { $0.isOnScreen && !($0.title?.isEmpty ?? true) }) {
-            return onScreenTitled
-        }
-        if let onScreen = matching.first(where: { $0.isOnScreen }) {
-            return onScreen
-        }
-        return matching.first
+    }
+
+    /// Caller holds `lock`.
+    private func clearPinLocked() {
+        pinnedWindowID = nil
+        pinnedPid = nil
     }
 
     private func makeConfiguration(for sourceSize: CGSize) -> SCStreamConfiguration {
@@ -502,6 +623,8 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         config.scalesToFit = true
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = true
+        // Sheets and popovers attached to the pinned window render as part of it.
+        config.includeChildWindows = true
         config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
         config.queueDepth = 3
         return config
@@ -566,10 +689,13 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
 
     private func refreshAutoWindowMetadata(generation gen: UInt64) async {
         lock.lock()
-        let shouldCheck = isActive && self.generation == gen && currentMode == .autoWindow && stream != nil
+        let shouldCheck = isActive && self.generation == gen && currentMode == .autoWindow
+            && currentTargetApp != nil && runningReconcileToken == nil
         let targetApp = currentTargetApp
+        let existingStream = stream
         let existingKey = activeTargetKey
         let existingSize = activeSourceSize
+        let pinned = pinnedPid == targetApp?.pid ? pinnedWindowID : nil
         lock.unlock()
 
         guard shouldCheck else { return }
@@ -577,24 +703,28 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
             return
         }
         guard isStillActive(generation: gen), !Task.isCancelled else { return }
-        guard let resolved = resolveTarget(in: shareable, mode: .autoWindow, targetApp: targetApp) else {
-            return
-        }
 
-        if resolved.key == existingKey && resolved.sourceSize == existingSize {
-            lock.lock()
-            if isActive, self.generation == gen {
-                currentSourceBounds = resolved.sourceBounds
-                currentSourceName = resolved.sourceName
-                currentIsWindow = resolved.isWindow
+        switch resolveTarget(in: shareable, mode: .autoWindow, targetApp: targetApp, pinnedWindowId: pinned) {
+        case .target(let resolved):
+            if existingStream != nil, resolved.key == existingKey, resolved.sourceSize == existingSize {
+                lock.lock()
+                if isActive, self.generation == gen, self.stream === existingStream {
+                    applySourceLocked(resolved)
+                }
+                lock.unlock()
+            } else {
+                // The target moved to another real window, the pinned one was resized, or a window showed up
+                // while waiting.
+                scheduleReconcile(generation: gen)
             }
-            lock.unlock()
-        } else {
-            scheduleReconcile(generation: gen)
+        case .waitingForWindow, .none:
+            if existingStream != nil {
+                scheduleReconcile(generation: gen)
+            }
         }
     }
 
-    private func stopCurrentStreamIfNeeded(generation gen: UInt64) {
+    private func stopCurrentStreamIfNeeded(generation gen: UInt64, keepMetadataLoop: Bool = false) {
         lock.lock()
         guard self.generation == gen, let oldStream = stream else {
             lock.unlock()
@@ -603,8 +733,10 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         stream = nil
         activeTargetKey = nil
         activeSourceSize = .zero
-        metadataTask?.cancel()
-        metadataTask = nil
+        if !keepMetadataLoop {
+            metadataTask?.cancel()
+            metadataTask = nil
+        }
         lock.unlock()
 
         Task {
@@ -629,5 +761,157 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         lock.unlock()
 
         handler?(status)
+    }
+}
+
+// MARK: - Preview geometry (pure, used by the HUD preview overlay)
+
+/// Maps global screen coordinates (top-left origin, the space AX frames and `sourceBounds` use) into the
+/// live preview, which draws the source aspect-fit like `CALayer.contentsGravity = .resizeAspect`.
+public enum LivePreviewGeometry {
+    /// Rect the source occupies inside a preview of `previewSize`.
+    public static func fittedRect(sourceSize: CGSize, in previewSize: CGSize) -> CGRect {
+        guard sourceSize.width > 0, sourceSize.height > 0, previewSize.width > 0, previewSize.height > 0 else {
+            return .zero
+        }
+        let scale = min(previewSize.width / sourceSize.width, previewSize.height / sourceSize.height)
+        let width = sourceSize.width * scale
+        let height = sourceSize.height * scale
+        return CGRect(
+            x: (previewSize.width - width) / 2,
+            y: (previewSize.height - height) / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    /// Preview position of a global point, or nil when it falls outside the source by more than `tolerance`
+    /// (a fraction of the source size).
+    public static func previewPoint(
+        _ point: CGPoint,
+        sourceBounds: CGRect,
+        previewSize: CGSize,
+        tolerance: CGFloat = 0
+    ) -> CGPoint? {
+        guard sourceBounds.width > 0, sourceBounds.height > 0 else { return nil }
+        let relX = (point.x - sourceBounds.minX) / sourceBounds.width
+        let relY = (point.y - sourceBounds.minY) / sourceBounds.height
+        guard relX >= -tolerance, relX <= 1 + tolerance, relY >= -tolerance, relY <= 1 + tolerance else {
+            return nil
+        }
+        let fitted = fittedRect(sourceSize: sourceBounds.size, in: previewSize)
+        guard fitted.width > 0, fitted.height > 0 else { return nil }
+        return CGPoint(x: fitted.minX + relX * fitted.width, y: fitted.minY + relY * fitted.height)
+    }
+
+    /// Preview rect of a global rect, clipped to the source, or nil when it does not overlap the source.
+    public static func previewRect(_ rect: CGRect, sourceBounds: CGRect, previewSize: CGSize) -> CGRect? {
+        guard sourceBounds.width > 0, sourceBounds.height > 0 else { return nil }
+        // Zero-size rects (Chrome reports them for clipped elements) still mark a position.
+        let target = CGRect(x: rect.minX, y: rect.minY, width: max(rect.width, 1), height: max(rect.height, 1))
+        let clipped = target.intersection(sourceBounds)
+        guard !clipped.isNull, !clipped.isEmpty else { return nil }
+        let fitted = fittedRect(sourceSize: sourceBounds.size, in: previewSize)
+        guard fitted.width > 0, fitted.height > 0 else { return nil }
+        let scaleX = fitted.width / sourceBounds.width
+        let scaleY = fitted.height / sourceBounds.height
+        return CGRect(
+            x: fitted.minX + (clipped.minX - sourceBounds.minX) * scaleX,
+            y: fitted.minY + (clipped.minY - sourceBounds.minY) * scaleY,
+            width: clipped.width * scaleX,
+            height: clipped.height * scaleY
+        )
+    }
+
+    /// Whether an overlay that belongs to window `overlayWindowId` of `overlayPid` may be drawn on the frame
+    /// the preview currently shows. Without a pid the overlay keeps the old behavior (mapped onto whatever
+    /// is shown). Chrome extension frames use page coordinates, so screen-space overlays never go on them.
+    public static func previewShowsOverlay(
+        overlayPid: Int32?,
+        overlayWindowId: UInt32?,
+        sourceIsBrowserFrame: Bool,
+        sourceIsWindow: Bool,
+        sourcePid: Int32?,
+        sourceWindowId: UInt32?
+    ) -> Bool {
+        guard let overlayPid else { return true }
+        if sourceIsBrowserFrame { return false }
+        // A display stream shows every window in global coordinates.
+        if !sourceIsWindow { return true }
+        if let overlayWindowId, let sourceWindowId {
+            return overlayWindowId == sourceWindowId
+        }
+        if let sourcePid {
+            return sourcePid == overlayPid
+        }
+        return true
+    }
+}
+
+/// Decides when the HUD should follow a new preview aspect ratio. Small changes are ignored, a real change
+/// must persist for `settleSeconds` (so a source that flips for a moment does not resize the HUD twice),
+/// and nothing is applied while `hold` is true (an action batch is running).
+public struct PreviewAspectRatioStabilizer: Sendable {
+    public static let defaultThreshold = 0.08
+    public static let defaultSettleSeconds = 0.6
+
+    /// Relative change that counts as a real change.
+    public let threshold: Double
+    public let settleSeconds: Double
+    public private(set) var current: Double?
+    private var pending: Double?
+    private var pendingSince: Double?
+
+    public init(threshold: Double = defaultThreshold, settleSeconds: Double = defaultSettleSeconds) {
+        self.threshold = threshold
+        self.settleSeconds = settleSeconds
+    }
+
+    public var hasPending: Bool { pending != nil }
+
+    /// Feeds one frame's ratio at `time` (seconds, monotonic). Returns the ratio to apply now, or nil to
+    /// keep the current one. The first ratio after `reset()` applies at once.
+    public mutating func observe(_ ratio: Double, at time: Double, hold: Bool) -> Double? {
+        guard ratio.isFinite, ratio > 0 else { return nil }
+        guard let current else {
+            self.current = ratio
+            pending = nil
+            pendingSince = nil
+            return ratio
+        }
+        if Self.relativeDifference(ratio, current) < threshold {
+            pending = nil
+            pendingSince = nil
+            return nil
+        }
+        if let pending, Self.relativeDifference(ratio, pending) < threshold {
+            self.pending = ratio
+        } else {
+            pending = ratio
+            pendingSince = time
+        }
+        return settle(at: time, hold: hold)
+    }
+
+    /// Applies a pending ratio that has persisted long enough. Call it without a new frame too, because a
+    /// static window stops sending frames.
+    public mutating func settle(at time: Double, hold: Bool) -> Double? {
+        guard !hold, let pending, let since = pendingSince, time - since >= settleSeconds else {
+            return nil
+        }
+        current = pending
+        self.pending = nil
+        pendingSince = nil
+        return pending
+    }
+
+    public mutating func reset() {
+        current = nil
+        pending = nil
+        pendingSince = nil
+    }
+
+    private static func relativeDifference(_ a: Double, _ b: Double) -> Double {
+        abs(a - b) / max(b, 0.0001)
     }
 }

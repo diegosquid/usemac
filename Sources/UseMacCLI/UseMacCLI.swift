@@ -27,6 +27,8 @@ struct UseMacCLI {
         var json: Bool = false
         var standalone: Bool = false
         var requireDaemon: Bool = false
+        /// `--help` / `-h` anywhere before a literal `--`: print help for the command instead of running it.
+        var help: Bool = false
     }
 
     private enum CLIError: Error {
@@ -40,6 +42,7 @@ struct UseMacCLI {
         struct ErrorBody: Encodable {
             let code: String
             let message: String
+            let hint: String?
         }
 
         let ok: Bool = false
@@ -113,6 +116,7 @@ struct UseMacCLI {
         .pairApp
     ]
 
+    /// Exit code 4: a safety rule blocked the request. Stop and tell the user.
     private static let policyBlockCodes: Set<String> = [
         "POLICY_BLOCKED",
         "POLICY_LOCKED",
@@ -120,14 +124,60 @@ struct UseMacCLI {
         "UPLOAD_BLOCKED"
     ]
 
+    /// Exit code 5: the screen is not what the caller expected. Observe again, then retry.
+    private static let screenChangedCodes: Set<String> = [
+        "STALE_SNAPSHOT",
+        "ELEMENT_NOT_FOUND",
+        "WAIT_TIMEOUT"
+    ]
+
+    /// Exit code 6: the step needs the app in front, or the user is busy. Use a background step or retry later.
+    private static let focusCodes: Set<String> = [
+        "TARGET_NOT_FRONTMOST",
+        "USER_ACTIVE"
+    ]
+
+    /// Exit code 7: this route cannot reach the content. Switch route (hybrid Chrome flow, observe instead of a capture).
+    private static let wrongRouteCodes: Set<String> = [
+        "RESTRICTED_PAGE",
+        "CAPTURE_TOO_SMALL"
+    ]
+
     private static let batchActionAllowedKeys: [String] = [
+        "allowStaleSnapshot",
         "app",
+        "expectWindowTitle",
+        "foreground",
         "includeScreenshot",
         "returnDiffOnly",
         "returnObservation",
         "steps",
-        "stopOnError"
+        "stopOnError",
+        "window"
     ]
+
+    /// Flags shared by every command that sends an `act` batch.
+    private static let batchValueFlags: Set<String> = ["--app", "--expect-title", "--window"]
+    private static let batchBoolFlags: Set<String> = ["--foreground", "--allow-stale"]
+
+    private static func exitCode(forErrorCode code: String) -> Int32 {
+        if code == "DAEMON_REQUIRED" { return 3 }
+        if policyBlockCodes.contains(code) { return 4 }
+        if screenChangedCodes.contains(code) { return 5 }
+        if focusCodes.contains(code) { return 6 }
+        if wrongRouteCodes.contains(code) { return 7 }
+        return 1
+    }
+
+    /// The code of the first failed step, which decides the exit code of a failed batch.
+    private static func firstFailureCode(_ result: BatchActionResult) -> String? {
+        result.stepResults.first(where: { !$0.success && ($0.errorCode?.isEmpty == false) })?.errorCode
+    }
+
+    private static func exitCode(for result: BatchActionResult) -> Int32 {
+        if result.success { return 0 }
+        return firstFailureCode(result).map(exitCode(forErrorCode:)) ?? 1
+    }
 
     private static let browserActAllowedKeys: [String] = [
         "profile",
@@ -158,10 +208,17 @@ struct UseMacCLI {
 
             let rest = Array(positionalAndSubFlags.dropFirst())
 
+            if command == "help" {
+                return try printHelp(for: rest)
+            }
+            if options.help {
+                // Only group commands take a subcommand word; for the others the next word is data (JSON, text).
+                let isGroup = command == "browser" || command == "vision"
+                let path = isGroup && !(rest.first?.hasPrefix("-") ?? true) ? [command, rest[0]] : [command]
+                return try printHelp(for: path)
+            }
+
             switch command {
-            case "help", "--help", "-h":
-                printUsage()
-                return 0
             case "--version", "-v", "version":
                 print(UseMacDefaults.version)
                 return 0
@@ -173,6 +230,8 @@ struct UseMacCLI {
                 return try await handleApps(options: options)
             case "observe":
                 return try await handleObserve(args: rest, options: options)
+            case "find":
+                return try await handleFind(args: rest, options: options)
             case "act":
                 return try await handleAct(args: rest, options: options)
             case "click":
@@ -234,22 +293,20 @@ struct UseMacCLI {
             message = msg
             includeCodeInText = true
         case .rpcFailure(let rpcCode, let rpcMessage):
-            if rpcCode == "DAEMON_REQUIRED" {
-                exitCode = 3
-            } else if policyBlockCodes.contains(rpcCode) {
-                exitCode = 4
-            } else {
-                exitCode = 1
-            }
+            exitCode = Self.exitCode(forErrorCode: rpcCode)
             code = rpcCode
             message = rpcMessage
             includeCodeInText = true
         }
 
+        let hint = UseMacErrorGuide.hint(for: code)
         if json {
-            printEncodableJSON(CLIErrorEnvelope(error: .init(code: code, message: message)))
+            printEncodableJSON(CLIErrorEnvelope(error: .init(code: code, message: message, hint: hint)))
         } else if includeCodeInText {
             writeStderr("Error [\(code)]: \(message)\n")
+            if let hint {
+                writeStderr("Next: \(hint)\n")
+            }
         } else {
             writeStderr("Error: \(message)\n")
         }
@@ -280,7 +337,7 @@ struct UseMacCLI {
 
         let message = error.localizedDescription
         if json {
-            printEncodableJSON(CLIErrorEnvelope(error: .init(code: code, message: message)))
+            printEncodableJSON(CLIErrorEnvelope(error: .init(code: code, message: message, hint: UseMacErrorGuide.hint(for: code))))
         } else if includeCodeInText {
             writeStderr("Error [\(code)]: \(message)\n")
         } else {
@@ -322,6 +379,9 @@ struct UseMacCLI {
                 i += 1
             case "--require-daemon":
                 options.requireDaemon = true
+                i += 1
+            case "--help", "-h":
+                options.help = true
                 i += 1
             default:
                 if arg.hasPrefix("--socket=") {
@@ -545,15 +605,19 @@ struct UseMacCLI {
     private static func handleObserve(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--app", "--max-depth", "--max-elements"],
-            boolFlags: ["--no-cache", "--diff", "--no-diff", "--screenshot"]
+            valueFlags: ["--app", "--max-depth", "--max-elements", "--role", "--text", "--window"],
+            boolFlags: ["--no-cache", "--diff", "--no-diff", "--screenshot", "--no-offscreen"]
         )
+        if let extra = parsed.positionals.first {
+            throw CLIError.usage("Unexpected argument '\(extra)'. Run 'usemac help observe'.")
+        }
 
         let maxDepth = try parseOptionalInt(parsed.values, flag: "--max-depth", positive: true)
         let maxElements = try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true)
         let useCache = !parsed.flags.contains("--no-cache")
         let includeDiff = parsed.flags.contains("--diff") || !parsed.flags.contains("--no-diff")
         let includeScreenshot = parsed.flags.contains("--screenshot")
+        let filter = ElementMatch(role: parsed.values["--role"], text: parsed.values["--text"])
 
         let params = ObserveParams(
             app: parsed.values["--app"],
@@ -561,34 +625,165 @@ struct UseMacCLI {
             maxElements: maxElements,
             useCache: useCache,
             includeDiff: includeDiff,
-            includeScreenshot: includeScreenshot
+            includeScreenshot: includeScreenshot,
+            includeOffscreen: parsed.flags.contains("--no-offscreen") ? false : nil,
+            window: parsed.values["--window"]
         )
         let req = RPCRequest(method: .observe, observe: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
         try ensureOK(res)
 
-        if options.json {
-            if let snapshot = res.snapshot {
-                printEncodableJSON(snapshot)
+        guard var snapshot = res.snapshot else {
+            if options.json {
+                printEncodableJSON(res)
                 return 0
             }
-            printEncodableJSON(res)
-            return 0
-        }
-
-        guard let snapshot = res.snapshot else {
             throw CLIError.rpcFailure(code: "empty_snapshot", message: "Response missing WindowSnapshot.")
         }
 
+        // --role/--text only narrow what is printed; the daemon still indexes (and keeps ids for) the whole window.
+        let totalElements = snapshot.elements.count
+        if !filter.isEmpty {
+            snapshot.elements = ClientElementFilter.filter(snapshot.elements, filter)
+        }
+
+        if options.json {
+            printEncodableJSON(snapshot)
+            return 0
+        }
+
         print(String(format: "[%@] RTT: %.2f ms", mode.rawValue, rttMs))
+        if !filter.isEmpty {
+            print("Filter: \(describeMatch(filter)) → \(snapshot.elements.count) of \(totalElements) elements")
+        }
         print(snapshot.formattedCompactSummary())
         return 0
     }
 
+    private struct FindOutput: Encodable {
+        let app: AppDescriptor
+        let count: Int
+        let matches: [ElementNode]
+    }
+
+    private static func handleFind(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let usage = "Usage: usemac find --app <name|pid> [--window <title>] [--role <role>] [--text <t>] [--title <t>] [--value <v>] [--exact] [--first] [--max-depth <n>] [--max-elements <n>]"
+        let parsed = try parseAppAndExtras(
+            args: args,
+            valueFlags: ["--app", "--role", "--text", "--title", "--value", "--max-depth", "--max-elements", "--window"],
+            boolFlags: ["--exact", "--first"]
+        )
+        if let extra = parsed.positionals.first {
+            throw CLIError.usage("Unexpected argument '\(extra)'. \(usage)")
+        }
+        guard let app = parsed.values["--app"], !app.isEmpty else {
+            throw CLIError.usage("find needs --app. \(usage)")
+        }
+        let match = ElementMatch(
+            role: parsed.values["--role"],
+            title: parsed.values["--title"],
+            value: parsed.values["--value"],
+            text: parsed.values["--text"],
+            exact: parsed.flags.contains("--exact") ? true : nil
+        )
+        guard [match.role, match.title, match.value, match.text].contains(where: { !($0 ?? "").isEmpty }) else {
+            throw CLIError.usage("find needs at least one of --role, --text, --title or --value. \(usage)")
+        }
+        let onlyFirst = parsed.flags.contains("--first")
+
+        // Always read the live tree: a cached tree could hide the element the agent is about to act on.
+        let params = ObserveParams(
+            app: app,
+            maxDepth: try parseOptionalInt(parsed.values, flag: "--max-depth", positive: true),
+            maxElements: try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true),
+            useCache: false,
+            includeDiff: false,
+            includeScreenshot: false,
+            window: parsed.values["--window"]
+        )
+        let (res, rttMs, mode) = try await executeRPC(RPCRequest(method: .observe, observe: params), options: options)
+        try ensureOK(res)
+        guard let snapshot = res.snapshot else {
+            throw CLIError.rpcFailure(code: "empty_snapshot", message: "Response missing WindowSnapshot.")
+        }
+
+        var matches = ClientElementFilter.filter(snapshot.elements, match)
+        if onlyFirst {
+            matches = Array(matches.prefix(1))
+        }
+
+        if options.json {
+            printEncodableJSON(FindOutput(app: snapshot.app, count: matches.count, matches: matches))
+            return matches.isEmpty ? 1 : 0
+        }
+
+        if onlyFirst {
+            guard let first = matches.first else {
+                writeStderr("No element in \(snapshot.app.name) matches \(describeMatch(match)).\n")
+                return 1
+            }
+            print(first.id)
+            return 0
+        }
+
+        let titlePart = snapshot.app.windowTitle.map { " — \($0)" } ?? ""
+        print(String(
+            format: "[%@] %d match(es) of %d element(s) in %@%@ (%.2f ms)",
+            mode.rawValue,
+            matches.count,
+            snapshot.elements.count,
+            snapshot.app.name,
+            titlePart,
+            rttMs
+        ))
+        for node in matches {
+            print(node.compactLine)
+        }
+        if matches.isEmpty {
+            writeStderr("No element matches \(describeMatch(match)). Raise --max-depth/--max-elements, scroll the list into view, or loosen the filters.\n")
+            return 1
+        }
+        return 0
+    }
+
+    private static func describeMatch(_ match: ElementMatch) -> String {
+        var parts: [String] = []
+        if let role = match.role, !role.isEmpty { parts.append("role=\(role)") }
+        if let title = match.title, !title.isEmpty { parts.append("title=\"\(title)\"") }
+        if let value = match.value, !value.isEmpty { parts.append("value=\"\(value)\"") }
+        if let text = match.text, !text.isEmpty { parts.append("text=\"\(text)\"") }
+        if match.exact == true { parts.append("exact") }
+        return parts.joined(separator: " ")
+    }
+
+    private static func parseBatchArgs(_ args: [String]) throws -> (values: [String: String], flags: Set<String>, positionals: [String]) {
+        let parsed = try parseAppAndExtras(args: args, valueFlags: batchValueFlags, boolFlags: batchBoolFlags)
+        if let title = parsed.values["--expect-title"], title.trimmingCharacters(in: .whitespaces).isEmpty {
+            throw CLIError.usage("--expect-title expects the text the window title must contain.")
+        }
+        return parsed
+    }
+
+    /// Flags win over the same keys in the JSON, so a caller can add a precondition to a saved batch.
+    private static func applyBatchFlags(_ parsed: (values: [String: String], flags: Set<String>, positionals: [String]), to batch: inout BatchActionRequest) {
+        if parsed.flags.contains("--foreground") {
+            batch.foreground = true
+        }
+        if parsed.flags.contains("--allow-stale") {
+            batch.allowStaleSnapshot = true
+        }
+        if let title = parsed.values["--expect-title"] {
+            batch.expectWindowTitle = title
+        }
+        if let window = parsed.values["--window"] {
+            batch.window = window
+        }
+    }
+
     private static func handleAct(args: [String], options: GlobalOptions) async throws -> Int32 {
-        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--app"])
+        let parsed = try parseBatchArgs(args)
         guard let rawInput = parsed.positionals.first else {
-            throw CLIError.usage("Usage: usemac act '<json>' [--app <name>]")
+            throw CLIError.usage("Usage: usemac act '<json>' | - [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]. Run 'usemac help act'.")
         }
 
         let jsonString: String
@@ -631,62 +826,67 @@ struct UseMacCLI {
             }
         }
 
+        applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
     private static func handleClick(args: [String], options: GlobalOptions) async throws -> Int32 {
-        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--app"])
+        let parsed = try parseBatchArgs(args)
         guard let elementId = parsed.positionals.first else {
-            throw CLIError.usage("Usage: usemac click <@eID> [--app <name>]")
+            throw CLIError.usage("Usage: usemac click <@eID> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]")
         }
         let app = parsed.values["--app"]
-        let batch = BatchActionRequest(
+        var batch = BatchActionRequest(
             app: app,
             steps: [ActionStep(action: .click, app: app, elementId: elementId)]
         )
+        applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
     private static func handleSet(args: [String], options: GlobalOptions) async throws -> Int32 {
-        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--app"])
+        let parsed = try parseBatchArgs(args)
         guard parsed.positionals.count >= 2 else {
-            throw CLIError.usage("Usage: usemac set <@eID> <text> [--app <name>]")
+            throw CLIError.usage("Usage: usemac set <@eID> <text> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]")
         }
         let elementId = parsed.positionals[0]
         let text = parsed.positionals.dropFirst().joined(separator: " ")
         let app = parsed.values["--app"]
-        let batch = BatchActionRequest(
+        var batch = BatchActionRequest(
             app: app,
             steps: [ActionStep(action: .setValue, app: app, elementId: elementId, text: text)]
         )
+        applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
     private static func handleType(args: [String], options: GlobalOptions) async throws -> Int32 {
-        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--app"])
+        let parsed = try parseBatchArgs(args)
         guard !parsed.positionals.isEmpty else {
-            throw CLIError.usage("Usage: usemac type <text> [--app <name>]")
+            throw CLIError.usage("Usage: usemac type <text> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]")
         }
         let text = parsed.positionals.joined(separator: " ")
         let app = parsed.values["--app"]
-        let batch = BatchActionRequest(
+        var batch = BatchActionRequest(
             app: app,
             steps: [ActionStep(action: .type, app: app, text: text)]
         )
+        applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
     private static func handleKey(args: [String], options: GlobalOptions) async throws -> Int32 {
-        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--app"])
+        let parsed = try parseBatchArgs(args)
         guard let chord = parsed.positionals.first else {
-            throw CLIError.usage("Usage: usemac key <chord> [--app <name>]")
+            throw CLIError.usage("Usage: usemac key <chord> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]")
         }
         let (modifiers, key) = parseKeyChord(chord)
         let app = parsed.values["--app"]
-        let batch = BatchActionRequest(
+        var batch = BatchActionRequest(
             app: app,
             steps: [ActionStep(action: .pressKey, app: app, key: key, modifiers: modifiers.isEmpty ? nil : modifiers)]
         )
+        applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
@@ -698,7 +898,7 @@ struct UseMacCLI {
         if options.json {
             if let actionResult = res.actionResult {
                 printEncodableJSON(actionResult)
-                return actionResult.success ? 0 : 1
+                return exitCode(for: actionResult)
             }
             printEncodableJSON(res)
             return 0
@@ -709,7 +909,7 @@ struct UseMacCLI {
         }
 
         printBatchActionResult(result, rttMs: rttMs, mode: mode)
-        return result.success ? 0 : 1
+        return exitCode(for: result)
     }
 
     private static func printBatchActionResult(
@@ -729,11 +929,17 @@ struct UseMacCLI {
         ))
         for step in result.stepResults {
             var extras: [String] = []
+            if let effect = step.effect, effect != .none {
+                extras.append("effect=\(effect.rawValue)")
+            }
             if let d = step.scrollDeltaY {
                 extras.append(String(format: "scrollDeltaY=%.0fpx", d))
             }
             if let v = step.visualChangePercent {
                 extras.append(String(format: "visualDiff=%.2f%%", v))
+            }
+            if let dl = step.downloadPath, !dl.isEmpty {
+                extras.append("download=\(dl)")
             }
             if let warn = step.blockedWarning, !warn.isEmpty {
                 extras.append("⚠️ \(warn)")
@@ -741,15 +947,30 @@ struct UseMacCLI {
                 extras.append(m)
             }
             let msg = extras.isEmpty ? "" : " — " + extras.joined(separator: " | ")
+            var status = step.success ? "ok" : "error"
+            if let code = step.errorCode, !code.isEmpty {
+                status += " [\(code)]"
+            }
+            let target = step.resolvedElementId.flatMap { $0.isEmpty ? nil : " → \($0)" } ?? ""
             print(String(
-                format: "  #%d [%@] %@ via %@ (%.2f ms)%@",
+                format: "  #%d [%@] %@ via %@ (%.2f ms)%@%@",
                 step.index,
                 step.action.rawValue,
-                step.success ? "ok" : "error",
+                status,
                 step.mechanism,
                 step.latencyMs,
+                target,
                 msg
             ))
+            let warning = step.warning.flatMap { $0.isEmpty ? nil : $0 }
+            if step.effect == ActionEffect.none {
+                print("     ⚠ no visible effect\(warning.map { ": \($0)" } ?? ""). Observe before continuing.")
+            } else if let warning {
+                print("     ⚠ \(warning)")
+            }
+        }
+        if let code = firstFailureCode(result), let hint = UseMacErrorGuide.hint(for: code) {
+            print("Next: \(hint)")
         }
         if let verification = result.visualVerification {
             print("")
@@ -796,9 +1017,8 @@ struct UseMacCLI {
             return try await handleBrowserScreenshot(args: rest, options: options)
         case "act":
             return try await handleBrowserAct(args: rest, options: options)
-        case "help", "--help", "-h":
-            printUsage()
-            return 0
+        case "help":
+            return try printHelp(for: ["browser"] + rest.prefix(1))
         default:
             throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, screenshot, act.")
         }
@@ -869,13 +1089,28 @@ struct UseMacCLI {
         let parsed = try parseAppAndExtras(
             args: args,
             valueFlags: ["--profile", "--tab"],
-            boolFlags: ["--same-tab", "--new-tab", "--no-stream"]
+            boolFlags: ["--same-tab", "--new-tab", "--no-stream", "--activate", "--new-window"]
         )
-        guard let url = parsed.positionals.first, !url.isEmpty else {
-            throw CLIError.usage("Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--no-stream]")
-        }
+        let usage = "Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream], or: usemac browser open --tab <id> --activate"
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
+        let activate = parsed.flags.contains("--activate")
+        let newWindow = parsed.flags.contains("--new-window")
+        let url = parsed.positionals.first ?? ""
+        // Only "activate this existing tab" may leave out the URL (sent as "").
+        if url.isEmpty, !(tabId != nil && activate) {
+            throw CLIError.usage(usage)
+        }
+        if parsed.positionals.count > 1 {
+            throw CLIError.usage("Unexpected argument '\(parsed.positionals[1])'. \(usage)")
+        }
+        if newWindow, tabId != nil {
+            throw CLIError.usage("--new-window opens the URL in a new window and cannot be combined with --tab.")
+        }
+        if newWindow, parsed.flags.contains("--same-tab") {
+            throw CLIError.usage("--new-window cannot be combined with --same-tab.")
+        }
         let openNewTab: Bool = {
+            if url.isEmpty { return false }
             if parsed.flags.contains("--same-tab") { return false }
             if parsed.flags.contains("--new-tab") { return true }
             return tabId == nil
@@ -885,7 +1120,9 @@ struct UseMacCLI {
             profile: parsed.values["--profile"],
             tabId: tabId,
             newTab: openNewTab,
-            stream: !parsed.flags.contains("--no-stream")
+            stream: !parsed.flags.contains("--no-stream"),
+            activate: activate ? true : nil,
+            newWindow: newWindow ? true : nil
         )
         let req = RPCRequest(method: .browserOpen, browserOpen: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 20000)
@@ -896,10 +1133,11 @@ struct UseMacCLI {
             return 0
         }
 
-        let tabStr = res.browserTabId.map { "tab=\($0)" } ?? "tab=?"
+        let tabStr = res.browserTabId.map { "tab=\($0)" } ?? (tabId.map { "tab=\($0)" } ?? "tab=?")
         let resolvedUrl = res.browserUrl ?? url
         let titlePart = res.browserTitle.map { " — \"\($0)\"" } ?? ""
-        print(String(format: "[%@] Chrome opened (%@): %@%@ (%.2f ms)", mode.rawValue, tabStr, resolvedUrl, titlePart, rttMs))
+        let verb = url.isEmpty ? "Chrome tab activated" : (newWindow ? "Chrome opened in a new window" : "Chrome opened")
+        print(String(format: "[%@] %@ (%@): %@%@ (%.2f ms)", mode.rawValue, verb, tabStr, resolvedUrl, titlePart, rttMs))
         if let snapshot = res.snapshot {
             print("")
             print(snapshot.formattedCompactSummary())
@@ -1131,7 +1369,7 @@ struct UseMacCLI {
         if options.json {
             if let actionResult = res.actionResult {
                 printEncodableJSON(actionResult)
-                return actionResult.success ? 0 : 1
+                return exitCode(for: actionResult)
             }
             printEncodableJSON(res)
             return 0
@@ -1150,7 +1388,7 @@ struct UseMacCLI {
         }
         let headerDetail = detailParts.isEmpty ? nil : detailParts.joined(separator: " ")
         printBatchActionResult(result, rttMs: rttMs, mode: mode, headerDetail: headerDetail)
-        return result.success ? 0 : 1
+        return exitCode(for: result)
     }
 
     private static func handleVision(args: [String], options: GlobalOptions) async throws -> Int32 {
@@ -1249,6 +1487,8 @@ struct UseMacCLI {
             }
             return 0
 
+        case "help":
+            return try printHelp(for: ["vision"] + rest.prefix(1))
         default:
             throw CLIError.usage("Unknown vision subcommand: '\(sub)'. Use: status, install, ask, verify, describe, locate, diagnose, or ocr.")
         }
@@ -1281,15 +1521,26 @@ struct UseMacCLI {
     private static func handleTaskComplete(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--app", "--summary"]
+            valueFlags: ["--profile", "--tab", "--app", "--summary", "--keep-tab"],
+            boolFlags: ["--keep-tabs"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let summary = parsed.values["--summary"] ?? (parsed.positionals.isEmpty ? nil : parsed.positionals.joined(separator: " "))
+        var keepTabIds: [Int]?
+        if let raw = parsed.values["--keep-tab"] {
+            let ids = raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard !ids.isEmpty, ids.allSatisfy({ Int($0) != nil }) else {
+                throw CLIError.usage("--keep-tab expects tab ids separated by commas, e.g. --keep-tab 123,456.")
+            }
+            keepTabIds = ids.compactMap { Int($0) }
+        }
         let params = TaskCompleteParams(
             profile: parsed.values["--profile"],
             tabId: tabId,
             app: parsed.values["--app"],
-            summary: summary
+            summary: summary,
+            keepTabs: parsed.flags.contains("--keep-tabs") ? true : nil,
+            keepTabIds: keepTabIds
         )
         let req = RPCRequest(method: .taskComplete, taskComplete: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -1695,16 +1946,19 @@ struct UseMacCLI {
         }
     }
 
+    // MARK: - Help
+
     private static func printUsage() {
         print("""
         UseMac CLI v\(UseMacDefaults.version) — Native macOS GUI & browser control
 
         Usage:
           usemac [global options] <command> [arguments]
+          usemac help <command>          Usage, flags and an example for one command (same as <command> --help)
 
         Global options:
           --socket <path>     Unix socket path (default: \(UseMacDefaults.defaultSocketPath))
-          --json              Output JSON
+          --json              Output JSON (shape below)
           --standalone        Run in-process without connecting to the UseMac daemon
           --require-daemon    Fail if the UseMac daemon is not reachable
 
@@ -1712,19 +1966,24 @@ struct UseMacCLI {
           ping                                       Test socket and engine latency
           status                                     Show daemon status, permissions, and telemetry
           apps                                       List running applications
-          observe [--app <n|pid>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--diff] [--screenshot]
-                                                     Capture a compact accessibility snapshot
-          act '<json>' [--app <name>]                Execute a BatchActionRequest or [ActionStep]
+          observe [--app <n|pid>] [--role <r>] [--text <t>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--no-offscreen] [--screenshot]
+                                                     Capture a compact accessibility snapshot (stable @eN ids)
+          find --app <n|pid> [--role <r>] [--text <t>] [--title <t>] [--value <v>] [--exact] [--first] [--max-depth <n>] [--max-elements <n>]
+                                                     Search the live accessibility tree with the same rules as act's "match"
+          act '<json>'|- [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]
+                                                     Execute a BatchActionRequest or [ActionStep]
           click <@eID> [--app <name>]                Click an element by ID
           set <@eID> <text> [--app <name>]           Set the value of an element by ID
           type <text> [--app <name>]                 Type text
           key <chord> [--app <name>]                 Press a key or shortcut (e.g. cmd+shift+p, return)
+                                                     (click, set, type and key also take --foreground, --expect-title, --allow-stale)
           screenshot [--app <name>] [--max-dim <n>] [--base64]
                                                      Capture a window or screen screenshot
           browser status                             List Chrome profiles connected to the extension
           browser tabs [--profile <n>] [--query <q>] List open Chrome tabs with tabId, title, and URL
-          browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--no-stream]
-                                                     Open a URL in a new tab or navigate a specific tab (--tab) in the background
+          browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--activate] [--new-window] [--no-stream]
+                                                     Open a URL in a background tab, navigate --tab, or open it in a new window
+          browser open --tab <id> --activate         Make an existing tab the active tab of its window (for native observe/act)
           browser observe [--profile <n>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables] [--width <px>] [--height <px>] [--scale <n>]
                                                      Inspect DOM (including cross-origin iframes and Shadow DOM), tables, text, and overlays (@b1..@bN)
           browser extract [auto|tables|text|kpis|eval|downloads] [--profile <n>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]
@@ -1735,18 +1994,8 @@ struct UseMacCLI {
                                                      Execute BrowserActParams or [ActionStep] in Chrome with optional local verification or screenshot
           vision status                              Show Local Vision engine status (Apple OCR + MLX-VLM)
           vision install [--model <hf-repo>]         Install the MLX runtime and download the local model on demand
-          vision ask "<question>" [--profile <n>] [--tab <id>] [--selector <css>] [--element <@bID>] [--app <n>] [--image <path>]
-                                                     Ask the local vision model + Apple OCR about the screen (zero cloud image tokens)
-          vision verify "<condition>" [--profile <n>] [--tab <id>] [--selector <css>] [--app <n>] [--image <path>]
-                                                     Visually verify an expectation locally (YES/NO + evidence)
-          vision describe [--profile <n>] [--tab <id>] [--selector <css>] [--app <n>] [--image <path>]
-                                                     Summarize the current visual state of the screen (errors, values, buttons, modals)
-          vision locate "<target>" [--profile <n>] [--tab <id>] [--app <n>] [--image <path>]
-                                                     Locate (x, y) coordinates of a visual element
-          vision diagnose [--profile <n>] [--tab <id>] [--app <n>] [--prompt "<text>"]
-                                                     Diagnose banners, modals, or errors blocking the page and suggest where to click
-          vision ocr [--profile <n>] [--tab <id>] [--app <n>] [--image <path>]
-                                                     Run fast native OCR via Apple Vision (Neural Engine)
+          vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
+                                                     Ask the on-device vision model + Apple OCR about the screen (zero cloud image tokens)
           start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
                                                      Start a continuous session keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
@@ -1756,7 +2005,471 @@ struct UseMacCLI {
           install-skill [--workspace] [--dir <path>] [--force] [--dry-run]
                                                      Install the UseMac SKILL.md into detected agent directories
           bench [--iterations <n>] [--app <name>]    Run a latency benchmark (default: 100)
+
+        Exit codes:
+          0  Success
+          1  Command or RPC failure (find: nothing matched)
+          2  Invalid usage, unknown flag or key, or invalid JSON
+          3  Daemon required (DAEMON_REQUIRED): ask the user to open UseMac
+          4  Blocked by a safety rule (POLICY_BLOCKED, POLICY_LOCKED, URL_BLOCKED, UPLOAD_BLOCKED): stop and tell the user
+          5  The screen is not what you expected (STALE_SNAPSHOT, ELEMENT_NOT_FOUND, WAIT_TIMEOUT): observe again, then retry
+          6  Needs the app in front, or the user is busy (TARGET_NOT_FRONTMOST, USER_ACTIVE): use a background step, or wait and retry
+          7  This route cannot reach it (RESTRICTED_PAGE, CAPTURE_TOO_SMALL): switch route (see 'usemac help browser')
+
+        JSON output (--json):
+          Success prints the result object itself: observe → WindowSnapshot, find → {"app","count","matches"},
+          act/click/set/type/key → BatchActionResult, apps → [AppDescriptor], status → DaemonStatus.
+          Errors print {"ok":false,"error":{"code":"…","message":"…","hint":"…"}} to stdout; the exit code is set as above.
+          Run 'usemac help <command>' for that command's fields.
         """)
+    }
+
+    private struct CommandHelp {
+        var usage: [String]
+        var summary: String
+        var flags: [(String, String)] = []
+        var notes: [String] = []
+        var examples: [String] = []
+        var json: String?
+    }
+
+    private static let batchFlagHelp: [(String, String)] = [
+        ("--app <name|pid>", "Target app (default: the app in the JSON, else the paired or frontmost app)"),
+        ("--foreground", "Foreground burst: bring the app to the front, run the steps with real input, then give focus back. Refused with USER_ACTIVE if the user typed or used the mouse in the last 1.5 s. Use only when a background step had no effect or failed with TARGET_NOT_FRONTMOST."),
+        ("--expect-title <text>", "Precondition: fail with STALE_SNAPSHOT before any step unless the target window title contains <text> (digits ignored)"),
+        ("--allow-stale", "Skip the automatic check that the window still shows what your last observe saw"),
+        ("--window <title>", "Act in the window whose title contains this text (default: the window of your last observe)")
+    ]
+
+    private static let batchResultJSON = "BatchActionResult {success, totalLatencyMs, stepResults: [{index, action, success, mechanism, latencyMs, message, errorCode, effect (changed|none|unverified), warning, resolvedElementId, scrollDeltaY, visualChangePercent, downloadPath}], observation: WindowSnapshot, agentFeedback, screenshot}"
+
+    private static let snapshotJSON = "WindowSnapshot {app: {pid, name, bundleId, windowTitle, windowId}, timestampMs, latencyMs, fromHotCache, focusedElementId, elements: [{id, role, title, value, roleDescription, enabled, focused, frame {x, y, width, height}, actions, offscreen}], diff, screenshotPath}"
+
+    private static let restrictedPageNote = "On RESTRICTED_PAGE (Chrome Web Store, chrome:// pages the extension cannot script) switch to the hybrid flow: 'usemac browser open --tab <id> --activate' (or 'browser open <url> --new-window'), then 'usemac observe --app \"Google Chrome\"' and 'usemac act … --app \"Google Chrome\"'. Native observe only sees the active tab of each Chrome window."
+
+    private static let browserSubcommands: [(String, String)] = [
+        ("status", "List Chrome profiles connected to the extension"),
+        ("tabs", "List open Chrome tabs with tabId, title and URL"),
+        ("open", "Open a URL in a background tab, navigate a tab, activate a tab, or open a new window"),
+        ("observe", "Inspect a tab's DOM (@b1..@bN), tables, text and overlays"),
+        ("extract", "Extract tables, KPIs, text, JS results or session downloads"),
+        ("screenshot", "Capture a JPEG of a tab or one element"),
+        ("act", "Run DOM action steps in a tab")
+    ]
+
+    private static let visionSubcommands: [(String, String)] = [
+        ("status", "Show Local Vision status (Apple OCR + MLX model)"),
+        ("install", "Install the MLX runtime and download a preset model"),
+        ("ask", "Ask a visual question about the screen"),
+        ("verify", "Check a visual assertion (YES/NO + evidence)"),
+        ("describe", "Summarize the visible state (errors, values, buttons, modals)"),
+        ("locate", "Find the (x, y) point of a visual element"),
+        ("diagnose", "Detect banners, modals or errors blocking the page"),
+        ("ocr", "Run Apple Vision OCR")
+    ]
+
+    private static func commandHelp(_ key: String) -> CommandHelp? {
+        switch key {
+        case "ping":
+            return CommandHelp(
+                usage: ["usemac ping"],
+                summary: "Check that the daemon answers and show the round-trip latency.",
+                examples: ["usemac ping"],
+                json: "{ok, mode, pong, roundTripMs, roundTripUs, serverLatencyMs}"
+            )
+        case "status":
+            return CommandHelp(
+                usage: ["usemac status"],
+                summary: "Show the daemon version, execution mode, Kill Switch, permissions, paired and frontmost app, connected Chrome profiles and telemetry.",
+                examples: ["usemac status"],
+                json: "DaemonStatus {version, pid, socketPath, policy, killSwitchTripped, permissions {accessibilityGranted, screenRecordingGranted}, pairedApp, frontmostApp, browserProfiles, telemetry}"
+            )
+        case "apps":
+            return CommandHelp(
+                usage: ["usemac apps"],
+                summary: "List running GUI apps with pid, bundle id, active state and front window title.",
+                examples: ["usemac apps"],
+                json: "[AppDescriptor {pid, name, bundleId, isActive, isHidden, windowTitle, windowBounds, windowId}]"
+            )
+        case "observe":
+            return CommandHelp(
+                usage: ["usemac observe [--app <name|pid>] [--role <role>] [--text <text>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--no-offscreen] [--screenshot]"],
+                summary: "Capture a compact accessibility snapshot of the app's focused window. The same element keeps the same @eN id across observes; elements scrolled out of view are listed as (offscreen) and acting on one scrolls it into view first.",
+                flags: [
+                    ("--app <name|pid>", "Target app name, bundle id or pid (default: the paired app, else the frontmost app)"),
+                    ("--role <role>", "Only print elements with this AX role, with or without the AX prefix (button = AXButton)"),
+                    ("--text <text>", "Only print elements whose title, description or value contains <text> (case- and accent-insensitive)"),
+                    ("--max-depth <n>", "How deep to walk the accessibility tree (raise it for nested lists and sheets)"),
+                    ("--max-elements <n>", "Maximum number of elements to index"),
+                    ("--no-cache", "Read the live tree instead of the hot cache"),
+                    ("--diff | --no-diff", "Include (default) or leave out the diff against the previous snapshot"),
+                    ("--no-offscreen", "Leave out elements scrolled out of view"),
+                    ("--window <title>", "Observe the window whose title contains this text instead of the focused one; later acts keep using it"),
+                    ("--screenshot", "Also save a JPEG of the window and print its path")
+                ],
+                notes: ["--role and --text only narrow what is printed; the daemon still indexes the whole window, so ids stay valid for act."],
+                examples: [
+                    "usemac observe --app \"Notes\"",
+                    "usemac observe --app \"System Settings\" --role checkbox --text bluetooth"
+                ],
+                json: snapshotJSON + " (with --role/--text, elements holds only the matches)"
+            )
+        case "find":
+            return CommandHelp(
+                usage: ["usemac find --app <name|pid> [--role <role>] [--text <t>] [--title <t>] [--value <v>] [--exact] [--first] [--max-depth <n>] [--max-elements <n>]"],
+                summary: "Read the app's live accessibility tree (no cache) and print the elements that match, using the same rules act uses for \"match\". Use it to check a match before acting, or to get an id.",
+                flags: [
+                    ("--app <name|pid>", "Target app (required)"),
+                    ("--role <role>", "AX role, with or without the AX prefix (button = AXButton)"),
+                    ("--text <t>", "Title, description or value contains <t>"),
+                    ("--title <t>", "Title or description contains <t>"),
+                    ("--value <v>", "Value contains <v>"),
+                    ("--exact", "Require equal text instead of contains"),
+                    ("--first", "Print only the id of the first match (exit 1 when nothing matches)"),
+                    ("--max-depth <n>", "How deep to walk the tree (raise it for long or nested lists)"),
+                    ("--max-elements <n>", "Maximum number of elements to read")
+                ],
+                notes: [
+                    "Text compares are case- and accent-insensitive. Every filter you pass must match. At least one filter is required.",
+                    "Exit code 1 when nothing matches, like grep."
+                ],
+                examples: [
+                    "usemac find --app \"Notes\" --role button --text \"new note\"",
+                    "ID=$(usemac find --app \"Mail\" --role textfield --title subject --first) && usemac set \"$ID\" \"Weekly report\" --app \"Mail\""
+                ],
+                json: "{app: AppDescriptor, count, matches: [ElementNode]} (count 0 and exit 1 when nothing matches)"
+            )
+        case "act":
+            return CommandHelp(
+                usage: [
+                    "usemac act '<json>' [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]",
+                    "usemac act - < batch.json"
+                ],
+                summary: "Run a BatchActionRequest (a JSON object) or a list of ActionStep (a JSON array) on a native app, in the background by default. Pass - to read the JSON from stdin.",
+                flags: batchFlagHelp,
+                notes: [
+                    "Batch keys: app, steps, stopOnError, returnObservation, returnDiffOnly, includeScreenshot, expectWindowTitle, allowStaleSnapshot, foreground, window. Flags win over the same keys in the JSON.",
+                    "Step actions: target, openURL, navigate, click, doubleClick, rightClick, hover, setValue, type, pressKey, scroll, focus, wait, uploadFile, scrollIntoView, axAction (actionName, e.g. AXOpen), waitFor (match or elementId, timeoutMs default 5000, gone: true to wait until it disappears).",
+                    "Target a step with \"elementId\": \"@e12\" or with \"match\": {\"role\", \"title\", \"value\", \"text\", \"exact\", \"index\"}, resolved when the step runs. Prefer match when the window may have changed.",
+                    "Each step reports effect: changed, none or unverified. \"⚠ no visible effect\" means the step reported ok but nothing changed: observe before continuing.",
+                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder."
+                ],
+                examples: [
+                    "usemac act '{\"app\":\"Notes\",\"steps\":[{\"action\":\"click\",\"match\":{\"role\":\"button\",\"title\":\"New Note\"}},{\"action\":\"type\",\"text\":\"Hello\"}]}'",
+                    "usemac act '[{\"action\":\"waitFor\",\"match\":{\"text\":\"Saved\"},\"timeoutMs\":8000}]' --app \"Notes\"",
+                    "usemac act '[{\"action\":\"uploadFile\",\"files\":[\"/Users/me/Desktop/report.pdf\"]}]' --app \"Safari\""
+                ],
+                json: batchResultJSON
+            )
+        case "click":
+            return CommandHelp(
+                usage: ["usemac click <@eID> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
+                summary: "Click an element by id (AXPress in the background when the element supports it).",
+                flags: batchFlagHelp,
+                notes: ["To click by what the element is, use act with \"match\", or: usemac click \"$(usemac find --app <name> --role button --title Save --first)\" --app <name>."],
+                examples: ["usemac click @e12 --app \"Notes\""],
+                json: batchResultJSON
+            )
+        case "set":
+            return CommandHelp(
+                usage: ["usemac set <@eID> <text> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
+                summary: "Set an element's value directly (AXValue) without typing. Works in the background.",
+                flags: batchFlagHelp,
+                examples: ["usemac set @e7 \"hello@example.com\" --app \"Mail\""],
+                json: batchResultJSON
+            )
+        case "type":
+            return CommandHelp(
+                usage: ["usemac type <text> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
+                summary: "Type text into the app's focused element.",
+                flags: batchFlagHelp,
+                examples: ["usemac type \"Meeting notes\" --app \"Notes\""],
+                json: batchResultJSON
+            )
+        case "key":
+            return CommandHelp(
+                usage: ["usemac key <chord> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
+                summary: "Press a key or shortcut. Modifiers: cmd, shift, opt (alt), ctrl, fn. Keys: return, tab, space, escape, delete, arrows, a–z, 0–9.",
+                flags: batchFlagHelp,
+                examples: ["usemac key cmd+shift+n --app \"Finder\""],
+                json: batchResultJSON
+            )
+        case "screenshot":
+            return CommandHelp(
+                usage: ["usemac screenshot [--app <name>] [--max-dim <n>] [--base64]"],
+                summary: "Save a downscaled JPEG of the app's target window (or the display) to a private temp folder (pruned after 30 minutes).",
+                flags: [
+                    ("--app <name>", "Target app (default: the paired or frontmost app)"),
+                    ("--max-dim <n>", "Longest edge in pixels (default 1280)"),
+                    ("--base64", "Also print the image as base64")
+                ],
+                notes: ["Fails with CAPTURE_TOO_SMALL (exit 7) when the only window found is too small to trust, such as a helper strip: observe the app instead of reading that image."],
+                examples: ["usemac screenshot --app \"Notes\""],
+                json: "ScreenshotResult {path, mimeType, width, height, byteCount, latencyMs, base64Data}"
+            )
+        case "browser":
+            return CommandHelp(
+                usage: ["usemac browser <subcommand> [arguments]"],
+                summary: "Drive Google Chrome tabs in the background through the UseMac Browser Bridge extension. Use these before any native observe/act on Chrome.",
+                flags: browserSubcommands,
+                notes: [restrictedPageNote, "Run 'usemac help browser <subcommand>' for its flags."],
+                examples: ["usemac browser tabs --query analytics", "usemac browser observe --tab 123"]
+            )
+        case "browser status":
+            return CommandHelp(
+                usage: ["usemac browser status"],
+                summary: "List the Chrome profiles connected to the extension (name, e-mail, extension version, tab count, streaming tab).",
+                examples: ["usemac browser status"],
+                json: "[BrowserProfileStatus {profileName, profileEmail, extensionVersion, tabCount, streamingTabId, streamingUrl}]"
+            )
+        case "browser tabs":
+            return CommandHelp(
+                usage: ["usemac browser tabs [--profile <name>] [--query <text>]"],
+                summary: "List open Chrome tabs with tabId, title, URL and active state.",
+                flags: [
+                    ("--profile <name>", "Chrome profile from 'browser status' (only needed with several profiles)"),
+                    ("--query <text>", "Case-insensitive filter on title or URL")
+                ],
+                examples: ["usemac browser tabs --query \"analytics\""],
+                json: "[BrowserTabInfo {tabId, windowId, index, title, url, active, pinned, status, profileName}]"
+            )
+        case "browser open":
+            return CommandHelp(
+                usage: [
+                    "usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream]",
+                    "usemac browser open --tab <id> --activate"
+                ],
+                summary: "Open a URL in a new background tab, navigate an existing tab, make a tab active, or open the URL in a new unfocused window.",
+                flags: [
+                    ("--profile <name>", "Chrome profile from 'browser status' (only needed with several profiles)"),
+                    ("--tab <id>", "Navigate this tab instead of opening a new one"),
+                    ("--same-tab | --new-tab", "Force navigating in place or opening a new tab"),
+                    ("--activate", "Make the tab the active tab of its window (Chrome stays in the background). With --tab and no URL, only activates that tab."),
+                    ("--new-window", "Open the URL in a new, unfocused Chrome window owned by UseMac (cannot be combined with --tab)"),
+                    ("--no-stream", "Do not stream live preview frames to the UseMac HUD")
+                ],
+                notes: [
+                    "Only http://, https:// and about:blank are allowed (a URL without a scheme gets https://); anything else fails with URL_BLOCKED.",
+                    restrictedPageNote
+                ],
+                examples: [
+                    "usemac browser open \"https://example.com\"",
+                    "usemac browser open --tab 123 --activate",
+                    "usemac browser open \"https://chromewebstore.google.com/\" --new-window"
+                ],
+                json: "RPCResponse {ok, browserTabId, browserUrl, browserTitle, snapshot}"
+            )
+        case "browser observe":
+            return CommandHelp(
+                usage: ["usemac browser observe [--profile <name>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables] [--width <px>] [--height <px>] [--scale <n>]"],
+                summary: "Inspect a tab's interactive DOM as @b1..@bN refs (including cross-origin iframes and Shadow DOM), tables, readable text, scroll state and blocking overlays.",
+                flags: [
+                    ("--profile <name>", "Chrome profile (only needed with several profiles)"),
+                    ("--tab <id>", "Tab to observe (default: the last UseMac tab)"),
+                    ("--max-elements <n>", "Maximum DOM elements (default 280, max 600)"),
+                    ("--screenshot", "Also save a JPEG of the tab"),
+                    ("--no-text | --no-tables", "Leave out readable text or tables"),
+                    ("--width/--height <px>, --scale <n>", "Emulated viewport size and pixel density")
+                ],
+                notes: [restrictedPageNote],
+                examples: ["usemac browser observe --tab 123"],
+                json: snapshotJSON + " plus pageState {readableText, tablesMarkdown, scroll…, blockingOverlay}"
+            )
+        case "browser extract":
+            return CommandHelp(
+                usage: ["usemac browser extract [auto|tables|text|kpis|eval|downloads] [--profile <name>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]"],
+                summary: "Extract structured data from a tab. auto, tables, text and kpis only read; downloads lists files downloaded during the UseMac session; eval runs JavaScript in the page (autonomous mode only, logged).",
+                flags: [
+                    ("--tab <id>", "Tab to read"),
+                    ("--selector <css>", "Scope extraction to one container"),
+                    ("--expr <js>", "Expression for eval mode"),
+                    ("--scan-horizontal", "Scroll wide virtualized grids horizontally and merge all columns"),
+                    ("--max-chars <n>", "Output limit (default 16000)")
+                ],
+                examples: ["usemac browser extract tables --tab 123 --scan-horizontal"],
+                json: "BrowserExtractResult {mode, tabId, url, tablesMarkdown, rowCount, columnCount, text, jsonResult, downloads, latencyMs}"
+            )
+        case "browser screenshot":
+            return CommandHelp(
+                usage: ["usemac browser screenshot [--profile <name>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--scale <n>] [--quality <n>]"],
+                summary: "Capture a JPEG of a tab, or crop it around a selector or @bID. Prefer observe/extract or on-device vision first.",
+                flags: [
+                    ("--selector <css> | --element <@bID>", "Crop around this element"),
+                    ("--full-page", "Capture the full scrollable height (capped at 6000 px)"),
+                    ("--width/--height <px>, --scale <n>", "Emulated viewport size and pixel density"),
+                    ("--quality <n>", "JPEG quality 30–100 (default 84)")
+                ],
+                examples: ["usemac browser screenshot --tab 123 --selector \"#chart\" --scale 2"],
+                json: "ScreenshotResult {path, mimeType, width, height, byteCount, latencyMs}"
+            )
+        case "browser act":
+            return CommandHelp(
+                usage: ["usemac browser act '<json>' [--profile <name>] [--tab <id>] [--read-only] [--verify \"<condition>\"] [--screenshot]"],
+                summary: "Run DOM action steps in a tab with @bN refs or CSS selectors: click, doubleClick, rightClick, hover, setValue (including <select>), type, pressKey, scroll, wait (with selector or text), uploadFile (no Finder), navigate/openURL.",
+                flags: [
+                    ("--tab <id>", "Tab to act on"),
+                    ("--read-only", "Block mutating steps (only scroll, hover, wait and target run)"),
+                    ("--verify \"<condition>\"", "Check the result on-device after the steps (zero cloud image tokens)"),
+                    ("--screenshot", "Attach a post-action screenshot")
+                ],
+                notes: [
+                    "JSON keys: profile, tabId, steps, stopOnError, returnObservation, returnDiffOnly, readOnly, verify, returnImageContent.",
+                    restrictedPageNote
+                ],
+                examples: ["usemac browser act '[{\"action\":\"setValue\",\"elementId\":\"@b2\",\"text\":\"UseMac\"},{\"action\":\"click\",\"elementId\":\"@b3\"}]' --tab 123"],
+                json: batchResultJSON
+            )
+        case "vision":
+            return CommandHelp(
+                usage: ["usemac vision <subcommand> [arguments]"],
+                summary: "On-device vision (Apple Vision OCR plus an optional MLX model). Images never leave the Mac.",
+                flags: visionSubcommands,
+                notes: ["Run 'usemac help vision <subcommand>' for its flags."],
+                examples: ["usemac vision verify \"Success banner is visible\" --tab 123"]
+            )
+        case "vision status":
+            return CommandHelp(
+                usage: ["usemac vision status"],
+                summary: "Show whether OCR and the local model are ready.",
+                examples: ["usemac vision status"],
+                json: "VisionStatus {state, enabled, backend, modelId, runtimeInstalled, modelDownloaded, workerRunning, lastError}"
+            )
+        case "vision install":
+            return CommandHelp(
+                usage: ["usemac vision install [--model <hf-repo>]"],
+                summary: "Install the MLX runtime and download one of the three preset models (INVALID_MODEL otherwise).",
+                flags: [("--model <hf-repo>", "Preset model id (default: the recommended preset)")],
+                examples: ["usemac vision install"]
+            )
+        case "vision ask", "vision verify", "vision describe", "vision locate", "vision diagnose", "vision ocr":
+            let mode = String(key.dropFirst("vision ".count))
+            let summaries: [String: String] = [
+                "ask": "Answer a visual question about the screen, grounded in OCR.",
+                "verify": "Check a visual assertion and answer YES/NO with evidence.",
+                "describe": "Summarize the visible state: errors, values, buttons, modals.",
+                "locate": "Return the (x, y) point of a visual element.",
+                "diagnose": "Detect banners, modals or errors blocking the page and suggest where to click.",
+                "ocr": "Run Apple Vision OCR and print the text with positions."
+            ]
+            let takesText = ["ask", "verify", "locate"].contains(mode)
+            return CommandHelp(
+                usage: ["usemac vision \(mode)\(takesText ? " \"<text>\"" : "") [--profile <name>] [--tab <id>] [--app <name>] [--image <path>] [--selector <css>] [--element <@bID>] [--prompt \"<text>\"]"],
+                summary: summaries[mode] ?? "",
+                flags: [
+                    ("--tab <id> | --app <name>", "What to look at: a Chrome tab or a native app window"),
+                    ("--image <path>", "Use an existing image (must be in your temp folder or /tmp)"),
+                    ("--selector <css> | --element <@bID>", "Crop to one element of a Chrome tab"),
+                    ("--prompt \"<text>\"", "Question or condition (same as the positional text)")
+                ],
+                examples: [mode == "verify" ? "usemac vision verify \"Success banner is visible\" --tab 123" : "usemac vision \(mode)\(takesText ? " \"X close button\"" : "") --app \"Notes\""],
+                json: "VisionQueryResult {mode, backend, modelId, answer, verified, x, y, blockingDetected, imagePath, detections, latencyMs}"
+            )
+        case "start":
+            return CommandHelp(
+                usage: ["usemac start [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>]"],
+                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps.",
+                examples: ["usemac start --summary \"Reviewing dashboard\""]
+            )
+        case "stop", "done", "complete":
+            return CommandHelp(
+                usage: ["usemac done [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>] [--keep-tab <id,id>] [--keep-tabs]   (aliases: stop, complete)"],
+                summary: "Call once when the whole task is finished: shows the completion state and closes the live preview. About 2 s later UseMac closes the Chrome tabs it opened (never your own tabs, the tab you are looking at, or tabs with a running download). --keep-tab keeps the page with the result; --keep-tabs keeps them all.",
+                examples: ["usemac done --summary \"Report exported\"", "usemac done --summary \"Invoice ready\" --keep-tab 123"]
+            )
+        case "serve":
+            return CommandHelp(
+                usage: ["usemac serve [--socket <path>]"],
+                summary: "Run the Unix socket RPC daemon in this process (for testing; UseMac.app normally runs it, with the Kill Switch and execution mode).",
+                examples: ["usemac serve --socket /tmp/usemac-test.sock"]
+            )
+        case "mcp":
+            return CommandHelp(
+                usage: ["usemac mcp"],
+                summary: "Start the stdio MCP server. Register it in your agent's MCP config as {\"command\": \"<path to usemac>\", \"args\": [\"mcp\"]}.",
+                examples: ["claude mcp add --scope user usemac -- \"/Applications/UseMac.app/Contents/Helpers/usemac\" mcp"]
+            )
+        case "install-skill", "skill":
+            return CommandHelp(
+                usage: ["usemac install-skill [--workspace] [--dir <path>] [--force] [--dry-run]"],
+                summary: "Install the usemac SKILL.md, stamped with this Mac's binary and socket path, into every detected agent skills folder.",
+                flags: [
+                    ("--workspace, -w", "Install into .agents/skills in the current folder"),
+                    ("--dir <path>, -d", "Install into this skills folder"),
+                    ("--force", "Replace a SKILL.md that does not belong to UseMac"),
+                    ("--dry-run", "Show the target paths without writing")
+                ],
+                examples: ["usemac install-skill"],
+                json: "{ok, binary, targets: [{path, status}]}"
+            )
+        case "bench":
+            return CommandHelp(
+                usage: ["usemac bench [--iterations <n>] [--app <name>]"],
+                summary: "Measure ping, list_apps and observe latency (cold and hot cache).",
+                flags: [
+                    ("--iterations <n>", "Ping iterations (default 100)"),
+                    ("--app <name>", "App to observe")
+                ],
+                examples: ["usemac bench --app \"Notes\""]
+            )
+        case "help":
+            return CommandHelp(
+                usage: ["usemac help [<command> [<subcommand>]]", "usemac <command> --help"],
+                summary: "Show the overview, or usage, flags and an example for one command.",
+                examples: ["usemac help act", "usemac help browser open"]
+            )
+        case "version":
+            return CommandHelp(
+                usage: ["usemac --version"],
+                summary: "Print the CLI version.",
+                examples: ["usemac --version"]
+            )
+        default:
+            return nil
+        }
+    }
+
+    private static func printHelp(for path: [String]) throws -> Int32 {
+        guard let command = path.first else {
+            printUsage()
+            return 0
+        }
+        let key = path.count > 1 ? "\(command) \(path[1])" : command
+        guard let help = commandHelp(key) else {
+            if path.count > 1, commandHelp(command) != nil {
+                throw CLIError.usage("Unknown \(command) subcommand: '\(path[1])'. Run 'usemac help \(command)'.")
+            }
+            throw CLIError.usage("Unknown command: '\(command)'. Run 'usemac help' to see available commands.")
+        }
+
+        var lines: [String] = ["usemac \(key) — \(help.summary)", "", "Usage:"]
+        lines.append(contentsOf: help.usage.map { "  \($0)" })
+        if !help.flags.isEmpty {
+            let isGroup = key == "browser" || key == "vision"
+            lines.append("")
+            lines.append(isGroup ? "Subcommands:" : "Flags:")
+            let width = min(28, help.flags.map(\.0.count).max() ?? 0)
+            for (flag, text) in help.flags {
+                let padded = flag.count >= width ? flag + "  " : flag.padding(toLength: width + 2, withPad: " ", startingAt: 0)
+                lines.append("  \(padded)\(text)")
+            }
+        }
+        if !help.notes.isEmpty {
+            lines.append("")
+            lines.append("Notes:")
+            lines.append(contentsOf: help.notes.map { "  - \($0)" })
+        }
+        if !help.examples.isEmpty {
+            lines.append("")
+            lines.append(help.examples.count == 1 ? "Example:" : "Examples:")
+            lines.append(contentsOf: help.examples.map { "  \($0)" })
+        }
+        if let json = help.json {
+            lines.append("")
+            lines.append("JSON (--json): \(json)")
+            lines.append("Errors with --json: {\"ok\":false,\"error\":{\"code\",\"message\",\"hint\"}}. Exit codes: run 'usemac help'.")
+        }
+        print(lines.joined(separator: "\n"))
+        return 0
     }
 
     // MARK: - Skill Installer

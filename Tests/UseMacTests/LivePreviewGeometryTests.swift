@@ -1,0 +1,209 @@
+import CoreGraphics
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
+import XCTest
+@testable import UseMacEngine
+
+final class LivePreviewGeometryTests: XCTestCase {
+    private let source = CGRect(x: 100, y: 50, width: 1600, height: 900)
+    private let preview = CGSize(width: 280, height: 200)
+
+    // MARK: Mapping
+
+    func testFittedRectLetterboxesLikeResizeAspect() {
+        let fitted = LivePreviewGeometry.fittedRect(sourceSize: source.size, in: preview)
+        XCTAssertEqual(fitted.width, 280, accuracy: 0.001)
+        XCTAssertEqual(fitted.height, 157.5, accuracy: 0.001)
+        XCTAssertEqual(fitted.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(fitted.minY, 21.25, accuracy: 0.001)
+    }
+
+    func testPointMapsIntoPreview() throws {
+        let center = try XCTUnwrap(LivePreviewGeometry.previewPoint(CGPoint(x: 900, y: 500), sourceBounds: source, previewSize: preview))
+        XCTAssertEqual(center.x, 140, accuracy: 0.001)
+        XCTAssertEqual(center.y, 100, accuracy: 0.001)
+
+        let topLeft = try XCTUnwrap(LivePreviewGeometry.previewPoint(CGPoint(x: 100, y: 50), sourceBounds: source, previewSize: preview))
+        XCTAssertEqual(topLeft.x, 0, accuracy: 0.001)
+        XCTAssertEqual(topLeft.y, 21.25, accuracy: 0.001)
+    }
+
+    func testPointOutsideThePreviewedWindowIsDropped() {
+        XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 1800, y: 500), sourceBounds: source, previewSize: preview))
+        XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 50, y: 500), sourceBounds: source, previewSize: preview))
+        // The legacy 5% slack still applies when asked for.
+        XCTAssertNotNil(LivePreviewGeometry.previewPoint(
+            CGPoint(x: 1740, y: 500),
+            sourceBounds: source,
+            previewSize: preview,
+            tolerance: 0.05
+        ))
+    }
+
+    func testRectIsClippedToTheSource() throws {
+        // Half outside on the right: only the visible half maps.
+        let mapped = try XCTUnwrap(LivePreviewGeometry.previewRect(
+            CGRect(x: 1600, y: 500, width: 200, height: 100),
+            sourceBounds: source,
+            previewSize: preview
+        ))
+        XCTAssertEqual(mapped.minX, 262.5, accuracy: 0.001)
+        XCTAssertEqual(mapped.width, 17.5, accuracy: 0.001)
+        XCTAssertEqual(mapped.height, 17.5, accuracy: 0.001)
+
+        XCTAssertNil(LivePreviewGeometry.previewRect(
+            CGRect(x: 2000, y: 500, width: 200, height: 100),
+            sourceBounds: source,
+            previewSize: preview
+        ))
+        // Zero-size element bounds (Chrome, clipped elements) still mark their position.
+        XCTAssertNotNil(LivePreviewGeometry.previewRect(
+            CGRect(x: 900, y: 500, width: 0, height: 0),
+            sourceBounds: source,
+            previewSize: preview
+        ))
+    }
+
+    func testPreviewShowsOverlayOnlyForTheShownWindow() {
+        // No identity: unchanged behavior.
+        XCTAssertTrue(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: nil, overlayWindowId: nil,
+            sourceIsBrowserFrame: true, sourceIsWindow: true, sourcePid: nil, sourceWindowId: nil
+        ))
+        // Extension frames are in page coordinates.
+        XCTAssertFalse(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: 500, overlayWindowId: 11,
+            sourceIsBrowserFrame: true, sourceIsWindow: true, sourcePid: 500, sourceWindowId: nil
+        ))
+        // A display stream maps every window.
+        XCTAssertTrue(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: 500, overlayWindowId: 11,
+            sourceIsBrowserFrame: false, sourceIsWindow: false, sourcePid: nil, sourceWindowId: nil
+        ))
+        XCTAssertTrue(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: 500, overlayWindowId: 11,
+            sourceIsBrowserFrame: false, sourceIsWindow: true, sourcePid: 500, sourceWindowId: 11
+        ))
+        XCTAssertFalse(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: 500, overlayWindowId: 11,
+            sourceIsBrowserFrame: false, sourceIsWindow: true, sourcePid: 500, sourceWindowId: 10
+        ))
+        // Window unknown on one side: fall back to the app.
+        XCTAssertTrue(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: 500, overlayWindowId: nil,
+            sourceIsBrowserFrame: false, sourceIsWindow: true, sourcePid: 500, sourceWindowId: 10
+        ))
+        XCTAssertFalse(LivePreviewGeometry.previewShowsOverlay(
+            overlayPid: 500, overlayWindowId: 11,
+            sourceIsBrowserFrame: false, sourceIsWindow: true, sourcePid: 600, sourceWindowId: nil
+        ))
+    }
+
+    // MARK: Aspect ratio debounce
+
+    func testFirstRatioAppliesAtOnceAndSmallChangesAreIgnored() {
+        var stabilizer = PreviewAspectRatioStabilizer()
+        XCTAssertEqual(stabilizer.observe(1.6, at: 0, hold: false), 1.6)
+        XCTAssertNil(stabilizer.observe(1.65, at: 5, hold: false))
+        XCTAssertNil(stabilizer.observe(1.55, at: 10, hold: false))
+        XCTAssertFalse(stabilizer.hasPending)
+        XCTAssertEqual(stabilizer.current, 1.6)
+    }
+
+    func testRealChangeMustPersistBeforeItApplies() {
+        var stabilizer = PreviewAspectRatioStabilizer(threshold: 0.08, settleSeconds: 0.6)
+        _ = stabilizer.observe(1.6, at: 0, hold: false)
+        XCTAssertNil(stabilizer.observe(2.0, at: 1.0, hold: false))
+        XCTAssertNil(stabilizer.observe(2.0, at: 1.3, hold: false))
+        XCTAssertEqual(stabilizer.observe(2.0, at: 1.61, hold: false), 2.0)
+        XCTAssertEqual(stabilizer.current, 2.0)
+    }
+
+    func testSourceThatFlipsBackDoesNotResize() {
+        var stabilizer = PreviewAspectRatioStabilizer(threshold: 0.08, settleSeconds: 0.6)
+        _ = stabilizer.observe(1.6, at: 0, hold: false)
+        XCTAssertNil(stabilizer.observe(2.0, at: 1.0, hold: false))
+        XCTAssertNil(stabilizer.observe(1.6, at: 1.2, hold: false))
+        XCTAssertFalse(stabilizer.hasPending)
+        // A later flip starts its own wait instead of inheriting the old one.
+        XCTAssertNil(stabilizer.observe(2.0, at: 2.0, hold: false))
+        XCTAssertNil(stabilizer.settle(at: 2.3, hold: false))
+        XCTAssertEqual(stabilizer.settle(at: 2.7, hold: false), 2.0)
+    }
+
+    func testHoldDefersTheChangeUntilReleased() {
+        var stabilizer = PreviewAspectRatioStabilizer(threshold: 0.08, settleSeconds: 0.6)
+        _ = stabilizer.observe(1.6, at: 0, hold: false)
+        XCTAssertNil(stabilizer.observe(1.0, at: 1.0, hold: true))
+        XCTAssertNil(stabilizer.observe(1.0, at: 3.0, hold: true))
+        XCTAssertNil(stabilizer.settle(at: 4.0, hold: true))
+        XCTAssertEqual(stabilizer.settle(at: 4.1, hold: false), 1.0)
+    }
+
+    func testResetAppliesTheNextRatioAtOnce() {
+        var stabilizer = PreviewAspectRatioStabilizer()
+        _ = stabilizer.observe(1.6, at: 0, hold: false)
+        stabilizer.reset()
+        XCTAssertNil(stabilizer.current)
+        XCTAssertEqual(stabilizer.observe(0.8, at: 0.1, hold: true), 0.8)
+    }
+
+    // MARK: Local vision size guard
+
+    func testVisionRefusesTinyCaptures() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usemac-vision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let tiny = dir.appendingPathComponent("tiny.png")
+        let fine = dir.appendingPathComponent("fine.png")
+        try writePNG(width: 52, height: 20, to: tiny)
+        try writePNG(width: 200, height: 64, to: fine)
+
+        XCTAssertThrowsError(try LocalVisionEngine.validateImageSize(atPath: tiny.path)) { error in
+            XCTAssertEqual(error as? LocalVisionError, .captureTooSmall(width: 52, height: 20))
+            XCTAssertTrue(error.localizedDescription.hasPrefix("CAPTURE_TOO_SMALL:"))
+        }
+        XCTAssertNoThrow(try LocalVisionEngine.validateImageSize(atPath: fine.path))
+        // Unreadable files are left to the normal error paths.
+        XCTAssertNoThrow(try LocalVisionEngine.validateImageSize(atPath: dir.appendingPathComponent("missing.png").path))
+    }
+
+    func testVisionQueryAnswersWithTheRefusalForTinyCaptures() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usemac-vision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let tiny = dir.appendingPathComponent("tiny.png")
+        try writePNG(width: 52, height: 20, to: tiny)
+
+        let result = await LocalVisionEngine().query(
+            mode: "verify",
+            query: "Is the order saved?",
+            imagePath: tiny.path,
+            viewportWidth: 52,
+            viewportHeight: 20
+        )
+        XCTAssertTrue(result.answer.hasPrefix(LocalVisionEngine.captureTooSmallPrefix))
+        XCTAssertEqual(result.verified, false)
+        XCTAssertTrue(result.detections.isEmpty)
+    }
+
+    private func writePNG(width: Int, height: Int, to url: URL) throws {
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try XCTUnwrap(context.makeImage())
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+}

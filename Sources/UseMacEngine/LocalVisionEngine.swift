@@ -5,7 +5,24 @@ import ImageIO
 import UseMacProtocol
 import Vision
 
+public enum LocalVisionError: Error, LocalizedError, Equatable {
+    /// The image is too small to read anything from (e.g. a 52x20 helper window was captured).
+    case captureTooSmall(width: Int, height: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .captureTooSmall(let width, let height):
+            return "\(LocalVisionEngine.captureTooSmallPrefix) the captured image is \(width)x\(height) px; local vision needs at least \(LocalVisionEngine.minimumImageSide) px on the shorter side. The capture probably hit a helper window instead of the app's main window: make sure the window is open and not minimized, then capture again."
+        }
+    }
+}
+
 public final class LocalVisionEngine: @unchecked Sendable {
+    /// Every refusal for a too-small image starts with this, so callers can map it to an error code.
+    public static let captureTooSmallPrefix = "CAPTURE_TOO_SMALL:"
+    /// Shorter side, in pixels, below which an image is refused.
+    public static let minimumImageSide = 64
+
     private enum DefaultsKeys {
         static let enabled = "usemac.vision.enabled"
         static let modelId = "usemac.vision.modelId"
@@ -529,6 +546,21 @@ public final class LocalVisionEngine: @unchecked Sendable {
         }.value
     }
 
+    /// Throws `LocalVisionError.captureTooSmall` when the image's shorter side is under `minimumImageSide`.
+    /// Reads only the image header. An unreadable file passes, so the normal error paths report it.
+    public static func validateImageSize(atPath imagePath: String) throws {
+        let url = URL(fileURLWithPath: imagePath) as CFURL
+        guard let source = CGImageSourceCreateWithURL(url, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            return
+        }
+        if min(width, height) < minimumImageSide {
+            throw LocalVisionError.captureTooSmall(width: width, height: height)
+        }
+    }
+
     public func query(
         mode: String,
         query: String?,
@@ -539,6 +571,24 @@ public final class LocalVisionEngine: @unchecked Sendable {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let normalizedMode = mode.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveMode = normalizedMode.isEmpty ? "ask" : normalizedMode
+
+        // Never answer from a sliver: a confident answer from a 52x20 capture is worse than none.
+        do {
+            try Self.validateImageSize(atPath: imagePath)
+        } catch {
+            let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+            return VisionQueryResult(
+                mode: effectiveMode,
+                backend: "size-check",
+                modelId: nil,
+                latencyMs: (latencyMs * 100).rounded() / 100,
+                answer: error.localizedDescription,
+                verified: effectiveMode == "verify" ? false : nil,
+                blockingDetected: false,
+                detections: [],
+                imagePath: imagePath
+            )
+        }
 
         // Direct OCR mode
         if effectiveMode == "ocr" {

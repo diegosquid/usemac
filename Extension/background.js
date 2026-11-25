@@ -717,7 +717,7 @@ function resetIdleTimer(tabId) {
   session.lastActiveAt = Date.now();
   session.idleTimer = setTimeout(() => {
     session.idleTimer = null;
-    enqueueTabCommand(tabId, () => stopStreamingAndDetach(tabId, true));
+    enqueueTabCommand(tabId, () => stopStreamingAndDetach(tabId, true, "idle"));
   }, IDLE_TIMEOUT_MS);
 }
 
@@ -797,11 +797,13 @@ function waitForFileChooser(tabId, timeoutMs = 2600) {
   });
 }
 
-async function stopStreamingAndDetach(tabId, emitStopped = true) {
+// `reason` tells the UseMac preview whether the tab is gone ("closed", "stopped", "detached") or only stopped
+// streaming while it stays open ("idle", "evicted"), in which case its card is kept with the last frame.
+async function stopStreamingAndDetach(tabId, emitStopped = true, reason = "stopped") {
   if (tabId == null) {
     const allIds = Array.from(state.tabSessions.keys());
     for (const id of allIds) {
-      await stopStreamingAndDetach(id, emitStopped);
+      await stopStreamingAndDetach(id, emitStopped, reason);
     }
     return;
   }
@@ -830,7 +832,7 @@ async function stopStreamingAndDetach(tabId, emitStopped = true) {
     state.lastTabId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
   }
   if (emitStopped && wasStreamingOrAttached) {
-    sendWS({ type: "stream_stopped", tabId });
+    sendWS({ type: "stream_stopped", tabId, reason });
   }
 }
 
@@ -842,7 +844,7 @@ async function evictOldestSessionIfNeeded(keepingTabId) {
   while (attached.length >= MAX_CONCURRENT_ATTACHED_TABS) {
     const oldest = attached.shift();
     if (oldest) {
-      await stopStreamingAndDetach(oldest.tabId, true);
+      await stopStreamingAndDetach(oldest.tabId, true, "evicted");
     }
   }
 }
@@ -877,16 +879,27 @@ async function applyViewportMetrics(tabId, width = null, height = null, scale = 
 }
 
 async function ensureAttached(tabId) {
-  const session = getOrCreateTabSession(tabId);
-  session.lastActiveAt = Date.now();
-  state.lastTabId = tabId;
-  if (session.attached) {
+  const existing = state.tabSessions.get(tabId);
+  if (existing?.attached) {
+    existing.lastActiveAt = Date.now();
+    state.lastTabId = tabId;
     return;
   }
 
+  // Fail fast (before evicting other sessions) on pages Chrome will refuse to attach to.
+  await assertTabScriptable(tabId);
+
+  const session = getOrCreateTabSession(tabId);
+  session.lastActiveAt = Date.now();
+  state.lastTabId = tabId;
+
   await evictOldestSessionIfNeeded(tabId);
 
-  await chrome.debugger.attach({ tabId }, "1.3");
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+  } catch (err) {
+    throw await toRestrictedPageErrorIfNeeded(err, tabId);
+  }
   session.attached = true;
   await refreshTabMeta(tabId);
 
@@ -1055,7 +1068,7 @@ chrome.debugger.onDetach.addListener((source) => {
     const remaining = Array.from(state.tabSessions.keys());
     state.lastTabId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
   }
-  sendWS({ type: "stream_stopped", tabId: detachedTabId });
+  sendWS({ type: "stream_stopped", tabId: detachedTabId, reason: "detached" });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -1067,6 +1080,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  forgetOwnedTab(tabId).catch(() => {});
   state.tabCancelGeneration.delete(tabId);
   const session = state.tabSessions.get(tabId);
   if (session) {
@@ -1081,7 +1095,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       const remaining = Array.from(state.tabSessions.keys());
       state.lastTabId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
     }
-    sendWS({ type: "stream_stopped", tabId });
+    sendWS({ type: "stream_stopped", tabId, reason: "closed" });
   }
 });
 
@@ -1237,6 +1251,257 @@ function assertAllowedUrl(url) {
     throw URL_BLOCKED_ERROR;
   }
   return url;
+}
+
+// --- Restricted pages -------------------------------------------------------------------------------------------
+// Chrome refuses chrome.debugger.attach (and therefore every CDP command UseMac uses) on browser-internal pages,
+// extension stores and, without "Allow access to file URLs", file:// pages. chrome.tabs.* and chrome.windows.* still
+// work there, so navigation and tab activation keep working; observe/extract/screenshot/act answer RESTRICTED_PAGE.
+
+// Schemes the debugger may attach to. Every other scheme (chrome:, chrome-extension:, devtools:, view-source:,
+// edge:, brave:, ...) is browser-internal. about: is special-cased below.
+const SCRIPTABLE_SCHEMES = new Set(["http:", "https:", "data:", "blob:", "filesystem:", "chrome-error:"]);
+
+// Extension stores. `browsers: null` means every Chromium browser refuses it. Chrome treats the whole
+// chrome.google.com host as the legacy Web Store origin, including /webstore/devconsole.
+const EXTENSION_STORE_HOSTS = [
+  { host: "chrome.google.com", browsers: null },
+  { host: "chromewebstore.google.com", browsers: null },
+  { host: "microsoftedge.microsoft.com", browsers: ["edge"] },
+  { host: "addons.opera.com", browsers: ["opera"] }
+];
+
+const RESTRICTED_REASON_TEXT = {
+  extension_store: "extension store page",
+  browser_page: "browser-internal page",
+  file_access: "file:// page without file URL access",
+  policy: "blocked for extensions by browser policy",
+  refused: "Chrome refused to let the extension script it"
+};
+
+// Error strings Chrome returns from chrome.debugger.attach / sendCommand on pages extensions may not script.
+const RESTRICTED_ERROR_PATTERNS = [
+  /cannot be scripted/i,
+  /Cannot access a [a-z][a-z0-9+.-]*:(\/\/)? ?URL/i,
+  /Cannot attach to this target/i,
+  /Cannot access contents of (the page|url)/i
+];
+
+// Errors that only mean "the debugger went away"; they point at a restricted page when the tab is now on one.
+const DETACHED_ERROR_PATTERNS = [/Debugger is not attached/i, /Detached while handling command/i, /target closed/i];
+
+function detectBrowserFlavor(nav = typeof navigator !== "undefined" ? navigator : null) {
+  const ua = String(nav?.userAgent || "");
+  if (/\bEdg(e|A|iOS)?\//.test(ua)) return "edge";
+  if (/\bOPR\//.test(ua)) return "opera";
+  if (nav?.brave && typeof nav.brave.isBrave === "function") return "brave";
+  return "chrome";
+}
+
+const BROWSER_FLAVOR = detectBrowserFlavor();
+const BROWSER_APP_NAMES = { chrome: "Google Chrome", edge: "Microsoft Edge", brave: "Brave Browser", opera: "Opera" };
+
+function hostMatchesDomain(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+// Returns null when the debugger can script `url`, otherwise a reason key from RESTRICTED_REASON_TEXT.
+// options.fileAccess: whether the user allowed file URL access; options.browser: "chrome" | "edge" | "opera" | "brave".
+function restrictedPageReason(url, options = {}) {
+  if (typeof url !== "string" || url.trim() === "") {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = new URL(url.trim());
+  } catch (_) {
+    return null;
+  }
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol === "http:" || protocol === "https:") {
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    const browser = options.browser || BROWSER_FLAVOR;
+    for (const store of EXTENSION_STORE_HOSTS) {
+      if (store.browsers && !store.browsers.includes(browser)) continue;
+      if (hostMatchesDomain(host, store.host)) return "extension_store";
+    }
+    return null;
+  }
+  if (protocol === "about:") {
+    const page = parsed.pathname.toLowerCase();
+    return page === "blank" || page === "srcdoc" ? null : "browser_page";
+  }
+  if (protocol === "file:") {
+    return options.fileAccess === true ? null : "file_access";
+  }
+  return SCRIPTABLE_SCHEMES.has(protocol) ? null : "browser_page";
+}
+
+function isRestrictedChromeError(errOrMessage) {
+  const msg = typeof errOrMessage === "string" ? errOrMessage : errOrMessage?.message;
+  return typeof msg === "string" && RESTRICTED_ERROR_PATTERNS.some((re) => re.test(msg));
+}
+
+async function fileSchemeAccessAllowed() {
+  try {
+    if (typeof chrome.extension?.isAllowedFileSchemeAccess === "function") {
+      return (await chrome.extension.isAllowedFileSchemeAccess()) === true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+// A tab that is navigating reports its destination in pendingUrl; that is the page any command would hit.
+function effectiveTabUrl(tab) {
+  return tab?.pendingUrl || tab?.url || "";
+}
+
+async function tabRestrictionReason(tab) {
+  const url = effectiveTabUrl(tab);
+  if (!url) return null;
+  const fileAccess = /^file:/i.test(url) ? await fileSchemeAccessAllowed() : false;
+  return restrictedPageReason(url, { fileAccess });
+}
+
+async function getTabOrNull(tabId) {
+  if (tabId == null) return null;
+  try {
+    return (await chrome.tabs.get(tabId)) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function restrictedPageGuidance(tab) {
+  const tabId = tab?.id ?? null;
+  const url = effectiveTabUrl(tab);
+  const tabRef = tabId != null ? String(tabId) : "<tabId>";
+  const appName = BROWSER_APP_NAMES[BROWSER_FLAVOR] || "Google Chrome";
+  let text;
+  if (tab?.active) {
+    text = `use native observe/act with app "${appName}": it is already the active tab of its window, and native observe only sees the active tab of each window.`;
+  } else {
+    text = `make it the active tab of its window with browser_open {"tabId":${tabRef},"url":"","activate":true}`;
+    if (/^https?:/i.test(url)) {
+      text += ` (or open it in a separate UseMac window with browser_open ${JSON.stringify({ url, newWindow: true })})`;
+    }
+    text += `, then use native observe/act with app "${appName}" (native observe only sees the active tab of each window).`;
+  }
+  text += ` To leave the page, call browser_open with this tabId and another URL.`;
+  return text;
+}
+
+function restrictedPageError(tab, reason, chromeMessage = null) {
+  const tabId = tab?.id ?? null;
+  const url = effectiveTabUrl(tab);
+  const what = RESTRICTED_REASON_TEXT[reason] || RESTRICTED_REASON_TEXT.refused;
+  let message = `Chrome does not allow extensions to script this page (${what}${url ? `: ${url}` : ""})`;
+  message += tabId != null ? `, so tab ${tabId} cannot be observed or operated through the extension.` : ".";
+  message += ` To work on it, ${restrictedPageGuidance(tab)}`;
+  if (reason === "file_access") {
+    message += ` Alternatively enable "Allow access to file URLs" for UseMac Browser Bridge in chrome://extensions.`;
+  }
+  if (chromeMessage) {
+    message += ` (Chrome: ${chromeMessage})`;
+  }
+  return { code: "RESTRICTED_PAGE", message };
+}
+
+function restrictedReasonFromChromeMessage(msg) {
+  if (/policy/i.test(msg)) return "policy";
+  if (/extensions gallery/i.test(msg)) return "extension_store";
+  if (/Cannot access a [a-z]/i.test(msg)) return "browser_page";
+  return null;
+}
+
+// Turns a raw Chrome error into RESTRICTED_PAGE when it comes from a page extensions may not script.
+// Errors UseMac threw itself (objects with a code) pass through unchanged.
+async function toRestrictedPageErrorIfNeeded(err, tabId) {
+  if (!err || err.code === "RESTRICTED_PAGE" || (typeof err.code === "string" && err.code !== "EXTENSION_ERROR")) {
+    return err;
+  }
+  const msg = typeof err === "string" ? err : String(err.message || err);
+  const restrictedError = isRestrictedChromeError(msg);
+  const detached = !restrictedError && DETACHED_ERROR_PATTERNS.some((re) => re.test(msg));
+  if (!restrictedError && !detached) {
+    return err;
+  }
+  const tab = await getTabOrNull(tabId);
+  const urlReason = tab ? await tabRestrictionReason(tab) : null;
+  if (restrictedError) {
+    return restrictedPageError(tab || (tabId != null ? { id: tabId } : null), urlReason || restrictedReasonFromChromeMessage(msg) || "refused", msg);
+  }
+  return urlReason ? restrictedPageError(tab, urlReason) : err;
+}
+
+// Throws RESTRICTED_PAGE before anything attaches the debugger to (or groups) a tab Chrome will not let us script.
+async function assertTabScriptable(tabId) {
+  const tab = await getTabOrNull(tabId);
+  if (!tab) return null;
+  const reason = await tabRestrictionReason(tab);
+  if (reason) {
+    throw restrictedPageError(tab, reason);
+  }
+  return tab;
+}
+
+function restrictedPageFeedback(tab, reason, { activated = false } = {}) {
+  const what = RESTRICTED_REASON_TEXT[reason] || RESTRICTED_REASON_TEXT.refused;
+  const url = effectiveTabUrl(tab);
+  const tabRef = tab?.id != null ? `Tab ${tab.id}` : "This tab";
+  const diagnosis = `${tabRef} is on a page Chrome does not let extensions script (${what}${url ? `: ${url}` : ""}). ` +
+    `browser_observe, browser_extract, browser_screenshot and browser_act will answer RESTRICTED_PAGE there; ` +
+    `navigation and tab activation still work.`;
+  const appName = BROWSER_APP_NAMES[BROWSER_FLAVOR] || "Google Chrome";
+  const suggestedAction = activated
+    ? `The tab is now the active tab of its window. Use native observe/act with app "${appName}" to work on it. To leave the page, call browser_open with this tabId and another URL.`
+    : `To work on it, ${restrictedPageGuidance(tab)}`;
+  return {
+    severity: "warning",
+    trigger: "restricted_page",
+    diagnosis,
+    suggestedAction,
+    source: "chrome-extension",
+    latencyMs: 0
+  };
+}
+
+// openURL/navigate use chrome.tabs.update and a plain wait only sleeps; every other step talks to the debugger.
+function stepNeedsDebugger(step) {
+  const action = step?.action;
+  if (action === "openURL" || action === "navigate") return false;
+  if (action === "wait") return Boolean(step.selector || step.text);
+  return true;
+}
+
+// Chrome force-detaches the debugger when a tab commits a restricted page. Returns RESTRICTED_PAGE in that state
+// (so steps say why instead of "Element not found"), otherwise null.
+async function restrictedPageErrorIfDetached(tabId) {
+  if (state.tabSessions.get(tabId)?.attached) return null;
+  const tab = await getTabOrNull(tabId);
+  const reason = tab ? await tabRestrictionReason(tab) : null;
+  return reason ? restrictedPageError(tab, reason) : null;
+}
+
+// Stand-in for an observation on pages the extension cannot read: no elements, only the guidance above.
+function restrictedPageSnapshot(tab, reason, options = {}) {
+  return {
+    app: {
+      pid: 0,
+      name: `Chrome (${state.profileName})`,
+      bundleId: "com.google.Chrome",
+      isActive: false,
+      isHidden: false,
+      windowTitle: tab?.title || ""
+    },
+    timestampMs: Date.now(),
+    latencyMs: 0,
+    fromHotCache: false,
+    focusedElementId: null,
+    elements: [],
+    pageState: null,
+    agentFeedback: restrictedPageFeedback(tab, reason, options)
+  };
 }
 
 const QUERY_DEEP_HELPER_JS = `
@@ -3366,13 +3631,23 @@ async function executeActionStep(tabId, step, cancelToken = null) {
 async function handleTabsCommand(req) {
   const query = (req.query || "").trim().toLowerCase();
   const rawTabs = await chrome.tabs.query({});
-  const tabs = (rawTabs || [])
-    .filter((t) => {
-      if (!query) return true;
-      const hay = `${t.title || ""} ${t.url || ""}`.toLowerCase();
-      return hay.includes(query);
-    })
-    .map((t) => ({
+  const filtered = (rawTabs || []).filter((t) => {
+    if (!query) return true;
+    const hay = `${t.title || ""} ${t.url || ""}`.toLowerCase();
+    return hay.includes(query);
+  });
+  const fileAccess = filtered.some((t) => /^file:/i.test(effectiveTabUrl(t))) ? await fileSchemeAccessAllowed() : false;
+  // Tabs that belong to UseMac (in its tab group, or opened by it). The UseMac preview only shows pixels of
+  // these; any other tab is the user's own.
+  const usemacGroupIds = new Set();
+  try {
+    for (const group of (await chrome.tabGroups?.query({ title: USEMAC_GROUP_TITLE })) || []) {
+      usemacGroupIds.add(group.id);
+    }
+  } catch (_) {}
+  const ownedIds = await loadOwnedTabIds();
+  const tabs = filtered.map((t) => {
+    const info = {
       tabId: t.id,
       windowId: t.windowId ?? null,
       index: t.index ?? null,
@@ -3382,7 +3657,16 @@ async function handleTabsCommand(req) {
       pinned: Boolean(t.pinned),
       status: t.status || null,
       profileName: state.profileName
-    }));
+    };
+    // Only present when true, so agents know up front that observe/act will answer RESTRICTED_PAGE.
+    if (restrictedPageReason(effectiveTabUrl(t), { fileAccess })) {
+      info.restricted = true;
+    }
+    if (ownedIds.has(t.id) || (t.groupId != null && usemacGroupIds.has(t.groupId))) {
+      info.usemac = true;
+    }
+    return info;
+  });
 
   return {
     type: "response",
@@ -3773,11 +4057,15 @@ async function handleExtractCommand(req, preResolvedTab = null) {
   }
 
   const tab = preResolvedTab || await resolveTargetTab(req.tabId);
+  await assertTabScriptable(tab.id);
   if (req.tabId != null) {
     await ensureTabInUsemacGroup(tab.id);
   }
   await ensureAttached(tab.id);
   resetIdleTimer(tab.id);
+  // The UseMac preview brings this tab's card to the front: send a fresh frame so it does not show
+  // whatever was captured while the page was still loading.
+  captureAndEmitFrame(tab.id).catch(() => {});
   const tabInfo = await refreshTabMeta(tab.id);
 
   let tablesMarkdown = null;
@@ -3885,11 +4173,13 @@ async function handleExtractCommand(req, preResolvedTab = null) {
 async function handleScreenshotCommand(req, preResolvedTab = null) {
   const start = performance.now();
   const tab = preResolvedTab || await resolveTargetTab(req.tabId);
+  await assertTabScriptable(tab.id);
   if (req.tabId != null) {
     await ensureTabInUsemacGroup(tab.id);
   }
   await ensureAttached(tab.id);
   resetIdleTimer(tab.id);
+  captureAndEmitFrame(tab.id).catch(() => {});
 
   if (req.viewportWidth != null || req.viewportHeight != null || req.deviceScaleFactor != null) {
     await applyViewportMetrics(
@@ -4019,47 +4309,254 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
   };
 }
 
+// Tabs UseMac itself opened (new tab or new window). Only these are closed when a task completes; tabs the
+// user had open (reached through tabId) are never closed. Kept in session storage so a service-worker
+// restart does not forget them.
+const OWNED_TABS_KEY = "usemacOwnedTabIds";
+
+async function loadOwnedTabIds() {
+  try {
+    const stored = await chrome.storage.session.get(OWNED_TABS_KEY);
+    return new Set(Array.isArray(stored?.[OWNED_TABS_KEY]) ? stored[OWNED_TABS_KEY] : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+async function saveOwnedTabIds(ids) {
+  try {
+    await chrome.storage.session.set({ [OWNED_TABS_KEY]: Array.from(ids) });
+  } catch (_) {}
+}
+
+async function markTabOwned(tabId) {
+  if (tabId == null) return;
+  const ids = await loadOwnedTabIds();
+  ids.add(tabId);
+  await saveOwnedTabIds(ids);
+}
+
+async function forgetOwnedTab(tabId) {
+  const ids = await loadOwnedTabIds();
+  if (ids.delete(tabId)) {
+    await saveOwnedTabIds(ids);
+  }
+}
+
+function hasRunningDownloadFrom(tabUrl, busyDownloadUrls) {
+  if (!tabUrl || busyDownloadUrls.size === 0) return false;
+  let origin;
+  try {
+    origin = new URL(tabUrl).origin;
+  } catch (_) {
+    return false;
+  }
+  return Array.from(busyDownloadUrls).some((u) => {
+    try {
+      return new URL(u).origin === origin;
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
+// Closes the tabs UseMac opened, except: tabs listed in keepTabIds, the tab the user is looking at (active in
+// the focused window) and tabs with a download still in progress. Returns what was closed and what was kept.
+async function handleCloseOwnedTabsCommand(req) {
+  const keep = new Set(Array.isArray(req.keepTabIds) ? req.keepTabIds.map(Number) : []);
+  const owned = await loadOwnedTabIds();
+  const closed = [];
+  const kept = [];
+  let focusedWindowId = null;
+  try {
+    const focused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (focused?.focused) focusedWindowId = focused.id;
+  } catch (_) {}
+  const busyDownloadUrls = new Set(
+    Array.from(state.downloads.values())
+      .filter((d) => (d.state || "in_progress") === "in_progress")
+      .map((d) => d.url)
+      .filter(Boolean)
+  );
+
+  for (const tabId of owned) {
+    const tab = await getTabOrNull(tabId);
+    if (!tab) {
+      owned.delete(tabId);
+      continue;
+    }
+    let reason = null;
+    if (keep.has(tabId)) reason = "asked to keep";
+    else if (tab.active && tab.windowId === focusedWindowId) reason = "the user is looking at it";
+    else if (hasRunningDownloadFrom(tab.url, busyDownloadUrls)) {
+      reason = "a download is still running";
+    }
+    if (reason) {
+      kept.push({ tabId, title: tab.title || "", reason });
+      continue;
+    }
+    try {
+      await chrome.tabs.remove(tabId);
+      owned.delete(tabId);
+      closed.push({ tabId, title: tab.title || "" });
+    } catch (err) {
+      kept.push({ tabId, title: tab.title || "", reason: String(err?.message || err) });
+    }
+  }
+  await saveOwnedTabIds(owned);
+  return {
+    type: "response",
+    id: req.id,
+    ok: true,
+    tabId: null,
+    profileName: state.profileName,
+    url: null,
+    title: null,
+    closedTabs: closed,
+    keptTabs: kept,
+    snapshot: null,
+    actionResult: null,
+    error: null
+  };
+}
+
+function createUsemacWindow(url) {
+  // focused: false keeps the user's current window in front.
+  return chrome.windows.create({ url, focused: false, type: "normal" });
+}
+
+// open with tabId, an empty url and activate: true. Pure tab management: no navigation, no debugger, and the
+// tab is not moved into the UseMac group (it usually is the user's own tab).
+async function handleActivateTabCommand(req) {
+  const tab = await resolveTargetTab(req.tabId);
+  const updated = (await chrome.tabs.update(tab.id, { active: true })) || tab;
+  const current = (await getTabOrNull(tab.id)) || updated;
+  const reason = await tabRestrictionReason(current);
+  return {
+    type: "response",
+    id: req.id,
+    ok: true,
+    tabId: current.id ?? tab.id,
+    windowId: current.windowId ?? null,
+    profileName: state.profileName,
+    url: current.url || null,
+    title: current.title || null,
+    restricted: reason ? true : undefined,
+    activated: true,
+    snapshot: reason ? restrictedPageSnapshot(current, reason, { activated: true }) : null,
+    actionResult: null,
+    error: null
+  };
+}
+
 async function handleOpenCommand(req) {
-  const targetUrl = req.url;
-  if (!targetUrl || typeof targetUrl !== "string") {
-    throw { code: "INVALID_ARGUMENT", message: "open requires url." };
+  const targetUrl = typeof req.url === "string" ? req.url.trim() : "";
+  const activate = req.activate === true;
+  const newWindow = req.newWindow === true;
+
+  if (!targetUrl) {
+    if (req.tabId != null && activate && !newWindow) {
+      return handleActivateTabCommand(req);
+    }
+    throw {
+      code: "INVALID_ARGUMENT",
+      message: "open requires url. To only switch to a tab, pass tabId with url \"\" and activate: true."
+    };
+  }
+  if (newWindow && req.tabId != null) {
+    throw {
+      code: "INVALID_ARGUMENT",
+      message: "newWindow opens the URL in a new UseMac window and cannot be combined with tabId."
+    };
   }
   assertAllowedUrl(targetUrl);
 
-  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
   let tab;
-
-  if (windows.length === 0) {
-    const createdWin = await chrome.windows.create({ focused: false, url: targetUrl });
+  let createdByUsemac = false;
+  if (newWindow) {
+    const createdWin = await createUsemacWindow(targetUrl);
     tab = createdWin?.tabs?.[0];
     if (!tab) {
-      throw { code: "WINDOW_ERROR", message: "Failed to create background Chrome window." };
+      throw { code: "WINDOW_ERROR", message: "Failed to create a UseMac Chrome window." };
     }
+    createdByUsemac = true;
   } else {
-    const targetWin = windows.find((w) => w.focused) || windows[0];
-    if (req.newTab !== false && req.tabId == null) {
-      tab = await chrome.tabs.create({
-        windowId: targetWin.id,
-        url: targetUrl,
-        active: false
-      });
+    const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    if (windows.length === 0) {
+      const createdWin = await createUsemacWindow(targetUrl);
+      tab = createdWin?.tabs?.[0];
+      if (!tab) {
+        throw { code: "WINDOW_ERROR", message: "Failed to create background Chrome window." };
+      }
+      createdByUsemac = true;
     } else {
-      const existing = await resolveTargetTab(req.tabId);
-      tab = await chrome.tabs.update(existing.id, { url: targetUrl });
+      const targetWin = windows.find((w) => w.focused) || windows[0];
+      if (req.newTab !== false && req.tabId == null) {
+        tab = await chrome.tabs.create({
+          windowId: targetWin.id,
+          url: targetUrl,
+          active: activate
+        });
+        createdByUsemac = true;
+      } else {
+        const existing = await resolveTargetTab(req.tabId);
+        const update = { url: targetUrl };
+        if (activate) update.active = true;
+        tab = await chrome.tabs.update(existing.id, update);
+      }
     }
   }
 
+  if (createdByUsemac) {
+    await markTabOwned(tab.id);
+  }
   await ensureTabInUsemacGroup(tab.id);
-  await waitForTabLoad(tab.id, 3000);
+  const loaded = await waitForTabLoad(tab.id, 3000);
+  const current = loaded || (await getTabOrNull(tab.id)) || tab;
+  // Remember the tab even when no debugger attaches below (restricted pages), so commands without a tabId find
+  // it. Set after the load: Chrome's forced detach during navigation onto a restricted page clears lastTabId.
+  state.lastTabId = tab.id;
 
-  if (req.stream !== false) {
-    await ensureStreaming(tab.id);
-  } else {
-    await ensureAttached(tab.id);
-    resetIdleTimer(tab.id);
+  // Navigation worked, but Chrome will not let the debugger in (and would detach it if it were attached):
+  // answer without streaming or observing, with guidance for native Accessibility instead.
+  const restrictedResponse = (tabNow, reason) => ({
+    type: "response",
+    id: req.id,
+    ok: true,
+    tabId: tab.id,
+    windowId: tabNow.windowId ?? tab.windowId ?? null,
+    profileName: state.profileName,
+    url: tabNow.url || targetUrl,
+    title: tabNow.title || "",
+    restricted: true,
+    snapshot: restrictedPageSnapshot(tabNow, reason),
+    actionResult: null,
+    error: null
+  });
+  const restriction = await tabRestrictionReason(current);
+  if (restriction) {
+    return restrictedResponse(current, restriction);
   }
 
-  const { tab: tabInfo, snapshot } = await observeTab(tab.id, req.maxElements || 280);
+  let tabInfo;
+  let snapshot;
+  try {
+    if (req.stream !== false) {
+      await ensureStreaming(tab.id);
+    } else {
+      await ensureAttached(tab.id);
+      resetIdleTimer(tab.id);
+    }
+    ({ tab: tabInfo, snapshot } = await observeTab(tab.id, req.maxElements || 280));
+  } catch (err) {
+    // Still loading when we checked, then landed on (or redirected to) a restricted page.
+    const mapped = await toRestrictedPageErrorIfNeeded(err, tab.id);
+    if (mapped?.code !== "RESTRICTED_PAGE") {
+      throw err;
+    }
+    const latest = (await getTabOrNull(tab.id)) || current;
+    return restrictedResponse(latest, (await tabRestrictionReason(latest)) || "refused");
+  }
   resetIdleTimer(tab.id);
 
   return {
@@ -4067,6 +4564,7 @@ async function handleOpenCommand(req) {
     id: req.id,
     ok: true,
     tabId: tab.id,
+    windowId: tabInfo?.windowId ?? current.windowId ?? null,
     profileName: state.profileName,
     url: tabInfo?.url || targetUrl,
     title: tabInfo?.title || snapshot.app.windowTitle || "",
@@ -4078,6 +4576,7 @@ async function handleOpenCommand(req) {
 
 async function handleObserveCommand(req, preResolvedTab = null) {
   const tab = preResolvedTab || await resolveTargetTab(req.tabId);
+  await assertTabScriptable(tab.id);
   if (req.tabId != null) {
     await ensureTabInUsemacGroup(tab.id);
   }
@@ -4110,6 +4609,7 @@ async function handleObserveCommand(req, preResolvedTab = null) {
 
 async function handleActCommand(req, preResolvedTab = null, cancelToken = null) {
   const tab = preResolvedTab || await resolveTargetTab(req.tabId);
+  await assertTabScriptable(tab.id);
   await ensureTabInUsemacGroup(tab.id);
   const session = getOrCreateTabSession(tab.id);
   await ensureStreaming(tab.id);
@@ -4145,6 +4645,10 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
     resetIdleTimer(tab.id);
 
     try {
+      if (stepNeedsDebugger(step)) {
+        const blocked = await restrictedPageErrorIfDetached(tab.id);
+        if (blocked) throw blocked;
+      }
       const outcome = await executeActionStep(tab.id, step, cancelToken);
       stepResults.push({
         index: i,
@@ -4186,13 +4690,21 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
         break;
       }
       allSucceeded = false;
+      // A step that navigated onto a restricted page makes Chrome detach the debugger; say so instead of
+      // reporting "Debugger is not attached" for the next step.
+      let mapped = await toRestrictedPageErrorIfNeeded(err, tab.id);
+      if (mapped?.code !== "RESTRICTED_PAGE" && stepNeedsDebugger(step)) {
+        mapped = (await restrictedPageErrorIfDetached(tab.id)) || mapped;
+      }
+      const restricted = mapped?.code === "RESTRICTED_PAGE";
       stepResults.push({
         index: i,
         action: step.action,
         success: false,
-        mechanism: "cdp-error",
+        mechanism: restricted ? "restricted-page" : "cdp-error",
         latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-        message: err?.message || String(err)
+        message: restricted ? mapped.message : (err?.message || String(err)),
+        errorCode: restricted ? "RESTRICTED_PAGE" : (typeof err?.code === "string" ? err.code : null)
       });
       if (stopOnError) {
         break;
@@ -4225,6 +4737,38 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
         code: "CANCELLED",
         message: CANCELLED_MESSAGE
       }
+    };
+  }
+
+  // The batch may have navigated onto a restricted page (openURL, or a click on a store link). Chrome detached
+  // the debugger there, so skip the CDP observation and frame capture and hand back the guidance instead.
+  const finalTab = await getTabOrNull(tab.id);
+  const finalRestriction = finalTab ? await tabRestrictionReason(finalTab) : null;
+  if (finalRestriction) {
+    const totalLatencyMs = Math.round((performance.now() - batchStart) * 100) / 100;
+    return {
+      type: "response",
+      id: req.id,
+      ok: true,
+      tabId: tab.id,
+      windowId: finalTab.windowId ?? null,
+      profileName: state.profileName,
+      url: finalTab.url || null,
+      title: finalTab.title || null,
+      restricted: true,
+      screenshotBase64: null,
+      screenshotWidth: null,
+      screenshotHeight: null,
+      screenshotLatencyMs: null,
+      snapshot: null,
+      actionResult: {
+        success: allSucceeded,
+        totalLatencyMs,
+        stepResults,
+        observation: null,
+        agentFeedback: restrictedPageFeedback(finalTab, finalRestriction)
+      },
+      error: null
     };
   }
 
@@ -4365,7 +4909,7 @@ function sendCancelledResponse(req, tabId = null) {
 }
 
 function dispatchDaemonRequest(req) {
-  if (req.command === "tabs" || (req.command === "extract" && String(req.mode || "").toLowerCase() === "downloads")) {
+  if (req.command === "tabs" || req.command === "close_owned_tabs" || (req.command === "extract" && String(req.mode || "").toLowerCase() === "downloads")) {
     handleDaemonRequest(req);
     return;
   }
@@ -4466,11 +5010,18 @@ async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = nul
       case "stop_stream":
         response = await handleStopStreamCommand(req);
         break;
+      case "close_owned_tabs":
+        response = await handleCloseOwnedTabsCommand(req);
+        break;
       default:
         throw { code: "UNKNOWN_COMMAND", message: `Unknown command: ${req.command}` };
     }
     sendWS(response);
-  } catch (err) {
+  } catch (rawErr) {
+    let err = rawErr;
+    try {
+      err = await toRestrictedPageErrorIfNeeded(rawErr, targetTabId);
+    } catch (_) {}
     sendWS({
       type: "response",
       id: req.id,

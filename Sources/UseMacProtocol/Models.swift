@@ -82,6 +82,9 @@ public struct AppDescriptor: Codable, Equatable, Identifiable, Sendable {
     public var isHidden: Bool
     public var windowTitle: String?
     public var windowBounds: ScreenRect?
+    /// CGWindowID of the window UseMac targets for this app (resolved from the AX window). Used to pin the
+    /// live preview, screenshots and overlay checks to the exact window instead of guessing by title.
+    public var windowId: UInt32?
 
     public var id: Int32 { pid }
 
@@ -92,7 +95,8 @@ public struct AppDescriptor: Codable, Equatable, Identifiable, Sendable {
         isActive: Bool = false,
         isHidden: Bool = false,
         windowTitle: String? = nil,
-        windowBounds: ScreenRect? = nil
+        windowBounds: ScreenRect? = nil,
+        windowId: UInt32? = nil
     ) {
         self.pid = pid
         self.name = name
@@ -101,6 +105,7 @@ public struct AppDescriptor: Codable, Equatable, Identifiable, Sendable {
         self.isHidden = isHidden
         self.windowTitle = windowTitle
         self.windowBounds = windowBounds
+        self.windowId = windowId
     }
 }
 
@@ -114,6 +119,9 @@ public struct ElementNode: Codable, Equatable, Identifiable, Sendable {
     public var focused: Bool
     public var frame: ScreenRect
     public var actions: [String]
+    /// True when the element exists but is scrolled out of view (Chrome reports clipped, zero-size bounds).
+    /// Acting on it scrolls it into view first with AXScrollToVisible.
+    public var offscreen: Bool?
 
     public init(
         id: String,
@@ -124,7 +132,8 @@ public struct ElementNode: Codable, Equatable, Identifiable, Sendable {
         enabled: Bool = true,
         focused: Bool = false,
         frame: ScreenRect,
-        actions: [String] = []
+        actions: [String] = [],
+        offscreen: Bool? = nil
     ) {
         self.id = id
         self.role = role
@@ -135,6 +144,7 @@ public struct ElementNode: Codable, Equatable, Identifiable, Sendable {
         self.focused = focused
         self.frame = frame
         self.actions = actions
+        self.offscreen = offscreen
     }
 
     public var compactLine: String {
@@ -153,7 +163,11 @@ public struct ElementNode: Codable, Equatable, Identifiable, Sendable {
         if !enabled {
             parts.append("(disabled)")
         }
-        parts.append("(\(Int(frame.x)),\(Int(frame.y)) \(Int(frame.width))x\(Int(frame.height)))")
+        if offscreen == true {
+            parts.append("(offscreen)")
+        } else {
+            parts.append("(\(Int(frame.x)),\(Int(frame.y)) \(Int(frame.width))x\(Int(frame.height)))")
+        }
         if !actions.isEmpty {
             parts.append("{\(actions.joined(separator: ","))}")
         }
@@ -430,6 +444,49 @@ public enum ActionStepType: String, Codable, Sendable {
     case focus
     case wait
     case uploadFile
+    /// Scrolls the element into view with AXScrollToVisible (background-safe, no events).
+    case scrollIntoView
+    /// Performs a named accessibility action (`actionName`, e.g. "AXOpen", "AXShowMenu", "AXIncrement").
+    case axAction
+    /// Waits until an element matching `match` (or `elementId`) appears, or disappears with `gone: true`.
+    case waitFor
+}
+
+/// Describes an element by what it is instead of by a snapshot id. Resolved when the step runs, so it
+/// never points at a stale element. Text comparisons are case- and diacritic-insensitive.
+public struct ElementMatch: Codable, Equatable, Sendable {
+    /// AX role, e.g. "AXButton", "AXTextField", "AXCheckBox". Optional.
+    public var role: String?
+    /// Matches the element title or description.
+    public var title: String?
+    /// Matches the element value.
+    public var value: String?
+    /// Matches title, description or value.
+    public var text: String?
+    /// When true, text must be equal instead of contained. Default false.
+    public var exact: Bool?
+    /// Zero-based index among the matches, in tree order. Default 0.
+    public var index: Int?
+
+    public init(
+        role: String? = nil,
+        title: String? = nil,
+        value: String? = nil,
+        text: String? = nil,
+        exact: Bool? = nil,
+        index: Int? = nil
+    ) {
+        self.role = role
+        self.title = title
+        self.value = value
+        self.text = text
+        self.exact = exact
+        self.index = index
+    }
+
+    public var isEmpty: Bool {
+        role == nil && title == nil && value == nil && text == nil
+    }
 }
 
 public struct ActionStep: Codable, Equatable, Sendable {
@@ -450,6 +507,14 @@ public struct ActionStep: Codable, Equatable, Sendable {
     public var restoreCursor: Bool?
     public var url: String?
     public var newTab: Bool?
+    /// Semantic target resolved at execution time (alternative to `elementId`).
+    public var match: ElementMatch?
+    /// Accessibility action name for `axAction` (e.g. "AXOpen").
+    public var actionName: String?
+    /// Timeout for `waitFor` (default 5000 ms, max 30000 ms).
+    public var timeoutMs: Int?
+    /// For `waitFor`: wait until the element disappears instead of appears.
+    public var gone: Bool?
 
     public init(
         action: ActionStepType,
@@ -468,7 +533,11 @@ public struct ActionStep: Codable, Equatable, Sendable {
         preferBackground: Bool? = true,
         restoreCursor: Bool? = true,
         url: String? = nil,
-        newTab: Bool? = nil
+        newTab: Bool? = nil,
+        match: ElementMatch? = nil,
+        actionName: String? = nil,
+        timeoutMs: Int? = nil,
+        gone: Bool? = nil
     ) {
         self.action = action
         self.app = app
@@ -487,7 +556,21 @@ public struct ActionStep: Codable, Equatable, Sendable {
         self.restoreCursor = restoreCursor
         self.url = url
         self.newTab = newTab
+        self.match = match
+        self.actionName = actionName
+        self.timeoutMs = timeoutMs
+        self.gone = gone
     }
+}
+
+/// Whether UseMac saw the step change anything.
+public enum ActionEffect: String, Codable, Sendable {
+    /// The app reported a change (AX notification, value, focus, selection or position change).
+    case changed
+    /// Nothing observable changed within the check window. The step may have had no effect.
+    case none
+    /// Not checked (waits, reads, or steps whose effect cannot be observed).
+    case unverified
 }
 
 public struct ActionStepResult: Codable, Equatable, Sendable {
@@ -502,6 +585,14 @@ public struct ActionStepResult: Codable, Equatable, Sendable {
     public var visualChangePercent: Double?
     public var blockedWarning: String?
     public var downloadPath: String?
+    /// Machine-readable failure code (e.g. TARGET_NOT_FRONTMOST, STALE_SNAPSHOT, ELEMENT_NOT_FOUND).
+    public var errorCode: String?
+    /// Whether UseMac observed an effect. `none` means the step reported ok but nothing changed.
+    public var effect: ActionEffect?
+    /// Non-fatal problem the agent should read (e.g. "no visible effect", "AX path failed, used HID").
+    public var warning: String?
+    /// Element id the step resolved to (useful with `match`).
+    public var resolvedElementId: String?
 
     public init(
         index: Int,
@@ -514,7 +605,11 @@ public struct ActionStepResult: Codable, Equatable, Sendable {
         scrollDeltaY: Double? = nil,
         visualChangePercent: Double? = nil,
         blockedWarning: String? = nil,
-        downloadPath: String? = nil
+        downloadPath: String? = nil,
+        errorCode: String? = nil,
+        effect: ActionEffect? = nil,
+        warning: String? = nil,
+        resolvedElementId: String? = nil
     ) {
         self.index = index
         self.action = action
@@ -527,6 +622,10 @@ public struct ActionStepResult: Codable, Equatable, Sendable {
         self.visualChangePercent = visualChangePercent
         self.blockedWarning = blockedWarning
         self.downloadPath = downloadPath
+        self.errorCode = errorCode
+        self.effect = effect
+        self.warning = warning
+        self.resolvedElementId = resolvedElementId
     }
 }
 
@@ -537,6 +636,18 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
     public var returnObservation: Bool
     public var returnDiffOnly: Bool
     public var includeScreenshot: Bool
+    /// Precondition: the target window title must contain this text (digits ignored), or the batch fails
+    /// with STALE_SNAPSHOT before any step runs.
+    public var expectWindowTitle: String?
+    /// Skip the automatic check that the window still shows what the last observe saw. Default false.
+    public var allowStaleSnapshot: Bool?
+    /// Foreground burst: bring the target app to the front, run the steps with real input, then give focus
+    /// back to the app that was in front. Refused with USER_ACTIVE if the user used the keyboard or mouse
+    /// in the last 1.5 s. Default false.
+    public var foreground: Bool?
+    /// Act in the app window whose title contains this text (see ObserveParams.window). Omit to use the
+    /// window of the last observe.
+    public var window: String?
 
     public init(
         app: String? = nil,
@@ -544,7 +655,11 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         stopOnError: Bool = true,
         returnObservation: Bool = true,
         returnDiffOnly: Bool = false,
-        includeScreenshot: Bool = false
+        includeScreenshot: Bool = false,
+        expectWindowTitle: String? = nil,
+        allowStaleSnapshot: Bool? = nil,
+        foreground: Bool? = nil,
+        window: String? = nil
     ) {
         self.app = app
         self.steps = steps
@@ -552,6 +667,10 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         self.returnObservation = returnObservation
         self.returnDiffOnly = returnDiffOnly
         self.includeScreenshot = includeScreenshot
+        self.expectWindowTitle = expectWindowTitle
+        self.allowStaleSnapshot = allowStaleSnapshot
+        self.foreground = foreground
+        self.window = window
     }
 
     public init(from decoder: Decoder) throws {
@@ -562,6 +681,10 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         self.returnObservation = try c.decodeIfPresent(Bool.self, forKey: .returnObservation) ?? true
         self.returnDiffOnly = try c.decodeIfPresent(Bool.self, forKey: .returnDiffOnly) ?? false
         self.includeScreenshot = try c.decodeIfPresent(Bool.self, forKey: .includeScreenshot) ?? false
+        self.expectWindowTitle = try c.decodeIfPresent(String.self, forKey: .expectWindowTitle)
+        self.allowStaleSnapshot = try c.decodeIfPresent(Bool.self, forKey: .allowStaleSnapshot)
+        self.foreground = try c.decodeIfPresent(Bool.self, forKey: .foreground)
+        self.window = try c.decodeIfPresent(String.self, forKey: .window)
     }
 }
 
@@ -713,19 +836,29 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
     public var tabId: Int?
     public var newTab: Bool?
     public var stream: Bool?
+    /// Make the tab the active tab of its window (does not bring Chrome to the front). With `tabId` and an
+    /// empty `url`, only activates the tab. Native `observe`/`act` on Chrome only see each window's active tab.
+    public var activate: Bool?
+    /// Open the URL in a new, unfocused Chrome window owned by UseMac, so native observe/act can work there
+    /// without switching the user's tabs.
+    public var newWindow: Bool?
 
     public init(
         url: String,
         profile: String? = nil,
         tabId: Int? = nil,
         newTab: Bool? = nil,
-        stream: Bool? = nil
+        stream: Bool? = nil,
+        activate: Bool? = nil,
+        newWindow: Bool? = nil
     ) {
         self.url = url
         self.profile = profile
         self.tabId = tabId
         self.newTab = newTab
         self.stream = stream
+        self.activate = activate
+        self.newWindow = newWindow
     }
 }
 
@@ -776,6 +909,10 @@ public struct BrowserTabInfo: Codable, Equatable, Identifiable, Sendable {
     public var pinned: Bool?
     public var status: String?
     public var profileName: String?
+    /// True when Chrome does not let extensions script this page (use the hybrid native flow).
+    public var restricted: Bool?
+    /// True when the tab belongs to UseMac (its tab group, or opened by it); otherwise it is the user's own tab.
+    public var usemac: Bool?
 
     public var id: Int { tabId }
 
@@ -788,7 +925,9 @@ public struct BrowserTabInfo: Codable, Equatable, Identifiable, Sendable {
         active: Bool = false,
         pinned: Bool? = nil,
         status: String? = nil,
-        profileName: String? = nil
+        profileName: String? = nil,
+        restricted: Bool? = nil,
+        usemac: Bool? = nil
     ) {
         self.tabId = tabId
         self.windowId = windowId
@@ -799,6 +938,8 @@ public struct BrowserTabInfo: Codable, Equatable, Identifiable, Sendable {
         self.pinned = pinned
         self.status = status
         self.profileName = profileName
+        self.restricted = restricted
+        self.usemac = usemac
     }
 }
 
@@ -1288,8 +1429,10 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
 }
 
 public enum OverlayVisualEvent: Codable, Equatable, Sendable {
-    case highlightElement(rect: ScreenRect, label: String, role: String?, durationMs: Int)
-    case pulsePoint(x: Double, y: Double, label: String?)
+    /// `pid`/`windowId` identify the window the rect belongs to, so the app can draw the highlight on screen
+    /// only when that window is actually visible there (otherwise inside the preview).
+    case highlightElement(rect: ScreenRect, label: String, role: String?, durationMs: Int, pid: Int32? = nil, windowId: UInt32? = nil)
+    case pulsePoint(x: Double, y: Double, label: String?, pid: Int32? = nil, windowId: UInt32? = nil)
     case agentBanner(appName: String, message: String, active: Bool)
     case clear
 }
@@ -1345,17 +1488,27 @@ public struct TaskCompleteParams: Codable, Equatable, Sendable {
     public var tabId: Int?
     public var app: String?
     public var summary: String?
+    /// Keep every Chrome tab UseMac opened during the task. By default they are closed shortly after the
+    /// completion animation (never tabs the user had open, the tab the user is looking at, or tabs with a
+    /// running download).
+    public var keepTabs: Bool?
+    /// Keep only these tabs open (e.g. the page that shows the result the user should see).
+    public var keepTabIds: [Int]?
 
     public init(
         profile: String? = nil,
         tabId: Int? = nil,
         app: String? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        keepTabs: Bool? = nil,
+        keepTabIds: [Int]? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
         self.app = app
         self.summary = summary
+        self.keepTabs = keepTabs
+        self.keepTabIds = keepTabIds
     }
 }
 

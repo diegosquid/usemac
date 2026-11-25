@@ -116,7 +116,34 @@ public final class WorkspaceMonitor: @unchecked Sendable {
         return currentPaired
     }
 
+    /// Resolves the app an action targets and pins the exact window (AX focused window → CGWindowID), so
+    /// previews, screenshots and overlay checks never guess by title.
     public func resolveApp(query: String?) -> AppDescriptor? {
+        guard let app = resolveAppWithoutWindow(query: query) else { return nil }
+        return Self.withTargetWindow(app)
+    }
+
+    public static func withTargetWindow(_ app: AppDescriptor) -> AppDescriptor {
+        guard app.pid > 0, let windowId = WindowResolver.targetWindowID(pid: app.pid) else {
+            return app
+        }
+        var resolved = app
+        resolved.windowId = UInt32(windowId)
+        if let info = WindowResolver.info(windowId: windowId) {
+            if let title = info.title, !title.isEmpty {
+                resolved.windowTitle = title
+            }
+            resolved.windowBounds = ScreenRect(
+                x: Double(info.frame.origin.x),
+                y: Double(info.frame.origin.y),
+                width: Double(info.frame.width),
+                height: Double(info.frame.height)
+            )
+        }
+        return resolved
+    }
+
+    private func resolveAppWithoutWindow(query: String?) -> AppDescriptor? {
         let apps = listRunningApps()
 
         if let query {

@@ -106,4 +106,91 @@ outside the per-tab command queues:
 
 `open`, and the `openURL` / `navigate` steps of `act`, accept only `http:` and `https:` URLs and the exact string
 `about:blank`. Anything else answers `error: {"code":"URL_BLOCKED","message":"Only http(s) URLs can be opened."}`.
-The daemon applies the same rule before sending; the extension applies it again.
+The daemon applies the same rule before sending; the extension applies it again. The one exception is the empty
+`url` of an activate-only `open` (below), which navigates nowhere.
+
+## `open`
+
+```json
+{"type":"request","id":"<uuid>","command":"open","url":"https://example.com/","tabId":123,"newTab":false,"stream":true,"activate":true,"newWindow":false}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `url` | Page to load. Must pass the URL rule, except `""` for activate-only. |
+| `tabId` | Navigate this existing tab with `chrome.tabs.update` (no debugger needed). |
+| `newTab` | Without `tabId`: `true` (default) opens a background tab in the focused window; `false` reuses the last UseMac tab. |
+| `stream` | Start the live preview after loading (default `true`). Skipped on restricted pages. |
+| `activate` | Optional. Make the tab the active tab of its window with `chrome.tabs.update({active: true})`. Never focuses or raises the Chrome window. |
+| `newWindow` | Optional. Open `url` in a new Chrome window created with `chrome.windows.create({url, focused: false})`. Cannot be combined with `tabId`. |
+
+The daemon omits `activate` and `newWindow` when they are not set.
+
+- **Activate only**: `tabId` + `url: ""` + `activate: true` only switches the tab. No navigation, no debugger, no
+  streaming, and the tab is not moved into the UseMac group (it is usually the user's own tab). The response has
+  `snapshot: null`, or the restricted-page snapshot below. `url: ""` without `activate` (or with `newWindow`) answers
+  `INVALID_ARGUMENT`.
+- **New window**: the window's single tab joins a `UseMac` tab group in that window and becomes the tab that later
+  commands without `tabId` use, exactly like a tab opened by `open` today. Use it to give native Accessibility
+  (`observe`/`act` with app "Google Chrome", which only see the active tab of each window) a place to work without
+  switching the user's tabs.
+- Every `open` response also carries `windowId` (the tab's Chrome window). Daemon-side decoding ignores it today.
+
+## Restricted pages
+
+Chrome does not let extensions attach the debugger (or run any script) on some pages. The extension detects them
+before attaching, so commands fail fast instead of waiting for `EXTENSION_TIMEOUT`:
+
+- every scheme other than `http:`, `https:`, `data:`, `blob:`, `filesystem:` and `chrome-error:` — `chrome://`,
+  `chrome-extension://`, `chrome-untrusted://`, `chrome-search://`, `devtools://`, `view-source:`, `edge://`,
+  `brave://`, `opera://`, …; `about:` pages other than `about:blank` / `about:srcdoc`;
+- extension stores: the whole `chrome.google.com` host (Chrome treats it as the legacy Web Store origin, which covers
+  `/webstore/devconsole`), `chromewebstore.google.com`, and in Edge / Opera their own stores
+  (`microsoftedge.microsoft.com`, `addons.opera.com`);
+- `file://` pages when "Allow access to file URLs" is off for the extension
+  (`chrome.extension.isAllowedFileSchemeAccess()`).
+
+A tab that is navigating is judged by its `pendingUrl`. If an attach still fails, Chrome's refusal messages
+("… cannot be scripted", "Cannot access a chrome:// URL", "Cannot attach to this target", "Cannot access contents of
+…") are mapped the same way, including policy-blocked hosts.
+
+Behavior on a restricted tab:
+
+- `observe`, `extract` (all modes except `downloads`), `screenshot` and `act` answer
+  `ok: false` and `error.code: "RESTRICTED_PAGE"` without attaching the debugger or moving the tab into the UseMac
+  group. The message names the page and tells the agent what to do: make the tab active with
+  `browser_open {"tabId":N,"url":"","activate":true}` (or, for http(s) pages, open the URL in a UseMac window with
+  `newWindow: true`), then use native `observe`/`act` with app "Google Chrome" (or the browser it runs in); call
+  `browser_open` with the tabId and another URL to leave the page.
+- `open` (navigation with `tabId`, a new tab, or `newWindow`) and activate-only still work. When the loaded page is
+  restricted, the response is `ok: true` with `restricted: true`, no streaming, and a stand-in `snapshot` with no
+  elements whose `agentFeedback` (`trigger: "restricted_page"`) carries the same guidance.
+- `act` whose step lands on a restricted page (an `openURL`, or a click on a store link): Chrome detaches the
+  debugger, so later steps that need it fail with `errorCode: "RESTRICTED_PAGE"` (`mechanism: "restricted-page"`).
+  The response skips the observation: `restricted: true`, `actionResult.observation: null` and
+  `actionResult.agentFeedback` with the guidance.
+- `tabs` adds `"restricted": true` to each restricted tab (the field is absent otherwise).
+- `focus_tab` and `stop_stream` are unaffected.
+
+
+## Closing the tabs UseMac opened (`close_owned_tabs`)
+
+The extension remembers the tabs it created itself (`open` with a new tab or `newWindow`), in
+`chrome.storage.session` so a service-worker restart keeps the list. The daemon sends `close_owned_tabs` about
+2 s after `task_complete` unless the agent passed `keepTabs: true`.
+
+```json
+{"type":"request","id":"…","command":"close_owned_tabs","keepTabIds":[123]}
+```
+
+The extension closes every owned tab except tabs in `keepTabIds`, the active tab of the focused window (the user
+is looking at it) and tabs whose origin has a download still in progress. Tabs the user opened are never in the
+list, even if a command used them through `tabId`. The response carries `closedTabs` and `keptTabs`
+(`[{tabId, title, reason}]`).
+
+## UseMac tabs in `tabs` (`usemac: true`)
+
+Tab listings mark tabs that belong to UseMac (in its "UseMac" tab group, or opened by it) with `usemac: true`.
+The UseMac app only streams a Chrome window through the native (ScreenCaptureKit) preview when that window's
+active tab is one of these; otherwise the preview shows a placeholder, so the user's own tabs never appear in it.
+Extensions that predate the field send no `usemac`, which the app treats as "not a UseMac tab".

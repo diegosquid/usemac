@@ -2,6 +2,21 @@ import Foundation
 import UseMacProtocol
 import Network
 
+/// Decides whether a Chrome window may appear in the UseMac preview: only when it is showing a UseMac tab.
+public enum UsemacTabPrivacy {
+    /// Chrome titles its window after the active tab (plus indicators such as a speaker emoji), so the window
+    /// shows a UseMac tab when an active UseMac tab's title starts the window title.
+    public static func windowShowsUsemacTab(windowTitle: String, tabs: [BrowserTabInfo]) -> Bool {
+        let window = windowTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !window.isEmpty else { return false }
+        return tabs.contains { tab in
+            guard tab.active, tab.usemac == true else { return false }
+            let tabTitle = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !tabTitle.isEmpty && window.hasPrefix(tabTitle)
+        }
+    }
+}
+
 public final class ChromeExtensionBridge: @unchecked Sendable {
     public struct BridgeResponse: Sendable {
         public let ok: Bool
@@ -15,6 +30,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         public let snapshot: WindowSnapshot?
         public let actionResult: BatchActionResult?
         public let error: RPCErrorPayload?
+        /// Chrome window of `tabId` (sent by `open`, including `newWindow`, and by restricted `act` answers).
+        public let windowId: Int?
+        /// True when the tab is on a page Chrome does not let extensions script (docs/BRIDGE-PROTOCOL.md).
+        public let restricted: Bool?
+        /// `close_owned_tabs`: tabs UseMac closed, and tabs it kept open with the reason.
+        public let closedTabs: [OwnedTabOutcome]?
+        public let keptTabs: [OwnedTabOutcome]?
 
         public init(
             ok: Bool,
@@ -27,7 +49,11 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             screenshot: ScreenshotResult? = nil,
             snapshot: WindowSnapshot? = nil,
             actionResult: BatchActionResult? = nil,
-            error: RPCErrorPayload? = nil
+            error: RPCErrorPayload? = nil,
+            windowId: Int? = nil,
+            restricted: Bool? = nil,
+            closedTabs: [OwnedTabOutcome]? = nil,
+            keptTabs: [OwnedTabOutcome]? = nil
         ) {
             self.ok = ok
             self.tabId = tabId
@@ -40,7 +66,17 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             self.snapshot = snapshot
             self.actionResult = actionResult
             self.error = error
+            self.windowId = windowId
+            self.restricted = restricted
+            self.closedTabs = closedTabs
+            self.keptTabs = keptTabs
         }
+    }
+
+    public struct OwnedTabOutcome: Decodable, Sendable, Equatable {
+        public let tabId: Int
+        public let title: String?
+        public let reason: String?
     }
 
     private enum AuthState {
@@ -155,6 +191,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     private struct StreamStoppedPayload: Decodable {
         let tabId: Int?
+        /// "closed", "stopped", "detached" (the tab is gone or the user stopped it) or "idle", "evicted" (the
+        /// tab is still open; only its live stream stopped). Older extensions send no reason.
+        let reason: String?
     }
 
     public struct CachedBrowserFrame: Sendable {
@@ -184,6 +223,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let screenshotLatencyMs: Double?
         let actionResult: BatchActionResult?
         let error: RPCErrorPayload?
+        let windowId: Int?
+        let restricted: Bool?
+        let closedTabs: [OwnedTabOutcome]?
+        let keptTabs: [OwnedTabOutcome]?
     }
 
     private struct PairingRequiredWireMessage: Encodable {
@@ -225,6 +268,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
     }
 
+    private struct CloseOwnedTabsWireCommand: Encodable {
+        let type = "request"
+        let id: String
+        let command = "close_owned_tabs"
+        let keepTabIds: [Int]
+    }
+
     private struct TabsWireCommand: Encodable {
         let type = "request"
         let id: String
@@ -240,6 +290,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let tabId: Int?
         let newTab: Bool
         let stream: Bool
+        /// Omitted when nil. With `tabId` and an empty `url`, the extension only activates the tab.
+        let activate: Bool?
+        /// Omitted when nil. Opens the URL in a new unfocused Chrome window owned by UseMac.
+        let newWindow: Bool?
     }
 
     private struct ObserveWireCommand: Encodable {
@@ -337,6 +391,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var _onBrowserFrame: (@Sendable (_ tabId: Int?, _ jpegData: Data, _ viewportWidth: Int, _ viewportHeight: Int, _ profileName: String, _ title: String) -> Void)?
     private var _onBrowserCursor: (@Sendable (BrowserCursorEvent) -> Void)?
     private var _onBrowserStreamStopped: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)?
+    private var _onBrowserStreamPaused: (@Sendable (_ profileName: String, _ tabId: Int) -> Void)?
     private var _onProfilesChanged: (@Sendable ([BrowserProfileStatus]) -> Void)?
     private var _onPairingStateChanged: (@Sendable () -> Void)?
 
@@ -381,6 +436,20 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         set {
             lock.lock()
             _onBrowserCursor = newValue
+            lock.unlock()
+        }
+    }
+
+    /// The tab is still open but its live stream stopped (idle timeout, or another tab took its streaming slot).
+    public var onBrowserStreamPaused: (@Sendable (_ profileName: String, _ tabId: Int) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _onBrowserStreamPaused
+        }
+        set {
+            lock.lock()
+            _onBrowserStreamPaused = newValue
             lock.unlock()
         }
     }
@@ -743,7 +812,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
                 url: params.url,
                 tabId: params.tabId,
                 newTab: params.newTab ?? (params.tabId == nil),
-                stream: params.stream ?? true
+                stream: params.stream ?? true,
+                activate: params.activate,
+                newWindow: params.newWindow
             )
         }
     }
@@ -772,6 +843,14 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             }
         }
         return latestCachedFrame
+    }
+
+    /// Closes the tabs UseMac opened itself (never the user's own tabs), keeping `keepTabIds`, the tab the
+    /// user is looking at and tabs with a running download.
+    public func closeOwnedTabs(profile: String?, keepTabIds: [Int]) async -> BridgeResponse {
+        await sendCommand(profileQuery: profile) { requestId in
+            CloseOwnedTabsWireCommand(id: requestId, keepTabIds: keepTabIds)
+        }
     }
 
     public func tabs(_ params: BrowserTabsParams) async -> BridgeResponse {
@@ -1336,10 +1415,16 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let snapshot = readySessionsLocked().map(\.status)
         let profilesHandler = _onProfilesChanged
         let stoppedHandler = _onBrowserStreamStopped
+        let pausedHandler = _onBrowserStreamPaused
         lock.unlock()
 
         profilesHandler?(snapshot)
-        stoppedHandler?(profileName, stoppedTabId)
+        let stillOpen = payload?.reason == "idle" || payload?.reason == "evicted"
+        if stillOpen, let stoppedTabId, let pausedHandler {
+            pausedHandler(profileName, stoppedTabId)
+        } else {
+            stoppedHandler?(profileName, stoppedTabId)
+        }
     }
 
     private func handleResponse(_ payload: ResponsePayload, sessionId: String) {
@@ -1403,7 +1488,11 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             screenshot: resolvedScreenshot,
             snapshot: resolvedSnapshot,
             actionResult: payload.actionResult,
-            error: payload.error
+            error: payload.error,
+            windowId: payload.windowId,
+            restricted: payload.restricted,
+            closedTabs: payload.closedTabs,
+            keptTabs: payload.keptTabs
         )
         completePendingRequest(id: payload.id, sessionId: sessionId, response: response)
     }
