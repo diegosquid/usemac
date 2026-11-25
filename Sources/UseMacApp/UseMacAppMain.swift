@@ -67,7 +67,9 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
         self.hotKeyManager = hotKeys
 
         setupStatusItem()
+        setupMainMenu()
         observeStatusUpdates()
+        observeWindowsForDockPresence()
         state.startDaemon()
 
         let perms = state.status.permissions
@@ -361,6 +363,94 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
         quitItem.keyEquivalentModifierMask = [.command]
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    // MARK: - Dock presence while a window is open
+
+    /// UseMac normally lives only in the menu bar. While the setup guide or Settings is open it also
+    /// shows in the Dock and in ⌘Tab, so the window can't get lost behind Chrome or System Settings.
+    private func observeWindowsForDockPresence() {
+        let center = NotificationCenter.default
+        center.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateActivationPolicy()
+            }
+        }
+        center.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // The closing window is still visible here; re-check once it is gone.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self?.updateActivationPolicy()
+                }
+            }
+        }
+    }
+
+    private func hasOpenStandardWindow() -> Bool {
+        NSApp.windows.contains { window in
+            window.isVisible
+                && !(window is NSPanel)
+                && window.styleMask.contains(.titled)
+        }
+    }
+
+    private func updateActivationPolicy() {
+        let wanted: NSApplication.ActivationPolicy = hasOpenStandardWindow() ? .regular : .accessory
+        guard NSApp.activationPolicy() != wanted else { return }
+        NSApp.setActivationPolicy(wanted)
+        if wanted == .regular {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Minimal menu bar menus for while UseMac is in the Dock: About, Settings, Quit, editing and Close (⌘W).
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "UseMac")
+        appMenu.addItem(withTitle: "About UseMac", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let guideItem = appMenu.addItem(withTitle: "Setup Guide…", action: #selector(openSetupGuide), keyEquivalent: "")
+        guideItem.target = self
+        let settingsItem = appMenu.addItem(withTitle: "Settings…", action: #selector(openControlCenter), keyEquivalent: ",")
+        settingsItem.target = self
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide UseMac", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        let quit = appMenu.addItem(withTitle: "Quit UseMac", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowItem.submenu = windowMenu
+        mainMenu.addItem(windowItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     @objc private func openSetupGuide() {

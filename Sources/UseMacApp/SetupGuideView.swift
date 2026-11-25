@@ -29,15 +29,45 @@ public final class SetupGuideWindowController: NSObject, NSWindowDelegate {
         super.init()
     }
 
+    private var isAppTerminating = false
+    private var terminateObserver: NSObjectProtocol?
+
     public var isVisible: Bool {
         window?.isVisible ?? false
     }
 
-    public func show(startAt step: SetupGuideStep = .welcome) {
+    /// Where the guide opens: an explicit step, else the step saved before a relaunch, else the welcome step.
+    private func resolvedStartStep(_ requested: SetupGuideStep?) -> SetupGuideStep {
+        if let requested {
+            return requested
+        }
+        if !appState.hasCompletedSetupGuide,
+           let saved = appState.savedSetupGuideStep,
+           let step = SetupGuideStep(rawValue: saved) {
+            return step
+        }
+        return .welcome
+    }
+
+    public func show(startAt requestedStep: SetupGuideStep? = nil) {
+        if terminateObserver == nil {
+            terminateObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.isAppTerminating = true
+                }
+            }
+        }
+
         if window == nil {
+            let step = resolvedStartStep(requestedStep)
             let view = SetupGuideView(
                 appState: appState,
                 initialStep: step,
+                onRequestFocus: { [weak self] in self?.bringToFront() },
                 onFinish: { [weak self] in self?.close() }
             )
             let hosting = NSHostingView(rootView: view)
@@ -69,8 +99,19 @@ public final class SetupGuideWindowController: NSObject, NSWindowDelegate {
         window?.close()
     }
 
+    /// Brings the guide back after the user finished something in another app (System Settings, Chrome, their agent).
+    public func bringToFront() {
+        guard let window, window.isVisible else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
     public func windowWillClose(_ notification: Notification) {
-        appState.markSetupGuideCompleted()
+        // Quitting the app (for example to apply Screen Recording) keeps the guide's place;
+        // only the user closing the window counts as done.
+        if !isAppTerminating {
+            appState.markSetupGuideCompleted()
+        }
         window = nil
     }
 }
@@ -80,6 +121,7 @@ public final class SetupGuideWindowController: NSObject, NSWindowDelegate {
 public struct SetupGuideView: View {
     @ObservedObject var appState: AppState
     private let onFinish: () -> Void
+    private let onRequestFocus: () -> Void
     private let appIconOverride: NSImage?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -95,10 +137,12 @@ public struct SetupGuideView: View {
         appState: AppState,
         initialStep: SetupGuideStep = .welcome,
         appIcon: NSImage? = nil,
+        onRequestFocus: @escaping () -> Void = {},
         onFinish: @escaping () -> Void
     ) {
         self.appState = appState
         self.onFinish = onFinish
+        self.onRequestFocus = onRequestFocus
         self.appIconOverride = appIcon
         _step = State(initialValue: initialStep)
         _visionChoice = State(initialValue: SetupVisionChoice.initial(
@@ -127,6 +171,26 @@ public struct SetupGuideView: View {
             }
         }
         .frame(width: SetupGuideWindowController.windowSize.width, height: SetupGuideWindowController.windowSize.height)
+        .onChange(of: appState.status.permissions) { old, new in
+            // Granted in System Settings: come back so the user sees the check mark.
+            let newlyGranted = (new.accessibilityGranted && !old.accessibilityGranted)
+                || (new.screenRecordingGranted && !old.screenRecordingGranted)
+            if step == .permissions && newlyGranted {
+                onRequestFocus()
+            }
+        }
+        .onChange(of: appState.connectedBrowserProfiles.isEmpty) { wasEmpty, isEmpty in
+            // Pairing finished in the Chrome extension popup.
+            if step == .chrome && wasEmpty && !isEmpty {
+                onRequestFocus()
+            }
+        }
+        .onChange(of: appState.hasEverConnectedAgent) { wasConnected, isConnected in
+            // The agent ran the setup prompt and reached UseMac.
+            if step == .agent && !wasConnected && isConnected {
+                onRequestFocus()
+            }
+        }
         .task(id: step) {
             guard step == .permissions else { return }
             while !Task.isCancelled {
@@ -150,6 +214,7 @@ public struct SetupGuideView: View {
     }
 
     private func go(to next: SetupGuideStep) {
+        appState.saveSetupGuideStep(next.rawValue)
         movingForward = next.rawValue > step.rawValue
         withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.42, dampingFraction: 0.88)) {
             step = next

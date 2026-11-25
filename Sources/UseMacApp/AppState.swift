@@ -90,6 +90,7 @@ public final class AppState: ObservableObject {
         static let onboardingAgentConnected = "usemac.onboarding.agentConnected"
         static let onboardingDismissed = "usemac.onboarding.dismissed"
         static let setupGuideCompleted = "usemac.onboarding.setupGuideCompleted"
+        static let setupGuideStep = "usemac.onboarding.setupGuideStep"
     }
 
     private static let browserFrameDecodeQueue = DispatchQueue(
@@ -744,6 +745,17 @@ public final class AppState: ObservableObject {
 
     public func markSetupGuideCompleted() {
         UserDefaults.standard.set(true, forKey: DefaultsKeys.setupGuideCompleted)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.setupGuideStep)
+    }
+
+    /// The setup guide step the user last reached, so the guide resumes there after a relaunch
+    /// (macOS asks to quit and reopen the app after granting Screen Recording).
+    public var savedSetupGuideStep: Int? {
+        UserDefaults.standard.object(forKey: DefaultsKeys.setupGuideStep) as? Int
+    }
+
+    public func saveSetupGuideStep(_ rawValue: Int) {
+        UserDefaults.standard.set(rawValue, forKey: DefaultsKeys.setupGuideStep)
     }
 
     /// Cheap permission check for polling while the setup guide is open (no window enumeration).
