@@ -8,6 +8,7 @@ public final class FastScreenCapturer: @unchecked Sendable {
     public enum CaptureError: Error, LocalizedError {
         case noDisplayAvailable
         case jpegEncodingFailed
+        case noCapturableWindow(appName: String)
 
         public var errorDescription: String? {
             switch self {
@@ -15,6 +16,8 @@ public final class FastScreenCapturer: @unchecked Sendable {
                 return "No shareable display found for screen capture"
             case .jpegEncodingFailed:
                 return "Failed to encode captured image as JPEG"
+            case .noCapturableWindow(let appName):
+                return "\(appName) has no window that can be captured (no open window, or only windows smaller than \(Int(WindowResolver.minimumContentSize.width))x\(Int(WindowResolver.minimumContentSize.height))). Open or restore its window and try again."
             }
         }
     }
@@ -27,7 +30,14 @@ public final class FastScreenCapturer: @unchecked Sendable {
     ) async throws -> ScreenshotResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
 
-        let prepared = try await prepareCapture(targetApp: targetApp, maxDimension: request.maxDimension)
+        // A capture for a named app must show that app. Falling back to the whole display would hand the
+        // agent the user's screen labeled as the app.
+        let namedApp = !(request.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let prepared = try await prepareCapture(
+            targetApp: targetApp,
+            maxDimension: request.maxDimension,
+            allowDisplayFallback: !namedApp
+        )
 
         let cgImage = try await SCScreenshotManager.captureImage(
             contentFilter: prepared.filter,
@@ -71,13 +81,18 @@ public final class FastScreenCapturer: @unchecked Sendable {
         )
     }
 
-    /// Captures an in-memory CGImage preview of the target app window (or primary display) without writing to disk.
+    /// Captures an in-memory CGImage preview of the target app window (or the primary display when no app is
+    /// given) without writing to disk. Returns nil when the app has no capturable window.
     public func capturePreviewCGImage(
         targetApp: AppDescriptor?,
         maxDimension: Int = 560
     ) async -> (image: CGImage, windowBounds: ScreenRect?)? {
         do {
-            let prepared = try await prepareCapture(targetApp: targetApp, maxDimension: maxDimension)
+            let prepared = try await prepareCapture(
+                targetApp: targetApp,
+                maxDimension: maxDimension,
+                allowDisplayFallback: targetApp == nil
+            )
             let cgImage = try await SCScreenshotManager.captureImage(
                 contentFilter: prepared.filter,
                 configuration: prepared.config
@@ -90,7 +105,8 @@ public final class FastScreenCapturer: @unchecked Sendable {
 
     private func prepareCapture(
         targetApp: AppDescriptor?,
-        maxDimension: Int
+        maxDimension: Int,
+        allowDisplayFallback: Bool
     ) async throws -> (filter: SCContentFilter, config: SCStreamConfiguration, windowBounds: ScreenRect?) {
         let shareable = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
@@ -108,6 +124,8 @@ public final class FastScreenCapturer: @unchecked Sendable {
                 width: Double(targetWindow.frame.size.width),
                 height: Double(targetWindow.frame.size.height)
             )
+        } else if let targetApp, !allowDisplayFallback {
+            throw CaptureError.noCapturableWindow(appName: targetApp.name)
         } else if let display = shareable.displays.first {
             filter = SCContentFilter(display: display, excludingWindows: [])
             sourceSize = CGSize(width: display.width, height: display.height)
@@ -130,18 +148,18 @@ public final class FastScreenCapturer: @unchecked Sendable {
         return (filter, config, windowBounds)
     }
 
+    /// Same exact-id choice as the live preview (descriptor `windowId`, else the AX focused window), so a
+    /// screenshot never lands on one of Chrome's tiny helper windows.
     private func selectWindow(for app: AppDescriptor, in windows: [SCWindow]) -> SCWindow? {
-        let matching = windows.filter {
-            $0.owningApplication?.processID == app.pid
-                && $0.frame.width > 10
-                && $0.frame.height > 10
+        let candidates = windows.compactMap(LiveScreenStreamer.captureCandidate(from:))
+        let targets = WindowResolver.targetWindows(
+            pid: app.pid,
+            knownWindowId: app.windowId.map { CGWindowID($0) },
+            availableIds: Set(candidates.map(\.windowId))
+        )
+        guard let chosen = WindowResolver.chooseCaptureWindow(from: candidates, pid: app.pid, targets: targets) else {
+            return nil
         }
-        if let onScreenTitled = matching.first(where: { $0.isOnScreen && !($0.title?.isEmpty ?? true) }) {
-            return onScreenTitled
-        }
-        if let onScreen = matching.first(where: { $0.isOnScreen }) {
-            return onScreen
-        }
-        return matching.first
+        return windows.first { $0.windowID == chosen.windowId }
     }
 }

@@ -1481,8 +1481,9 @@ final class ProtocolAndIPCTests: XCTestCase {
     }
 
     private func makeSolidCGImage(gray: UInt8) throws -> CGImage {
-        let w = 64
-        let h = 40
+        // Local vision refuses images under 64 px on the shorter side (CAPTURE_TOO_SMALL).
+        let w = 96
+        let h = 64
         var bytes = [UInt8](repeating: gray, count: w * h)
         let colorSpace = CGColorSpaceCreateDeviceGray()
         let img = bytes.withUnsafeMutableBytes { raw -> CGImage? in

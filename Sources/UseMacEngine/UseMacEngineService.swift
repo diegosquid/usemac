@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import UseMacProtocol
 
 public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendable {
@@ -137,7 +138,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
-            guard let app = workspaceMonitor.resolveApp(query: params.app) else {
+            guard let resolvedObserveApp = workspaceMonitor.resolveApp(query: params.app) else {
                 let latencyMs = elapsedMs(since: startNs)
                 appendAudit(method: request.method.rawValue, targetApp: params.app, summary: "App not found", latencyMs: latencyMs, success: false)
                 emitLiveActivity(LiveActivityItem(
@@ -158,6 +159,22 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
+            // `window` pins the observed (and later acted-on) window; observing without it goes back to focus.
+            WindowResolver.pin(pid: resolvedObserveApp.pid, title: params.window)
+            if let wanted = params.window?.trimmingCharacters(in: .whitespacesAndNewlines), !wanted.isEmpty,
+               WindowResolver.window(pid: resolvedObserveApp.pid, titleContains: wanted) == nil {
+                WindowResolver.pin(pid: resolvedObserveApp.pid, title: nil)
+                let latencyMs = elapsedMs(since: startNs)
+                response = .failure(
+                    id: request.id,
+                    code: "ELEMENT_NOT_FOUND",
+                    message: "No \(resolvedObserveApp.name) window has a title containing \"\(wanted)\".",
+                    latencyMs: latencyMs
+                )
+                break
+            }
+            let app = WorkspaceMonitor.withTargetWindow(resolvedObserveApp)
+
             let perms = currentPermissions(promptAccessibility: false)
             var snapshot = axIndexer.observe(
                 app: app,
@@ -165,7 +182,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 maxElements: params.maxElements ?? 220,
                 useCache: params.useCache ?? true,
                 includeDiff: params.includeDiff ?? true,
-                accessibilityGranted: perms.accessibilityGranted
+                accessibilityGranted: perms.accessibilityGranted,
+                includeOffscreen: params.includeOffscreen ?? true
             )
 
             if params.includeScreenshot == true, perms.screenRecordingGranted {
@@ -502,7 +520,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
-            let urlValidation = NavigationPolicy.validate(params.url)
+            // With a tabId and activate, an empty url means "only make this tab active" (no navigation).
+            let activateOnly = params.activate == true && params.tabId != nil
+                && params.url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let urlValidation: Result<String, NavigationPolicy.BlockedURL> = activateOnly
+                ? .success("")
+                : NavigationPolicy.validate(params.url)
             if case .failure(let blocked) = urlValidation {
                 let latencyMs = elapsedMs(since: startNs)
                 appendAudit(method: request.method.rawValue, targetApp: params.profile ?? "Chrome", summary: "URL blocked: \(blocked.message)", latencyMs: latencyMs, success: false)
@@ -1236,6 +1259,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
+            if let tooSmall = Self.tooSmallCaptureMessage(path: input.path) {
+                let latencyMs = elapsedMs(since: startNs)
+                response = .failure(id: request.id, code: "CAPTURE_TOO_SMALL", message: tooSmall, latencyMs: latencyMs)
+                break
+            }
             let targetLabel = input.profileName.map { "Chrome (\($0))" } ?? params.profile.map { "Chrome (\($0))" } ?? params.app ?? "Local Vision"
             emitLiveActivity(LiveActivityItem(
                 kind: .observe,
@@ -1257,6 +1285,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 viewportHeight: input.height
             )
             let latencyMs = elapsedMs(since: startNs)
+            if result.answer.hasPrefix("CAPTURE_TOO_SMALL:") {
+                let message = result.answer.dropFirst("CAPTURE_TOO_SMALL:".count).trimmingCharacters(in: .whitespaces)
+                response = .failure(id: request.id, code: "CAPTURE_TOO_SMALL", message: message, latencyMs: latencyMs)
+                break
+            }
             let doneTitle: String = {
                 switch result.mode {
                 case "verify":
@@ -1364,11 +1397,32 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserTabId: params.tabId,
                 browserProfile: resolvedProfile
             ))
+            if params.keepTabs != true {
+                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: params.keepTabIds ?? [])
+            }
             response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus())
         }
 
         notifyStateChanged()
         return response
+    }
+
+    /// Closes the Chrome tabs UseMac opened during the task once the completion animation has played, so the
+    /// user's tab strip does not fill up with agent tabs. The extension never closes tabs the user had open,
+    /// the tab the user is looking at, or tabs with a running download.
+    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int]) {
+        let profiles: [String?] = {
+            if let profile, !profile.isEmpty { return [profile] }
+            let connected = chromeBridge.connectedProfiles().map(\.profileName)
+            return connected.isEmpty ? [] : connected.map { Optional($0) }
+        }()
+        guard !profiles.isEmpty else { return }
+        Task { [chromeBridge] in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            for name in profiles {
+                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keepTabIds)
+            }
+        }
     }
 
     private func resolveVisionInputImage(
@@ -1627,11 +1681,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             return nil
         }
 
+        let owner = axIndexer.node(for: elementId)?.pid
         onOverlayEvent?(.highlightElement(
             rect: node.frame,
             label: node.id,
             role: node.role,
-            durationMs: durationMs
+            durationMs: durationMs,
+            pid: owner,
+            windowId: owner.flatMap { WindowResolver.targetWindowID(pid: $0) }.map { UInt32($0) }
         ))
         return node.frame
     }
@@ -1777,6 +1834,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         return resolved.hasSuffix("/") ? resolved : resolved + "/"
     }
 
+    /// A capture this small is almost certainly the wrong window (e.g. a 52x20 helper strip); answering from
+    /// it would be a confident guess. Returns the refusal message, or nil when the image is usable.
+    static func tooSmallCaptureMessage(path: String?) -> String? {
+        guard let path,
+              let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            return nil
+        }
+        guard min(width, height) < 64 else { return nil }
+        return "The captured image is only \(width)x\(height) px, which means the wrong window was captured. Nothing was analyzed. Observe the app again or pass a tabId/selector."
+    }
+
     private func isAllowedVisionImagePath(_ rawPath: String) -> Bool {
         let expanded = (rawPath as NSString).expandingTildeInPath
         let resolvedPath = URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path
@@ -1789,15 +1860,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
     private func isMutatingStepForPolicy(_ step: ActionStep) -> Bool {
         switch step.action {
-        case .target, .scroll, .hover, .wait:
+        case .target, .scroll, .hover, .wait, .scrollIntoView, .waitFor:
             return false
-        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile:
+        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile, .axAction:
             return true
         }
     }
 
     private func isSensitiveStepForPolicy(_ step: ActionStep) -> Bool {
         if step.action == .uploadFile {
+            return true
+        }
+        // AXOpen picks a file in an open panel, which is an upload in disguise.
+        if step.action == .axAction, step.actionName?.lowercased() == "axopen" {
             return true
         }
         guard step.action == .pressKey, let modifiers = step.modifiers else {

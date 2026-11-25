@@ -67,12 +67,33 @@ public struct OverlayPulse: Equatable, Identifiable {
     public let x: Double
     public let y: Double
     public let label: String?
+    /// False when the target window is not visible at that point (other Space, covered, minimized).
+    public let isVisibleOnScreen: Bool
 
-    public init(id: UUID = UUID(), x: Double, y: Double, label: String?) {
+    public init(id: UUID = UUID(), x: Double, y: Double, label: String?, isVisibleOnScreen: Bool = true) {
         self.id = id
         self.x = x
         self.y = y
         self.label = label
+        self.isVisibleOnScreen = isVisibleOnScreen
+    }
+}
+
+/// Window an overlay element belongs to, with the on-screen visibility checked once when the event arrived
+/// (the check walks the window list, so it never runs per frame).
+public struct OverlayTargetWindow: Equatable {
+    public let pid: Int32
+    public let windowId: UInt32?
+    public let isVisibleOnScreen: Bool
+    /// Point the virtual cursor was moved to for this event. The target only applies while the cursor is
+    /// still there; other code paths (Chrome extension cursor, activity items) move it without a target.
+    public let anchor: CGPoint?
+
+    public init(pid: Int32, windowId: UInt32?, isVisibleOnScreen: Bool, anchor: CGPoint? = nil) {
+        self.pid = pid
+        self.windowId = windowId
+        self.isVisibleOnScreen = isVisibleOnScreen
+        self.anchor = anchor
     }
 }
 
@@ -112,6 +133,9 @@ public final class AppState: ObservableObject {
 
     // Chrome Extension bridge state
     @Published public var isBrowserStreamActive: Bool = false
+    /// True while the native preview of Chrome is withheld because its window is showing one of the user's own
+    /// tabs (not a UseMac tab). The HUD shows a neutral placeholder instead of pixels.
+    @Published public var chromePreviewHidden: Bool = false
     @Published public var connectedBrowserProfiles: [BrowserProfileStatus] = []
     @Published public var pendingBrowserPairings: [String] = []
 
@@ -149,10 +173,21 @@ public final class AppState: ObservableObject {
     @Published public var highlightedRect: ScreenRect?
     @Published public var highlightLabel: String?
     @Published public var highlightRole: String?
+    /// Window of `highlightedRect`; nil when the event carried no pid (drawn everywhere, as before).
+    @Published public private(set) var highlightTarget: OverlayTargetWindow?
     @Published public var pulsePoint: OverlayPulse?
     @Published public var virtualAgentPoint: CGPoint?
     @Published public var virtualAgentLabel: String?
     @Published public var virtualClickPulseId: UUID?
+    @Published private var virtualAgentEventTarget: OverlayTargetWindow?
+
+    /// Window the virtual cursor's current point belongs to, when an overlay event placed it there.
+    public var virtualAgentTarget: OverlayTargetWindow? {
+        guard let target = virtualAgentEventTarget, let point = virtualAgentPoint, target.anchor == point else {
+            return nil
+        }
+        return target
+    }
 
     // Window / coordination callbacks
     public var onOpenControlCenter: (() -> Void)?
@@ -168,6 +203,7 @@ public final class AppState: ObservableObject {
     private var captionClearTask: Task<Void, Never>?
     private var virtualAgentFadeTask: Task<Void, Never>?
     private var virtualAgentMoveTask: Task<Void, Never>?
+    private var previewResizeHoldTask: Task<Void, Never>?
     private var activityIndicatorHoldTask: Task<Void, Never>?
     private var hudAutoHideTask: Task<Void, Never>?
     private var taskIdleSettleTask: Task<Void, Never>?
@@ -454,22 +490,28 @@ public final class AppState: ObservableObject {
                 self?.handleLiveActivity(item)
             }
         }
-        engine.liveStreamer.onFrame = { [weak self] surface, width, height, sourceBounds, sourceName, isWindow in
+        engine.liveStreamer.onFrame = { [weak self] surface, width, height, sourceBounds, sourceName, isWindow, windowId, pid in
             Task { @MainActor [weak self] in
-                guard let self, !self.isBrowserStreamActive && !self.showingFrozenBrowserFrame else { return }
+                guard let self, !self.isBrowserStreamActive && !self.showingFrozenBrowserFrame, !self.chromePreviewHidden else { return }
                 self.videoSink.pushFrame(
                     surface: surface,
                     width: width,
                     height: height,
                     sourceBounds: sourceBounds,
                     sourceName: sourceName,
-                    isWindow: isWindow
+                    isWindow: isWindow,
+                    windowId: windowId,
+                    pid: pid
                 )
             }
         }
         engine.liveStreamer.onThumbnail = { [weak self] cgImage, pid, appName in
             Task { @MainActor [weak self] in
                 guard let self, let idx = self.hudDeck.firstIndex(where: { $0.id == "app:\(pid)" }) else { return }
+                if self.chromePreviewHidden, let app = self.hudDeck[idx].appDescriptor, Self.isChromium(app) {
+                    self.hudDeck[idx].previewImage = nil
+                    return
+                }
                 self.hudDeck[idx].previewImage = cgImage
                 if self.hudDeck[idx].title.isEmpty {
                     self.hudDeck[idx].title = appName
@@ -564,6 +606,18 @@ public final class AppState: ObservableObject {
             }
         }
 
+        // A tab whose live stream paused (idle, or another tab took its streaming slot) is still part of the
+        // task: keep its card with the last frame instead of dropping it from the deck.
+        engine.chromeBridge.onBrowserStreamPaused = { [weak self] profileName, tabId in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let idx = self.hudDeck.firstIndex(where: { $0.isBrowser && $0.browserTabId == tabId }) {
+                    self.hudDeck[idx].isBusy = false
+                }
+                self.isBrowserStreamActive = self.hudDeck.contains { $0.isBrowser && $0.isBusy }
+            }
+        }
+
         engine.chromeBridge.onBrowserStreamStopped = { [weak self] profileName, tabId in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -600,6 +654,9 @@ public final class AppState: ObservableObject {
             }
         }
     }
+
+    /// Cards kept in the preview deck; the filmstrip shows up to 8 and summarizes the rest as "+N".
+    static let maxDeckCards = 12
 
     private static func browserCardId(profile: String, tabId: Int?) -> String {
         if let tabId {
@@ -1335,8 +1392,8 @@ public final class AppState: ObservableObject {
             )
             withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
                 hudDeck.insert(newCard, at: 0)
-                if hudDeck.count > 6 {
-                    hudDeck.removeLast(hudDeck.count - 6)
+                if hudDeck.count > Self.maxDeckCards {
+                    hudDeck.removeLast(hudDeck.count - Self.maxDeckCards)
                 }
             }
             syncFrontCardToUI()
@@ -1379,7 +1436,14 @@ public final class AppState: ObservableObject {
             if let app = front.appDescriptor {
                 activeTargetApp = app
             }
-            if let cgImage = front.previewImage {
+            // The cached thumbnail is only a placeholder for switching to this card. Re-pushing it on every
+            // activity item rewound the live preview by up to half a second and swapped the stream's window
+            // bounds for the AX ones, which made the picture and the highlight jump.
+            let previewShowsCardApp = videoSink.hasReceivedFrame
+                && !videoSink.isBrowserStream
+                && videoSink.sourcePid != nil
+                && videoSink.sourcePid == front.appDescriptor?.pid
+            if let cgImage = front.previewImage, !previewShowsCardApp {
                 let w = cgImage.width
                 let h = cgImage.height
                 videoSink.pushCGImage(
@@ -1387,7 +1451,9 @@ public final class AppState: ObservableObject {
                     width: max(1, w),
                     height: max(1, h),
                     sourceBounds: front.appDescriptor?.windowBounds ?? front.sourceBounds,
-                    sourceName: front.title
+                    sourceName: front.title,
+                    isBrowser: false,
+                    pid: front.appDescriptor?.pid
                 )
             }
             syncLiveStream()
@@ -1532,6 +1598,25 @@ public final class AppState: ObservableObject {
 
         let shouldStream = isServerRunning && isHUDVisible && !isHUDCollapsed
         let target = pairedApp ?? activeTargetApp
+        if shouldStream, hudStreamMode == .autoWindow, let target, Self.isChromium(target), !connectedBrowserProfiles.isEmpty {
+            // Chrome windows only stream when their active tab is UseMac's; never show the user's own tabs.
+            if chromeWindowShowsUsemacTab(target) != true {
+                if isStreamActive {
+                    isStreamActive = false
+                    engine.liveStreamer.stop()
+                }
+                videoSink.reset()
+                chromePreviewHidden = true
+                // Drop any Chrome window thumbnail captured before the check answered.
+                for index in hudDeck.indices where !hudDeck[index].isBrowser {
+                    if let app = hudDeck[index].appDescriptor, Self.isChromium(app) {
+                        hudDeck[index].previewImage = nil
+                    }
+                }
+                return
+            }
+        }
+        chromePreviewHidden = false
         if shouldStream {
             if isStreamActive {
                 engine.liveStreamer.updateTarget(mode: hudStreamMode, targetApp: target)
@@ -1546,9 +1631,72 @@ public final class AppState: ObservableObject {
         }
     }
 
+    private struct ChromeWindowCheck {
+        let key: String
+        let allowed: Bool
+        let checkedAt: Date
+    }
+
+    private var chromeWindowCheck: ChromeWindowCheck?
+    private var chromeWindowCheckTask: Task<Void, Never>?
+
+    static func isChromium(_ app: AppDescriptor) -> Bool {
+        let bid = (app.bundleId ?? "").lowercased()
+        let name = app.name.lowercased()
+        return bid.contains("chrome") || bid.contains("chromium") || bid.contains("brave") || bid.contains("edgemac")
+            || name.contains("chrome") || name.contains("brave") || name.contains("edge")
+    }
+
+    /// Whether the targeted Chrome window is showing a UseMac tab. Returns the cached answer (nil while the
+    /// first check runs) and refreshes it in the background; the stream is re-synced when the answer arrives.
+    private func chromeWindowShowsUsemacTab(_ target: AppDescriptor) -> Bool? {
+        let title = (target.windowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = "\(target.pid):\(target.windowId.map(String.init) ?? "-"):\(title)"
+        let cached = (chromeWindowCheck?.key == key) ? chromeWindowCheck : nil
+        if cached == nil || Date().timeIntervalSince(cached!.checkedAt) > 2, chromeWindowCheckTask == nil {
+            chromeWindowCheckTask = Task { [weak self] in
+                guard let self else { return }
+                let response = await self.engine.chromeBridge.tabs(BrowserTabsParams())
+                let allowed = UsemacTabPrivacy.windowShowsUsemacTab(windowTitle: title, tabs: response.tabs ?? [])
+                await MainActor.run {
+                    self.chromeWindowCheckTask = nil
+                    let changed = self.chromeWindowCheck?.key != key || self.chromeWindowCheck?.allowed != allowed
+                    self.chromeWindowCheck = ChromeWindowCheck(key: key, allowed: allowed, checkedAt: Date())
+                    if changed {
+                        self.syncLiveStream()
+                    }
+                }
+            }
+        }
+        return cached?.allowed
+    }
+
+    /// Keeps the HUD size steady while an action batch runs; an aspect change that persists applies once
+    /// the batch ends.
+    private func updatePreviewResizeHold(for item: LiveActivityItem) {
+        switch item.kind {
+        case .actionStart, .actionStep:
+            videoSink.setAspectRatioHold(true)
+            previewResizeHoldTask?.cancel()
+            previewResizeHoldTask = Task { @MainActor [weak self] in
+                // Safety release in case the batch never reports completion.
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard !Task.isCancelled else { return }
+                self?.videoSink.setAspectRatioHold(false)
+            }
+        case .actionComplete, .taskComplete, .policyOrSafety:
+            previewResizeHoldTask?.cancel()
+            previewResizeHoldTask = nil
+            videoSink.setAspectRatioHold(false)
+        case .taskStart, .observe, .screenshot, .highlight:
+            break
+        }
+    }
+
     // MARK: - Live Activity Stream Handling
 
     private func handleLiveActivity(_ item: LiveActivityItem) {
+        updatePreviewResizeHold(for: item)
         liveActivities.append(item)
         if liveActivities.count > 80 {
             liveActivities.removeFirst(liveActivities.count - 80)
@@ -1667,6 +1815,18 @@ public final class AppState: ObservableObject {
             }
         }
 
+        // Native work in Chrome on one of the user's own tabs (not a UseMac tab): no card and no preview.
+        // The answer is cached per window; until the first check returns, treat the window as the user's.
+        var suppressNativeChromePreview = false
+        if !isChromeBridgeActivity, let app = cardAppDescriptor, Self.isChromium(app),
+           !connectedBrowserProfiles.isEmpty, hudStreamMode == .autoWindow,
+           item.kind != .taskComplete,
+           chromeWindowShowsUsemacTab(app) != true {
+            cardId = nil
+            suppressNativeChromePreview = true
+            hudDeck.removeAll { !$0.isBrowser && $0.appDescriptor?.pid == app.pid }
+        }
+
         if item.kind == .taskComplete {
             var matchedAny = false
             for idx in hudDeck.indices {
@@ -1760,7 +1920,7 @@ public final class AppState: ObservableObject {
         }
 
         let hasStreamTarget = (pairedApp != nil || activeTargetApp != nil || hudStreamMode == .fullDisplay || isBrowserStreamActive || showingFrozenBrowserFrame || !hudDeck.isEmpty)
-        if autoShowHUDOnActivity && !isHUDVisible && hasStreamTarget && !engine.isKillSwitchTripped() && status.policy != .paused {
+        if autoShowHUDOnActivity && !isHUDVisible && hasStreamTarget && !suppressNativeChromePreview && !engine.isKillSwitchTripped() && status.policy != .paused {
             let recentlyDismissed = lastUserDismissDate.map { Date().timeIntervalSince($0) < 4.0 } ?? false
             switch item.kind {
             case .taskStart:
@@ -1916,13 +2076,28 @@ public final class AppState: ObservableObject {
 
     public func handleOverlayEvent(_ event: OverlayVisualEvent) {
         switch event {
-        case .highlightElement(let rect, let label, let role, let durationMs):
+        case .highlightElement(let rect, let label, let role, let durationMs, let pid, let windowId):
             highlightClearTask?.cancel()
+            let cursorPoint = CGPoint(x: rect.centerX, y: rect.centerY)
+            let target = pid.map { pid in
+                OverlayTargetWindow(
+                    pid: pid,
+                    windowId: windowId,
+                    isVisibleOnScreen: WindowResolver.isRectVisible(
+                        CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height),
+                        pid: pid,
+                        windowId: windowId.map { CGWindowID($0) }
+                    ),
+                    anchor: cursorPoint
+                )
+            }
+            highlightTarget = target
             highlightedRect = rect
             highlightLabel = label
             highlightRole = role
             virtualAgentMoveTask?.cancel()
-            virtualAgentPoint = CGPoint(x: rect.centerX, y: rect.centerY)
+            virtualAgentEventTarget = target
+            virtualAgentPoint = cursorPoint
             virtualAgentLabel = friendlyCursorLabel(from: label) ?? "Inspecting"
             scheduleVirtualAgentFade()
 
@@ -1933,14 +2108,29 @@ public final class AppState: ObservableObject {
                 self?.highlightedRect = nil
                 self?.highlightLabel = nil
                 self?.highlightRole = nil
+                self?.highlightTarget = nil
             }
 
-        case .pulsePoint(let x, let y, let label):
+        case .pulsePoint(let x, let y, let label, let pid, let windowId):
             pulseClearTask?.cancel()
-            let pulse = OverlayPulse(x: x, y: y, label: label)
+            let point = CGPoint(x: x, y: y)
+            let target = pid.map { pid in
+                OverlayTargetWindow(
+                    pid: pid,
+                    windowId: windowId,
+                    isVisibleOnScreen: WindowResolver.isPointVisible(
+                        point,
+                        pid: pid,
+                        windowId: windowId.map { CGWindowID($0) }
+                    ),
+                    anchor: point
+                )
+            }
+            let pulse = OverlayPulse(x: x, y: y, label: label, isVisibleOnScreen: target?.isVisibleOnScreen ?? true)
             pulsePoint = pulse
             virtualAgentMoveTask?.cancel()
-            virtualAgentPoint = CGPoint(x: x, y: y)
+            virtualAgentEventTarget = target
+            virtualAgentPoint = point
             virtualAgentLabel = friendlyCursorLabel(from: label)
             virtualClickPulseId = UUID()
             scheduleVirtualAgentFade()
@@ -1969,9 +2159,11 @@ public final class AppState: ObservableObject {
         highlightedRect = nil
         highlightLabel = nil
         highlightRole = nil
+        highlightTarget = nil
         pulsePoint = nil
         virtualAgentPoint = nil
         virtualAgentLabel = nil
+        virtualAgentEventTarget = nil
         virtualClickPulseId = nil
     }
 }

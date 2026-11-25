@@ -102,11 +102,15 @@ public struct AgentOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .topLeading) {
-            if let rect = appState.highlightedRect, rectIntersectsScreen(rect) {
+            // The panels sit above every app on every Space, so only draw where the target window is really
+            // visible. Otherwise the HUD preview shows the highlight on the window itself.
+            if let rect = appState.highlightedRect,
+               appState.highlightTarget?.isVisibleOnScreen ?? true,
+               rectIntersectsScreen(rect) {
                 highlightBox(for: rect)
             }
 
-            if let pulse = appState.pulsePoint, pointInsideScreen(x: pulse.x, y: pulse.y) {
+            if let pulse = appState.pulsePoint, pulse.isVisibleOnScreen, pointInsideScreen(x: pulse.x, y: pulse.y) {
                 rippleView(for: pulse)
                     .id(pulse.id)
             }

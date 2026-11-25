@@ -146,7 +146,7 @@ public final class ActivityHUDController {
     private var transitionGeneration: UInt64 = 0
 
     private let edgeMargin: CGFloat = 14
-    private let peekStep: CGFloat = 24
+    private let peekStep: CGFloat = hudFilmstripHeight
     private let collapsedSize = NSSize(width: 164, height: 34)
     private let regularPiPSize = NSSize(width: 268, height: 172)
     private let largePiPSize = NSSize(width: 380, height: 242)
@@ -158,7 +158,7 @@ public final class ActivityHUDController {
     public init(appState: AppState) {
         self.appState = appState
 
-        let initialBehind = appState.isHUDCollapsed ? 0 : min(max(appState.hudDeck.count - 1, 0), 2)
+        let initialBehind = appState.isHUDCollapsed ? 0 : (appState.hudDeck.count > 1 ? 1 : 0)
         let initialSize = Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
             isLarge: appState.isHUDLarge,
@@ -210,8 +210,9 @@ public final class ActivityHUDController {
             self?.snap(to: corner, animated: true)
         }
 
+        // The filmstrip appears (and the panel grows by its height) as soon as a second card joins the deck.
         let deckBehindPublisher = appState.$hudDeck
-            .map { min(max($0.count - 1, 0), 2) }
+            .map { $0.count > 1 ? 1 : 0 }
             .removeDuplicates()
 
         Publishers.CombineLatest4(
@@ -382,7 +383,7 @@ public final class ActivityHUDController {
     }
 
     private func currentTargetSize() -> NSSize {
-        let behind = appState.isHUDCollapsed ? 0 : min(max(appState.hudDeck.count - 1, 0), 2)
+        let behind = appState.isHUDCollapsed ? 0 : (appState.hudDeck.count > 1 ? 1 : 0)
         return Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
             isLarge: appState.isHUDLarge,
@@ -428,7 +429,7 @@ public final class ActivityHUDController {
         } else {
             baseSize = isLarge ? largePiPSize : regularPiPSize
         }
-        let extraHeight = CGFloat(max(0, min(stackBehindCount, 2))) * peekStep
+        let extraHeight = stackBehindCount > 0 ? peekStep : 0
         return NSSize(width: baseSize.width, height: baseSize.height + extraHeight)
     }
 

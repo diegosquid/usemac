@@ -1,4 +1,95 @@
 import Foundation
+import UseMacProtocol
+
+/// Client-side filtering of observed elements for `usemac find` and `usemac observe --role/--text`.
+/// Follows the same rules the engine uses to resolve `ActionStep.match`, so what `find` prints is what a
+/// `match` step would hit: text compares are case- and diacritic-insensitive "contains" (equality with
+/// `exact`), `title` also covers the AX description (the indexer stores it as the title), `text` checks title
+/// and value, `role` is compared with or without the "AX" prefix, and every given field must match.
+public enum ClientElementFilter {
+    public static func matches(_ node: ElementNode, _ match: ElementMatch) -> Bool {
+        let exact = match.exact ?? false
+        if let role = nonEmpty(match.role), !roleMatches(node.role, role) {
+            return false
+        }
+        if let title = nonEmpty(match.title), !textMatches(node.title, title, exact: exact) {
+            return false
+        }
+        if let value = nonEmpty(match.value), !textMatches(node.value, value, exact: exact) {
+            return false
+        }
+        if let text = nonEmpty(match.text),
+           !textMatches(node.title, text, exact: exact),
+           !textMatches(node.value, text, exact: exact) {
+            return false
+        }
+        return true
+    }
+
+    /// Every element that matches, in tree order (`index` is ignored).
+    public static func filter(_ nodes: [ElementNode], _ match: ElementMatch) -> [ElementNode] {
+        nodes.filter { matches($0, match) }
+    }
+
+    /// The element a `match` step would resolve to: the `index`-th match (default 0), or nil.
+    public static func resolve(_ nodes: [ElementNode], _ match: ElementMatch) -> ElementNode? {
+        let all = filter(nodes, match)
+        let index = max(0, match.index ?? 0)
+        return index < all.count ? all[index] : nil
+    }
+
+    public static func fold(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func nonEmpty(_ text: String?) -> String? {
+        guard let text, !fold(text).isEmpty else { return nil }
+        return text
+    }
+
+    private static func roleMatches(_ role: String, _ wanted: String) -> Bool {
+        let have = fold(role)
+        let want = fold(wanted)
+        return have == want || have == "ax" + want || "ax" + have == want
+    }
+
+    private static func textMatches(_ haystack: String?, _ needle: String, exact: Bool) -> Bool {
+        guard let haystack else { return false }
+        let have = fold(haystack)
+        let want = fold(needle)
+        return exact ? have == want : have.contains(want)
+    }
+}
+
+/// One-line "what to do next" for the error codes agents hit most. Shared by the CLI and the MCP server so
+/// both give the same advice.
+public enum UseMacErrorGuide {
+    public static func hint(for code: String) -> String? {
+        switch code {
+        case "TARGET_NOT_FRONTMOST":
+            return "This step needs real keyboard or mouse input but the app is not in front, so nothing was sent. Use a background step (click on an element with AXPress, setValue, axAction) or retry the batch with foreground: true."
+        case "STALE_SNAPSHOT":
+            return "The app's window changed since your last observe, so nothing ran. Observe again and use the new ids, or target the step with match."
+        case "USER_ACTIVE":
+            return "The user is typing or using the mouse, so the foreground burst was refused. Wait a few seconds and retry; never force it while the user is active."
+        case "ELEMENT_NOT_FOUND":
+            return "No element matched. Observe again (raise maxDepth/maxElements or scroll the list), loosen the match, or check its index."
+        case "WAIT_TIMEOUT":
+            return "The element did not appear (or go away) in time. Observe to see the current state before retrying."
+        case "RESTRICTED_PAGE":
+            return "The Chrome extension cannot script this page (Chrome Web Store or chrome:// pages). Make the tab active with browser_open tabId + activate: true (CLI: browser open --tab <id> --activate), or open the URL with newWindow: true (CLI: --new-window), then use native observe/act with app \"Google Chrome\"."
+        case "CAPTURE_TOO_SMALL":
+            return "The captured window is too small to trust (a helper strip or hidden window). Do not draw conclusions from it: observe the app instead, or make the right window visible and retry."
+        case "POLICY_BLOCKED", "POLICY_LOCKED", "URL_BLOCKED", "UPLOAD_BLOCKED":
+            return "Blocked by a UseMac safety rule. Stop and tell the user; do not look for another route."
+        case "DAEMON_REQUIRED":
+            return "Ask the user to open UseMac.app; do not bypass it with --standalone."
+        default:
+            return nil
+        }
+    }
+}
 
 public enum JSONValue: Codable, Equatable, Sendable {
     case null

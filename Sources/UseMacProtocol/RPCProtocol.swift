@@ -32,6 +32,12 @@ public struct ObserveParams: Codable, Equatable, Sendable {
     public var useCache: Bool?
     public var includeDiff: Bool?
     public var includeScreenshot: Bool?
+    /// Include elements scrolled out of view, flagged `offscreen`. Default true.
+    public var includeOffscreen: Bool?
+    /// Observe the app window whose title contains this text instead of the focused one (e.g. a Chrome
+    /// window UseMac opened in the background). Later acts without `window` keep using it. Omit to observe
+    /// the focused window again.
+    public var window: String?
 
     public init(
         app: String? = nil,
@@ -39,7 +45,9 @@ public struct ObserveParams: Codable, Equatable, Sendable {
         maxElements: Int? = nil,
         useCache: Bool? = true,
         includeDiff: Bool? = true,
-        includeScreenshot: Bool? = false
+        includeScreenshot: Bool? = false,
+        includeOffscreen: Bool? = nil,
+        window: String? = nil
     ) {
         self.app = app
         self.maxDepth = maxDepth
@@ -47,6 +55,8 @@ public struct ObserveParams: Codable, Equatable, Sendable {
         self.useCache = useCache
         self.includeDiff = includeDiff
         self.includeScreenshot = includeScreenshot
+        self.includeOffscreen = includeOffscreen
+        self.window = window
     }
 }
 
