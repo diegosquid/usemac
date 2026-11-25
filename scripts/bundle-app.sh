@@ -36,6 +36,11 @@ APP_VERSION="${USEMAC_VERSION:-0.6.0-beta.1}"
 APP_BUILD="${USEMAC_BUILD_NUMBER:-60}"
 APPCAST_URL="${USEMAC_APPCAST_URL:-https://usemac.app/appcast.xml}"
 SPARKLE_PUBLIC_KEY="${USEMAC_SPARKLE_PUBLIC_KEY:-}"
+# The EdDSA public key that update signatures are checked against (the private key stays in the
+# maintainer's keychain). Not a secret.
+if [[ -z "$SPARKLE_PUBLIC_KEY" && -f "$SCRIPT_DIR/sparkle-public-key.txt" ]]; then
+  SPARKLE_PUBLIC_KEY="$(tr -d '[:space:]' < "$SCRIPT_DIR/sparkle-public-key.txt")"
+fi
 CHROME_EXT_ID="${USEMAC_CHROME_EXTENSION_ID:-}"
 
 if [[ -n "$CHROME_EXT_ID" ]]; then

@@ -8,6 +8,10 @@ set -euo pipefail
 #   4. Notarizes (--notarize) via Apple Notary Service + staples + validates Gatekeeper
 #   5. Optional (--update-appcast): Signs with Sparkle EdDSA + updates website/public/appcast.xml
 #   6. Publishes notarized DMG + _redirects to website/public/
+#
+# Betas (--github-beta, VERSION with a pre-release suffix such as 0.6.0-beta.1) are not notarized yet: the DMG is
+# meant for a GitHub pre-release, its appcast item goes in the "beta" channel (only apps that opted in see it),
+# and the website download and _redirects are left on the stable release.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -20,6 +24,8 @@ SKIP_NOTARIZE="0"
 UPDATE_APPCAST="0"
 LOCAL_DEV="0"
 CHECK_ONLY="0"
+GITHUB_BETA="0"
+GITHUB_REPO="${USEMAC_GITHUB_REPO:-diegosquid/usemac}"
 NOTARY_PROFILE="${USEMAC_NOTARY_PROFILE:-usemac-notary}"
 DOWNLOAD_BASE_URL="${USEMAC_DOWNLOAD_BASE_URL:-https://usemac.app/downloads}"
 
@@ -40,8 +46,11 @@ for arg in "$@"; do
     --check)
       CHECK_ONLY="1"
       ;;
+    --github-beta)
+      GITHUB_BETA="1"
+      ;;
     *)
-      echo "Usage: $0 [--local] [--notarize | --skip-notarize] [--update-appcast] [--check]" >&2
+      echo "Usage: $0 [--local] [--notarize | --skip-notarize] [--update-appcast] [--check] | --github-beta" >&2
       exit 1
       ;;
   esac
@@ -66,6 +75,32 @@ find_sign_update() {
 DEV_ID=""
 SIGN_UPDATE=""
 RELEASE_NOTES_FILE="$ROOT_DIR/docs/release-notes/${VERSION}.html"
+
+if [[ -z "${USEMAC_SPARKLE_PUBLIC_KEY:-}" && -f "$SCRIPT_DIR/sparkle-public-key.txt" ]]; then
+  USEMAC_SPARKLE_PUBLIC_KEY="$(tr -d '[:space:]' < "$SCRIPT_DIR/sparkle-public-key.txt")"
+  export USEMAC_SPARKLE_PUBLIC_KEY
+fi
+
+if [[ "$GITHUB_BETA" == "1" ]]; then
+  BETA_ERRORS=()
+  [[ "$VERSION" == *-* ]] || BETA_ERRORS+=("--github-beta needs a pre-release VERSION such as 0.6.0-beta.1 (got ${VERSION})")
+  [[ -n "${USEMAC_SPARKLE_PUBLIC_KEY:-}" ]] || BETA_ERRORS+=("no Sparkle public key (scripts/sparkle-public-key.txt)")
+  [[ -f "$RELEASE_NOTES_FILE" ]] || BETA_ERRORS+=("docs/release-notes/${VERSION}.html not found")
+  SIGN_UPDATE="$(find_sign_update || true)"
+  [[ -n "$SIGN_UPDATE" ]] || BETA_ERRORS+=("Sparkle sign_update tool not found (run swift build first)")
+  if [[ ${#BETA_ERRORS[@]} -gt 0 ]]; then
+    for err in "${BETA_ERRORS[@]}"; do
+      echo "beta preflight: $err" >&2
+    done
+    exit 1
+  fi
+  if [[ "$CHECK_ONLY" == "1" ]]; then
+    echo "Beta preflight OK."
+    exit 0
+  fi
+  # Built and signed like a local build (no Developer ID / notarization yet), but with the update key.
+  LOCAL_DEV="1"
+fi
 
 if [[ "$LOCAL_DEV" != "1" ]]; then
   PREFLIGHT_ERRORS=()
@@ -134,6 +169,10 @@ if [[ "$LOCAL_DEV" != "1" ]]; then
     USEMAC_BUILD_NUMBER="$BUILD_NUMBER" \
     USEMAC_SIGN_IDENTITY="$DEV_ID" \
     "$SCRIPT_DIR/bundle-app.sh" --hardened --require-sparkle-key
+elif [[ "$GITHUB_BETA" == "1" ]]; then
+  USEMAC_VERSION="$VERSION" \
+    USEMAC_BUILD_NUMBER="$BUILD_NUMBER" \
+    "$SCRIPT_DIR/bundle-app.sh" --require-sparkle-key
 else
   USEMAC_VERSION="$VERSION" \
     USEMAC_BUILD_NUMBER="$BUILD_NUMBER" \
@@ -185,40 +224,10 @@ if [[ "$LOCAL_DEV" != "1" && "$NOTARIZE" == "1" ]]; then
       echo "Error: Sparkle signature is empty" >&2
       exit 1
     fi
-    PUB_DATE="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
     APPCAST_FILE="$ROOT_DIR/website/public/appcast.xml"
-    {
-      cat <<XML
-<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <channel>
-    <title>UseMac Changelog</title>
-    <link>https://usemac.app/appcast.xml</link>
-    <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
-    <language>en</language>
-    <item>
-      <title>Version ${VERSION}</title>
-      <sparkle:version>${BUILD_NUMBER}</sparkle:version>
-      <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
-      <pubDate>${PUB_DATE}</pubDate>
-      <description><![CDATA[
-XML
-      awk '{print "        " $0}' "$RELEASE_NOTES_FILE"
-      cat <<XML
-      ]]></description>
-      <enclosure
-        url="${DOWNLOAD_BASE_URL}/${DMG_NAME}"
-        sparkle:edSignature="${SPARKLE_SIG}"
-        length="${DMG_SIZE}"
-        type="application/octet-stream"
-        sparkle:os="macos"
-      />
-    </item>
-  </channel>
-</rss>
-XML
-    } > "$APPCAST_FILE"
+    python3 "$SCRIPT_DIR/appcast_add_item.py" "$APPCAST_FILE" \
+      --version "$VERSION" --build "$BUILD_NUMBER" --notes "$RELEASE_NOTES_FILE" \
+      --url "${DOWNLOAD_BASE_URL}/${DMG_NAME}" --signature "$SPARKLE_SIG" --length "$DMG_SIZE"
     echo "Updated $APPCAST_FILE with signed EdDSA signature."
   fi
 
@@ -228,6 +237,24 @@ XML
   echo "Published ${DMG_NAME} and updated website/public/_redirects."
 elif [[ "$LOCAL_DEV" != "1" && "$SKIP_NOTARIZE" == "1" ]]; then
   echo "NOT PUBLISHED: this build is not notarized."
+fi
+
+if [[ "$GITHUB_BETA" == "1" ]]; then
+  echo "==> 3. Signing the DMG for Sparkle and adding it to the beta channel..."
+  SIGN_UPDATE_OUTPUT="$("$SIGN_UPDATE" "$DMG_PATH")"
+  SPARKLE_SIG="$(printf '%s\n' "$SIGN_UPDATE_OUTPUT" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')"
+  if [[ -z "$SPARKLE_SIG" ]]; then
+    echo "Error: Sparkle signature is empty" >&2
+    exit 1
+  fi
+  python3 "$SCRIPT_DIR/appcast_add_item.py" "$ROOT_DIR/website/public/appcast.xml" \
+    --version "$VERSION" --build "$BUILD_NUMBER" --notes "$RELEASE_NOTES_FILE" \
+    --url "https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/${DMG_NAME}" \
+    --signature "$SPARKLE_SIG" --length "$DMG_SIZE" --channel beta
+  echo ""
+  echo "Next: publish the GitHub pre-release with this DMG as an asset, then deploy the website (appcast):"
+  echo "  gh release create v${VERSION} \"$DMG_PATH\" --prerelease --title \"UseMac ${VERSION}\" --notes-file <notes>"
+  echo "The website download and _redirects still point to the stable release."
 fi
 
 echo ""

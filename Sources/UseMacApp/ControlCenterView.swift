@@ -1342,6 +1342,31 @@ private struct SoftwareUpdatesGroupView: View {
 
                 HStack(spacing: 16) {
                     VStack(alignment: .leading, spacing: 2.5) {
+                        Text("Beta updates")
+                            .font(.system(size: 13.5, weight: .medium))
+                        Text("Also offer pre-release versions. They get new features first and may have rough edges.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+
+                    Spacer(minLength: 16)
+
+                    CodexToggle(
+                        isOn: Binding(
+                            get: { updater.receivesBetaUpdates },
+                            set: { updater.setReceivesBetaUpdates($0) }
+                        ),
+                        accessibilityLabel: "Beta updates"
+                    )
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+
+                InsetDivider(leading: 18)
+
+                HStack(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 2.5) {
                         Text("Check for updates")
                             .font(.system(size: 13.5, weight: .medium))
                         Text("Checks \(updater.feedURL) with EdDSA verification.")
