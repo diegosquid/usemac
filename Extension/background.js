@@ -1,10 +1,10 @@
 importScripts("bridge-auth.js");
 
-const WS_URL = "ws://127.0.0.1:49222/macuse-bridge";
+const WS_URL = "ws://127.0.0.1:49222/usemac-bridge";
 const BRIDGE_ENDPOINT = "127.0.0.1:49222";
 const PROTOCOL_VERSION = 2;
 const EXTENSION_VERSION = "0.5.0";
-const KEEPALIVE_ALARM = "macuse-keepalive";
+const KEEPALIVE_ALARM = "usemac-keepalive";
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 800;
 const IDLE_TIMEOUT_MS = 180000;
@@ -14,7 +14,7 @@ const PING_INTERVAL_MS = 20000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const KEY_MISMATCH_RETRY_MS = 30000;
 const CANCEL_POLL_SLICE_MS = 100;
-const CANCELLED_MESSAGE = "Cancelled by usemac";
+const CANCELLED_MESSAGE = "Cancelled by UseMac";
 const CANCELLED_ERROR = Object.freeze({ code: "CANCELLED", message: CANCELLED_MESSAGE });
 const URL_BLOCKED_ERROR = Object.freeze({ code: "URL_BLOCKED", message: "Only http(s) URLs can be opened." });
 const PRE_READY_ALLOWED_TYPES = new Set(["hello", "auth", "ping", "pong"]);
@@ -1142,7 +1142,7 @@ async function waitForTabLoad(tabId, timeoutMs = 4500) {
   return refreshTabMeta(tabId);
 }
 
-const USEMAC_GROUP_TITLE = "usemac";
+const USEMAC_GROUP_TITLE = "UseMac";
 const USEMAC_GROUP_COLOR = "blue";
 
 async function findUsemacGroupInWindow(windowId) {
@@ -1216,7 +1216,7 @@ async function resolveTargetTab(requestedTabId) {
   }
   throw {
     code: "NO_USEMAC_TAB",
-    message: "No usemac tab is open. Call browser_open first, or pass a tabId from browser_tabs."
+    message: "No UseMac tab is open. Call browser_open first, or pass a tabId from browser_tabs."
   };
 }
 
@@ -1650,9 +1650,9 @@ function buildFrameIndexExpression({
       const offsetX = ${Number(offsetX) || 0};
       const offsetY = ${Number(offsetY) || 0};
 
-      const prev = queryAllDeep(document, '[data-macuse-id]');
+      const prev = queryAllDeep(document, '[data-usemac-id]');
       for (let i = 0; i < prev.length; i++) {
-        prev[i].removeAttribute('data-macuse-id');
+        prev[i].removeAttribute('data-usemac-id');
       }
 
       const selector = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [contenteditable="true"], summary, h1, h2, h3';
@@ -1709,13 +1709,13 @@ function buildFrameIndexExpression({
       }
 
       function addElement(el, forcedRole = null, forcedTitle = null) {
-        const existingId = el.getAttribute('data-macuse-id');
+        const existingId = el.getAttribute('data-usemac-id');
         if (existingId) return existingId;
         const rect = el.getBoundingClientRect();
         if (!isVisibleRect(el, rect)) return null;
 
         const id = '@b' + (startIndex + elements.length);
-        el.setAttribute('data-macuse-id', id);
+        el.setAttribute('data-usemac-id', id);
 
         const role = forcedRole || mapRole(el);
         const tag = el.tagName.toLowerCase();
@@ -1823,9 +1823,9 @@ function buildFrameIndexExpression({
       const fileInputs = queryAllDeep(document, 'input[type="file"]');
       for (let i = 0; i < fileInputs.length && elements.length < limit + 16; i++) {
         const fi = fileInputs[i];
-        if (fi.getAttribute('data-macuse-id')) continue;
+        if (fi.getAttribute('data-usemac-id')) continue;
         const id = '@b' + (startIndex + elements.length);
-        fi.setAttribute('data-macuse-id', id);
+        fi.setAttribute('data-usemac-id', id);
 
         let labelText = fi.getAttribute('aria-label') || fi.getAttribute('title') || '';
         if (!labelText && fi.id) {
@@ -2473,9 +2473,9 @@ async function moveCursorSmoothly(tabId, targetX, targetY, label = null) {
   return { x: tx, y: ty };
 }
 
-function macuseIdSelectorLiteral(elementId) {
+function usemacIdSelectorLiteral(elementId) {
   const escapedId = String(elementId).replace(/["\\]/g, "\\$&");
-  return JSON.stringify(`[data-macuse-id="${escapedId}"]`);
+  return JSON.stringify(`[data-usemac-id="${escapedId}"]`);
 }
 
 async function resolveInSpecificFrame(tabId, frameMeta, selectorLit, scrollOwnerIntoView = true) {
@@ -2537,7 +2537,7 @@ async function resolveSelectorCenter(tabId, cssSelector) {
 }
 
 async function resolveElementCenter(tabId, elementId) {
-  const selectorLit = macuseIdSelectorLiteral(elementId);
+  const selectorLit = usemacIdSelectorLiteral(elementId);
   const session = getOrCreateTabSession(tabId);
   const mappedFrame = session.elementFrameMap.get(elementId);
   if (mappedFrame) {
@@ -2757,7 +2757,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     const target = await resolveStepTarget(tabId, step);
     if (step.elementId || step.selector) {
       const selectorLit = step.elementId
-        ? macuseIdSelectorLiteral(step.elementId)
+        ? usemacIdSelectorLiteral(step.elementId)
         : JSON.stringify(String(step.selector));
       await evalInFrame(tabId, target?.frameMeta || null, `(() => {
         ${QUERY_DEEP_HELPER_JS}
@@ -2780,7 +2780,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     // Native <select> and checkbox/radio handling in setValue (React-safe, OOPIF + Shadow DOM aware)
     if (action === "setValue" && (step.elementId || step.selector)) {
       const selLit = step.elementId
-        ? macuseIdSelectorLiteral(step.elementId)
+        ? usemacIdSelectorLiteral(step.elementId)
         : JSON.stringify(String(step.selector));
       const textLit = JSON.stringify(String(text));
       const specialRes = await evalInFrame(tabId, frameMeta, `(() => {
@@ -2840,7 +2840,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     if (action === "setValue") {
       if (step.elementId || step.selector) {
         const selectorLit = step.elementId
-          ? macuseIdSelectorLiteral(step.elementId)
+          ? usemacIdSelectorLiteral(step.elementId)
           : JSON.stringify(String(step.selector));
         await evalInFrame(tabId, frameMeta, `(() => {
           ${QUERY_DEEP_HELPER_JS}
@@ -2904,7 +2904,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       // Guarantee OOPIF / Shadow DOM inputs updated even if compositor focus lagged
       if (frameMeta && (step.elementId || step.selector)) {
         const selectorLit = step.elementId
-          ? macuseIdSelectorLiteral(step.elementId)
+          ? usemacIdSelectorLiteral(step.elementId)
           : JSON.stringify(String(step.selector));
         const textLit = JSON.stringify(String(text));
         const isSetValue = action === "setValue" ? "true" : "false";
@@ -2932,7 +2932,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
 
     if (step.elementId || step.selector) {
       const selectorLit = step.elementId
-        ? macuseIdSelectorLiteral(step.elementId)
+        ? usemacIdSelectorLiteral(step.elementId)
         : JSON.stringify(String(step.selector));
       await evalInFrame(tabId, frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
@@ -3211,7 +3211,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     }
 
     const selLit = step.elementId
-      ? macuseIdSelectorLiteral(step.elementId)
+      ? usemacIdSelectorLiteral(step.elementId)
       : step.selector
         ? JSON.stringify(String(step.selector))
         : "null";
@@ -3548,7 +3548,7 @@ async function extractTablesWithHorizontalScan(tabId, scopeSelector = null, maxC
         }
       }
       if (!best) return null;
-      best.setAttribute('data-macuse-hscan', '1');
+      best.setAttribute('data-usemac-hscan', '1');
       return {
         origLeft: best.scrollLeft,
         clientWidth: best.clientWidth,
@@ -3584,7 +3584,7 @@ async function extractTablesWithHorizontalScan(tabId, scopeSelector = null, maxC
     for (const pos of positions) {
       await evalInFrame(tabId, frameMeta, `(() => {
           ${QUERY_DEEP_HELPER_JS}
-          const el = queryOneDeep(document, '[data-macuse-hscan="1"]');
+          const el = queryOneDeep(document, '[data-usemac-hscan="1"]');
           if (el) el.scrollLeft = ${pos};
         })()`);
       await sleep(180);
@@ -3630,10 +3630,10 @@ async function extractTablesWithHorizontalScan(tabId, scopeSelector = null, maxC
   } finally {
     await evalInFrame(tabId, frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
-        const el = queryOneDeep(document, '[data-macuse-hscan="1"]');
+        const el = queryOneDeep(document, '[data-usemac-hscan="1"]');
         if (el) {
           el.scrollLeft = ${info.origLeft};
-          el.removeAttribute('data-macuse-hscan');
+          el.removeAttribute('data-usemac-hscan');
         }
       })()`).catch(() => {});
   }
@@ -3912,7 +3912,7 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
 
   if (req.elementId || req.selector) {
     const selLit = req.elementId
-      ? macuseIdSelectorLiteral(req.elementId)
+      ? usemacIdSelectorLiteral(req.elementId)
       : JSON.stringify(String(req.selector));
     const candidateFrames = [];
     const mapped = req.elementId ? session.elementFrameMap.get(req.elementId) : null;

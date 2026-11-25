@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Official Apple Direct Distribution Release Pipeline for usemac:
+# Official Apple Direct Distribution Release Pipeline for UseMac:
 #   1. Preflights release requirements before building or modifying dist/ or website/
-#   2. Builds release MacUse.app with Sparkle 2 + Hardened Runtime
+#   2. Builds release UseMac.app with Sparkle 2 + Hardened Runtime
 #   3. Packages a clean drag-to-Applications .dmg (Apple Silicon arm64)
 #   4. Notarizes (--notarize) via Apple Notary Service + staples + validates Gatekeeper
 #   5. Optional (--update-appcast): Signs with Sparkle EdDSA + updates website/public/appcast.xml
@@ -13,15 +13,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-VERSION="${MACUSE_VERSION:-0.5.0}"
-BUILD_NUMBER="${MACUSE_BUILD_NUMBER:-50}"
+VERSION="${USEMAC_VERSION:-0.5.0}"
+BUILD_NUMBER="${USEMAC_BUILD_NUMBER:-50}"
 NOTARIZE="0"
 SKIP_NOTARIZE="0"
 UPDATE_APPCAST="0"
 LOCAL_DEV="0"
 CHECK_ONLY="0"
-NOTARY_PROFILE="${MACUSE_NOTARY_PROFILE:-usemac-notary}"
-DOWNLOAD_BASE_URL="${MACUSE_DOWNLOAD_BASE_URL:-https://usemac.app/downloads}"
+NOTARY_PROFILE="${USEMAC_NOTARY_PROFILE:-usemac-notary}"
+DOWNLOAD_BASE_URL="${USEMAC_DOWNLOAD_BASE_URL:-https://usemac.app/downloads}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -70,9 +70,9 @@ RELEASE_NOTES_FILE="$ROOT_DIR/docs/release-notes/${VERSION}.html"
 if [[ "$LOCAL_DEV" != "1" ]]; then
   PREFLIGHT_ERRORS=()
 
-  if [[ -n "${MACUSE_SIGN_IDENTITY:-}" ]]; then
-    if [[ "$MACUSE_SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
-      DEV_ID="$MACUSE_SIGN_IDENTITY"
+  if [[ -n "${USEMAC_SIGN_IDENTITY:-}" ]]; then
+    if [[ "$USEMAC_SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
+      DEV_ID="$USEMAC_SIGN_IDENTITY"
     fi
   else
     DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"
@@ -81,8 +81,8 @@ if [[ "$LOCAL_DEV" != "1" ]]; then
     PREFLIGHT_ERRORS+=('no "Developer ID Application" signing identity found')
   fi
 
-  if [[ -z "${MACUSE_SPARKLE_PUBLIC_KEY:-}" ]]; then
-    PREFLIGHT_ERRORS+=('MACUSE_SPARKLE_PUBLIC_KEY is not set (Sparkle updates would be disabled)')
+  if [[ -z "${USEMAC_SPARKLE_PUBLIC_KEY:-}" ]]; then
+    PREFLIGHT_ERRORS+=('USEMAC_SPARKLE_PUBLIC_KEY is not set (Sparkle updates would be disabled)')
   fi
 
   if [[ "$NOTARIZE" == "1" && "$SKIP_NOTARIZE" == "1" ]]; then
@@ -130,29 +130,29 @@ fi
 
 echo "==> 1. Building release app bundle (v${VERSION}, build ${BUILD_NUMBER})..."
 if [[ "$LOCAL_DEV" != "1" ]]; then
-  MACUSE_VERSION="$VERSION" \
-    MACUSE_BUILD_NUMBER="$BUILD_NUMBER" \
-    MACUSE_SIGN_IDENTITY="$DEV_ID" \
+  USEMAC_VERSION="$VERSION" \
+    USEMAC_BUILD_NUMBER="$BUILD_NUMBER" \
+    USEMAC_SIGN_IDENTITY="$DEV_ID" \
     "$SCRIPT_DIR/bundle-app.sh" --hardened --require-sparkle-key
 else
-  MACUSE_VERSION="$VERSION" \
-    MACUSE_BUILD_NUMBER="$BUILD_NUMBER" \
+  USEMAC_VERSION="$VERSION" \
+    USEMAC_BUILD_NUMBER="$BUILD_NUMBER" \
     "$SCRIPT_DIR/bundle-app.sh"
 fi
 
-APP_DIR="$ROOT_DIR/dist/MacUse.app"
+APP_DIR="$ROOT_DIR/dist/UseMac.app"
 DMG_NAME="usemac-${VERSION}-arm64.dmg"
 DMG_PATH="$ROOT_DIR/dist/${DMG_NAME}"
 STAGE_DIR="$(mktemp -d /tmp/usemac-dmg-stage.XXXXXX)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
 echo "==> 2. Staging drag-to-Applications DMG..."
-/usr/bin/ditto "$APP_DIR" "$STAGE_DIR/usemac.app"
+/usr/bin/ditto "$APP_DIR" "$STAGE_DIR/UseMac.app"
 ln -s /Applications "$STAGE_DIR/Applications"
 
 rm -f "$DMG_PATH"
 /usr/bin/hdiutil create \
-  -volname "usemac ${VERSION}" \
+  -volname "UseMac ${VERSION}" \
   -srcfolder "$STAGE_DIR" \
   -ov \
   -format UDZO \
@@ -192,9 +192,9 @@ if [[ "$LOCAL_DEV" != "1" && "$NOTARIZE" == "1" ]]; then
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
-    <title>usemac Changelog</title>
+    <title>UseMac Changelog</title>
     <link>https://usemac.app/appcast.xml</link>
-    <description>Official automatic updates for usemac (macOS 15+ Apple Silicon).</description>
+    <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
     <language>en</language>
     <item>
       <title>Version ${VERSION}</title>

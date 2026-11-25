@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Privacy Policy — usemac &amp; usemac Browser Bridge</title>
-  <meta name="description" content="usemac runs on your Mac with no analytics, no telemetry and no usemac servers in the path. What your AI agent sees goes to the AI service you connect." />
+  <title>Privacy Policy — UseMac &amp; UseMac Browser Bridge</title>
+  <meta name="description" content="UseMac runs on your Mac with no analytics, no telemetry and no UseMac servers in the path. What your AI agent sees goes to the AI service you connect." />
   <link rel="canonical" href="https://usemac.app/privacy" />
-  <meta property="og:title" content="Privacy Policy — usemac &amp; usemac Browser Bridge" />
-  <meta property="og:description" content="usemac runs on your Mac with no analytics, no telemetry and no usemac servers in the path. What your AI agent sees goes to the AI service you connect." />
+  <meta property="og:title" content="Privacy Policy — UseMac &amp; UseMac Browser Bridge" />
+  <meta property="og:description" content="UseMac runs on your Mac with no analytics, no telemetry and no UseMac servers in the path. What your AI agent sees goes to the AI service you connect." />
   <meta property="og:url" content="https://usemac.app/privacy" />
   <meta property="og:image" content="https://usemac.app/assets/og-image.png" />
   <meta property="og:image:width" content="1200" />
@@ -95,8 +95,8 @@
   <header class="nav-wrap nav-light">
     <nav class="nav">
       <a href="/" class="brand">
-        <img src="/assets/usemac-icon.png" alt="usemac icon" class="brand-icon" />
-        <span>usemac</span>
+        <img src="/assets/usemac-icon.png" alt="UseMac icon" class="brand-icon" />
+        <span>UseMac</span>
       </a>
       <div class="nav-links">
         <a href="/#features">Features</a>
@@ -109,57 +109,57 @@
 
   <main class="privacy-shell">
     <article class="privacy-card">
-      <a href="/" class="privacy-back">&larr; Back to usemac</a>
+      <a href="/" class="privacy-back">&larr; Back to UseMac</a>
       <div class="eyebrow-light">Local-First Privacy Architecture</div>
       <h1>Privacy Policy</h1>
-      <p class="privacy-meta">Effective Date: November 25, 2026 &middot; Applies to usemac macOS App &amp; usemac Browser Bridge Chrome Extension</p>
+      <p class="privacy-meta">Effective Date: November 25, 2026 &middot; Applies to UseMac macOS App &amp; UseMac Browser Bridge Chrome Extension</p>
 
       <div class="privacy-highlight">
-        <strong>In short:</strong> usemac and the usemac Browser Bridge run on your Mac. We operate no servers that receive your screen contents, browsing data or files, and the app has no analytics or telemetry. What your AI agent sees is sent to the AI service you chose to connect, under that service's terms.
+        <strong>In short:</strong> UseMac and the UseMac Browser Bridge run on your Mac. We operate no servers that receive your screen contents, browsing data or files, and the app has no analytics or telemetry. What your AI agent sees is sent to the AI service you chose to connect, under that service's terms.
       </div>
 
       <h2>1. How data flows</h2>
       <p>
-        The <strong>usemac Browser Bridge</strong> Chrome extension talks only to the usemac app running on the same Mac over <code>ws://127.0.0.1:49222</code>. Both ends authenticate each other using a local pairing key stored on your Mac. Your agent communicates with the usemac app locally over a same-user Unix domain socket or MCP stdio.
+        The <strong>UseMac Browser Bridge</strong> Chrome extension talks only to the UseMac app running on the same Mac over <code>ws://127.0.0.1:49222</code>. Both ends authenticate each other using a local pairing key stored on your Mac. Your agent communicates with the UseMac app locally over a same-user Unix domain socket or MCP stdio.
       </p>
       <p>
-        When you connect an AI client (such as Claude Code, Cursor, Codex or Antigravity), the screen contents, page text, screenshots and file names that the agent requests are returned to that client. The client typically sends them to its AI provider. usemac does not control how that provider handles them.
+        When you connect an AI client (such as Claude Code, Cursor, Codex or Antigravity), the screen contents, page text, screenshots and file names that the agent requests are returned to that client. The client typically sends them to its AI provider. UseMac does not control how that provider handles them.
       </p>
 
       <h2>2. Chrome extension permissions</h2>
       <ul>
         <li><code>tabs</code> — Lists open tab titles/URLs and routes actions to the exact background tab you or your agent target without stealing window focus.</li>
-        <li><code>tabGroups</code> — Automatically organizes agent-controlled tabs into a clean <code>usemac</code> Chrome Tab Group so you can always see which tabs are on autopilot and collapse or close them in one click.</li>
-        <li><code>debugger</code> — Uses Chrome DevTools Protocol (CDP) locally to read interactive DOM trees, dispatch background clicks/typing/uploads, and stream ephemeral JPEG preview frames to the usemac corner HUD.</li>
+        <li><code>tabGroups</code> — Automatically organizes agent-controlled tabs into a clean <code>UseMac</code> Chrome Tab Group so you can always see which tabs are on autopilot and collapse or close them in one click.</li>
+        <li><code>debugger</code> — Uses Chrome DevTools Protocol (CDP) locally to read interactive DOM trees, dispatch background clicks/typing/uploads, and stream ephemeral JPEG preview frames to the UseMac corner HUD.</li>
         <li><code>storage</code> — Saves the profile label you type and the pairing key, inside Chrome's local storage on your Mac.</li>
         <li><code>alarms</code> — Keeps the local WebSocket bridge responsive when Chrome puts idle Manifest V3 service workers to sleep.</li>
         <li><code>downloads</code> — Detects newly downloaded files triggered by an explicit agent click (e.g., exporting a CSV report) so the local file path can be returned directly to your agent.</li>
       </ul>
       <p>
-        The extension does not read your Google account e-mail and does not send window titles or browsing history to the usemac app unless an agent you connected asks to list or read a tab.
+        The extension does not read your Google account e-mail and does not send window titles or browsing history to the UseMac app unless an agent you connected asks to list or read a tab.
       </p>
 
-      <h2>3. What usemac stores on your Mac</h2>
+      <h2>3. What UseMac stores on your Mac</h2>
       <ul>
         <li><strong>App preferences:</strong> Local settings such as execution mode, HUD corner, and local vision preferences.</li>
-        <li><strong>Pairing key:</strong> The local bridge pairing key used to authenticate the Chrome extension to the usemac app.</li>
+        <li><strong>Pairing key:</strong> The local bridge pairing key used to authenticate the Chrome extension to the UseMac app.</li>
         <li><strong>Temporary screenshots:</strong> Screenshots captured for observation, visual checks, or agents are stored in a private folder inside your user temporary directory and deleted after 30 minutes.</li>
         <li><strong>Action history:</strong> Kept in memory only and cleared when you quit the app.</li>
       </ul>
 
       <h2>4. On-device vision and optional downloads</h2>
       <p>
-        Apple Vision OCR runs natively on your Mac with no network requests. If you optionally install Local Vision inside usemac Settings, usemac downloads a Python runtime and open-source packages (via <code>uv</code>, from PyPI) along with the weights for the model preset you selected from Hugging Face. All inference runs locally on your Mac. Those download services see your IP address, like any download.
+        Apple Vision OCR runs natively on your Mac with no network requests. If you optionally install Local Vision inside UseMac Settings, UseMac downloads a Python runtime and open-source packages (via <code>uv</code>, from PyPI) along with the weights for the model preset you selected from Hugging Face. All inference runs locally on your Mac. Those download services see your IP address, like any download.
       </p>
 
       <h2>5. Safety controls</h2>
       <p>
-        usemac enforces local guardrails on your Mac: <code>uploadFile</code> blocks sensitive directories and secret files (including <code>~/.ssh</code>, <code>~/.aws</code>, <code>~/.gnupg</code>, Keychains, <code>.env</code> files, browser and password-manager data in <code>~/Library</code>, shell histories, and <code>.pem</code>, <code>.pfx</code>, <code>.p8</code>, <code>.kdbx</code>, <code>.ovpn</code>, <code>.jks</code>, <code>.keystore</code>, and <code>.tfstate</code> files). Four execution modes (<strong>Autonomous</strong>, <strong>Block sensitive</strong>, <strong>Read-only</strong>, and <strong>Paused</strong>) let you control what agents may do, and the global Kill Switch (<code>&#x21E7;&#x2318;&#x238B;</code>) immediately blocks all automation including reads and cancels any in-progress Chrome batch.
+        UseMac enforces local guardrails on your Mac: <code>uploadFile</code> blocks sensitive directories and secret files (including <code>~/.ssh</code>, <code>~/.aws</code>, <code>~/.gnupg</code>, Keychains, <code>.env</code> files, browser and password-manager data in <code>~/Library</code>, shell histories, and <code>.pem</code>, <code>.pfx</code>, <code>.p8</code>, <code>.kdbx</code>, <code>.ovpn</code>, <code>.jks</code>, <code>.keystore</code>, and <code>.tfstate</code> files). Four execution modes (<strong>Autonomous</strong>, <strong>Block sensitive</strong>, <strong>Read-only</strong>, and <strong>Paused</strong>) let you control what agents may do, and the global Kill Switch (<code>&#x21E7;&#x2318;&#x238B;</code>) immediately blocks all automation including reads and cancels any in-progress Chrome batch.
       </p>
 
       <h2>6. Automatic updates</h2>
       <p>
-        When automatic updates are enabled, usemac periodically checks our static Sparkle 2 appcast XML feed to see if a newer signed version is available. Standard HTTP server logs may temporarily record an IP address and macOS version header for bandwidth and security protection, with no personal identifiers or usage analytics attached.
+        When automatic updates are enabled, UseMac periodically checks our static Sparkle 2 appcast XML feed to see if a newer signed version is available. Standard HTTP server logs may temporarily record an IP address and macOS version header for bandwidth and security protection, with no personal identifiers or usage analytics attached.
       </p>
 
       <h2>7. This website</h2>
@@ -169,7 +169,7 @@
 
       <h2>8. Limited Use disclosure (Chrome Web Store)</h2>
       <p>
-        The usemac Browser Bridge's use of information received from Google Chrome APIs adheres strictly to the Chrome Web Store User Data Policy, including the Limited Use requirements. Data accessed in your browser is used exclusively to execute your direct local automation commands and render your local live preview HUD.
+        The UseMac Browser Bridge's use of information received from Google Chrome APIs adheres strictly to the Chrome Web Store User Data Policy, including the Limited Use requirements. Data accessed in your browser is used exclusively to execute your direct local automation commands and render your local live preview HUD.
       </p>
 
       <h2>9. Contact</h2>

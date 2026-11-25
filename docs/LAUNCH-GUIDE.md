@@ -1,8 +1,8 @@
-# usemac Official Launch Guide
+# UseMac Official Launch Guide
 
-Everything required to ship **usemac** officially:
+Everything required to ship **UseMac** officially:
 1. Landing page + Privacy Policy + Sparkle `appcast.xml` on Cloudflare Workers
-2. Chrome Web Store publication (`usemac Browser Bridge`)
+2. Chrome Web Store publication (`UseMac Browser Bridge`)
 3. Apple Direct Distribution (Developer ID + Hardened Runtime + Notarization + Sparkle 2 auto-update)
 
 ---
@@ -32,16 +32,16 @@ npx wrangler deploy
 3. **Privacy Policy URL:** `https://usemac.app/privacy.html`
 
 4. **Permission Justifications (copy-paste ready):**
-   - **Single Purpose:** *"Connects Google Chrome to the user's local usemac desktop daemon over loopback (`127.0.0.1`), authenticated with a local pairing key, to execute zero-focus background tab automation and stream a local live corner preview."*
+   - **Single Purpose:** *"Connects Google Chrome to the user's local UseMac desktop daemon over loopback (`127.0.0.1`), authenticated with a local pairing key, to execute zero-focus background tab automation and stream a local live corner preview."*
    - **`tabs`:** *"Lists open tab titles/URLs and routes user-requested agent commands to the exact background tab without stealing window focus."*
-   - **`tabGroups`:** *"Groups tabs actively controlled by usemac into a dedicated 'usemac' tab group so users can visually distinguish automated tabs from personal browsing."*
+   - **`tabGroups`:** *"Groups tabs actively controlled by UseMac into a dedicated 'UseMac' tab group so users can visually distinguish automated tabs from personal browsing."*
    - **`debugger`:** *"Attaches Chrome DevTools Protocol locally on active tasks to read interactive DOM trees, dispatch background clicks/typing/uploads, and capture local HUD preview frames."*
    - **`storage`:** *"Stores the profile label typed by the user and the local pairing key in `chrome.storage.local`."*
    - **`alarms`:** *"Keeps the local `127.0.0.1` WebSocket connection alive across Manifest V3 service worker idle suspensions."*
    - **`downloads`:** *"Detects newly downloaded files triggered by explicit agent actions (e.g., CSV exports) so the local file path is returned to the user's agent."*
    - **Remote Code:** **No** (all JavaScript is bundled inside the extension package).
 
-5. Once approved, copy your 32-character Extension ID and set `MACUSE_CHROME_EXTENSION_ID=<32-char-id>` when building your release `.dmg` — `usemac` will then show a 1-click **Install Extension** button that registers Chrome's official External Extension JSON automatically!
+5. Once approved, copy your 32-character Extension ID and set `USEMAC_CHROME_EXTENSION_ID=<32-char-id>` when building your release `.dmg` — UseMac will then show a 1-click **Install Extension** button that registers Chrome's official External Extension JSON automatically!
 
 ---
 
@@ -73,18 +73,18 @@ generate_keys
 1. Write the release notes HTML fragment at `docs/release-notes/<VERSION>.html` (required when using `--update-appcast`).
 2. Verify all release prerequisites before building with `--check`:
    ```bash
-   MACUSE_VERSION="0.5.0" \
-   MACUSE_BUILD_NUMBER="50" \
-   MACUSE_SPARKLE_PUBLIC_KEY="<YOUR_SUPUBLICEDKEY>" \
-   MACUSE_CHROME_EXTENSION_ID="<YOUR_CHROME_WEB_STORE_ID>" \
+   USEMAC_VERSION="0.5.0" \
+   USEMAC_BUILD_NUMBER="50" \
+   USEMAC_SPARKLE_PUBLIC_KEY="<YOUR_SUPUBLICEDKEY>" \
+   USEMAC_CHROME_EXTENSION_ID="<YOUR_CHROME_WEB_STORE_ID>" \
    ./scripts/release-dmg.sh --notarize --update-appcast --check
    ```
 3. Build, sign, notarize, verify, and stage the website release artifacts:
    ```bash
-   MACUSE_VERSION="0.5.0" \
-   MACUSE_BUILD_NUMBER="50" \
-   MACUSE_SPARKLE_PUBLIC_KEY="<YOUR_SUPUBLICEDKEY>" \
-   MACUSE_CHROME_EXTENSION_ID="<YOUR_CHROME_WEB_STORE_ID>" \
+   USEMAC_VERSION="0.5.0" \
+   USEMAC_BUILD_NUMBER="50" \
+   USEMAC_SPARKLE_PUBLIC_KEY="<YOUR_SUPUBLICEDKEY>" \
+   USEMAC_CHROME_EXTENSION_ID="<YOUR_CHROME_WEB_STORE_ID>" \
    ./scripts/release-dmg.sh --notarize --update-appcast
    ```
    - After notarization, stapling, and Gatekeeper (`spctl`) verification pass, the script copies `usemac-<VERSION>-arm64.dmg` into `website/public/downloads/`, updates `website/public/_redirects` to point `/downloads/usemac-latest-arm64.dmg` to `/downloads/usemac-<VERSION>-arm64.dmg`, and writes the signed `website/public/appcast.xml` with the release notes.

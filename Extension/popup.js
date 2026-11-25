@@ -15,8 +15,8 @@ const stopAllBtn = document.getElementById("stopAllBtn");
 const endpointMeta = document.getElementById("endpointMeta");
 const reconnectBtn = document.getElementById("reconnectBtn");
 
-const FORMAT_ERROR_TEXT = "That doesn't look like a usemac pairing key.";
-const MISMATCH_ERROR_TEXT = "This key doesn't match the usemac app running on this Mac. Copy the key again.";
+const FORMAT_ERROR_TEXT = "That doesn't look like a UseMac pairing key.";
+const MISMATCH_ERROR_TEXT = "This key doesn't match the UseMac app running on this Mac. Copy the key again.";
 
 let saveTimer = null;
 let lastSavedValue = "";
@@ -73,7 +73,7 @@ function renderStatus(state) {
   } else if (wsState === "connecting" || (wsState === "connected" && authState === "authenticating")) {
     setStatusBadge("status-waiting", "Connecting…");
   } else {
-    setStatusBadge("status-disconnected", "usemac app not running");
+    setStatusBadge("status-disconnected", "UseMac app not running");
   }
 
   const showExpandedPairing =

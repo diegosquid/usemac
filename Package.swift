@@ -2,32 +2,32 @@
 import PackageDescription
 
 let package = Package(
-    name: "MacUse",
+    name: "UseMac",
     platforms: [
         .macOS(.v15)
     ],
     products: [
-        .library(name: "MacUseProtocol", targets: ["MacUseProtocol"]),
-        .library(name: "MacUseEngine", targets: ["MacUseEngine"]),
-        .library(name: "MacUseIPC", targets: ["MacUseIPC"]),
-        .executable(name: "MacUse", targets: ["MacUseApp"]),
-        .executable(name: "macuse", targets: ["MacUseCLI"])
+        .library(name: "UseMacProtocol", targets: ["UseMacProtocol"]),
+        .library(name: "UseMacEngine", targets: ["UseMacEngine"]),
+        .library(name: "UseMacIPC", targets: ["UseMacIPC"]),
+        .executable(name: "UseMac", targets: ["UseMacApp"]),
+        .executable(name: "usemac", targets: ["UseMacCLI"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.4")
     ],
     targets: [
         .target(
-            name: "MacUseProtocol",
-            path: "Sources/MacUseProtocol",
+            name: "UseMacProtocol",
+            path: "Sources/UseMacProtocol",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]
         ),
         .target(
-            name: "MacUseEngine",
-            dependencies: ["MacUseProtocol"],
-            path: "Sources/MacUseEngine",
+            name: "UseMacEngine",
+            dependencies: ["UseMacProtocol"],
+            path: "Sources/UseMacEngine",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ],
@@ -42,22 +42,22 @@ let package = Package(
             ]
         ),
         .target(
-            name: "MacUseIPC",
-            dependencies: ["MacUseProtocol"],
-            path: "Sources/MacUseIPC",
+            name: "UseMacIPC",
+            dependencies: ["UseMacProtocol"],
+            path: "Sources/UseMacIPC",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]
         ),
         .executableTarget(
-            name: "MacUseApp",
+            name: "UseMacApp",
             dependencies: [
-                "MacUseProtocol",
-                "MacUseEngine",
-                "MacUseIPC",
+                "UseMacProtocol",
+                "UseMacEngine",
+                "UseMacIPC",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
-            path: "Sources/MacUseApp",
+            path: "Sources/UseMacApp",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ],
@@ -68,17 +68,17 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "MacUseCLI",
-            dependencies: ["MacUseProtocol", "MacUseEngine", "MacUseIPC"],
-            path: "Sources/MacUseCLI",
+            name: "UseMacCLI",
+            dependencies: ["UseMacProtocol", "UseMacEngine", "UseMacIPC"],
+            path: "Sources/UseMacCLI",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]
         ),
         .testTarget(
-            name: "MacUseTests",
-            dependencies: ["MacUseProtocol", "MacUseEngine", "MacUseIPC"],
-            path: "Tests/MacUseTests",
+            name: "UseMacTests",
+            dependencies: ["UseMacProtocol", "UseMacEngine", "UseMacIPC"],
+            path: "Tests/UseMacTests",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]

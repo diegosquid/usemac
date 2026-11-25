@@ -1,9 +1,9 @@
-# usemac — Direct Unix Socket Protocol (`SOCKET.md`)
+# UseMac — Direct Unix Socket Protocol (`SOCKET.md`)
 
 **Default Local Transport (Zero MCP Overhead)**
 
-`usemac.app` listens on a local Unix domain stream socket (`AF_UNIX`, `SOCK_STREAM`) using **Newline-Delimited JSON (NDJSON)**:
-- Default socket path: `/tmp/macuse-$UID.sock` (override via `$MACUSE_SOCKET`).
+`UseMac.app` listens on a local Unix domain stream socket (`AF_UNIX`, `SOCK_STREAM`) using **Newline-Delimited JSON (NDJSON)**:
+- Default socket path: `/tmp/usemac-$UID.sock` (override via `$USEMAC_SOCKET`).
 - Only processes running as the same macOS user can connect (`0600` socket permissions and peer UID verification).
 - Requests larger than 16 MiB are rejected with `message_too_large`.
 - Each request is **one UTF-8 JSON object followed by `\n`**; each response is **one UTF-8 JSON object followed by `\n`**.
@@ -17,7 +17,7 @@
 Run once so your agent skills directory has the complete workflow and safety rules:
 
 ```bash
-"/Applications/usemac.app/Contents/Helpers/macuse" install-skill
+"/Applications/UseMac.app/Contents/Helpers/usemac" install-skill
 ```
 
 ---
@@ -35,7 +35,7 @@ Run once so your agent skills directory has the complete workflow and safety rul
 | `set_policy` | Keep or tighten the execution mode (`autonomous` → `confirmSensitive` → `readOnly` → `paused`); relaxing returns `POLICY_LOCKED`. |
 | `pair_app` | Set or clear the default paired macOS target app (`appTarget`). |
 | `audit_log` | Return recent in-memory action and RPC audit entries (up to 50). |
-| `highlight` | Visually highlight a cached `@eID` element on screen via the usemac overlay. |
+| `highlight` | Visually highlight a cached `@eID` element on screen via the UseMac overlay. |
 | `browser_status` | List paired, connected Google Chrome profiles and daemon status. |
 | `browser_tabs` | List open Chrome tabs (`tabId`, `title`, `url`, `active`) with optional substring filter. |
 | `browser_open` | Open an `http://`, `https://`, or `about:blank` URL in a new background Chrome tab or navigate an existing `tabId`. |
@@ -72,7 +72,7 @@ When **Paused** or the **Kill Switch (`⇧⌘⎋`)** is tripped, only `ping`, `s
 Returns `snapshot.elements` (`@e1`, `@e2`, …) with `role`, `title`, `value`, `frame`, and `actions`.
 
 ### Batch Background Actions (`act`)
-Leave `"preferBackground": true` (default) so usemac dispatches `AXPress`, `AXValue`, and `CGEvent.postToPid(pid)` without stealing window focus from the user:
+Leave `"preferBackground": true` (default) so UseMac dispatches `AXPress`, `AXValue`, and `CGEvent.postToPid(pid)` without stealing window focus from the user:
 ```json
 {"method":"act","act":{"app":"Notes","returnDiffOnly":true,"steps":[{"action":"pressKey","key":"n","modifiers":["cmd"],"preferBackground":true},{"action":"wait","durationMs":200},{"action":"type","text":"Meeting notes","preferBackground":true}]}}
 ```
@@ -87,11 +87,11 @@ Screenshots are saved to a private folder inside your user temporary directory a
 
 ## 4. Google Chrome Zero-Focus Control (Mandatory Path)
 
-Whenever controlling **Google Chrome**, use the `browser_*` methods over `/tmp/macuse-$UID.sock` instead of AX/CGEvent UI automation or `open -a "Google Chrome"`.
-- **How it works**: The **usemac Browser Bridge** Chrome extension controls background tabs locally over `ws://127.0.0.1:49222` using `chrome.tabs`, `chrome.tabGroups`, and Chrome DevTools Protocol (`debugger`) — Chrome never steals focus or switches Spaces, and DOM elements use compact `@b1..@bN` refs.
-- **Pairing prerequisite**: Before browser methods work, the user must pair each Chrome profile once: open **usemac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The pairing key is never exposed over RPC, MCP, or CLI.
+Whenever controlling **Google Chrome**, use the `browser_*` methods over `/tmp/usemac-$UID.sock` instead of AX/CGEvent UI automation or `open -a "Google Chrome"`.
+- **How it works**: The **UseMac Browser Bridge** Chrome extension controls background tabs locally over `ws://127.0.0.1:49222` using `chrome.tabs`, `chrome.tabGroups`, and Chrome DevTools Protocol (`debugger`) — Chrome never steals focus or switches Spaces, and DOM elements use compact `@b1..@bN` refs.
+- **Pairing prerequisite**: Before browser methods work, the user must pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The pairing key is never exposed over RPC, MCP, or CLI.
 - **Profile selection**: `profile` is optional when only one Chrome profile is connected. When multiple profiles are connected, call `browser_status` to read exact profile names and pass `"profile"` (case-insensitive exact or substring match on profile name).
-- **Tab targeting**: Without `tabId`, browser methods target the last tab used by usemac or a tab in the `usemac` tab group; if none exists, they return `NO_USEMAC_TAB`. To work in an already open user tab, list tabs with `browser_tabs` and pass its `tabId`.
+- **Tab targeting**: Without `tabId`, browser methods target the last tab used by UseMac or a tab in the `UseMac` tab group; if none exists, they return `NO_USEMAC_TAB`. To work in an already open user tab, list tabs with `browser_tabs` and pass its `tabId`.
 - **URL rule**: `browser_open` and `openURL`/`navigate` steps accept only `http://`, `https://`, and `about:blank` (scheme-less URLs receive `https://`; other schemes return `URL_BLOCKED`).
 
 ### Check Connected Chrome Profiles (`browser_status`)
@@ -117,14 +117,14 @@ Returns `@b1..@bN` interactive DOM elements (`link`, `button`, `textbox`, etc.),
 ```
 
 ### Extract Structured Data (`browser_extract`)
-Modes `auto`, `tables`, `text`, and `kpis` are read-only; `downloads` lists only downloads started during the current usemac session; `eval` runs arbitrary JavaScript in the page, is allowed only in `autonomous` mode, and logs every expression in the audit history:
+Modes `auto`, `tables`, `text`, and `kpis` are read-only; `downloads` lists only downloads started during the current UseMac session; `eval` runs arbitrary JavaScript in the page, is allowed only in `autonomous` mode, and logs every expression in the audit history:
 ```json
 {"method":"browser_extract","browserExtract":{"tabId":42,"mode":"tables","scanHorizontal":true}}
 ```
 
 ### Act on Chrome DOM Elements (`browser_act`)
 ```json
-{"method":"browser_act","browserAct":{"tabId":42,"steps":[{"action":"setValue","elementId":"@b2","text":"usemac"},{"action":"click","elementId":"@b3"}]}}
+{"method":"browser_act","browserAct":{"tabId":42,"steps":[{"action":"setValue","elementId":"@b2","text":"UseMac"},{"action":"click","elementId":"@b3"}]}}
 ```
 
 ### On-Device Local Vision (`vision_status`, `vision_query`)
@@ -151,14 +151,14 @@ Call `task_start` once when starting a multi-step task and `task_complete` once 
 
 One-off shell call with `nc`:
 ```bash
-printf '{"method":"status"}\n' | nc -U "/tmp/macuse-$(id -u).sock"
+printf '{"method":"status"}\n' | nc -U "/tmp/usemac-$(id -u).sock"
 ```
 
 Persistent multi-step Python session:
 ```python
 import json, os, socket
 
-sock_path = os.environ.get("MACUSE_SOCKET", f"/tmp/macuse-{os.getuid()}.sock")
+sock_path = os.environ.get("USEMAC_SOCKET", f"/tmp/usemac-{os.getuid()}.sock")
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
     s.connect(sock_path)
     f = s.makefile("r", encoding="utf-8")

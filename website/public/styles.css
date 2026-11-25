@@ -977,7 +977,7 @@ button:focus-visible,
   border-radius: 8px;
 }
 
-/* ---------- Compact Authentic Floating usemac HUD (Real Corner PiP Scale + Scaled Full Chrome Page!) ---------- */
+/* ---------- Compact Authentic Floating UseMac HUD (Real Corner PiP Scale + Scaled Full Chrome Page!) ---------- */
 .usemac-hud {
   position: absolute;
   right: 24px;
@@ -1036,7 +1036,7 @@ button:focus-visible,
   opacity: 0.35;
 }
 
-/* Miniature Real Chrome Tab Strip + Blue 'usemac' Tab Group */
+/* Miniature Real Chrome Tab Strip + Blue 'UseMac' Tab Group */
 .mini-chrome-tabs {
   height: 30px;
   padding: 5px 10px 0;

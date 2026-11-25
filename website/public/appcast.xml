@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
-    <title>usemac Changelog</title>
+    <title>UseMac Changelog</title>
     <link>https://usemac.app/appcast.xml</link>
-    <description>Official automatic updates for usemac (macOS 15+ Apple Silicon).</description>
+    <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
     <language>en</language>
     <!-- Generated & signed automatically by scripts/release-dmg.sh (Sparkle 2 EdDSA) -->
     <item>
@@ -13,7 +13,7 @@
       <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
       <pubDate>Wed, 25 Nov 2026 15:00:00 +0000</pubDate>
       <description><![CDATA[
-        <h3>What's New in usemac 0.5.0</h3>
+        <h3>What's New in UseMac 0.5.0</h3>
         <ul>
           <li>Continuous preview HUD lifecycle (<code>task_start</code> &rarr; <code>task_complete</code>) with calm glacier-blue rim and frosted completion overlay.</li>
           <li>Hybrid on-device Apple Vision OCR + MLX Qwen visual assistant (<code>ask</code>, <code>verify</code>, <code>describe</code>) cutting cloud vision tokens by 97%.</li>

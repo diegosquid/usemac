@@ -1,12 +1,12 @@
-# usemac Browser Bridge protocol (v2)
+# UseMac Browser Bridge protocol (v2)
 
 Contract between the Chrome extension (`Extension/`) and the daemon bridge
-(`Sources/MacUseEngine/ChromeExtensionBridge.swift`). Both sides must implement it exactly.
+(`Sources/UseMacEngine/ChromeExtensionBridge.swift`). Both sides must implement it exactly.
 
 ## Transport
 
 - WebSocket, text frames, one JSON object per frame.
-- The extension is the client and connects to `ws://127.0.0.1:49222/macuse-bridge`.
+- The extension is the client and connects to `ws://127.0.0.1:49222/usemac-bridge`.
 - The daemon binds `127.0.0.1` only and accepts the WebSocket upgrade only when the `Origin` header starts with
   `chrome-extension://`. Authentication below, not the port, is what proves each side to the other.
 
@@ -16,7 +16,7 @@ Contract between the Chrome extension (`Extension/`) and the daemon bridge
 - Text form shown to the user and pasted into the extension popup: `umk_` followed by 64 lowercase hex characters
   (68 characters in total). Input is trimmed and compared case-insensitively; anything else is rejected.
 - The HMAC key `K` is the 32 decoded bytes (never the text form).
-- Daemon storage: `~/Library/Application Support/usemac/bridge-key`, file mode `0600`, directory mode `0700`,
+- Daemon storage: `~/Library/Application Support/UseMac/bridge-key`, file mode `0600`, directory mode `0700`,
   content is the text form followed by a newline.
 - Extension storage: `chrome.storage.local`, item `bridgeKey`, value is the text form.
 
@@ -97,8 +97,8 @@ Extension → daemon frames keep the existing shapes: `response`, `frame`, `curs
 outside the per-tab command queues:
 
 - A running `act` batch on the affected tab stops before its next step and inside any `wait` step. Steps that did
-  not run are reported with `success: false` and the message `Cancelled by usemac`. The batch answers with
-  `ok: false` and `error: {"code":"CANCELLED","message":"Cancelled by usemac"}`.
+  not run are reported with `success: false` and the message `Cancelled by UseMac`. The batch answers with
+  `ok: false` and `error: {"code":"CANCELLED","message":"Cancelled by UseMac"}`.
 - Commands still queued for the affected tab answer with the same error without running.
 - The extension detaches the debugger from the affected tab (or from every tab) and emits `stream_stopped`.
 

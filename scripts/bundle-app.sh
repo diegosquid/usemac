@@ -2,8 +2,8 @@
 set -euo pipefail
 
 CONFIG="release"
-ALLOW_ADHOC="${MACUSE_ALLOW_ADHOC:-0}"
-HARDENED="${MACUSE_HARDENED_RUNTIME:-0}"
+ALLOW_ADHOC="${USEMAC_ALLOW_ADHOC:-0}"
+HARDENED="${USEMAC_HARDENED_RUNTIME:-0}"
 REQUIRE_SPARKLE_KEY="0"
 
 for arg in "$@"; do
@@ -31,29 +31,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-APP_DIR="$ROOT_DIR/dist/MacUse.app"
-APP_VERSION="${MACUSE_VERSION:-0.5.0}"
-APP_BUILD="${MACUSE_BUILD_NUMBER:-50}"
-APPCAST_URL="${MACUSE_APPCAST_URL:-https://usemac.app/appcast.xml}"
-SPARKLE_PUBLIC_KEY="${MACUSE_SPARKLE_PUBLIC_KEY:-}"
-CHROME_EXT_ID="${MACUSE_CHROME_EXTENSION_ID:-}"
+APP_DIR="$ROOT_DIR/dist/UseMac.app"
+APP_VERSION="${USEMAC_VERSION:-0.5.0}"
+APP_BUILD="${USEMAC_BUILD_NUMBER:-50}"
+APPCAST_URL="${USEMAC_APPCAST_URL:-https://usemac.app/appcast.xml}"
+SPARKLE_PUBLIC_KEY="${USEMAC_SPARKLE_PUBLIC_KEY:-}"
+CHROME_EXT_ID="${USEMAC_CHROME_EXTENSION_ID:-}"
 
 if [[ -n "$CHROME_EXT_ID" ]]; then
   CHROME_EXT_ID_REGEX='^[abcdefghijklmnop]{32}$'
   if [[ ! "$CHROME_EXT_ID" =~ $CHROME_EXT_ID_REGEX ]]; then
-    echo "MACUSE_CHROME_EXTENSION_ID must be 32 characters a-p" >&2
+    echo "USEMAC_CHROME_EXTENSION_ID must be 32 characters a-p" >&2
     exit 1
   fi
 fi
 
 if [[ "$REQUIRE_SPARKLE_KEY" == "1" && -z "$SPARKLE_PUBLIC_KEY" ]]; then
-  echo "MACUSE_SPARKLE_PUBLIC_KEY is required for this build" >&2
+  echo "USEMAC_SPARKLE_PUBLIC_KEY is required for this build" >&2
   exit 1
 fi
 
 # Resolve a persistent signing identity BEFORE rebuilding or deleting the existing bundle,
 # avoiding any silent fallback to ad-hoc signing (which invalidates TCC permissions).
-SIGN_IDENTITY="${MACUSE_SIGN_IDENTITY:-}"
+SIGN_IDENTITY="${USEMAC_SIGN_IDENTITY:-}"
 if [[ -z "$SIGN_IDENTITY" && "$HARDENED" == "1" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"
 fi
@@ -67,7 +67,7 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
-  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(MacUse[^"]*\)".*/\1/p' | head -n 1 || true)"
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(UseMac[^"]*\)".*/\1/p' | head -n 1 || true)"
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -n 1 || true)"
@@ -81,7 +81,7 @@ fi
 if [[ -z "$SIGN_IDENTITY" && "$ALLOW_ADHOC" != "1" ]]; then
   echo "No persistent codesigning identity found in Keychain." >&2
   echo "Aborting before modifying $APP_DIR to avoid invalidating Accessibility/Screen Recording (TCC) permissions." >&2
-  echo "Set MACUSE_SIGN_IDENTITY=\"...\" or pass --allow-adhoc explicitly." >&2
+  echo "Set USEMAC_SIGN_IDENTITY=\"...\" or pass --allow-adhoc explicitly." >&2
   exit 1
 fi
 
@@ -115,12 +115,12 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$HELPERS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
 
-# On case-insensitive APFS volumes, 'MacUse' and 'macuse' collide in the same directory.
+# On case-insensitive APFS volumes, 'UseMac' and 'usemac' collide in the same directory.
 # Build and copy each product separately to preserve both binaries.
-echo "Building MacUse.app ($CONFIG)..."
-rm -f "$BIN_PATH/MacUse" "$BIN_PATH/macuse"
-CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG" --product MacUse
-cp "$BIN_PATH/MacUse" "$MACOS_DIR/MacUse"
+echo "Building UseMac.app ($CONFIG)..."
+rm -f "$BIN_PATH/UseMac" "$BIN_PATH/usemac"
+CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG" --product UseMac
+cp "$BIN_PATH/UseMac" "$MACOS_DIR/UseMac"
 
 # Embed Sparkle.framework with symlinks intact (ditto) and ensure @executable_path/../Frameworks rpath
 SPARKLE_SRC=""
@@ -132,15 +132,15 @@ fi
 if [[ -n "$SPARKLE_SRC" && -d "$SPARKLE_SRC" ]]; then
   echo "Embedding Sparkle.framework..."
   /usr/bin/ditto "$SPARKLE_SRC" "$FRAMEWORKS_DIR/Sparkle.framework"
-  /usr/bin/install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/MacUse" 2>/dev/null || true
+  /usr/bin/install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/UseMac" 2>/dev/null || true
 fi
 
-echo "Building macuse CLI ($CONFIG)..."
-rm -f "$BIN_PATH/MacUse" "$BIN_PATH/macuse"
-CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG" --product macuse
-cp "$BIN_PATH/macuse" "$HELPERS_DIR/macuse"
+echo "Building usemac CLI ($CONFIG)..."
+rm -f "$BIN_PATH/UseMac" "$BIN_PATH/usemac"
+CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG" --product usemac
+cp "$BIN_PATH/usemac" "$HELPERS_DIR/usemac"
 
-chmod +x "$MACOS_DIR/MacUse" "$HELPERS_DIR/macuse"
+chmod +x "$MACOS_DIR/UseMac" "$HELPERS_DIR/usemac"
 
 if [[ -d "$ROOT_DIR/.agents" ]]; then
   mkdir -p "$RESOURCES_DIR/agent"
@@ -152,9 +152,9 @@ if [[ -d "$ROOT_DIR/Extension" ]]; then
   rsync -a --exclude='.DS_Store' --exclude='*.tmp' --exclude='*.bak' --exclude='*.swp' "$ROOT_DIR/Extension/" "$RESOURCES_DIR/chrome-extension/"
 fi
 
-if [[ -f "$ROOT_DIR/scripts/macuse-vision-worker.py" ]]; then
+if [[ -f "$ROOT_DIR/scripts/usemac-vision-worker.py" ]]; then
   mkdir -p "$RESOURCES_DIR/vision"
-  cp "$ROOT_DIR/scripts/macuse-vision-worker.py" "$RESOURCES_DIR/vision/worker.py"
+  cp "$ROOT_DIR/scripts/usemac-vision-worker.py" "$RESOURCES_DIR/vision/worker.py"
   chmod +x "$RESOURCES_DIR/vision/worker.py"
 fi
 
@@ -179,7 +179,7 @@ fi
 
 CHROME_EXT_PLIST=""
 if [[ -n "$CHROME_EXT_ID" ]]; then
-  CHROME_EXT_PLIST="  <key>MacUseChromeExtensionID</key>
+  CHROME_EXT_PLIST="  <key>UseMacChromeExtensionID</key>
   <string>${CHROME_EXT_ID}</string>"
 fi
 
@@ -191,16 +191,16 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>usemac</string>
+  <string>UseMac</string>
   <key>CFBundleExecutable</key>
-  <string>MacUse</string>
+  <string>UseMac</string>
 ${ICON_PLIST_ENTRY}
   <key>CFBundleIdentifier</key>
   <string>app.usemac</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>usemac</string>
+  <string>UseMac</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -222,11 +222,11 @@ ${ICON_PLIST_ENTRY}
 ${SPARKLE_KEY_PLIST}
 ${CHROME_EXT_PLIST}
   <key>NSAccessibilityUsageDescription</key>
-  <string>usemac needs Accessibility permission to inspect UI elements and execute background actions in macOS windows.</string>
+  <string>UseMac needs Accessibility permission to inspect UI elements and execute background actions in macOS windows.</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>usemac needs Screen Recording permission to stream background window previews and capture on-demand screenshots.</string>
+  <string>UseMac needs Screen Recording permission to stream background window previews and capture on-demand screenshots.</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>usemac uses Apple Events to focus specific browser tabs when you click the floating preview.</string>
+  <string>UseMac uses Apple Events to focus specific browser tabs when you click the floating preview.</string>
 </dict>
 </plist>
 PLIST
@@ -266,7 +266,7 @@ if [[ -d "$SPARKLE_FW" ]]; then
   /usr/bin/codesign "${SIGN_FLAGS[@]}" "$SPARKLE_FW"
 fi
 
-/usr/bin/codesign "${SIGN_FLAGS[@]}" "$HELPERS_DIR/macuse"
+/usr/bin/codesign "${SIGN_FLAGS[@]}" "$HELPERS_DIR/usemac"
 
 if [[ "$HARDENED" == "1" && -f "$ROOT_DIR/Assets/usemac.entitlements" ]]; then
   /usr/bin/codesign "${SIGN_FLAGS[@]}" --entitlements "$ROOT_DIR/Assets/usemac.entitlements" "$APP_DIR"

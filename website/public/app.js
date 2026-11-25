@@ -36,7 +36,7 @@
   );
   reveals.forEach((el) => io.observe(el));
 
-  // ---------- Interactive Live macOS Desktop + Floating usemac HUD Demo ----------
+  // ---------- Interactive Live macOS Desktop + Floating UseMac HUD Demo ----------
   const hud = document.getElementById("demoHud");
   const webPage = document.getElementById("demoWebPage");
   const formView = document.getElementById("demoFormView");
@@ -393,14 +393,14 @@
   });
 
   // ---------- Interactive "Paste into Your Agent" Setup Composer ----------
-  const BIN = "/Applications/usemac.app/Contents/Helpers/macuse";
+  const BIN = "/Applications/UseMac.app/Contents/Helpers/usemac";
   const agentConfigs = {
     claude: {
       name: "Claude Code",
       buttonLabel: "Copy prompt for Claude Code",
       copiedLabel: "Copied — paste into Claude Code ✓",
-      plain: `Set up usemac on my Mac so you can control my Mac apps and Chrome tabs in the background:\n\n1. Run \`${BIN} install-skill\`\n2. Add the MCP server (\`${BIN} mcp\`) to my Claude Code config\n3. Run \`${BIN} status\` and confirm Accessibility, Screen Recording, and Chrome Bridge are connected`,
-      html: `<p>Set up <strong>usemac</strong> on my Mac so you can control my Mac apps and Chrome tabs in the background:</p>
+      plain: `Set up UseMac on my Mac so you can control my Mac apps and Chrome tabs in the background:\n\n1. Run \`${BIN} install-skill\`\n2. Add the MCP server (\`${BIN} mcp\`) to my Claude Code config\n3. Run \`${BIN} status\` and confirm Accessibility, Screen Recording, and Chrome Bridge are connected`,
+      html: `<p>Set up <strong>UseMac</strong> on my Mac so you can control my Mac apps and Chrome tabs in the background:</p>
 <ol>
   <li>Run <code>${BIN} install-skill</code></li>
   <li>Add the MCP server <code>${BIN} mcp</code> to my Claude Code config</li>
@@ -411,11 +411,11 @@
       name: "Cursor",
       buttonLabel: "Copy prompt for Cursor",
       copiedLabel: "Copied — paste into Cursor ✓",
-      plain: `Set up usemac on my Mac for background browser and desktop control:\n\n1. Run \`${BIN} install-skill\`\n2. Add \`macuse\` to \`~/.cursor/mcp.json\` with command \`${BIN}\` and args \`["mcp"]\`\n3. Run \`${BIN} status\` and verify permissions and Chrome Bridge are connected`,
-      html: `<p>Set up <strong>usemac</strong> on my Mac for background browser and desktop control:</p>
+      plain: `Set up UseMac on my Mac for background browser and desktop control:\n\n1. Run \`${BIN} install-skill\`\n2. Add \`usemac\` to \`~/.cursor/mcp.json\` with command \`${BIN}\` and args \`["mcp"]\`\n3. Run \`${BIN} status\` and verify permissions and Chrome Bridge are connected`,
+      html: `<p>Set up <strong>UseMac</strong> on my Mac for background browser and desktop control:</p>
 <ol>
   <li>Run <code>${BIN} install-skill</code></li>
-  <li>Add <code>macuse</code> to <code>~/.cursor/mcp.json</code> using <code>${BIN} mcp</code></li>
+  <li>Add <code>usemac</code> to <code>~/.cursor/mcp.json</code> using <code>${BIN} mcp</code></li>
   <li>Run <code>${BIN} status</code> and verify permissions &amp; Chrome Bridge</li>
 </ol>`,
     },
@@ -423,8 +423,8 @@
       name: "Codex",
       buttonLabel: "Copy prompt for Codex",
       copiedLabel: "Copied — paste into Codex ✓",
-      plain: `Install and verify usemac on my Mac:\n\n1. Run \`${BIN} install-skill\` to install the skill in ~/.codex/skills\n2. Register the MCP server \`${BIN} mcp\`\n3. Run \`${BIN} status\` and report if Accessibility, Screen Recording, and Chrome Bridge are ready`,
-      html: `<p>Install and verify <strong>usemac</strong> on my Mac:</p>
+      plain: `Install and verify UseMac on my Mac:\n\n1. Run \`${BIN} install-skill\` to install the skill in ~/.codex/skills\n2. Register the MCP server \`${BIN} mcp\`\n3. Run \`${BIN} status\` and report if Accessibility, Screen Recording, and Chrome Bridge are ready`,
+      html: `<p>Install and verify <strong>UseMac</strong> on my Mac:</p>
 <ol>
   <li>Run <code>${BIN} install-skill</code> to add the skill in <code>~/.codex/skills</code></li>
   <li>Register the MCP server <code>${BIN} mcp</code></li>
@@ -435,8 +435,8 @@
       name: "Antigravity",
       buttonLabel: "Copy prompt for Antigravity",
       copiedLabel: "Copied — paste into Antigravity ✓",
-      plain: `Connect usemac on my Mac so you can use my real Chrome tabs and Mac apps in the background:\n\n1. Run \`${BIN} install-skill\`\n2. Run \`${BIN} status\` and confirm the daemon socket and Chrome Bridge are online`,
-      html: `<p>Connect <strong>usemac</strong> on my Mac so you can use my real Chrome tabs and Mac apps in the background:</p>
+      plain: `Connect UseMac on my Mac so you can use my real Chrome tabs and Mac apps in the background:\n\n1. Run \`${BIN} install-skill\`\n2. Run \`${BIN} status\` and confirm the daemon socket and Chrome Bridge are online`,
+      html: `<p>Connect <strong>UseMac</strong> on my Mac so you can use my real Chrome tabs and Mac apps in the background:</p>
 <ol>
   <li>Run <code>${BIN} install-skill</code></li>
   <li>Run <code>${BIN} status</code> and confirm the local Unix socket &amp; Chrome Bridge are online</li>
@@ -446,10 +446,10 @@
       name: "MCP JSON",
       buttonLabel: "Copy MCP JSON",
       copiedLabel: "MCP JSON copied ✓",
-      plain: `{\n  "mcpServers": {\n    "macuse": {\n      "command": "${BIN}",\n      "args": ["mcp"]\n    }\n  }\n}`,
+      plain: `{\n  "mcpServers": {\n    "usemac": {\n      "command": "${BIN}",\n      "args": ["mcp"]\n    }\n  }\n}`,
       html: `<pre>{
   "mcpServers": {
-    "macuse": {
+    "usemac": {
       "command": "${BIN}",
       "args": ["mcp"]
     }
