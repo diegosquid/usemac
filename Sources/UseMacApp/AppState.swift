@@ -781,8 +781,8 @@ public final class AppState: ObservableObject {
 
         1. Install the ready-made skill into your skills folder:
            "\(cli)" install-skill
-        2. Read the Unix socket protocol & workflow guides:
-           \(docs)/SOCKET.md
+        2. Read the agent guide (section "Unix socket") and the skill:
+           \(docs)/AGENTS.md
            \(docs)/skills/usemac/SKILL.md
         3. For Google Chrome, always use zero-focus Chrome Extension RPCs (`browser_status`, `browser_open`, `browser_observe`, `browser_act`):
            printf '{"id":"1","method":"browser_status"}\\n' | nc -U \(sock)
@@ -799,7 +799,7 @@ public final class AppState: ObservableObject {
         return """
         Configure the UseMac MCP server and install its skill so you can control macOS apps in the background without stealing focus:
 
-        1. Read "\(docs)/MCP.md" and add this MCP server to your configuration:
+        1. Read the "MCP server" section of "\(docs)/AGENTS.md" and add this MCP server to your configuration:
         {
           "mcpServers": {
             "usemac": {
@@ -823,7 +823,7 @@ public final class AppState: ObservableObject {
 
         1. Install and read the bundled skill first:
            "\(cli)" install-skill
-           Read: \(docs)/CLI.md
+           Read: \(docs)/AGENTS.md (section "CLI")
            Skill: \(docs)/skills/usemac/SKILL.md
         2. Verify daemon status:
            "\(cli)" status

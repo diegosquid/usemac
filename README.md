@@ -114,21 +114,21 @@ node --test Tests/ExtensionTests/*.test.mjs
 
 ## Repository layout
 
-- `.agents/` — Agent setup guides (`SETUP.md`, `SOCKET.md`, `MCP.md`, `CLI.md`) and the `usemac` skill (`skills/usemac/SKILL.md`).
+- `.agents/` — The agent guide (`AGENTS.md`: setup, Unix socket, MCP and CLI) and the `usemac` skill (`skills/usemac/SKILL.md`), both bundled inside the app.
 - `Assets/` — Master app icon artwork and Hardened Runtime entitlements.
 - `Extension/` — Manifest V3 Google Chrome extension (`UseMac Browser Bridge`).
 - `Sources/` — Swift package sources for the protocol, automation engine, IPC/MCP layer, macOS app, and CLI.
 - `Tests/` — Swift unit/integration tests and Node.js extension tests.
-- `docs/` — Bridge protocol specification, launch guide, and release notes.
+- `docs/` — Chrome bridge protocol specification and release notes.
 - `scripts/` — App bundling, DMG notarization/release, extension packaging, icon generation, and local vision worker scripts.
 - `website/` — Static landing page, privacy policy, and Sparkle appcast deployed to Cloudflare Workers.
 
 ## Documentation
 
-- [Agent Setup Guide](.agents/SETUP.md)
-- [Unix Socket Protocol](.agents/SOCKET.md)
-- [MCP Server Guide](.agents/MCP.md)
-- [CLI Quickstart](.agents/CLI.md)
+- [Agent Guide](.agents/AGENTS.md): setup, Unix socket, MCP and CLI
 - [Agent Skill](.agents/skills/usemac/SKILL.md)
 - [Chrome Extension Bridge Protocol](docs/BRIDGE-PROTOCOL.md)
-- [Official Launch Guide](docs/LAUNCH-GUIDE.md)
+
+## License
+
+UseMac is released under the [MIT License](LICENSE).

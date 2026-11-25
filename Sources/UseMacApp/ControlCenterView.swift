@@ -1097,12 +1097,12 @@ public struct ControlCenterView: View {
 
     private var bundledSkillFilesGroup: some View {
         let skillPath = "\(appState.resolvedAgentDocsDir)/skills/usemac/SKILL.md"
-        return SettingsGroup(title: "Ready-Made Markdown Kit") {
+        return SettingsGroup(title: "Agent Files") {
             EmptyView()
         } content: {
             codexRow(
-                title: "SKILL.md & Protocol Guides",
-                subtitle: "Pre-built skill and Markdown playbooks (SOCKET.md, SETUP.md, MCP.md, CLI.md) bundled inside UseMac."
+                title: "Skill & Agent Guide",
+                subtitle: "The usemac skill (SKILL.md) and the agent guide (AGENTS.md), bundled inside UseMac."
             ) {
                 HStack(spacing: 8) {
                     Button {
