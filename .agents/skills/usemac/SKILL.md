@@ -10,7 +10,7 @@ description: >-
 
 # UseMac — Native macOS Background Computer Control
 
-Use **UseMac** to inspect and control macOS desktop applications and Google Chrome tabs through the local `UseMac.app` daemon (`{{USEMAC_SOCKET}}`, default `/tmp/usemac-$UID.sock`).
+Use **UseMac** to inspect and control macOS desktop applications and Google Chrome tabs through the local `UseMac.app` daemon (`{{USEMAC_SOCKET}}`, default `/tmp/usemac-$UID/usemac.sock`).
 
 > **Golden Rule — Always Act in the Background (`preferBackground: true`)**
 > Never steal window focus (`open -a` without `-g`, `NSApp.activate`, or `preferBackground: false`) unless the user explicitly asks you to bring an app to the front. UseMac dispatches `AXPress`, `AXValue`, `AXConfirm`, and `CGEvent.postToPid(pid)` directly to background windows while showing an ephemeral live preview in the corner of the user's screen.
@@ -20,7 +20,7 @@ Use **UseMac** to inspect and control macOS desktop applications and Google Chro
 ## 1. Transport Priority (Unix Socket Default)
 
 ### Option A — Direct Unix Socket NDJSON (Default)
-Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u).sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
+Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u)/usemac.sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
 
 - **Status**:
   ```json
@@ -44,7 +44,7 @@ Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac
   ```
 
 #### Mandatory Zero-Focus Path for Google Chrome (`browser_*`)
-Whenever controlling **Google Chrome**, you **MUST** use `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, and `browser_act` over `/tmp/usemac-$UID.sock` (never `observe`/`act` or `open -a "Google Chrome"`, which would steal the user's Full Screen Space).
+Whenever controlling **Google Chrome**, you **MUST** use `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, and `browser_act` over `/tmp/usemac-$UID/usemac.sock` (never `observe`/`act` or `open -a "Google Chrome"`, which would steal the user's Full Screen Space).
 
 - **Pairing prerequisite**: Each Chrome profile must be paired once before browser methods work. The user opens **UseMac → Settings → General → Chrome Extension**, clicks **Copy key**, and pastes the `umk_…` key into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The pairing key is never exposed via RPC, MCP, or CLI.
 - **Profile selection**: `profile` is optional when only one Chrome profile is connected. When multiple profiles are connected, get profile names from `browser_status` (lookup matches profile name, not e-mail) and pass `"profile": "<name>"`.

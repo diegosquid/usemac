@@ -5,6 +5,7 @@ import UseMacProtocol
 public enum UnixSocketServerError: Error, LocalizedError, Sendable {
     case pathTooLong(String, maxBytes: Int)
     case pathOwnedByAnotherUser(String)
+    case unsafeSocketDirectory(String)
     case pathIsNotSocket(String)
     case alreadyListening(String)
     case socketCreationFailed(Int32)
@@ -18,6 +19,8 @@ public enum UnixSocketServerError: Error, LocalizedError, Sendable {
             return "Unix socket path exceeds maximum length (\(maxBytes) bytes): \(path)"
         case let .pathOwnedByAnotherUser(path):
             return "Socket path is owned by another user: \(path)"
+        case let .unsafeSocketDirectory(path):
+            return "Socket folder is not private to this user: \(path)"
         case let .pathIsNotSocket(path):
             return "Path exists and is not a Unix domain socket: \(path)"
         case let .alreadyListening(path):
@@ -34,6 +37,43 @@ public enum UnixSocketServerError: Error, LocalizedError, Sendable {
     }
 }
 
+/// Rules for the private folder that holds the default socket (`/tmp/usemac-$UID`).
+public enum PrivateSocketDirectory {
+    /// Creates the folder with mode 0700, or tightens an existing one that this user owns.
+    /// Throws when the path is a symlink, not a folder, or owned by someone else.
+    public static func ensure(atPath path: String) throws {
+        var st = Darwin.stat()
+        if Darwin.lstat(path, &st) != 0 {
+            guard errno == ENOENT else {
+                throw UnixSocketServerError.unsafeSocketDirectory(path)
+            }
+            if Darwin.mkdir(path, 0o700) != 0 && errno != EEXIST {
+                throw UnixSocketServerError.unsafeSocketDirectory(path)
+            }
+            guard Darwin.lstat(path, &st) == 0 else {
+                throw UnixSocketServerError.unsafeSocketDirectory(path)
+            }
+        }
+        guard (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == getuid() else {
+            throw UnixSocketServerError.unsafeSocketDirectory(path)
+        }
+        if (st.st_mode & 0o077) != 0 {
+            guard Darwin.chmod(path, 0o700) == 0 else {
+                throw UnixSocketServerError.unsafeSocketDirectory(path)
+            }
+        }
+    }
+
+    /// True when the folder is a real folder (not a symlink) owned by `expectedUID` with no group or other access.
+    public static func isTrusted(atPath path: String, expectedUID: uid_t) -> Bool {
+        var st = Darwin.stat()
+        guard Darwin.lstat(path, &st) == 0 else { return false }
+        return (st.st_mode & S_IFMT) == S_IFDIR
+            && st.st_uid == expectedUID
+            && (st.st_mode & 0o077) == 0
+    }
+}
+
 public final class UnixSocketServer: @unchecked Sendable {
     public static let maxRequestBytes = 16 * 1024 * 1024
 
@@ -46,8 +86,13 @@ public final class UnixSocketServer: @unchecked Sendable {
     private var serverFd: Int32 = -1
     private var running = false
     private var clientFds: Set<Int32> = []
+    private var boundInode: ino_t = 0
+    private var boundDevice: dev_t = 0
+    private var pathHealthTimer: DispatchSourceTimer?
+    private let pathCheckInterval: TimeInterval
 
     private let acceptQueue = DispatchQueue(label: "app.usemac.ipc.server.accept", qos: .userInteractive)
+    private let healthQueue = DispatchQueue(label: "app.usemac.ipc.server.path-health", qos: .utility)
     private let clientQueue = DispatchQueue(
         label: "app.usemac.ipc.server.clients",
         qos: .userInteractive,
@@ -58,12 +103,14 @@ public final class UnixSocketServer: @unchecked Sendable {
         socketPath: String = UseMacDefaults.defaultSocketPath,
         service: UseMacServiceProtocol,
         onClientCountChange: (@Sendable (Int) -> Void)? = nil,
-        allowedPeerUID: uid_t = getuid()
+        allowedPeerUID: uid_t = getuid(),
+        pathCheckInterval: TimeInterval = 30
     ) {
         self.socketPath = socketPath
         self.service = service
         self.onClientCountChange = onClientCountChange
         self.allowedPeerUID = allowedPeerUID
+        self.pathCheckInterval = pathCheckInterval
     }
 
     deinit {
@@ -86,6 +133,24 @@ public final class UnixSocketServer: @unchecked Sendable {
         }
         stateLock.unlock()
 
+        let bound = try bindListeningSocket()
+
+        stateLock.lock()
+        serverFd = bound.fd
+        boundInode = bound.inode
+        boundDevice = bound.device
+        running = true
+        stateLock.unlock()
+
+        acceptQueue.async { [weak self] in
+            self?.runAcceptLoop(listenFd: bound.fd)
+        }
+        startPathHealthTimer()
+    }
+
+    /// Creates, binds and listens on the socket path. Returns the listening descriptor and the
+    /// identity of the file it created, so later checks can tell our socket from a replacement.
+    private func bindListeningSocket() throws -> (fd: Int32, inode: ino_t, device: dev_t) {
         try prepareSocketPath()
 
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -131,16 +196,86 @@ public final class UnixSocketServer: @unchecked Sendable {
             throw UnixSocketServerError.listenFailed(err)
         }
 
-        stateLock.lock()
-        serverFd = fd
-        running = true
-        stateLock.unlock()
+        var st = Darwin.stat()
+        guard Darwin.lstat(socketPath, &st) == 0 else {
+            let err = errno
+            throw UnixSocketServerError.bindFailed(socketPath, err)
+        }
 
         closeOnError = false
+        return (fd, st.st_ino, st.st_dev)
+    }
 
-        acceptQueue.async { [weak self] in
-            self?.runAcceptLoop(listenFd: fd)
+    // MARK: - Self-healing socket path
+
+    private func startPathHealthTimer() {
+        guard pathCheckInterval > 0 else { return }
+        let timer = DispatchSource.makeTimerSource(queue: healthQueue)
+        timer.schedule(deadline: .now() + pathCheckInterval, repeating: pathCheckInterval, leeway: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            self?.checkSocketPathHealth()
         }
+        stateLock.lock()
+        pathHealthTimer?.cancel()
+        pathHealthTimer = timer
+        stateLock.unlock()
+        timer.resume()
+    }
+
+    /// Recreates the socket when its file was deleted (for example by a manual `rm`) while the server
+    /// keeps running. Never touches a path that now holds something else or another live server.
+    private func checkSocketPathHealth() {
+        stateLock.lock()
+        let isActive = running
+        let inode = boundInode
+        let device = boundDevice
+        stateLock.unlock()
+        guard isActive else { return }
+
+        var st = Darwin.stat()
+        if Darwin.lstat(socketPath, &st) == 0 {
+            if (st.st_mode & S_IFMT) == S_IFSOCK && st.st_ino == inode && st.st_dev == device {
+                return
+            }
+            if (st.st_mode & S_IFMT) != S_IFSOCK || isExistingSocketActive() {
+                return
+            }
+        }
+
+        guard let bound = try? bindListeningSocket() else { return }
+
+        stateLock.lock()
+        guard running else {
+            stateLock.unlock()
+            Darwin.close(bound.fd)
+            unlinkIfOwned(inode: bound.inode, device: bound.device)
+            return
+        }
+        let previousFd = serverFd
+        serverFd = bound.fd
+        boundInode = bound.inode
+        boundDevice = bound.device
+        stateLock.unlock()
+
+        if previousFd >= 0 {
+            Darwin.shutdown(previousFd, SHUT_RDWR)
+            Darwin.close(previousFd)
+        }
+        acceptQueue.async { [weak self] in
+            self?.runAcceptLoop(listenFd: bound.fd)
+        }
+    }
+
+    /// Removes the socket file only when it is still the one this server created.
+    private func unlinkIfOwned(inode: ino_t, device: dev_t) {
+        var st = Darwin.stat()
+        guard Darwin.lstat(socketPath, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFSOCK,
+              st.st_ino == inode,
+              st.st_dev == device else {
+            return
+        }
+        Darwin.unlink(socketPath)
     }
 
     public func stop() {
@@ -148,7 +283,12 @@ public final class UnixSocketServer: @unchecked Sendable {
         let clientsToClose: [Int32]
         let shouldNotifyZero: Bool
 
+        let ownedInode: ino_t
+        let ownedDevice: dev_t
+
         stateLock.lock()
+        pathHealthTimer?.cancel()
+        pathHealthTimer = nil
         if !running && serverFd < 0 && clientFds.isEmpty {
             stateLock.unlock()
             return
@@ -156,6 +296,8 @@ public final class UnixSocketServer: @unchecked Sendable {
         running = false
         fdToClose = serverFd
         serverFd = -1
+        ownedInode = boundInode
+        ownedDevice = boundDevice
         clientsToClose = Array(clientFds)
         shouldNotifyZero = !clientFds.isEmpty
         clientFds.removeAll()
@@ -170,7 +312,7 @@ public final class UnixSocketServer: @unchecked Sendable {
             Darwin.shutdown(clientFd, SHUT_RDWR)
         }
 
-        Darwin.unlink(socketPath)
+        unlinkIfOwned(inode: ownedInode, device: ownedDevice)
 
         if shouldNotifyZero {
             onClientCountChange?(0)
@@ -179,7 +321,9 @@ public final class UnixSocketServer: @unchecked Sendable {
 
     private func prepareSocketPath() throws {
         let parentDir = (socketPath as NSString).deletingLastPathComponent
-        if !parentDir.isEmpty {
+        if parentDir == UseMacDefaults.defaultSocketDirectory {
+            try PrivateSocketDirectory.ensure(atPath: parentDir)
+        } else if !parentDir.isEmpty {
             try FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true)
         }
 

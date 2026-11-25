@@ -275,6 +275,15 @@ public final class UnixSocketClient: @unchecked Sendable {
             }
         }
 
+        // The default socket lives in a private per-user folder; refuse it if that folder was replaced.
+        let parentDir = (socketPath as NSString).deletingLastPathComponent
+        var parentStat = Darwin.stat()
+        if parentDir == UseMacDefaults.defaultSocketDirectory,
+           Darwin.lstat(parentDir, &parentStat) == 0,
+           !PrivateSocketDirectory.isTrusted(atPath: parentDir, expectedUID: expectedPeerUID) {
+            throw UnixSocketClientError.untrustedSocket(socketPath)
+        }
+
         let sockFd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard sockFd >= 0 else {
             throw UnixSocketClientError.socketCreationFailed(errno)

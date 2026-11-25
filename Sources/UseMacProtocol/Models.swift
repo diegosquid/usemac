@@ -6,11 +6,16 @@ public enum UseMacDefaults {
     public static let buildNumber = "50"
     public static let applicationSupportFolderName = "UseMac"
 
+    /// Private per-user folder (mode 0700) that holds the default socket, like tmux's `/tmp/tmux-$UID`.
+    public static var defaultSocketDirectory: String {
+        "/tmp/usemac-\(getuid())"
+    }
+
     public static var defaultSocketPath: String {
         if let env = ProcessInfo.processInfo.environment["USEMAC_SOCKET"], !env.isEmpty {
             return env
         }
-        return "/tmp/usemac-\(getuid()).sock"
+        return "\(defaultSocketDirectory)/usemac.sock"
     }
 
     /// Per-user private directory (inside the user's 0700 temporary directory), never the shared `/tmp`.

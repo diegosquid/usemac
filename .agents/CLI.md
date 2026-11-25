@@ -1,6 +1,6 @@
 # UseMac — CLI Quickstart for Agents (`CLI.md`)
 
-Any agent with shell access can invoke the `usemac` helper binary (`/Applications/UseMac.app/Contents/Helpers/usemac`), which talks to the running `UseMac.app` daemon over `/tmp/usemac-$UID.sock` (or `$USEMAC_SOCKET`).
+Any agent with shell access can invoke the `usemac` helper binary (`/Applications/UseMac.app/Contents/Helpers/usemac`), which talks to the running `UseMac.app` daemon over `/tmp/usemac-$UID/usemac.sock` (or `$USEMAC_SOCKET`).
 
 When `UseMac.app` is closed, the CLI runs in read-only mode: action commands (`act`, `click`, `set`, `type`, `key`, `browser open`, `browser act`, `vision install`) fail with `DAEMON_REQUIRED` (exit code `3`). Passing `--standalone` runs in-process without the app and without its safety controls (Kill Switch and execution mode do not apply).
 

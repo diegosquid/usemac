@@ -19,10 +19,10 @@ UseMac is a native macOS app and background daemon (written in Swift) that lets 
 
 ### Unix socket (NDJSON)
 
-`UseMac.app` listens on `/tmp/usemac-$UID.sock` (override with `USEMAC_SOCKET`). Connections are restricted to the same macOS user, and requests over 16 MiB are rejected (`message_too_large`). `id` is optional on requests, and boolean fields on `act` default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false`.
+`UseMac.app` listens on `/tmp/usemac-$UID/usemac.sock` (override with `USEMAC_SOCKET`), inside a folder only your user can open. If the socket file is deleted while the app runs, UseMac recreates it within 30 seconds. Connections are restricted to the same macOS user, and requests over 16 MiB are rejected (`message_too_large`). `id` is optional on requests, and boolean fields on `act` default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false`.
 
 ```bash
-printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u).sock"
+printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
 ### MCP (`stdio`)

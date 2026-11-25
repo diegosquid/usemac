@@ -3,7 +3,7 @@
 **Default Local Transport (Zero MCP Overhead)**
 
 `UseMac.app` listens on a local Unix domain stream socket (`AF_UNIX`, `SOCK_STREAM`) using **Newline-Delimited JSON (NDJSON)**:
-- Default socket path: `/tmp/usemac-$UID.sock` (override via `$USEMAC_SOCKET`).
+- Default socket path: `/tmp/usemac-$UID/usemac.sock` (override via `$USEMAC_SOCKET`).
 - Only processes running as the same macOS user can connect (`0600` socket permissions and peer UID verification).
 - Requests larger than 16 MiB are rejected with `message_too_large`.
 - Each request is **one UTF-8 JSON object followed by `\n`**; each response is **one UTF-8 JSON object followed by `\n`**.
@@ -87,7 +87,7 @@ Screenshots are saved to a private folder inside your user temporary directory a
 
 ## 4. Google Chrome Zero-Focus Control (Mandatory Path)
 
-Whenever controlling **Google Chrome**, use the `browser_*` methods over `/tmp/usemac-$UID.sock` instead of AX/CGEvent UI automation or `open -a "Google Chrome"`.
+Whenever controlling **Google Chrome**, use the `browser_*` methods over `/tmp/usemac-$UID/usemac.sock` instead of AX/CGEvent UI automation or `open -a "Google Chrome"`.
 - **How it works**: The **UseMac Browser Bridge** Chrome extension controls background tabs locally over `ws://127.0.0.1:49222` using `chrome.tabs`, `chrome.tabGroups`, and Chrome DevTools Protocol (`debugger`) — Chrome never steals focus or switches Spaces, and DOM elements use compact `@b1..@bN` refs.
 - **Pairing prerequisite**: Before browser methods work, the user must pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The pairing key is never exposed over RPC, MCP, or CLI.
 - **Profile selection**: `profile` is optional when only one Chrome profile is connected. When multiple profiles are connected, call `browser_status` to read exact profile names and pass `"profile"` (case-insensitive exact or substring match on profile name).
@@ -151,14 +151,14 @@ Call `task_start` once when starting a multi-step task and `task_complete` once 
 
 One-off shell call with `nc`:
 ```bash
-printf '{"method":"status"}\n' | nc -U "/tmp/usemac-$(id -u).sock"
+printf '{"method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
 Persistent multi-step Python session:
 ```python
 import json, os, socket
 
-sock_path = os.environ.get("USEMAC_SOCKET", f"/tmp/usemac-{os.getuid()}.sock")
+sock_path = os.environ.get("USEMAC_SOCKET", f"/tmp/usemac-{os.getuid()}/usemac.sock")
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
     s.connect(sock_path)
     f = s.makefile("r", encoding="utf-8")

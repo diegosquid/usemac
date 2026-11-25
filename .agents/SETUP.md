@@ -18,10 +18,10 @@ Run the bundled helper binary (`/Applications/UseMac.app/Contents/Helpers/usemac
 
 ## 2. Default Transport: Direct Unix Socket
 
-By default, talk directly to the `UseMac.app` NDJSON Unix domain socket (`/tmp/usemac-$UID.sock`, or `$USEMAC_SOCKET`) with no MCP schema overhead. Read `./SOCKET.md` for all 22 RPC methods and payload examples.
+By default, talk directly to the `UseMac.app` NDJSON Unix domain socket (`/tmp/usemac-$UID/usemac.sock`, or `$USEMAC_SOCKET`) with no MCP schema overhead. Read `./SOCKET.md` for all 22 RPC methods and payload examples.
 
 > **Google Chrome Rules**:
-> - Whenever automating **Google Chrome**, use the `browser_*` methods (`browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`) over `/tmp/usemac-$UID.sock` so Chrome tabs run in the background without stealing focus or switching Full Screen Spaces.
+> - Whenever automating **Google Chrome**, use the `browser_*` methods (`browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`) over `/tmp/usemac-$UID/usemac.sock` so Chrome tabs run in the background without stealing focus or switching Full Screen Spaces.
 > - **Pairing required**: Each Chrome profile must be paired once. The user copies the `umk_…` key from **UseMac → Settings → General → Chrome Extension** (**Copy key**) and pastes it into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The key is never exposed via RPC, MCP, or CLI.
 > - **Profiles**: `profile` is optional when only one Chrome profile is connected. If multiple profiles are connected, read exact names from `browser_status` (for example `"profile": "Work"` — matched by profile name, not e-mail).
 > - **Tabs**: Without `tabId`, browser methods use the last tab used by UseMac or a tab in the `UseMac` tab group (`NO_USEMAC_TAB` if none exists). Call `browser_open` first, or call `browser_tabs` and pass `tabId` to act on an existing user tab.
@@ -37,7 +37,7 @@ When `UseMac.app` is closed, the CLI and MCP server only allow read operations; 
 ## 3. Verify Daemon & Permissions
 
 ```bash
-printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u).sock"
+printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
 Confirm `accessibilityGranted: true` and `screenRecordingGranted: true`, check `browserProfiles` if automating Chrome, and keep `preferBackground: true` so background GUI actions never steal focus from the user's active window.
