@@ -199,6 +199,12 @@ node --test Tests/ExtensionTests/*.test.mjs
 
 ## How to contribute
 
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start: it says when to open an issue first, how AI-assisted
+contributions work and how to sign off commits. [GOVERNANCE.md](GOVERNANCE.md) explains how changes are reviewed and
+released, and everyone follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+**Security problems**: don't open an issue. Report them privately, as described in [SECURITY.md](SECURITY.md).
+
 ### Report a problem
 
 **With your agent.** When a task fails in a way that looks like a UseMac bug, your agent can offer to report it (or ask it to). It calls `report_prepare` (MCP `usemac_report_prepare`, CLI `usemac report --summary "…"`), and UseMac opens a **Review problem report** window with exactly the text that would be sent:
@@ -209,7 +215,7 @@ node --test Tests/ExtensionTests/*.test.mjs
 
 **Copy** puts the report on the clipboard, and **Cancel** discards it. Nothing leaves your Mac until you submit the issue on GitHub yourself. Only a click with your own mouse or trackpad checks the box or presses the buttons: the window ignores clicks some process posted and Accessibility actions, and agents can't observe or act on UseMac's windows. The agent only learns that the report is waiting for your review (`awaiting_user_review`), never its text or what you decided. One report shows at a time.
 
-**By hand.** [Open an issue](https://github.com/diegosquid/usemac/issues/new) with what you did, what you expected and what happened, your UseMac version (`usemac --version`) and macOS version, and the error code if there was one. `usemac audit --since 30m` prints recent activity; check it for personal data before you paste it.
+**By hand.** [Open an issue](https://github.com/diegosquid/usemac/issues/new/choose) with the **Bug report** form: what you did, what you expected and what happened, your UseMac version (`usemac --version`) and macOS version, and the error code if there was one. `usemac audit --since 30m` prints recent activity; check it for personal data before you paste it.
 
 **What a report contains**: the agent's description of the problem; the environment (UseMac version and build, macOS version, architecture, Chrome extension version and where Chrome loads it from, execution mode, permissions); the error codes UseMac recorded for the task since it last started; and up to 40 of the task's audit entries (or the last 30 minutes of activity when no task is named), already redacted as described under **Audit log** above.
 
@@ -230,11 +236,12 @@ node --test Tests/ExtensionTests/*.test.mjs  # Chrome extension tests
 
 ### Open a pull request
 
-1. Fork the repository and create a branch from `main`.
-2. Keep commits small, with a subject in the imperative and a body that says why.
-3. Run `swift build`, `swift test` and the extension tests. CI runs the same three on every pull request.
-4. Document agent-facing changes (methods, parameters, MCP tools, error codes, defaults) in `.agents/AGENTS.md`, the skill, the MCP tool descriptions, the CLI help and this README.
-5. Open the pull request against `main`. Say what changed for users and agents, how you tested it, and what you couldn't test. Link the issue it fixes (`Closes #123`).
+1. For anything bigger than a small fix, open an issue first and wait until the approach is agreed. An issue with an assignee is taken.
+2. Fork the repository and create a branch from `main`.
+3. Keep commits small, with a subject in the imperative and a body that says why, and sign each one off (`git commit -s`).
+4. Run `swift build`, `swift test` and the extension tests. CI runs the same three on every pull request.
+5. Document agent-facing changes (methods, parameters, MCP tools, error codes, defaults) in `.agents/AGENTS.md`, the skill, the MCP tool descriptions, the CLI help and this README.
+6. Open the pull request against `main` and fill in the template: what changed for users and agents, how you tested it, what you couldn't test, and whether it touches a safety-critical path. Link the issue it fixes (`Closes #123`).
 
 ## License
 
