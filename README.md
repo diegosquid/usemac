@@ -12,7 +12,7 @@ UseMac is a native macOS app and background daemon (written in Swift) that lets 
 
 1. Drag `UseMac.app` into `/Applications` and open it.
 2. Grant **Accessibility** and **Screen Recording** permissions in **UseMac → Settings → General → Permissions**.
-3. Load the bundled Chrome extension in `chrome://extensions` (enable **Developer mode**, click **Load unpacked**, and select `/Applications/UseMac.app/Contents/Resources/chrome-extension`), then pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup.
+3. Add the Chrome extension. Once the Chrome Web Store listing is live, add it from there: **Open Web Store** in the setup guide opens the listing, where you click **Add to Chrome**. Until then, and in beta builds, load the bundled copy in `chrome://extensions` (enable **Developer mode**, click **Load unpacked**, and select `/Applications/UseMac.app/Contents/Resources/chrome-extension`). Then pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup.
 4. Open **UseMac → Settings → Connect** and paste the setup prompt into your AI agent (or run `/Applications/UseMac.app/Contents/Helpers/usemac install-skill`).
 
 ## How agents connect
@@ -129,6 +129,7 @@ node --test Tests/ExtensionTests/*.test.mjs
 - [Agent Guide](.agents/AGENTS.md): setup, Unix socket, MCP and CLI
 - [Agent Skill](.agents/skills/usemac/SKILL.md)
 - [Chrome Extension Bridge Protocol](docs/BRIDGE-PROTOCOL.md)
+- [Chrome Web Store release](docs/CHROME-WEB-STORE.md): the store ID (`USEMAC_CHROME_EXTENSION_ID`), packaging and submitting the extension
 
 ## License
 
