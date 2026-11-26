@@ -668,29 +668,12 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             guard let originHeader = headers.first(where: { $0.name.caseInsensitiveCompare("Origin") == .orderedSame })?.value else {
                 return NWProtocolWebSocket.Response(status: .reject, subprotocol: nil, additionalHeaders: [("Connection", "close")])
             }
-            let normalized = originHeader.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard normalized.hasPrefix("chrome-extension://") else {
-                return NWProtocolWebSocket.Response(status: .reject, subprotocol: nil, additionalHeaders: [("Connection", "close")])
-            }
-            let afterScheme = normalized.dropFirst("chrome-extension://".count)
-            let extId = afterScheme.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
-            guard !extId.isEmpty else {
+            guard let extId = BridgeOriginPolicy.extensionId(fromOrigin: originHeader) else {
                 return NWProtocolWebSocket.Response(status: .reject, subprotocol: nil, additionalHeaders: [("Connection", "close")])
             }
 
-            var allowed = Set<String>()
-            if let allowedEnv = ProcessInfo.processInfo.environment["USEMAC_ALLOWED_EXTENSION_IDS"] {
-                for rawId in allowedEnv.split(separator: ",") {
-                    let trimmed = rawId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    if !trimmed.isEmpty {
-                        allowed.insert(trimmed)
-                    }
-                }
-            }
-            if let storeId = UseMacDefaults.chromeWebStoreExtensionId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-               !storeId.isEmpty {
-                allowed.insert(storeId)
-            }
+            // Store builds accept the store ID and the app's own unpacked folder; beta builds accept any extension.
+            let allowed = BridgeOriginPolicy.allowedExtensionIds()
             if !allowed.isEmpty && !allowed.contains(extId) {
                 return NWProtocolWebSocket.Response(status: .reject, subprotocol: nil, additionalHeaders: [("Connection", "close")])
             }

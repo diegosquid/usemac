@@ -9,6 +9,15 @@ Contract between the Chrome extension (`Extension/`) and the daemon bridge
 - The extension is the client and connects to `ws://127.0.0.1:49222/usemac-bridge`.
 - The daemon binds `127.0.0.1` only and accepts the WebSocket upgrade only when the `Origin` header starts with
   `chrome-extension://`. Authentication below, not the port, is what proves each side to the other.
+- Builds that know the Chrome Web Store ID (Info.plist `UseMacChromeExtensionID`, or `USEMAC_CHROME_EXTENSION_ID`)
+  also check the ID in that `Origin`. They accept the store ID, the ID Chrome gives the app's own
+  `UseMac.app/Contents/Resources/chrome-extension` folder when it is loaded unpacked, the comma-separated IDs in
+  `USEMAC_ALLOWED_EXTENSION_IDS`, and the IDs in the app's `usemac.bridge.allowedExtensionIds` default (an array,
+  set only by the user with `defaults write app.usemac`). Any other extension, such as a copy loaded unpacked from
+  a repo checkout, is refused at the upgrade, and its popup shows the app as not running. Builds without a store ID
+  accept any extension ID unless `USEMAC_ALLOWED_EXTENSION_IDS` is set; the default only adds IDs and never turns
+  the check on. Everything after the upgrade, pairing included, is the same for a store install and an unpacked
+  one. Each install keeps its own copy of the pairing key, so a new install needs the key pasted once.
 
 ## Pairing key
 

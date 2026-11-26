@@ -658,12 +658,12 @@ public struct ControlCenterView: View {
                 codexRow(
                     title: "UseMac Browser Bridge",
                     subtitle: appState.chromeWebStoreExtensionId != nil
-                        ? "One-click install from Chrome Web Store for zero-focus background tabs."
+                        ? "Add it from the Chrome Web Store, then paste the pairing key into its popup."
                         : "In chrome://extensions, turn on Developer mode, click Load unpacked, press ⌘⇧G and paste the path."
                 ) {
                     HStack(spacing: 8) {
                         if appState.chromeWebStoreExtensionId != nil {
-                            Button("Install Extension") {
+                            Button("Open Web Store") {
                                 appState.installPublishedChromeExtension()
                             }
                             .buttonStyle(SubtleOutlineButtonStyle())
