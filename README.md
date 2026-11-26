@@ -26,7 +26,7 @@ UseMac is a native macOS app and background daemon (written in Swift) that lets 
 printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
-Methods (22): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one.
+Methods (23): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one.
 
 ### MCP (`stdio`)
 
@@ -84,7 +84,7 @@ Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error
 - **The screen changed** (observe again): `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`.
 - **Needs the app in front, or the user is busy**: `TARGET_NOT_FRONTMOST`, `USER_ACTIVE`.
 - **Wrong route** (switch to native observe or the hybrid Chrome flow): `RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`.
-- **Chrome extension**: `EXTENSION_NOT_CONNECTED`, `EXTENSION_NOT_PAIRED`, `EXTENSION_TIMEOUT`, `NO_USEMAC_TAB`, `CANCELLED`, `WINDOW_ERROR`, `EVAL_ERROR`.
+- **Chrome extension**: `EXTENSION_NOT_CONNECTED`, `EXTENSION_NOT_PAIRED`, `EXTENSION_TIMEOUT`, `EXTENSION_RELOAD_UNSUPPORTED`, `EXTENSION_RELOAD_TIMEOUT`, `BROWSER_BUSY`, `NO_USEMAC_TAB`, `CANCELLED`, `WINDOW_ERROR`, `EVAL_ERROR`.
 - **Apps, permissions and captures**: `APP_NOT_FOUND`, `PERMISSION_DENIED`, `CAPTURE_FAILED`, `UPLOAD_FAILED`, `NO_IMAGE_SOURCE`.
 - **Malformed requests**: `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND`, `INVALID_MODEL`.
 - **Unexpected failures**: `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED`.

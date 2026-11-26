@@ -22,7 +22,7 @@ Use **UseMac** to inspect and control macOS desktop applications and Google Chro
 ### Option A — Direct Unix Socket NDJSON (Default)
 Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u)/usemac.sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
 
-Methods: `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`.
+Methods: `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`.
 
 - **Status**:
   ```json
