@@ -472,17 +472,52 @@ public final class UnixSocketServer: @unchecked Sendable {
         }
     }
 
+    private final class AtomicFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value = false
+
+        var value: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _value
+        }
+
+        func set(_ newValue: Bool) {
+            lock.lock()
+            _value = newValue
+            lock.unlock()
+        }
+    }
+
     private func handleClient(clientFd: Int32) {
+        let replyQueue = DispatchQueue(label: "app.usemac.ipc.server.reply.\(clientFd)", qos: .userInteractive)
+        let inFlightGroup = DispatchGroup()
+        let writeFailed = AtomicFlag()
+
         defer {
+            inFlightGroup.wait()
+            replyQueue.sync {}
             unregisterAndCloseClient(clientFd)
         }
 
+        let sendResponse: @Sendable (RPCResponse) -> Void = { [weak self] response in
+            guard let self, self.isRunning, !writeFailed.value else { return }
+            guard var encoded = try? JSONEncoder().encode(response) else { return }
+            encoded.append(0x0A)
+            replyQueue.async { [weak self] in
+                guard let self, self.isRunning, !writeFailed.value else { return }
+                if !self.writeAll(fd: clientFd, data: encoded) {
+                    writeFailed.set(true)
+                    Darwin.shutdown(clientFd, SHUT_RDWR)
+                }
+            }
+        }
+
         let decoder = JSONDecoder()
-        let encoder = JSONEncoder()
         var readBuffer = Data()
         var chunk = [UInt8](repeating: 0, count: 65536)
 
-        while isRunning {
+        while isRunning && !writeFailed.value {
             let bytesRead = Darwin.read(clientFd, &chunk, chunk.count)
             if bytesRead < 0 {
                 if errno == EINTR {
@@ -502,7 +537,9 @@ public final class UnixSocketServer: @unchecked Sendable {
                 while true {
                     let lineLength = readBuffer.distance(from: readBuffer.startIndex, to: newlineIndex)
                     if lineLength > Self.maxRequestBytes {
-                        sendOversizedRequestError(clientFd: clientFd, encoder: encoder)
+                        replyQueue.sync {
+                            sendOversizedRequestError(clientFd: clientFd)
+                        }
                         return
                     }
 
@@ -513,30 +550,22 @@ public final class UnixSocketServer: @unchecked Sendable {
                         lineData.removeLast()
                     }
                     if !lineData.isEmpty {
-                        let response: RPCResponse
                         do {
                             let request = try decoder.decode(RPCRequest.self, from: lineData)
-                            response = awaitService(request)
+                            let svc = service
+                            inFlightGroup.enter()
+                            Task {
+                                defer { inFlightGroup.leave() }
+                                let response = await svc.handle(request)
+                                sendResponse(response)
+                            }
                         } catch {
-                            response = RPCResponse.failure(
+                            let failure = RPCResponse.failure(
                                 id: "unknown",
                                 code: "invalid_request",
                                 message: "Failed to decode RPCRequest: \(error.localizedDescription)"
                             )
-                        }
-
-                        guard isRunning else {
-                            return
-                        }
-
-                        do {
-                            var encoded = try encoder.encode(response)
-                            encoded.append(0x0A)
-                            if !writeAll(fd: clientFd, data: encoded) {
-                                return
-                            }
-                        } catch {
-                            return
+                            sendResponse(failure)
                         }
                     }
 
@@ -548,42 +577,24 @@ public final class UnixSocketServer: @unchecked Sendable {
             }
 
             if readBuffer.count > Self.maxRequestBytes {
-                sendOversizedRequestError(clientFd: clientFd, encoder: encoder)
+                replyQueue.sync {
+                    sendOversizedRequestError(clientFd: clientFd)
+                }
                 return
             }
         }
     }
 
-    private func sendOversizedRequestError(clientFd: Int32, encoder: JSONEncoder) {
+    private func sendOversizedRequestError(clientFd: Int32) {
         let response = RPCResponse.failure(
             id: "unknown",
             code: "message_too_large",
             message: "Request exceeds 16 MiB"
         )
-        if var encoded = try? encoder.encode(response) {
+        if var encoded = try? JSONEncoder().encode(response) {
             encoded.append(0x0A)
             _ = writeAll(fd: clientFd, data: encoded)
         }
-    }
-
-    private final class ResponseBox: @unchecked Sendable {
-        var value: RPCResponse?
-    }
-
-    private func awaitService(_ request: RPCRequest) -> RPCResponse {
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = ResponseBox()
-        let svc = service
-        Task {
-            box.value = await svc.handle(request)
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return box.value ?? RPCResponse.failure(
-            id: request.id,
-            code: "internal_error",
-            message: "Service returned no response"
-        )
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {

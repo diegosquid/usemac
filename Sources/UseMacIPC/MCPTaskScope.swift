@@ -32,17 +32,24 @@ final class MCPTaskScope: @unchecked Sendable {
         return id
     }
 
-    /// Stamps the connection's task on a request that names none (`task_start` never: it opens a new task).
+    /// Stamps the connection's task on a request that names none (`task_start` and piggybacked `taskStart` never:
+    /// they open a new task).
     func stamp(_ request: inout RPCRequest, explicitTaskId: String?, now: Date = Date()) {
-        guard request.method != .taskStart, request.taskId == nil else { return }
-        request.taskId = explicitTaskId ?? currentTaskId(now: now)
+        guard request.method != .taskStart, request.taskStart == nil else { return }
+        if request.taskId == nil {
+            request.taskId = explicitTaskId ?? currentTaskId(now: now)
+        }
+        if request.taskComplete != nil, request.taskComplete?.taskId == nil {
+            request.taskComplete?.taskId = request.taskId
+        }
     }
 
     /// Tools that work in a window or tab take an optional `taskId`, for a connection that runs several tasks.
     static let taskScopedTools: Set<String> = [
-        "usemac_observe", "usemac_act", "usemac_screenshot",
-        "usemac_browser_observe", "usemac_browser_extract", "usemac_browser_screenshot", "usemac_browser_act",
-        "usemac_vision_query"
+        "usemac_observe", "usemac_act", "usemac_browser_open", "usemac_browser_extract",
+        "usemac_screenshot", "usemac_vision", "usemac_skill", "usemac_session",
+        // Legacy aliases kept for callers or tests checking them directly
+        "usemac_browser_observe", "usemac_browser_screenshot", "usemac_browser_act", "usemac_vision_query"
     ]
 
     /// The tool with a `taskId` argument added to its schema when it is task-scoped and has none yet.
@@ -53,7 +60,7 @@ final class MCPTaskScope: @unchecked Sendable {
               properties["taskId"] == nil else { return tool }
         properties["taskId"] = [
             "type": "string",
-            "description": "Optional taskId from usemac_task_start. Leave it out when this connection started one task: UseMac uses that task. Without tabId, browser tools go to this task's own last tab."
+            "description": "Task id (auto-filled)."
         ]
         schema["properties"] = .object(properties)
         var copy = tool
@@ -61,17 +68,23 @@ final class MCPTaskScope: @unchecked Sendable {
         return copy
     }
 
-    /// Notes a finished request: `task_start` opens a task on this connection, `task_complete` closes it.
+    /// Notes a finished request: `task_start` (or piggybacked `taskStart`) opens a task on this connection,
+    /// `task_complete` (or piggybacked `taskComplete`) closes it.
     func record(_ request: RPCRequest, response: RPCResponse, now: Date = Date()) {
-        guard response.ok, let taskId = response.taskId else { return }
+        guard response.ok else { return }
+        let startsTask = request.method == .taskStart || request.taskStart != nil
+        let completesTask = request.method == .taskComplete || request.taskComplete != nil
+        guard startsTask || completesTask else { return }
+
         lock.lock(); defer { lock.unlock() }
-        switch request.method {
-        case .taskStart:
-            openTasks[taskId] = now
-        case .taskComplete:
-            openTasks.removeValue(forKey: taskId)
-        default:
-            break
+        if startsTask && !completesTask {
+            if let taskId = response.taskId {
+                openTasks[taskId] = now
+            }
+        } else if completesTask {
+            if let taskId = response.taskId ?? request.taskComplete?.taskId ?? request.taskId {
+                openTasks.removeValue(forKey: taskId)
+            }
         }
     }
 }

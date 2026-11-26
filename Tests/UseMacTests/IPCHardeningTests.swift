@@ -497,13 +497,13 @@ final class IPCHardeningTests: XCTestCase {
         let instructions = try XCTUnwrap(initResult["instructions"] as? String)
         XCTAssertTrue(instructions.contains("untrusted data"))
 
-        // 2. tools/list returns 17 tools, all with boolean annotations.readOnlyHint
+        // 2. tools/list returns 9 compact tools, all with boolean annotations.readOnlyHint
         let listLine = #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#
         let listRaw = await mcp.processLine(listLine)
         let listObj = try parseJSON(try XCTUnwrap(listRaw))
         let listResult = try XCTUnwrap(listObj["result"] as? [String: Any])
         let tools = try XCTUnwrap(listResult["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 17)
+        XCTAssertEqual(tools.count, 9)
 
         for tool in tools {
             let name = try XCTUnwrap(tool["name"] as? String)
@@ -515,9 +515,9 @@ final class IPCHardeningTests: XCTestCase {
         let actAnnotations = try XCTUnwrap(actTool["annotations"] as? [String: Any])
         XCTAssertEqual(actAnnotations["destructiveHint"] as? Bool, true)
 
-        let statusTool = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "usemac_status" }))
-        let statusAnnotations = try XCTUnwrap(statusTool["annotations"] as? [String: Any])
-        XCTAssertEqual(statusAnnotations["readOnlyHint"] as? Bool, true)
+        let discoverTool = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "usemac_discover" }))
+        let discoverAnnotations = try XCTUnwrap(discoverTool["annotations"] as? [String: Any])
+        XCTAssertEqual(discoverAnnotations["readOnlyHint"] as? Bool, true)
 
         // 3. Wrong argument type returns JSON-RPC error -32602 naming the key
         let badArgsLine = #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"usemac_browser_observe","arguments":{"tabId":"77"}}}"#
@@ -527,5 +527,71 @@ final class IPCHardeningTests: XCTestCase {
         XCTAssertEqual(rpcError["code"] as? Int, -32602)
         let message = try XCTUnwrap(rpcError["message"] as? String)
         XCTAssertTrue(message.contains("tabId"), "Expected error message to mention tabId, got: \(message)")
+    }
+
+    func testServerSupportsConcurrentPipelinedRequestsOnSingleSocket() throws {
+        final class PipeliningService: UseMacServiceProtocol, @unchecked Sendable {
+            func handle(_ request: RPCRequest) async -> RPCResponse {
+                if request.id == "slow" {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+                return RPCResponse.success(id: request.id, latencyMs: 0.1, pong: request.id)
+            }
+        }
+
+        let socketPath = makeTempSocketPath(prefix: "usemac-ht-pipe")
+        let server = UnixSocketServer(socketPath: socketPath, service: PipeliningService())
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { Darwin.close(fd) }
+
+        var noSigPipe: Int32 = 1
+        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: 5, tv_usec: 0)
+        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = makeSockAddrUn(path: socketPath)
+        let connectRes = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                Darwin.connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        XCTAssertEqual(connectRes, 0)
+
+        // Write 2 pipelined requests in one payload and half-close the write side to verify in-flight draining.
+        let payload = "{\"id\":\"slow\",\"method\":\"ping\"}\n{\"id\":\"fast\",\"method\":\"ping\"}\n"
+        let payloadBytes = Array(payload.utf8)
+        let written = payloadBytes.withUnsafeBytes { rawBuf in
+            Darwin.write(fd, rawBuf.baseAddress!, rawBuf.count)
+        }
+        XCTAssertEqual(written, payloadBytes.count)
+        Darwin.shutdown(fd, SHUT_WR)
+
+        var received = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = Darwin.read(fd, &buf, buf.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if n == 0 { break }
+            received.append(contentsOf: buf[..<n])
+        }
+
+        let lines = String(decoding: received, as: UTF8.self)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertEqual(lines.count, 2, "Expected 2 pipelined responses, got: \(lines)")
+        let responses = try lines.map { try JSONDecoder().decode(RPCResponse.self, from: Data($0.utf8)) }
+        // Because requests run concurrently on the server, "fast" finishes before "slow"!
+        XCTAssertEqual(responses.map(\.id), ["fast", "slow"])
+        XCTAssertEqual(responses.map(\.pong), ["fast", "slow"])
     }
 }
