@@ -83,6 +83,8 @@ public enum UseMacErrorGuide {
             return "The captured window is too small to trust (a helper strip or hidden window). Do not draw conclusions from it: observe the app instead, or make the right window visible and retry."
         case "POLICY_BLOCKED", "POLICY_LOCKED", "URL_BLOCKED", "UPLOAD_BLOCKED":
             return "Blocked by a UseMac safety rule. Stop and tell the user; do not look for another route."
+        case "SELF_TARGET_BLOCKED":
+            return "UseMac never observes or acts on its own windows. Stop and tell the user; never try to change UseMac's settings through its UI."
         case "DAEMON_REQUIRED":
             return "Ask the user to open UseMac.app; do not bypass it with --standalone."
         default:
