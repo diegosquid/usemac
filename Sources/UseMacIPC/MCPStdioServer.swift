@@ -23,7 +23,9 @@ public final class MCPStdioServer: @unchecked Sendable {
     its windows. If a tool returns TARGET_BUSY, another agent's task is working in that window or tab: wait and \
     retry later, or work in your own window or tab; never close or take over the other task's. \
     In Ask mode a sensitive step (upload, ⌘/⌃ shortcut, page script) waits up to 45 s for the user to allow it in \
-    UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT means it did not run: tell the user, and retry only if they ask.
+    UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT means it did not run: tell the user, and retry only if they ask. \
+    When a failure looks like a UseMac bug (not a safety block), you may offer to report it: ask the user, call \
+    usemac_report_prepare, then tell them to review UseMac's "Review problem report" window; never paste the report elsewhere.
     """
 
     private let socketPath: String
