@@ -105,9 +105,9 @@ public final class AppState: ObservableObject {
         static let autoShowHUDOnActivity = "usemac.hud.autoShowOnActivity"
         static let hudStreamMode = "usemac.hud.streamMode"
         static let hudIsLarge = "usemac.hud.isLarge"
-        static let safetyPolicy = "usemac.safety.policy"
-        static let safetyPolicyBeforePause = "usemac.safety.policyBeforePause"
-        static let safetyKillSwitchTripped = "usemac.safety.killSwitchTripped"
+        static let safetyPolicy = StartupSafetyState.DefaultsKey.policy
+        static let safetyPolicyBeforePause = StartupSafetyState.DefaultsKey.policyBeforePause
+        static let safetyKillSwitchTripped = StartupSafetyState.DefaultsKey.killSwitchTripped
         static let onboardingAgentConnected = "usemac.onboarding.agentConnected"
         static let onboardingDismissed = "usemac.onboarding.dismissed"
         static let setupGuideCompleted = "usemac.onboarding.setupGuideCompleted"
@@ -225,27 +225,9 @@ public final class AppState: ObservableObject {
         let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore())
         let defaults = UserDefaults.standard
 
-        let savedPolicy = defaults.string(forKey: DefaultsKeys.safetyPolicy)
-            .flatMap(GovernancePolicy.init(rawValue:))
-        let savedBeforePause = defaults.string(forKey: DefaultsKeys.safetyPolicyBeforePause)
-            .flatMap(GovernancePolicy.init(rawValue:))
-        let savedKillSwitchTripped = defaults.bool(forKey: DefaultsKeys.safetyKillSwitchTripped)
-
-        if let savedPolicy {
-            engineService.setGovernancePolicy(savedPolicy)
-        }
-        if savedKillSwitchTripped {
-            engineService.tripKillSwitch(true)
-        }
-
-        let resolvedBeforePause: GovernancePolicy?
-        if let savedBeforePause, savedBeforePause != .paused {
-            resolvedBeforePause = savedBeforePause
-        } else if let savedPolicy, savedPolicy != .paused {
-            resolvedBeforePause = savedPolicy
-        } else {
-            resolvedBeforePause = nil
-        }
+        // Nothing saved, or an unknown mode, starts in Autonomous with the Emergency stop off (StartupSafetyStateTests).
+        let startupSafety = StartupSafetyState.load(from: defaults)
+        startupSafety.apply(to: engineService)
 
         let savedCorner = defaults.string(forKey: DefaultsKeys.hudCorner)
             .flatMap(HUDCorner.init(rawValue:)) ?? .bottomTrailing
@@ -258,7 +240,7 @@ public final class AppState: ObservableObject {
         let savedOnboardingDismissed = defaults.bool(forKey: DefaultsKeys.onboardingDismissed)
 
         self.engine = engineService
-        self.policyBeforePause = resolvedBeforePause
+        self.policyBeforePause = startupSafety.policyBeforePause
         self.status = engineService.currentStatus()
         self.pairedApp = engineService.getPairedApp()
         self.runningApps = engineService.listRunningApps()
