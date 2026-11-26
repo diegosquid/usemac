@@ -21,10 +21,25 @@ public enum AuditLogSettings {
         }
     }
 
+    private static let recordsTypedTextLock = NSLock()
+    nonisolated(unsafe) private static var recordsTypedTextValue = false
+
     /// Whether audit entries keep typed text and page scripts. Off by default: they keep only the length.
+    ///
+    /// Kept in memory: the app sets it at launch from the sealed settings and when the user changes it in Settings,
+    /// and saves it through SafetySettingsStore. Reading the preferences each time would let a `defaults write` turn
+    /// it on behind the user's back.
     public static var recordsTypedText: Bool {
-        get { UserDefaults.standard.bool(forKey: recordTypedTextKey) }
-        set { UserDefaults.standard.set(newValue, forKey: recordTypedTextKey) }
+        get {
+            recordsTypedTextLock.lock()
+            defer { recordsTypedTextLock.unlock() }
+            return recordsTypedTextValue
+        }
+        set {
+            recordsTypedTextLock.lock()
+            recordsTypedTextValue = newValue
+            recordsTypedTextLock.unlock()
+        }
     }
 }
 

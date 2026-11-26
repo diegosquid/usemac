@@ -11,12 +11,37 @@ public struct SavedSafetySettings: Equatable, Sendable {
     public var policyBeforePause: String?
     public var killSwitchTripped: Bool
     public var debugCaptureEnabled: Bool
+    /// The app and site rules (`TargetRulesStore`), each nil when never saved (the rules' defaults apply).
+    public var rulesMode: String?
+    public var deniedApps: [String]?
+    public var deniedSites: [String]?
+    public var allowedApps: [String]?
+    public var allowedSites: [String]?
+    /// Whether History keeps typed text and page scripts (`AuditLogSettings.recordsTypedText`).
+    public var recordTypedText: Bool
 
-    public init(policy: String?, policyBeforePause: String?, killSwitchTripped: Bool, debugCaptureEnabled: Bool) {
+    public init(
+        policy: String?,
+        policyBeforePause: String?,
+        killSwitchTripped: Bool,
+        debugCaptureEnabled: Bool,
+        rulesMode: String? = nil,
+        deniedApps: [String]? = nil,
+        deniedSites: [String]? = nil,
+        allowedApps: [String]? = nil,
+        allowedSites: [String]? = nil,
+        recordTypedText: Bool = false
+    ) {
         self.policy = policy
         self.policyBeforePause = policyBeforePause
         self.killSwitchTripped = killSwitchTripped
         self.debugCaptureEnabled = debugCaptureEnabled
+        self.rulesMode = rulesMode
+        self.deniedApps = deniedApps
+        self.deniedSites = deniedSites
+        self.allowedApps = allowedApps
+        self.allowedSites = allowedSites
+        self.recordTypedText = recordTypedText
     }
 
     /// What UseMac saves for `state`.
@@ -27,6 +52,53 @@ public struct SavedSafetySettings: Equatable, Sendable {
             killSwitchTripped: state.killSwitchTripped,
             debugCaptureEnabled: state.debugCaptureEnabled
         )
+    }
+
+    /// These values with the four in `state` replaced; the rules and Record typed text stay.
+    public func with(state: StartupSafetyState) -> SavedSafetySettings {
+        var next = SavedSafetySettings(state)
+        next.rulesMode = rulesMode
+        next.deniedApps = deniedApps
+        next.deniedSites = deniedSites
+        next.allowedApps = allowedApps
+        next.allowedSites = allowedSites
+        next.recordTypedText = recordTypedText
+        return next
+    }
+
+    /// The app and site rules these values give: a list never saved is the rules' default.
+    public var rules: TargetRules {
+        let base = TargetRules.defaults
+        return TargetRules(
+            mode: rulesMode.flatMap(TargetRules.Mode.init(rawValue:)) ?? base.mode,
+            deniedApps: deniedApps ?? base.deniedApps,
+            deniedSites: deniedSites ?? base.deniedSites,
+            allowedApps: allowedApps ?? base.allowedApps,
+            allowedSites: allowedSites ?? base.allowedSites
+        ).normalized()
+    }
+
+    /// These values with `rules` saved in full.
+    public func with(rules: TargetRules) -> SavedSafetySettings {
+        var next = self
+        let cleaned = rules.normalized()
+        next.rulesMode = cleaned.mode.rawValue
+        next.deniedApps = cleaned.deniedApps
+        next.deniedSites = cleaned.deniedSites
+        next.allowedApps = cleaned.allowedApps
+        next.allowedSites = cleaned.allowedSites
+        return next
+    }
+
+    /// These values with the rules back to their defaults (nothing saved).
+    public var withDefaultRules: SavedSafetySettings {
+        var next = self
+        next.rulesMode = nil
+        next.deniedApps = nil
+        next.deniedSites = nil
+        next.allowedApps = nil
+        next.allowedSites = nil
+        return next
     }
 
     /// What UseMac starts with from these values.
@@ -130,6 +202,10 @@ public enum SafetySealCheck: Equatable, Sendable {
     case verified
     /// No marker and no key: a new install, or the first launch of a version that seals. UseMac seals now.
     case firstSeal
+    /// A matching seal in the first format (`SafetySeal.legacyVersion`), which covered only the mode, the Emergency
+    /// stop and Debug capture. UseMac keeps those and the rules as saved, turns Record typed text off, and seals
+    /// everything in the current format.
+    case upgraded
     /// The values may have been changed outside UseMac. UseMac starts from `StartupSafetyState.tamperFallback`.
     case tampered(SafetySealProblem)
 
@@ -145,13 +221,34 @@ public enum SafetySealCheck: Equatable, Sendable {
 /// settings (`defaults write`) and relaunch UseMac. With it, values UseMac didn't write fail the check and UseMac
 /// starts paused. Only `SafetySettingsStore` writes the settings and the seal.
 public enum SafetySeal {
-    /// What the marker holds while the settings are sealed in this format.
-    public static let version = 1
+    /// What the marker holds while the settings are sealed in this format. Version 2 adds the app and site rules
+    /// and Record typed text.
+    public static let version = 2
+    /// The first format: the mode, the mode to resume to, the Emergency stop and Debug capture. A seal in it still
+    /// opens once, to move to `version` (`SafetySealCheck.upgraded`).
+    public static let legacyVersion = 1
 
-    /// The bytes the seal covers. Every value has its name, and every string its length, so no two sets of values
-    /// encode the same way. Changing this format changes every seal: it needs a new `version`.
+    /// The bytes the seal covers. Every value has its name, every string its length and every list its count, so no
+    /// two sets of values encode the same way. Changing this format changes every seal: it needs a new `version`.
     public static func canonicalEncoding(of saved: SavedSafetySettings, generation: UInt64) -> Data {
         var text = "UseMac safety seal v\(version)\n"
+        text += field("policy", saved.policy)
+        text += field("policyBeforePause", saved.policyBeforePause)
+        text += "killSwitchTripped=\(saved.killSwitchTripped ? 1 : 0)\n"
+        text += "debugCaptureEnabled=\(saved.debugCaptureEnabled ? 1 : 0)\n"
+        text += field("rulesMode", saved.rulesMode)
+        text += list("deniedApps", saved.deniedApps)
+        text += list("deniedSites", saved.deniedSites)
+        text += list("allowedApps", saved.allowedApps)
+        text += list("allowedSites", saved.allowedSites)
+        text += "recordTypedText=\(saved.recordTypedText ? 1 : 0)\n"
+        text += "generation=\(generation)\n"
+        return Data(text.utf8)
+    }
+
+    /// The first format's bytes, only to open a seal made before version 2.
+    static func legacyEncoding(of saved: SavedSafetySettings, generation: UInt64) -> Data {
+        var text = "UseMac safety seal v\(legacyVersion)\n"
         text += field("policy", saved.policy)
         text += field("policyBeforePause", saved.policyBeforePause)
         text += "killSwitchTripped=\(saved.killSwitchTripped ? 1 : 0)\n"
@@ -165,23 +262,37 @@ public enum SafetySeal {
         return "\(name)=\(value.utf8.count):\(value)\n"
     }
 
+    private static func list(_ name: String, _ values: [String]?) -> String {
+        guard let values else { return "\(name)~\n" }
+        return "\(name)#\(values.count)\n" + values.map { "-\($0.utf8.count):\($0)\n" }.joined()
+    }
+
     /// The seal for `saved`, base64.
     public static func seal(_ saved: SavedSafetySettings, with secret: SafetySealSecret) -> String {
-        let code = HMAC<SHA256>.authenticationCode(
-            for: canonicalEncoding(of: saved, generation: secret.generation),
-            using: SymmetricKey(data: secret.key)
-        )
-        return Data(code).base64EncodedString()
+        sealCode(canonicalEncoding(of: saved, generation: secret.generation), key: secret.key)
+    }
+
+    /// A seal in the first format, for tests of the move to `version`.
+    static func legacySeal(_ saved: SavedSafetySettings, with secret: SafetySealSecret) -> String {
+        sealCode(legacyEncoding(of: saved, generation: secret.generation), key: secret.key)
+    }
+
+    private static func sealCode(_ data: Data, key: Data) -> String {
+        Data(HMAC<SHA256>.authenticationCode(for: data, using: SymmetricKey(data: key))).base64EncodedString()
     }
 
     /// Whether `seal` is the seal for `saved` (compared in constant time).
     public static func isValid(_ seal: String?, for saved: SavedSafetySettings, with secret: SafetySealSecret) -> Bool {
+        matches(seal, canonicalEncoding(of: saved, generation: secret.generation), key: secret.key)
+    }
+
+    static func isValidLegacy(_ seal: String?, for saved: SavedSafetySettings, with secret: SafetySealSecret) -> Bool {
+        matches(seal, legacyEncoding(of: saved, generation: secret.generation), key: secret.key)
+    }
+
+    private static func matches(_ seal: String?, _ data: Data, key: Data) -> Bool {
         guard let seal, let code = Data(base64Encoded: seal), code.count == SHA256.byteCount else { return false }
-        return HMAC<SHA256>.isValidAuthenticationCode(
-            code,
-            authenticating: canonicalEncoding(of: saved, generation: secret.generation),
-            using: SymmetricKey(data: secret.key)
-        )
+        return HMAC<SHA256>.isValidAuthenticationCode(code, authenticating: data, using: SymmetricKey(data: key))
     }
 
     /// Decides what the saved values are worth. `marker` is the saved seal version, nil when there is none.
@@ -195,13 +306,16 @@ public enum SafetySeal {
             case .unreadable: return .tampered(.keyUnreadable)
             }
         }
-        guard marker == version else { return .tampered(.unknownVersion) }
+        guard marker == version || marker == legacyVersion else { return .tampered(.unknownVersion) }
         switch key {
         case .none: return .tampered(.keyMissing)
         case .invalid: return .tampered(.keyInvalid)
         case .unreadable: return .tampered(.keyUnreadable)
         case .found(let secret):
             guard seal != nil else { return .tampered(.sealMissing) }
+            if marker == legacyVersion {
+                return isValidLegacy(seal, for: saved, with: secret) ? .upgraded : .tampered(.sealMismatch)
+            }
             return isValid(seal, for: saved, with: secret) ? .verified : .tampered(.sealMismatch)
         }
     }
@@ -246,11 +360,11 @@ public struct SafetySealNotice: Equatable, Sendable {
         menuSubtitle = "Automation is paused. Check Settings → Safety before you resume."
         if problem == .keyUnreadable {
             title = "UseMac couldn't check its safety settings"
-            message = "UseMac couldn't read its safety seal from the Keychain, so automation is paused and Debug capture is off. Check your settings in Settings → Safety before you resume."
+            message = "UseMac couldn't read its safety seal from the Keychain, so automation is paused, Debug capture and Record typed text are off, and the app and site rules are back to their defaults. Check your settings in Settings → Safety and General before you resume."
             menuTitle = "Couldn't Check Safety Settings"
         } else {
             title = "Safety settings changed outside UseMac"
-            message = "UseMac's safety settings were changed outside UseMac, so automation is paused and Debug capture is off. Check them in Settings → Safety before you resume."
+            message = "UseMac's safety settings were changed outside UseMac, so automation is paused, Debug capture and Record typed text are off, and the app and site rules are back to their defaults. Check them in Settings → Safety and General before you resume."
             menuTitle = "Safety Settings Changed Outside UseMac"
         }
     }
@@ -264,11 +378,15 @@ public struct SafetySealNotice: Equatable, Sendable {
             return sealed
                 ? "Sealed the safety settings (a new install, or the first launch of a version that seals them)"
                 : "Couldn't seal the safety settings: the Keychain didn't save the seal key. UseMac tries again at the next change."
+        case .upgraded:
+            return sealed
+                ? "Sealed the safety settings with the app and site rules and Record typed text (turned off)"
+                : "Couldn't reseal the safety settings: the Keychain didn't save the seal key. UseMac tries again at the next change."
         case .tampered(let problem):
             let lead = problem == .keyUnreadable
                 ? "Couldn't check the safety settings"
                 : "Safety settings changed outside UseMac"
-            return "\(lead) (\(problem.auditDetail)). Started paused with Debug capture off."
+            return "\(lead) (\(problem.auditDetail)). Started paused with Debug capture and Record typed text off and the default app and site rules."
         }
     }
 }
