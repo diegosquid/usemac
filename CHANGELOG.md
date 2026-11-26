@@ -8,6 +8,16 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [0.7.0-beta.1] - 2026-11-26
 
+### Added
+
+- **Debug capture**, for developing UseMac itself: once you turn it on in **Settings → General → Developer**, agents
+  can save PNGs of UseMac's own windows (the live preview, Settings, the setup guide) and of the screen around the
+  preview, one capture or a short burst to see an animation (`debug_capture`, CLI `usemac debug capture`). It only
+  takes screenshots: agents still can't click or type in UseMac's windows. It is off by default, and only your own
+  click on **Turn On** in the confirmation turns it on; no method, MCP tool or CLI command can. While it is on, the
+  menu bar menu says "Debug Capture: On" and can turn it off. While it is off, agents get `DEBUG_CAPTURE_OFF` (CLI
+  exit code 4).
+
 ### Changed
 
 - **The live preview is a stack that shuffles itself.** With several agents at once, up to two cards sit behind the

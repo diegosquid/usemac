@@ -20,6 +20,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     public let approvals = ApprovalBroker()
     /// `report_prepare` drafts waiting in the app's review window (UseMacEngineService+ProblemReport.swift).
     public let problemReports = ProblemReportBroker()
+    /// Debug capture: off until the user turns it on in Settings (UseMacEngineService+DebugCapture.swift).
+    let debugCaptureGate = DebugCaptureGate()
     /// The audit log on disk; nil keeps it in memory only (tests, in-process CLI calls).
     public let auditStore: AuditLogStore?
 
@@ -1591,6 +1593,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
             response = prepareProblemReport(request, startNs: startNs)
+
+        case .debugCapture:
+            // A read of UseMac's own windows: the Kill Switch and pause stop it like a screenshot.
+            if let reason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {
+                response = blockedPolicyResponse(request: request, startNs: startNs, targetApp: WorkspaceMonitor.useMacAppName, activityTitle: "Debug capture blocked", reason: reason)
+                break
+            }
+            response = await handleDebugCapture(request, startNs: startNs)
         }
 
         notifyStateChanged()

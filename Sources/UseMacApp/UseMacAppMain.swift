@@ -325,6 +325,19 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
             menu.addItem(modeItem)
         }
 
+        // "Debug Capture: On" while agents may capture UseMac's own windows, with a way to turn it off right here.
+        if appState.isDebugCaptureEnabled {
+            let debugItem = NSMenuItem(title: DebugCaptureNotice.menuTitle, action: #selector(openDeveloperSettings), keyEquivalent: "")
+            debugItem.subtitle = DebugCaptureNotice.menuSubtitle
+            debugItem.toolTip = "Open Settings → Developer"
+            debugItem.target = self
+            menu.addItem(debugItem)
+
+            let debugOffItem = NSMenuItem(title: DebugCaptureNotice.menuTurnOffTitle, action: #selector(turnOffDebugCapture), keyEquivalent: "")
+            debugOffItem.target = self
+            menu.addItem(debugOffItem)
+        }
+
         let perms = appState.status.permissions
         if !perms.accessibilityGranted || !perms.screenRecordingGranted {
             let permsItem = NSMenuItem(
@@ -494,6 +507,14 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
 
     @objc private func openSafetySettings() {
         controlCenterController.show(section: .overview, scrollTo: .safety)
+    }
+
+    @objc private func openDeveloperSettings() {
+        controlCenterController.show(section: .overview, scrollTo: .developer)
+    }
+
+    @objc private func turnOffDebugCapture() {
+        appState.turnOffDebugCapture()
     }
 
     @objc private func checkForUpdates() {

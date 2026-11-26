@@ -30,6 +30,8 @@ public final class ControlCenterRouter: ObservableObject {
 /// Groups in General that other parts of the app can open Settings at.
 public enum ControlCenterAnchor: Hashable {
     case safety
+    /// Developer → Debug capture (the menu bar's "Debug Capture: On" line).
+    case developer
 }
 
 // MARK: - Window Drag Strip for Transparent Titlebar
@@ -353,6 +355,8 @@ public struct ControlCenterView: View {
                 AuditLogSettingsGroup(store: appState.engine.auditStore, onOpenHistory: { router.selection = .audit })
                 TargetRulesGroupView()
                 SoftwareUpdatesGroupView(updater: appState.updater)
+                DebugCaptureGroupView(appState: appState)
+                    .id(ControlCenterAnchor.developer)
             }
             .frame(maxWidth: 640, alignment: .leading)
             .padding(.horizontal, 34)
