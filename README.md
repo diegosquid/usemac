@@ -188,6 +188,7 @@ node --test Tests/ExtensionTests/*.test.mjs
 - [Agent Guide](.agents/AGENTS.md): setup, Unix socket, MCP and CLI
 - [Agent Skill](.agents/skills/usemac/SKILL.md)
 - [Chrome Extension Bridge Protocol](docs/BRIDGE-PROTOCOL.md)
+- [Live smoke run](docs/SMOKE.md): `scripts/smoke.sh`, run before every release
 
 ## License
 
