@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Acme Finance — New expense</title>
+  <!-- Fixture for scripts/bench.sh: a typical web-app form, served locally on 127.0.0.1. No scripts, no network. -->
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #0f172a; background: #f1f5f9; }
+    header { display: flex; align-items: center; justify-content: space-between; padding: 14px 28px; background: #fff; border-bottom: 1px solid #e2e8f0; }
+    header nav a { margin-left: 18px; color: #475569; text-decoration: none; }
+    .layout { display: grid; grid-template-columns: 200px 1fr; gap: 24px; padding: 24px 28px; }
+    aside a { display: block; padding: 7px 10px; border-radius: 8px; color: #334155; text-decoration: none; }
+    aside a[aria-current] { background: #e0e7ff; color: #3730a3; font-weight: 600; }
+    main { display: grid; gap: 20px; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 22px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
+    label { display: grid; gap: 5px; font-size: 13px; color: #475569; }
+    input, select, textarea { font: inherit; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; color: #0f172a; }
+    textarea { min-height: 64px; }
+    .full { grid-column: span 2; }
+    .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+    button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #e2e8f0; }
+    th { color: #64748b; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Acme Finance</strong>
+    <nav aria-label="Account">
+      <a href="#">Help</a>
+      <a href="#">Notifications</a>
+      <a href="#">Dana Rivera</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside aria-label="Sections">
+      <a href="#">Overview</a>
+      <a href="#">Cards</a>
+      <a href="#" aria-current="page">Expenses</a>
+      <a href="#">Invoices</a>
+      <a href="#">Vendors</a>
+      <a href="#">Settings</a>
+    </aside>
+    <main>
+      <section class="card">
+        <h1 style="margin: 0 0 14px; font-size: 20px;">New expense</h1>
+        <form onsubmit="return false">
+          <div class="grid">
+            <label>Vendor <input name="vendor" placeholder="Who did you pay?" /></label>
+            <label>Amount <input name="amount" inputmode="decimal" placeholder="0.00" /></label>
+            <label>Category
+              <select name="category">
+                <option>Cloud hosting</option>
+                <option>Software</option>
+                <option>Travel</option>
+                <option>Meals</option>
+                <option>Other</option>
+              </select>
+            </label>
+            <label>Date <input name="date" type="date" /></label>
+            <label class="full">Receipt <input name="receipt" type="file" accept="application/pdf,image/*" /></label>
+            <label class="full">Notes <textarea name="notes" placeholder="Optional"></textarea></label>
+          </div>
+          <div class="actions">
+            <button type="button">Save draft</button>
+            <button type="submit" class="primary">Submit expense</button>
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2 style="margin: 0 0 10px; font-size: 16px;">Recent expenses</h2>
+        <table>
+          <thead><tr><th>Vendor</th><th>Category</th><th>Date</th><th>Amount</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>Northwind Hosting</td><td>Cloud hosting</td><td>2026-11-02</td><td>$312.00</td><td>Paid</td></tr>
+            <tr><td>Contoso Analytics</td><td>Software</td><td>2026-10-28</td><td>$49.00</td><td>Paid</td></tr>
+            <tr><td>Fabrikam Air</td><td>Travel</td><td>2026-10-19</td><td>$684.20</td><td>Approved</td></tr>
+            <tr><td>Blue Yonder Cafe</td><td>Meals</td><td>2026-10-17</td><td>$38.50</td><td>Paid</td></tr>
+            <tr><td>Litware Design</td><td>Software</td><td>2026-10-03</td><td>$120.00</td><td>Pending</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

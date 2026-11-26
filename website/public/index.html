@@ -6,7 +6,7 @@
   <title>UseMac — Computer Use, Rebuilt for Mac Speed</title>
   <meta name="description" content="Native macOS background computer control for AI agents. Sub-millisecond Unix socket RPC, zero-focus Chrome automation, live corner HUD preview, and on-device Apple Silicon MLX vision." />
   <meta property="og:title" content="UseMac — Computer Use, Rebuilt for Mac Speed" />
-  <meta property="og:description" content="Zero-focus background automation for macOS & Chrome with live floating preview HUD and hybrid Apple Silicon MLX vision. 97% fewer vision tokens, 0.14 ms local IPC." />
+  <meta property="og:description" content="Zero-focus background automation for macOS & Chrome with live floating preview HUD and hybrid Apple Silicon MLX vision. 0.04 ms local IPC round trips." />
   <link rel="canonical" href="https://usemac.app/" />
   <meta property="og:url" content="https://usemac.app/" />
   <meta property="og:image" content="https://usemac.app/assets/og-image.png" />
@@ -152,66 +152,52 @@
           </div>
 
           <div class="mac-desktop">
-            <!-- Authentic Claude Code macOS Terminal Window (main workspace on the left) -->
-            <div class="cc-window">
-              <div class="cc-titlebar">
+            <!-- A generic AI agent session in a macOS terminal window (main workspace on the left) -->
+            <div class="term-window">
+              <div class="term-titlebar">
                 <div class="traffic-lights">
                   <span class="tl-red"></span>
                   <span class="tl-yellow"></span>
                   <span class="tl-green"></span>
                 </div>
-                <span class="cc-title">claude &mdash; ~/projects/acme</span>
-                <span class="cc-spacer"></span>
+                <span class="term-title">agent &mdash; ~/projects/acme</span>
+                <span class="term-spacer"></span>
               </div>
 
-              <div class="cc-body">
-                <!-- Authentic Claude Code Welcome Strip -->
-                <div class="cc-welcome">
-                  <div class="cc-mascot" aria-hidden="true">
-                    <svg width="38" height="24" viewBox="0 0 16 10" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">
-                      <rect x="2" y="0" width="12" height="8" fill="#d97757" />
-                      <rect x="0" y="4" width="2" height="2" fill="#d97757" />
-                      <rect x="14" y="4" width="2" height="2" fill="#d97757" />
-                      <rect x="4" y="2" width="1" height="2" fill="#141720" />
-                      <rect x="11" y="2" width="1" height="2" fill="#141720" />
-                      <rect x="3" y="8" width="1" height="2" fill="#d97757" />
-                      <rect x="5" y="8" width="1" height="2" fill="#d97757" />
-                      <rect x="10" y="8" width="1" height="2" fill="#d97757" />
-                      <rect x="12" y="8" width="1" height="2" fill="#d97757" />
-                    </svg>
-                  </div>
-                  <div class="cc-meta">
-                    <div><strong>Claude Code</strong> <span class="cc-dim">v2.1</span></div>
-                    <div class="cc-dim">Opus 4.6 &middot; ~/projects/acme</div>
+              <div class="term-body">
+                <!-- Session line: any MCP or CLI agent connected to UseMac -->
+                <div class="term-session">
+                  <span class="term-session-dot"></span>
+                  <span>Your AI agent</span>
+                  <span class="term-dim">&middot; UseMac tools over MCP</span>
+                </div>
+
+                <!-- The user's request -->
+                <div class="term-prompt">
+                  <span class="term-who">you</span>
+                  <div class="term-prompt-copy">
+                    Submit my Q4 cloud expense ($480) on Acme Finance with receipt.pdf
                   </div>
                 </div>
 
-                <!-- User Prompt calling /usemac -->
-                <div class="cc-prompt">
-                  <span class="cc-gt">&rsaquo;</span>
-                  <div class="cc-prompt-copy">
-                    <span class="slash-cmd">/usemac</span> submit my Q4 cloud expense ($480) on Acme Finance with receipt.pdf
-                  </div>
+                <!-- The UseMac tool calls the agent makes -->
+                <div class="term-stream" id="agentStream">
+                  <div class="term-step" data-idx="0"><span class="term-bullet"></span><span><code class="term-tool">usemac_browser_open</code> acme.app/expenses</span></div>
+                  <div class="term-step" data-idx="1"><span class="term-bullet"></span><span><code class="term-tool">usemac_browser_act</code> fill vendor &amp; amount</span></div>
+                  <div class="term-step" data-idx="2"><span class="term-bullet"></span><span><code class="term-tool">usemac_browser_act</code> upload receipt-q4.pdf <span class="term-dim">(no Finder)</span></span></div>
+                  <div class="term-step" data-idx="3"><span class="term-bullet"></span><span><code class="term-tool">usemac_browser_act</code> click Submit expense</span></div>
                 </div>
 
-                <!-- Clean Live Tool Calls -->
-                <div class="cc-stream" id="ccStream">
-                  <div class="cc-step" data-idx="0"><span class="cc-bullet"></span><span><strong>UseMac</strong> &middot; Opening acme.app/expenses</span></div>
-                  <div class="cc-step" data-idx="1"><span class="cc-bullet"></span><span><strong>UseMac</strong> &middot; Filling vendor &amp; amount</span></div>
-                  <div class="cc-step" data-idx="2"><span class="cc-bullet"></span><span><strong>UseMac</strong> &middot; Uploading receipt-q4.pdf <span class="cc-dim">(no Finder)</span></span></div>
-                  <div class="cc-step" data-idx="3"><span class="cc-bullet"></span><span><strong>UseMac</strong> &middot; Submitting expense</span></div>
-                </div>
-
-                <!-- Final Assistant Reply -->
-                <div class="cc-reply" id="claudeReply">
-                  <span class="cc-reply-dot">&#x2713;</span>
+                <!-- The agent's answer -->
+                <div class="term-reply" id="agentReply">
+                  <span class="term-reply-dot">&#x2713;</span>
                   <span>Done &mdash; submitted <strong>Expense #2048</strong> ($480.00, <code>receipt-q4.pdf</code>).</span>
                 </div>
 
-                <!-- Bottom Input Prompt -->
-                <div class="cc-input-bar">
-                  <span class="cc-gt">&rsaquo;</span>
-                  <span class="cc-input-hint" id="ccInputHint">Running in background&hellip;</span><span class="cc-caret"></span>
+                <!-- Input line -->
+                <div class="term-input-bar">
+                  <span class="term-who term-who-idle">you</span>
+                  <span class="term-input-hint" id="agentInputHint">Running in background&hellip;</span><span class="term-caret"></span>
                 </div>
               </div>
             </div>
@@ -413,7 +399,7 @@
         </div>
 
         <div class="stage-caption">
-          <span>Stay inside Claude Code</span>
+          <span>Stay in your agent</span>
           <span class="cap-dot">&middot;</span>
           <span>Live mini-preview floats in the corner</span>
           <span class="cap-dot">&middot;</span>
@@ -435,44 +421,56 @@
         <!-- Card 1: Speed & On-Device Vision Visual -->
         <div class="studio-card span-7 reveal">
           <div class="artifact-well speed-well">
+            <!-- Numbers from scripts/bench.sh; method and raw results in README.md → Benchmarks. -->
             <div class="speed-metrics-top">
               <div class="sm-stat">
-                <span class="sm-val">0.14<small>ms</small></span>
-                <span class="sm-lbl">Local Unix socket</span>
+                <span class="sm-val">0.04<small>ms</small></span>
+                <span class="sm-lbl">Socket round trip (p50)</span>
               </div>
               <div class="sm-divider"></div>
               <div class="sm-stat">
-                <span class="sm-val sm-mint">&minus;97%</span>
-                <span class="sm-lbl">Vision tokens</span>
+                <span class="sm-val">1.2<small>ms</small></span>
+                <span class="sm-lbl">Cached window re-read</span>
               </div>
               <div class="sm-divider"></div>
               <div class="sm-stat">
-                <span class="sm-val">0.5<small>s</small></span>
-                <span class="sm-lbl">On-device MLX</span>
+                <span class="sm-val sm-mint">&minus;91%</span>
+                <span class="sm-lbl">Tokens per visual check</span>
               </div>
             </div>
 
             <div class="speed-bars">
               <div class="sp-row">
                 <div class="sp-meta">
-                  <span>Screenshot-loop agent</span>
-                  <code>1,366 tokens &middot; 3.5s</code>
+                  <span>Screenshot of a 1280&times;800 form page</span>
+                  <code>1,366 tokens</code>
                 </div>
                 <div class="sp-track"><div class="sp-fill sp-old" style="width: 100%;"></div></div>
               </div>
               <div class="sp-row">
                 <div class="sp-meta">
-                  <span class="sp-hi">UseMac + Local MLX</span>
-                  <code class="sp-hi">38 tokens &middot; 0.5s</code>
+                  <span>UseMac text snapshot of the same page</span>
+                  <code>&asymp;904 tokens</code>
                 </div>
-                <div class="sp-track"><div class="sp-fill sp-new" style="width: 5.5%;"></div></div>
+                <div class="sp-track"><div class="sp-fill sp-mid" style="width: 66%;"></div></div>
               </div>
+              <div class="sp-row">
+                <div class="sp-meta">
+                  <span class="sp-hi">Visual check, answered on your Mac</span>
+                  <code class="sp-hi">&asymp;118 tokens &middot; 2.3 s</code>
+                </div>
+                <div class="sp-track"><div class="sp-fill sp-new" style="width: 8.6%;"></div></div>
+              </div>
+              <p class="sp-method">
+                M4 Pro, macOS 15.7. Token counts are estimates.
+                <a href="https://github.com/diegosquid/usemac#benchmarks">How we measured</a>
+              </p>
             </div>
           </div>
 
           <div class="studio-copy">
             <h3>Milliseconds, not screenshot loops.</h3>
-            <p>Indexed DOM &amp; Accessibility trees plus optional on-device Apple Silicon vision replace slow cloud prints.</p>
+            <p>Agents read indexed DOM &amp; Accessibility trees as text, and can ask an on-device Apple Silicon model to check the screen instead of uploading a screenshot.</p>
           </div>
         </div>
 
