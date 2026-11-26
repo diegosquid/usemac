@@ -17,63 +17,18 @@ public enum LocalVisionError: Error, LocalizedError, Equatable {
     }
 }
 
+/// On-device Apple Vision OCR and native Swift frame-diff engine (Neural Engine, zero Python/MLX sidecar).
 public final class LocalVisionEngine: @unchecked Sendable {
     /// Every refusal for a too-small image starts with this, so callers can map it to an error code.
     public static let captureTooSmallPrefix = "CAPTURE_TOO_SMALL:"
     /// Shorter side, in pixels, below which an image is refused.
     public static let minimumImageSide = 64
 
-    private enum DefaultsKeys {
-        static let enabled = "usemac.vision.enabled"
-        static let modelId = "usemac.vision.modelId"
-    }
-
-    private let lock = NSLock()
-    private let workerQueue = DispatchQueue(label: "app.usemac.vision-worker-io", qos: .userInitiated)
-    /// Whether this engine may start the MLX worker. Only the app's engine (and `usemac serve`) may: the CLI's
-    /// standalone and read-only fallback engines run once per agent process, and each would load its own ~3 GB copy.
-    /// Those answer with Apple Vision OCR.
-    private let allowsModel: Bool
-
-    private var _enabled: Bool
-    private var _modelId: String
-    private var _installing: Bool = false
-    private var _installProgress: String?
-    private var _lastError: String?
-
-    private var workerProcess: Process?
-    private var workerStdin: FileHandle?
-    private var workerStdout: FileHandle?
-    private var workerReadBuffer = Data()
-    private var workerLoadedModel: String?
-    private var idleUnloadWorkItem: DispatchWorkItem?
-
     public var onStatusChanged: (@Sendable (VisionStatus) -> Void)?
 
-    public init(allowsModel: Bool = false) {
-        self.allowsModel = allowsModel
-        let savedModel = UserDefaults.standard.string(forKey: DefaultsKeys.modelId)
-        if let savedModel, !savedModel.isEmpty {
-            self._modelId = savedModel
-        } else if Self.isModelCached(LocalVisionModelPreset.qwen35_08B.rawValue) {
-            self._modelId = LocalVisionModelPreset.qwen35_08B.rawValue
-        } else {
-            self._modelId = LocalVisionModelPreset.qwen25VL3B.rawValue
-        }
-        // Off until the user turns it on (installing turns it on). A model found in the Hugging Face cache doesn't.
-        self._enabled = UserDefaults.standard.bool(forKey: DefaultsKeys.enabled)
-    }
+    public init() {}
 
-    deinit {
-        stopWorker()
-    }
-
-    // MARK: - Paths & Discovery
-
-    private static var applicationSupportBaseDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-    }
+    // MARK: - Legacy Directory Helper
 
     @discardableResult
     public static func migrateLegacyDirectory(from legacy: URL, to current: URL) -> Bool {
@@ -107,177 +62,24 @@ public final class LocalVisionEngine: @unchecked Sendable {
         }
     }
 
-    private static let performLegacyVisionMigrationOnce: Void = {
-        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
-        let base = applicationSupportBaseDir
-        let legacy = base
-            .appendingPathComponent("MacUse", isDirectory: true) // Legacy folder name, kept for one-time migration.
-            .appendingPathComponent("vision-venv", isDirectory: true)
-        let current = base
-            .appendingPathComponent(UseMacDefaults.applicationSupportFolderName, isDirectory: true)
-            .appendingPathComponent("vision-venv", isDirectory: true)
-        _ = migrateLegacyDirectory(from: legacy, to: current)
-    }()
-
-    public static var appSupportDir: URL {
-        _ = performLegacyVisionMigrationOnce
-        return applicationSupportBaseDir.appendingPathComponent(UseMacDefaults.applicationSupportFolderName, isDirectory: true)
-    }
-
-    public static var venvDir: URL {
-        appSupportDir.appendingPathComponent("vision-venv", isDirectory: true)
-    }
-
-    public static var venvPythonURL: URL {
-        venvDir.appendingPathComponent("bin/python")
-    }
-
-    public static func isRuntimeInstalled() -> Bool {
-        guard FileManager.default.isExecutableFile(atPath: venvPythonURL.path) else { return false }
-        return sitePackagesContainMLXVLM(libDir: venvDir.appendingPathComponent("lib", isDirectory: true))
-    }
-
-    /// Looks for `lib/python*/site-packages/mlx_vlm` directly. Walking the whole venv (about 15,000 files)
-    /// made every status call slow, and under load the walk failed with EINVAL in tests that start engines.
-    static func sitePackagesContainMLXVLM(libDir: URL) -> Bool {
-        let fileManager = FileManager.default
-        guard let pythons = try? fileManager.contentsOfDirectory(atPath: libDir.path) else { return false }
-        for name in pythons where name.hasPrefix("python") {
-            let package = libDir
-                .appendingPathComponent(name, isDirectory: true)
-                .appendingPathComponent("site-packages/mlx_vlm", isDirectory: true)
-            var isDirectory: ObjCBool = false
-            if fileManager.fileExists(atPath: package.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                return true
-            }
-        }
-        return false
-    }
-
-    public static func isModelCached(_ modelId: String) -> Bool {
-        let sanitized = "models--" + modelId.replacingOccurrences(of: "/", with: "--")
-        let hfCache = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".cache/huggingface/hub/\(sanitized)/snapshots", isDirectory: true)
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: hfCache.path),
-              let first = entries.first else {
-            return false
-        }
-        let snapshotDir = hfCache.appendingPathComponent(first, isDirectory: true)
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: snapshotDir.path) else {
-            return false
-        }
-        return files.contains(where: { $0.hasSuffix(".safetensors") })
-    }
-
-    public static func resolveWorkerScriptPath() -> String? {
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("vision/worker.py"),
-           FileManager.default.fileExists(atPath: bundled.path) {
-            return bundled.path
-        }
-        if let execURL = Bundle.main.executableURL {
-            let bundledFallback = execURL
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Resources/vision/worker.py")
-            if FileManager.default.fileExists(atPath: bundledFallback.path) {
-                return bundledFallback.path
-            }
-        }
-        return nil
-    }
-
-    /// True when the `uv` installer the optional MLX runtime needs is present on this Mac.
-    public static var isInstallerAvailable: Bool {
-        resolveUVPath() != nil
-    }
-
-    private static func resolveUVPath() -> String? {
-        let candidates = [
-            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/uv"),
-            "/opt/homebrew/bin/uv",
-            "/usr/local/bin/uv",
-            "/usr/bin/uv"
-        ]
-        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-    }
-
-    // MARK: - Status & Configuration
+    // MARK: - Status
 
     public func currentStatus() -> VisionStatus {
-        lock.lock()
-        let enabled = _enabled
-        let modelId = _modelId
-        let installing = _installing
-        let progress = _installProgress
-        let lastError = _lastError
-        let running = workerProcess?.isRunning == true
-        lock.unlock()
-
-        let runtimeInstalled = Self.isRuntimeInstalled()
-        let modelDownloaded = Self.isModelCached(modelId)
-
-        let state: String
-        if installing {
-            state = "installing"
-        } else if !runtimeInstalled || !modelDownloaded {
-            state = "not_installed"
-        } else if !enabled {
-            state = "disabled"
-        } else {
-            state = "ready"
-        }
-
-        // The backend that would answer a query now; `state` still reports the user's setup.
-        let backend = (allowsModel && enabled && runtimeInstalled && modelDownloaded) ? "mlx-vlm" : "apple-vision-ocr"
-        return VisionStatus(
-            enabled: enabled,
-            state: state,
-            modelId: modelId,
-            backend: backend,
+        VisionStatus(
+            enabled: true,
+            state: "ready",
+            modelId: "apple-vision-ocr",
+            backend: "apple-vision-ocr",
             ocrAvailable: true,
-            runtimeInstalled: runtimeInstalled,
-            modelDownloaded: modelDownloaded,
-            workerRunning: running,
-            installProgress: progress,
-            lastError: lastError
+            runtimeInstalled: false,
+            modelDownloaded: false,
+            workerRunning: false,
+            installProgress: nil,
+            lastError: nil
         )
     }
 
-    public func setEnabled(_ enabled: Bool) {
-        lock.lock()
-        _enabled = enabled
-        UserDefaults.standard.set(enabled, forKey: DefaultsKeys.enabled)
-        lock.unlock()
-        if !enabled {
-            stopWorker()
-        }
-        notifyStatusChanged()
-    }
-
-    public func setModelId(_ modelId: String) {
-        let trimmed = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        lock.lock()
-        let changed = _modelId != trimmed
-        _modelId = trimmed
-        UserDefaults.standard.set(trimmed, forKey: DefaultsKeys.modelId)
-        if Self.isRuntimeInstalled() && Self.isModelCached(trimmed) {
-            _enabled = true
-            UserDefaults.standard.set(true, forKey: DefaultsKeys.enabled)
-        }
-        lock.unlock()
-        if changed {
-            stopWorker()
-        }
-        notifyStatusChanged()
-    }
-
-    private func notifyStatusChanged() {
-        let status = currentStatus()
-        onStatusChanged?(status)
-    }
-
-    // MARK: - Phase 1: Native Swift Frame-Diff (< 2 ms, 0 MB)
+    // MARK: - Native Swift Frame-Diff (< 2 ms, 0 MB)
 
     public static func computeFrameDiffPercent(beforeJPEG: Data, afterJPEG: Data) -> Double? {
         guard let imgA = decodeCGImage(fromJPEG: beforeJPEG),
@@ -332,7 +134,7 @@ public final class LocalVisionEngine: @unchecked Sendable {
         return CGImageSourceCreateImageAtIndex(src, 0, nil)
     }
 
-    // MARK: - Phase 1: Native Apple Vision OCR (Neural Engine, ~25 ms, 0 MB)
+    // MARK: - Native Apple Vision OCR (Neural Engine, ~25 ms, 0 MB)
 
     public static func recognizeText(
         in cgImage: CGImage,
@@ -379,183 +181,6 @@ public final class LocalVisionEngine: @unchecked Sendable {
         return detections
     }
 
-    // MARK: - Phase 2: One-Click Install (MLX-VLM + Model Weights)
-
-    public func install(modelId requestedModel: String? = nil, enable: Bool = true) async -> VisionStatus {
-        let targetModel = (requestedModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? requestedModel!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : currentStatus().modelId
-
-        let alreadyInstalling = lock.withLock { () -> Bool in
-            if _installing { return true }
-            _installing = true
-            _modelId = targetModel
-            UserDefaults.standard.set(targetModel, forKey: DefaultsKeys.modelId)
-            _lastError = nil
-            _installProgress = "Checking Apple Silicon MLX runtime…"
-            return false
-        }
-        if alreadyInstalling {
-            return currentStatus()
-        }
-        notifyStatusChanged()
-
-        defer {
-            lock.withLock {
-                _installing = false
-                _installProgress = nil
-            }
-            notifyStatusChanged()
-        }
-
-        do {
-            try FileManager.default.createDirectory(at: Self.appSupportDir, withIntermediateDirectories: true)
-
-            if !Self.isRuntimeInstalled() {
-                guard let uvPath = Self.resolveUVPath() else {
-                    throw NSError(
-                        domain: "UseMacVision",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "uv not found (~/.local/bin/uv or /opt/homebrew/bin/uv). Install uv first."]
-                    )
-                }
-
-                updateProgress("Creating isolated MLX Python 3.12 runtime…")
-                if !FileManager.default.isExecutableFile(atPath: Self.venvPythonURL.path) {
-                    try await runShell(
-                        executable: uvPath,
-                        arguments: ["venv", "--python", "3.12", Self.venvDir.path]
-                    )
-                }
-
-                updateProgress("Installing Apple Silicon mlx-vlm packages…")
-                try await runShell(
-                    executable: uvPath,
-                    arguments: ["pip", "install", "--python", Self.venvPythonURL.path, "mlx-vlm>=0.1.24", "pillow", "huggingface_hub"]
-                )
-            }
-
-            if !Self.isModelCached(targetModel) {
-                updateProgress("Downloading \(targetModel)…")
-                let script = "from huggingface_hub import snapshot_download; print(snapshot_download(\(Self.pythonStringLiteral(targetModel))))"
-                try await runShell(
-                    executable: Self.venvPythonURL.path,
-                    arguments: ["-c", script]
-                )
-            }
-
-            lock.withLock {
-                if enable {
-                    _enabled = true
-                    UserDefaults.standard.set(true, forKey: DefaultsKeys.enabled)
-                }
-                _lastError = nil
-            }
-        } catch {
-            lock.withLock {
-                _lastError = error.localizedDescription
-            }
-        }
-
-        return currentStatus()
-    }
-
-    private func updateProgress(_ text: String) {
-        lock.lock()
-        _installProgress = text
-        lock.unlock()
-        notifyStatusChanged()
-    }
-
-    private static func pythonStringLiteral(_ value: String) -> String {
-        let escaped = value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        return "\"\(escaped)\""
-    }
-
-    private func runShell(executable: String, arguments: [String]) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: executable)
-                proc.arguments = arguments
-                let errPipe = Pipe()
-                proc.standardOutput = Pipe()
-                proc.standardError = errPipe
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    if proc.terminationStatus == 0 {
-                        cont.resume()
-                    } else {
-                        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                        let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        let tail = errStr.split(separator: "\n").suffix(4).joined(separator: " | ")
-                        cont.resume(throwing: NSError(
-                            domain: "UseMacVision",
-                            code: Int(proc.terminationStatus),
-                            userInfo: [NSLocalizedDescriptionKey: tail.isEmpty ? "Command failed with exit \(proc.terminationStatus)" : tail]
-                        ))
-                    }
-                } catch {
-                    cont.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    // MARK: - Unified Vision Query (MLX-VLM + Apple Vision OCR Hybrid)
-
-    private static func extractCompactOCRContext(
-        imagePath: String,
-        viewportWidth: Double,
-        viewportHeight: Double,
-        maxChars: Int = 1800
-    ) async -> String {
-        await Task.detached(priority: .userInitiated) {
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
-                  let cgImage = Self.decodeCGImage(fromJPEG: data) else {
-                return ""
-            }
-            let detections = Self.recognizeText(in: cgImage, viewportWidth: viewportWidth, viewportHeight: viewportHeight, fast: true)
-            guard !detections.isEmpty else { return "" }
-            // Sort top-to-bottom (row buckets of ~14px), then left-to-right for natural reading order
-            let sorted = detections.sorted { a, b in
-                let rowA = Int(a.y / 14.0)
-                let rowB = Int(b.y / 14.0)
-                if rowA != rowB { return rowA < rowB }
-                return a.x < b.x
-            }
-            var lines: [String] = []
-            var totalChars = 0
-            var currentRow = Int.min
-            var rowBuffer: [String] = []
-
-            func flushRow() {
-                guard !rowBuffer.isEmpty else { return }
-                let joined = rowBuffer.joined(separator: " | ")
-                if totalChars + joined.count + 1 <= maxChars {
-                    lines.append(joined)
-                    totalChars += joined.count + 1
-                }
-                rowBuffer.removeAll(keepingCapacity: true)
-            }
-
-            for det in sorted {
-                let row = Int(det.y / 14.0)
-                if row != currentRow {
-                    flushRow()
-                    currentRow = row
-                }
-                if totalChars >= maxChars { break }
-                rowBuffer.append(det.label)
-            }
-            flushRow()
-            return lines.joined(separator: "\n")
-        }.value
-    }
-
     /// Throws `LocalVisionError.captureTooSmall` when the image's shorter side is under `minimumImageSide`.
     /// Reads only the image header. An unreadable file passes, so the normal error paths report it.
     public static func validateImageSize(atPath imagePath: String) throws {
@@ -600,46 +225,6 @@ public final class LocalVisionEngine: @unchecked Sendable {
             )
         }
 
-        // Direct OCR mode
-        if effectiveMode == "ocr" {
-            return await runOCRQuery(
-                mode: "ocr",
-                query: query,
-                imagePath: imagePath,
-                viewportWidth: viewportWidth,
-                viewportHeight: viewportHeight,
-                startNs: startNs
-            )
-        }
-
-        // Try Local MLX VLM if this engine may load it and it is enabled, installed, and cached.
-        // The worker starts and loads the model here, on the first query that needs it.
-        let status = currentStatus()
-        if status.backend == "mlx-vlm" {
-            // Hybrid boost: attach ~25ms Apple Vision OCR text for exact literal fidelity on hostnames, codes, errors & numbers
-            let needsOCRContext = (effectiveMode == "ask" || effectiveMode == "verify" || effectiveMode == "describe" || effectiveMode == "diagnose")
-            let ocrContext = needsOCRContext
-                ? await Self.extractCompactOCRContext(
-                    imagePath: imagePath,
-                    viewportWidth: viewportWidth,
-                    viewportHeight: viewportHeight
-                )
-                : ""
-
-            if let mlxResult = await queryMLXWorker(
-                modelId: status.modelId,
-                mode: effectiveMode,
-                query: query ?? "",
-                ocrContext: ocrContext,
-                imagePath: imagePath,
-                viewportWidth: viewportWidth,
-                viewportHeight: viewportHeight
-            ) {
-                return mlxResult
-            }
-        }
-
-        // Seamless Apple Vision OCR fallback (always works with 0 MB extra)
         return await runOCRQuery(
             mode: effectiveMode,
             query: query,
@@ -675,7 +260,7 @@ public final class LocalVisionEngine: @unchecked Sendable {
             if mode == "ocr" || mode == "describe" {
                 let preview = detections.prefix(32).map(\.label).joined(separator: " | ")
                 let prefix = mode == "describe"
-                    ? "Visible screen text (Apple Vision OCR fallback, \(detections.count) blocks): "
+                    ? "Visible screen text (Apple Vision OCR, \(detections.count) blocks): "
                     : "Detected \(detections.count) text blocks: "
                 return VisionQueryResult(
                     mode: mode,
@@ -734,7 +319,7 @@ public final class LocalVisionEngine: @unchecked Sendable {
                 }
             }
 
-            // Smart OCR matching for locate/diagnose fallback
+            // Smart OCR matching for locate/diagnose
             let q = (query ?? "").lowercased()
             let tokens = q.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count >= 2 }
             let dismissKeywords = ["fechar", "close", "não", "nao", "agora não", "recusar", "rejeitar", "no thanks", "not now", "x", "×"]
@@ -770,7 +355,7 @@ public final class LocalVisionEngine: @unchecked Sendable {
             if let best {
                 answer = "Apple Vision OCR matched \"\(best.label)\" at (\(Int(best.x)), \(Int(best.y)))."
             } else if hasPopupHint {
-                answer = "Apple Vision OCR detected popup/notification text on screen, but no text close button. Enable Local MLX Vision for icon-level grounding (e.g. 'X' buttons)."
+                answer = "Apple Vision OCR detected popup/notification text on screen, but no text close button. Use observe or screenshot to inspect non-text controls."
             } else {
                 answer = "Apple Vision OCR scanned \(detections.count) text blocks; no exact match for \"\(query ?? "")\"."
             }
@@ -789,228 +374,5 @@ public final class LocalVisionEngine: @unchecked Sendable {
                 imagePath: imagePath
             )
         }.value
-    }
-
-    // MARK: - Persistent MLX Worker Process
-
-    private func queryMLXWorker(
-        modelId: String,
-        mode: String,
-        query: String,
-        ocrContext: String,
-        imagePath: String,
-        viewportWidth: Double,
-        viewportHeight: Double
-    ) async -> VisionQueryResult? {
-        await withCheckedContinuation { cont in
-            workerQueue.async { [weak self] in
-                guard let self else {
-                    cont.resume(returning: nil)
-                    return
-                }
-                let result = self.performSyncMLXQuery(
-                    modelId: modelId,
-                    mode: mode,
-                    query: query,
-                    ocrContext: ocrContext,
-                    imagePath: imagePath,
-                    viewportWidth: viewportWidth,
-                    viewportHeight: viewportHeight
-                )
-                cont.resume(returning: result)
-            }
-        }
-    }
-
-    private func performSyncMLXQuery(
-        modelId: String,
-        mode: String,
-        query: String,
-        ocrContext: String,
-        imagePath: String,
-        viewportWidth: Double,
-        viewportHeight: Double
-    ) -> VisionQueryResult? {
-        guard ensureWorkerRunningLocked() else { return nil }
-        guard let stdin = workerStdin, let stdout = workerStdout else { return nil }
-
-        let reqId = UUID().uuidString
-        var payload: [String: Any] = [
-            "id": reqId,
-            "cmd": "query",
-            "model": modelId,
-            "mode": mode,
-            "query": query,
-            "imagePath": imagePath,
-            "viewportWidth": viewportWidth,
-            "viewportHeight": viewportHeight
-        ]
-        if !ocrContext.isEmpty {
-            payload["ocrContext"] = ocrContext
-        }
-
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
-        var lineData = jsonData
-        lineData.append(0x0A)
-        do {
-            try stdin.write(contentsOf: lineData)
-        } catch {
-            stopWorker()
-            return nil
-        }
-
-        scheduleIdleUnload()
-
-        guard let respLine = readNextLine(from: stdout),
-              let respData = respLine.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: respData) as? [String: Any] else {
-            stopWorker()
-            return nil
-        }
-
-        guard (json["ok"] as? Bool) == true else {
-            let errMsg = json["error"] as? String ?? "MLX worker error"
-            lock.lock()
-            _lastError = errMsg
-            lock.unlock()
-            notifyStatusChanged()
-            return nil
-        }
-
-        workerLoadedModel = modelId
-        let xVal = json["x"] as? Double
-        let yVal = json["y"] as? Double
-        var frameRect: ScreenRect?
-        if let f = json["frame"] as? [String: Any],
-           let fx = f["x"] as? Double,
-           let fy = f["y"] as? Double,
-           let fw = f["width"] as? Double,
-           let fh = f["height"] as? Double {
-            frameRect = ScreenRect(x: fx, y: fy, width: fw, height: fh)
-        }
-
-        var detections: [VisionDetection] = []
-        if let rawDets = json["detections"] as? [[String: Any]] {
-            for d in rawDets {
-                if let label = d["label"] as? String,
-                   let dx = d["x"] as? Double,
-                   let dy = d["y"] as? Double {
-                    var df: ScreenRect?
-                    if let f = d["frame"] as? [String: Any],
-                       let fx = f["x"] as? Double,
-                       let fy = f["y"] as? Double,
-                       let fw = f["width"] as? Double,
-                       let fh = f["height"] as? Double {
-                        df = ScreenRect(x: fx, y: fy, width: fw, height: fh)
-                    }
-                    detections.append(VisionDetection(
-                        label: label,
-                        x: dx,
-                        y: dy,
-                        frame: df,
-                        confidence: d["confidence"] as? Double ?? 0.9,
-                        source: d["source"] as? String ?? "mlx-vlm"
-                    ))
-                }
-            }
-        }
-
-        return VisionQueryResult(
-            mode: json["mode"] as? String ?? mode,
-            backend: "mlx-vlm",
-            modelId: json["modelId"] as? String ?? modelId,
-            latencyMs: json["latencyMs"] as? Double ?? 0,
-            answer: json["answer"] as? String ?? "",
-            verified: json["verified"] as? Bool,
-            x: xVal,
-            y: yVal,
-            frame: frameRect,
-            blockingDetected: json["blockingDetected"] as? Bool ?? false,
-            detections: detections,
-            imagePath: imagePath
-        )
-    }
-
-    private func ensureWorkerRunningLocked() -> Bool {
-        if let proc = workerProcess, proc.isRunning {
-            return true
-        }
-        guard let scriptPath = Self.resolveWorkerScriptPath(),
-              FileManager.default.isExecutableFile(atPath: Self.venvPythonURL.path) else {
-            return false
-        }
-
-        let proc = Process()
-        proc.executableURL = Self.venvPythonURL
-        proc.arguments = ["-u", scriptPath]
-        let inPipe = Pipe()
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardInput = inPipe
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-
-        do {
-            try proc.run()
-        } catch {
-            lock.lock()
-            _lastError = error.localizedDescription
-            lock.unlock()
-            return false
-        }
-
-        workerProcess = proc
-        workerStdin = inPipe.fileHandleForWriting
-        workerStdout = outPipe.fileHandleForReading
-        workerReadBuffer.removeAll(keepingCapacity: true)
-
-        // Read ready banner
-        if let readyLine = readNextLine(from: outPipe.fileHandleForReading),
-           readyLine.contains("\"ready\"") {
-            notifyStatusChanged()
-            return true
-        }
-        stopWorker()
-        return false
-    }
-
-    private func readNextLine(from handle: FileHandle) -> String? {
-        while true {
-            if let range = workerReadBuffer.range(of: Data([0x0A])) {
-                let lineData = workerReadBuffer.subdata(in: 0..<range.lowerBound)
-                workerReadBuffer.removeSubrange(0..<range.upperBound)
-                return String(data: lineData, encoding: .utf8)
-            }
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                return nil
-            }
-            workerReadBuffer.append(chunk)
-        }
-    }
-
-    private func scheduleIdleUnload() {
-        idleUnloadWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            self?.stopWorker()
-        }
-        idleUnloadWorkItem = item
-        workerQueue.asyncAfter(deadline: .now() + 300, execute: item)
-    }
-
-    public func stopWorker() {
-        idleUnloadWorkItem?.cancel()
-        idleUnloadWorkItem = nil
-        if let proc = workerProcess {
-            if proc.isRunning {
-                proc.terminate()
-            }
-        }
-        workerProcess = nil
-        workerStdin = nil
-        workerStdout = nil
-        workerLoadedModel = nil
-        workerReadBuffer.removeAll(keepingCapacity: false)
-        notifyStatusChanged()
     }
 }

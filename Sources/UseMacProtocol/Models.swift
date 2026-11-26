@@ -159,8 +159,32 @@ public struct ElementNode: Codable, Equatable, Identifiable, Sendable {
         self.offscreen = offscreen
     }
 
-    public var compactLine: String {
-        var parts: [String] = ["\(id) [\(role)]"]
+    private static func shortRole(for role: String) -> String {
+        switch role {
+        case "AXButton": return "btn"
+        case "AXLink": return "link"
+        case "AXTextField": return "input"
+        case "AXTextArea": return "textarea"
+        case "AXCheckBox": return "checkbox"
+        case "AXRadioButton": return "radio"
+        case "AXPopUpButton", "AXComboBox": return "select"
+        case "AXStaticText": return "text"
+        case "AXMenuItem": return "menuitem"
+        case "AXRow": return "row"
+        case "AXTab": return "tab"
+        case "AXImage": return "img"
+        case "AXHeading": return "heading"
+        default:
+            if role.hasPrefix("AX"), role.count > 2 {
+                return String(role.dropFirst(2)).lowercased()
+            }
+            return role.lowercased()
+        }
+    }
+
+    public func compactLine(includeFrames: Bool = false) -> String {
+        let mappedRole = Self.shortRole(for: role)
+        var parts: [String] = ["\(id) [\(mappedRole)]"]
         if let title, !title.isEmpty {
             parts.append("\"\(title.replacingOccurrences(of: "\n", with: " "))\"")
         }
@@ -177,13 +201,58 @@ public struct ElementNode: Codable, Equatable, Identifiable, Sendable {
         }
         if offscreen == true {
             parts.append("(offscreen)")
-        } else {
+        } else if includeFrames || !id.hasPrefix("@") {
             parts.append("(\(Int(frame.x)),\(Int(frame.y)) \(Int(frame.width))x\(Int(frame.height)))")
         }
-        if !actions.isEmpty {
-            parts.append("{\(actions.joined(separator: ","))}")
+        let nonDefaultActions: [String] = {
+            guard !actions.isEmpty else { return [] }
+            switch mappedRole {
+            case "btn", "link", "menuitem", "tab", "checkbox", "radio":
+                return actions.filter { $0 != "AXPress" }
+            case "input", "textarea":
+                if actions.contains("AXSetValue") {
+                    return actions.filter { $0 != "AXSetValue" && $0 != "AXConfirm" }
+                }
+                return actions
+            default:
+                return actions
+            }
+        }()
+        if !nonDefaultActions.isEmpty {
+            parts.append("{\(nonDefaultActions.joined(separator: ","))}")
         }
         return parts.joined(separator: " ")
+    }
+
+    public var compactLine: String {
+        compactLine(includeFrames: false)
+    }
+}
+
+public enum ObservationMode: String, Codable, Equatable, Sendable {
+    case auto
+    case delta
+    case interactive
+    case full
+    case none
+}
+
+public struct ElementFilter: Codable, Equatable, Sendable {
+    public var role: String?
+    public var text: String?
+    public var selector: String?
+    public var viewportOnly: Bool?
+
+    public init(
+        role: String? = nil,
+        text: String? = nil,
+        selector: String? = nil,
+        viewportOnly: Bool? = nil
+    ) {
+        self.role = role
+        self.text = text
+        self.selector = selector
+        self.viewportOnly = viewportOnly
     }
 }
 
@@ -247,6 +316,8 @@ public struct PageState: Codable, Equatable, Sendable {
     public var readableText: String?
     public var tablesMarkdown: String?
     public var scrollableContainers: [String]?
+    public var tablesSummary: String?
+    public var webMcpTools: [String]?
 
     public init(
         scrollX: Double = 0,
@@ -263,7 +334,9 @@ public struct PageState: Codable, Equatable, Sendable {
         blockingOverlay: PageBlockingOverlay? = nil,
         readableText: String? = nil,
         tablesMarkdown: String? = nil,
-        scrollableContainers: [String]? = nil
+        scrollableContainers: [String]? = nil,
+        tablesSummary: String? = nil,
+        webMcpTools: [String]? = nil
     ) {
         self.scrollX = scrollX
         self.scrollY = scrollY
@@ -280,6 +353,8 @@ public struct PageState: Codable, Equatable, Sendable {
         self.readableText = readableText
         self.tablesMarkdown = tablesMarkdown
         self.scrollableContainers = scrollableContainers
+        self.tablesSummary = tablesSummary
+        self.webMcpTools = webMcpTools
     }
 }
 
@@ -343,6 +418,7 @@ public struct WindowSnapshot: Codable, Equatable, Sendable {
     public var screenshotPath: String?
     public var pageState: PageState?
     public var agentFeedback: AgentFeedback?
+    public var offscreenCount: Int?
 
     public init(
         app: AppDescriptor,
@@ -354,7 +430,8 @@ public struct WindowSnapshot: Codable, Equatable, Sendable {
         diff: SnapshotDiff? = nil,
         screenshotPath: String? = nil,
         pageState: PageState? = nil,
-        agentFeedback: AgentFeedback? = nil
+        agentFeedback: AgentFeedback? = nil,
+        offscreenCount: Int? = nil
     ) {
         self.app = app
         self.timestampMs = timestampMs
@@ -366,14 +443,22 @@ public struct WindowSnapshot: Codable, Equatable, Sendable {
         self.screenshotPath = screenshotPath
         self.pageState = pageState
         self.agentFeedback = agentFeedback
+        self.offscreenCount = offscreenCount
     }
 
-    public func formattedCompactSummary(maxElements: Int = 250) -> String {
+    public func formattedCompactSummary(
+        maxElements: Int = 250,
+        returnDiffOnly: Bool = false,
+        includeFrames: Bool = false,
+        includeLatency: Bool = false
+    ) -> String {
         var lines: [String] = []
         let titlePart = app.windowTitle.map { " — \($0)" } ?? ""
-        let cacheTag = fromHotCache ? "hot-cache" : "live-ax"
         lines.append("App: \(app.name) (pid \(app.pid))\(titlePart)")
-        lines.append(String(format: "Latency: %.2f ms [%@] | Elements: %d", latencyMs, cacheTag, elements.count))
+        if includeLatency {
+            let cacheTag = fromHotCache ? "hot-cache" : "live-ax"
+            lines.append(String(format: "Latency: %.2f ms [%@] | Elements: %d", latencyMs, cacheTag, elements.count))
+        }
         if let focusedElementId {
             lines.append("Focused: \(focusedElementId)")
         }
@@ -415,6 +500,15 @@ public struct WindowSnapshot: Codable, Equatable, Sendable {
                 }
                 lines.append("BlockingOverlay: \"\(overlay.summary)\"\(closeHint)")
             }
+            if let tablesSummary = page.tablesSummary, !tablesSummary.isEmpty {
+                lines.append("Tables: \(tablesSummary)")
+            }
+            if let webMcpTools = page.webMcpTools, !webMcpTools.isEmpty {
+                lines.append("WebMCP: \(webMcpTools.joined(separator: ", "))")
+            }
+        }
+        if let offscreenCount, offscreenCount > 0 {
+            lines.append("Offscreen: \(offscreenCount) elements")
         }
         if let feedback = agentFeedback {
             lines.append(feedback.formattedBanner)
@@ -422,12 +516,28 @@ public struct WindowSnapshot: Codable, Equatable, Sendable {
         if let diff {
             lines.append("Diff: \(diff.summary)")
         }
-        lines.append("---")
-        for node in elements.prefix(maxElements) {
-            lines.append(node.compactLine)
+        if returnDiffOnly, let diff {
+            lines.append("---")
+            for node in diff.added {
+                lines.append("+ \(node.compactLine(includeFrames: includeFrames))")
+            }
+            for node in diff.changed {
+                lines.append("~ \(node.compactLine(includeFrames: includeFrames))")
+            }
+            if !diff.removedIds.isEmpty {
+                lines.append("- \(diff.removedIds.joined(separator: ", "))")
+            }
+            return lines.joined(separator: "\n")
         }
-        if elements.count > maxElements {
-            lines.append("... (\(elements.count - maxElements) more elements omitted)")
+        lines.append("---")
+        let visible = elements.filter { $0.offscreen != true }
+        let offscreen = elements.filter { $0.offscreen == true }
+        let ordered = visible + offscreen
+        for node in ordered.prefix(maxElements) {
+            lines.append(node.compactLine(includeFrames: includeFrames))
+        }
+        if ordered.count > maxElements {
+            lines.append("... (\(ordered.count - maxElements) more elements omitted)")
         }
         if let tables = pageState?.tablesMarkdown, !tables.isEmpty {
             lines.append("--- TABLES / DATA GRIDS ---")
@@ -462,6 +572,39 @@ public enum ActionStepType: String, Codable, Sendable {
     case axAction
     /// Waits until an element matching `match` (or `elementId`) appears, or disappears with `gone: true`.
     case waitFor
+    /// Declarative assertion against page/window text, URL, title or element presence.
+    case assert
+    /// Repeatedly scrolls until a target element or expected text appears (bounded by `maxScrolls`).
+    case scrollUntil
+    /// Declarative multi-field form fill (`fields`) with optional submit (`submitMatch` / `submitSelector`).
+    case fillForm
+    /// Invokes a native app menu bar item by `menuPath` (e.g. `["File", "Save"]`).
+    case menuAction
+}
+
+public struct FormFieldEntry: Codable, Equatable, Sendable {
+    public var elementId: String?
+    public var selector: String?
+    public var match: ElementMatch?
+    public var label: String?
+    public var value: String?
+    public var checked: Bool?
+
+    public init(
+        elementId: String? = nil,
+        selector: String? = nil,
+        match: ElementMatch? = nil,
+        label: String? = nil,
+        value: String? = nil,
+        checked: Bool? = nil
+    ) {
+        self.elementId = elementId
+        self.selector = selector
+        self.match = match
+        self.label = label
+        self.value = value
+        self.checked = checked
+    }
 }
 
 /// Describes an element by what it is instead of by a snapshot id. Resolved when the step runs, so it
@@ -527,6 +670,26 @@ public struct ActionStep: Codable, Equatable, Sendable {
     public var timeoutMs: Int?
     /// For `waitFor`: wait until the element disappears instead of appears.
     public var gone: Bool?
+    /// When true, step failure is recorded as skipped/non-fatal without stopping the batch.
+    public var optional: Bool?
+    /// Declarative fields for `fillForm`.
+    public var fields: [FormFieldEntry]?
+    /// Optional submit button matcher for `fillForm`.
+    public var submitMatch: ElementMatch?
+    /// Optional submit CSS selector for `fillForm` (browser).
+    public var submitSelector: String?
+    /// Maximum scroll iterations for `scrollUntil`.
+    public var maxScrolls: Int?
+    /// Menu bar path for `menuAction` (e.g. `["File", "Export"]`).
+    public var menuPath: [String]?
+    /// Expected visible text for `assert` or `scrollUntil`.
+    public var expectText: String?
+    /// Text that must NOT be visible for `assert`.
+    public var expectNotText: String?
+    /// Expected URL substring for `assert`.
+    public var expectUrl: String?
+    /// Expected window/page title substring for `assert`.
+    public var expectTitle: String?
 
     public init(
         action: ActionStepType,
@@ -549,7 +712,17 @@ public struct ActionStep: Codable, Equatable, Sendable {
         match: ElementMatch? = nil,
         actionName: String? = nil,
         timeoutMs: Int? = nil,
-        gone: Bool? = nil
+        gone: Bool? = nil,
+        optional: Bool? = nil,
+        fields: [FormFieldEntry]? = nil,
+        submitMatch: ElementMatch? = nil,
+        submitSelector: String? = nil,
+        maxScrolls: Int? = nil,
+        menuPath: [String]? = nil,
+        expectText: String? = nil,
+        expectNotText: String? = nil,
+        expectUrl: String? = nil,
+        expectTitle: String? = nil
     ) {
         self.action = action
         self.app = app
@@ -572,6 +745,16 @@ public struct ActionStep: Codable, Equatable, Sendable {
         self.actionName = actionName
         self.timeoutMs = timeoutMs
         self.gone = gone
+        self.optional = optional
+        self.fields = fields
+        self.submitMatch = submitMatch
+        self.submitSelector = submitSelector
+        self.maxScrolls = maxScrolls
+        self.menuPath = menuPath
+        self.expectText = expectText
+        self.expectNotText = expectNotText
+        self.expectUrl = expectUrl
+        self.expectTitle = expectTitle
     }
 }
 
@@ -605,6 +788,8 @@ public struct ActionStepResult: Codable, Equatable, Sendable {
     public var warning: String?
     /// Element id the step resolved to (useful with `match`).
     public var resolvedElementId: String?
+    /// True when an `optional` step did not match or was skipped without failing the batch.
+    public var skipped: Bool?
 
     public init(
         index: Int,
@@ -621,7 +806,8 @@ public struct ActionStepResult: Codable, Equatable, Sendable {
         errorCode: String? = nil,
         effect: ActionEffect? = nil,
         warning: String? = nil,
-        resolvedElementId: String? = nil
+        resolvedElementId: String? = nil,
+        skipped: Bool? = nil
     ) {
         self.index = index
         self.action = action
@@ -638,6 +824,7 @@ public struct ActionStepResult: Codable, Equatable, Sendable {
         self.effect = effect
         self.warning = warning
         self.resolvedElementId = resolvedElementId
+        self.skipped = skipped
     }
 }
 
@@ -660,6 +847,15 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
     /// Act in the app window whose title contains this text (see ObserveParams.window). Omit to use the
     /// window of the last observe.
     public var window: String?
+    public var observationMode: ObservationMode?
+    public var maxElements: Int?
+    public var includeText: Bool?
+    public var includeTables: Bool?
+    public var diffCrop: Bool?
+    public var verify: String?
+    public var foregroundFallback: Bool?
+    public var waitForIdleMs: Int?
+    public var returnImageContent: Bool?
 
     public init(
         app: String? = nil,
@@ -671,7 +867,16 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         expectWindowTitle: String? = nil,
         allowStaleSnapshot: Bool? = nil,
         foreground: Bool? = nil,
-        window: String? = nil
+        window: String? = nil,
+        observationMode: ObservationMode? = nil,
+        maxElements: Int? = nil,
+        includeText: Bool? = nil,
+        includeTables: Bool? = nil,
+        diffCrop: Bool? = nil,
+        verify: String? = nil,
+        foregroundFallback: Bool? = nil,
+        waitForIdleMs: Int? = nil,
+        returnImageContent: Bool? = nil
     ) {
         self.app = app
         self.steps = steps
@@ -683,6 +888,15 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         self.allowStaleSnapshot = allowStaleSnapshot
         self.foreground = foreground
         self.window = window
+        self.observationMode = observationMode
+        self.maxElements = maxElements
+        self.includeText = includeText
+        self.includeTables = includeTables
+        self.diffCrop = diffCrop
+        self.verify = verify
+        self.foregroundFallback = foregroundFallback
+        self.waitForIdleMs = waitForIdleMs
+        self.returnImageContent = returnImageContent
     }
 
     public init(from decoder: Decoder) throws {
@@ -697,6 +911,15 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         self.allowStaleSnapshot = try c.decodeIfPresent(Bool.self, forKey: .allowStaleSnapshot)
         self.foreground = try c.decodeIfPresent(Bool.self, forKey: .foreground)
         self.window = try c.decodeIfPresent(String.self, forKey: .window)
+        self.observationMode = try c.decodeIfPresent(ObservationMode.self, forKey: .observationMode)
+        self.maxElements = try c.decodeIfPresent(Int.self, forKey: .maxElements)
+        self.includeText = try c.decodeIfPresent(Bool.self, forKey: .includeText)
+        self.includeTables = try c.decodeIfPresent(Bool.self, forKey: .includeTables)
+        self.diffCrop = try c.decodeIfPresent(Bool.self, forKey: .diffCrop)
+        self.verify = try c.decodeIfPresent(String.self, forKey: .verify)
+        self.foregroundFallback = try c.decodeIfPresent(Bool.self, forKey: .foregroundFallback)
+        self.waitForIdleMs = try c.decodeIfPresent(Int.self, forKey: .waitForIdleMs)
+        self.returnImageContent = try c.decodeIfPresent(Bool.self, forKey: .returnImageContent)
     }
 }
 
@@ -708,6 +931,9 @@ public struct BatchActionResult: Codable, Equatable, Sendable {
     public var agentFeedback: AgentFeedback?
     public var visualVerification: VisionQueryResult?
     public var screenshot: ScreenshotResult?
+    public var networkErrors: [String]?
+    public var dirtyRect: ScreenRect?
+    public var visualDeltaOCR: String?
 
     public init(
         success: Bool,
@@ -716,7 +942,10 @@ public struct BatchActionResult: Codable, Equatable, Sendable {
         observation: WindowSnapshot? = nil,
         agentFeedback: AgentFeedback? = nil,
         visualVerification: VisionQueryResult? = nil,
-        screenshot: ScreenshotResult? = nil
+        screenshot: ScreenshotResult? = nil,
+        networkErrors: [String]? = nil,
+        dirtyRect: ScreenRect? = nil,
+        visualDeltaOCR: String? = nil
     ) {
         self.success = success
         self.totalLatencyMs = totalLatencyMs
@@ -725,6 +954,9 @@ public struct BatchActionResult: Codable, Equatable, Sendable {
         self.agentFeedback = agentFeedback
         self.visualVerification = visualVerification
         self.screenshot = screenshot
+        self.networkErrors = networkErrors
+        self.dirtyRect = dirtyRect
+        self.visualDeltaOCR = visualDeltaOCR
     }
 }
 
@@ -733,17 +965,23 @@ public struct ScreenshotRequest: Codable, Equatable, Sendable {
     public var maxDimension: Int
     public var quality: Double
     public var includeBase64: Bool
+    public var diffCrop: Bool?
+    public var region: ScreenRect?
 
     public init(
         app: String? = nil,
         maxDimension: Int = 1280,
         quality: Double = 0.78,
-        includeBase64: Bool = false
+        includeBase64: Bool = false,
+        diffCrop: Bool? = nil,
+        region: ScreenRect? = nil
     ) {
         self.app = app
         self.maxDimension = maxDimension
         self.quality = quality
         self.includeBase64 = includeBase64
+        self.diffCrop = diffCrop
+        self.region = region
     }
 
     public init(from decoder: Decoder) throws {
@@ -752,6 +990,8 @@ public struct ScreenshotRequest: Codable, Equatable, Sendable {
         self.maxDimension = try c.decodeIfPresent(Int.self, forKey: .maxDimension) ?? 1280
         self.quality = try c.decodeIfPresent(Double.self, forKey: .quality) ?? 0.78
         self.includeBase64 = try c.decodeIfPresent(Bool.self, forKey: .includeBase64) ?? false
+        self.diffCrop = try c.decodeIfPresent(Bool.self, forKey: .diffCrop)
+        self.region = try c.decodeIfPresent(ScreenRect.self, forKey: .region)
     }
 }
 
@@ -906,6 +1146,12 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
     public var newWindow: Bool?
     /// The task this tab belongs to (from `task_start`), so `task_complete` of another task never closes it.
     public var taskId: String?
+    /// Optional action steps to execute immediately after the page finishes loading.
+    public var steps: [ActionStep]?
+    /// Automatically dismiss cookie banners / blocking popups after load.
+    public var autoDismissOverlays: Bool?
+    public var returnDiffOnly: Bool?
+    public var observationMode: ObservationMode?
 
     public init(
         url: String,
@@ -915,7 +1161,11 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
         stream: Bool? = nil,
         activate: Bool? = nil,
         newWindow: Bool? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        steps: [ActionStep]? = nil,
+        autoDismissOverlays: Bool? = nil,
+        returnDiffOnly: Bool? = nil,
+        observationMode: ObservationMode? = nil
     ) {
         self.url = url
         self.profile = profile
@@ -925,6 +1175,10 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
         self.activate = activate
         self.newWindow = newWindow
         self.taskId = taskId
+        self.steps = steps
+        self.autoDismissOverlays = autoDismissOverlays
+        self.returnDiffOnly = returnDiffOnly
+        self.observationMode = observationMode
     }
 }
 
@@ -936,6 +1190,7 @@ public struct BrowserObserveParams: Codable, Equatable, Sendable {
     public var includeTables: Bool?
     public var includeScreenshot: Bool?
     public var returnImageContent: Bool?
+    public var filter: ElementFilter?
     /// Ignored, like `viewportHeight` and `deviceScaleFactor`: UseMac never resizes a tab. Kept so older clients
     /// still decode.
     public var viewportWidth: Int?
@@ -950,6 +1205,7 @@ public struct BrowserObserveParams: Codable, Equatable, Sendable {
         includeTables: Bool? = true,
         includeScreenshot: Bool? = false,
         returnImageContent: Bool? = false,
+        filter: ElementFilter? = nil,
         viewportWidth: Int? = nil,
         viewportHeight: Int? = nil,
         deviceScaleFactor: Double? = nil
@@ -961,6 +1217,7 @@ public struct BrowserObserveParams: Codable, Equatable, Sendable {
         self.includeTables = includeTables
         self.includeScreenshot = includeScreenshot
         self.returnImageContent = returnImageContent
+        self.filter = filter
         self.viewportWidth = viewportWidth
         self.viewportHeight = viewportHeight
         self.deviceScaleFactor = deviceScaleFactor
@@ -1060,6 +1317,9 @@ public struct BrowserExtractParams: Codable, Equatable, Sendable {
     public var expression: String?
     public var scanHorizontal: Bool?
     public var maxChars: Int?
+    public var urlFilter: String?
+    public var scanVertical: Bool?
+    public var frameIndex: Int?
 
     public init(
         profile: String? = nil,
@@ -1068,7 +1328,10 @@ public struct BrowserExtractParams: Codable, Equatable, Sendable {
         selector: String? = nil,
         expression: String? = nil,
         scanHorizontal: Bool? = false,
-        maxChars: Int? = 16000
+        maxChars: Int? = 16000,
+        urlFilter: String? = nil,
+        scanVertical: Bool? = nil,
+        frameIndex: Int? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
@@ -1077,6 +1340,9 @@ public struct BrowserExtractParams: Codable, Equatable, Sendable {
         self.expression = expression
         self.scanHorizontal = scanHorizontal
         self.maxChars = maxChars
+        self.urlFilter = urlFilter
+        self.scanVertical = scanVertical
+        self.frameIndex = frameIndex
     }
 
     public init(from decoder: Decoder) throws {
@@ -1088,6 +1354,9 @@ public struct BrowserExtractParams: Codable, Equatable, Sendable {
         self.expression = try c.decodeIfPresent(String.self, forKey: .expression)
         self.scanHorizontal = try c.decodeIfPresent(Bool.self, forKey: .scanHorizontal)
         self.maxChars = try c.decodeIfPresent(Int.self, forKey: .maxChars)
+        self.urlFilter = try c.decodeIfPresent(String.self, forKey: .urlFilter)
+        self.scanVertical = try c.decodeIfPresent(Bool.self, forKey: .scanVertical)
+        self.frameIndex = try c.decodeIfPresent(Int.self, forKey: .frameIndex)
     }
 }
 
@@ -1148,6 +1417,8 @@ public struct BrowserScreenshotParams: Codable, Equatable, Sendable {
     public var deviceScaleFactor: Double?
     public var quality: Int?
     public var returnImageContent: Bool?
+    public var diffCrop: Bool?
+    public var region: ScreenRect?
 
     public init(
         profile: String? = nil,
@@ -1159,7 +1430,9 @@ public struct BrowserScreenshotParams: Codable, Equatable, Sendable {
         viewportHeight: Int? = nil,
         deviceScaleFactor: Double? = nil,
         quality: Int? = 84,
-        returnImageContent: Bool? = true
+        returnImageContent: Bool? = true,
+        diffCrop: Bool? = nil,
+        region: ScreenRect? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
@@ -1171,30 +1444,8 @@ public struct BrowserScreenshotParams: Codable, Equatable, Sendable {
         self.deviceScaleFactor = deviceScaleFactor
         self.quality = quality
         self.returnImageContent = returnImageContent
-    }
-}
-
-public enum LocalVisionModelPreset: String, Codable, CaseIterable, Identifiable, Sendable {
-    case qwen35_08B = "mlx-community/Qwen3.5-0.8B-4bit"
-    case qwen25VL3B = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
-    case holo1_3B = "mlx-community/Holo1-3B-4bit"
-
-    public var id: String { rawValue }
-
-    public var displayName: String {
-        switch self {
-        case .qwen35_08B: return "Qwen3.5 0.8B (4-bit)"
-        case .qwen25VL3B: return "Qwen2.5-VL 3B (4-bit)"
-        case .holo1_3B: return "Holo1 3B GUI (4-bit)"
-        }
-    }
-
-    public var sizeHint: String {
-        switch self {
-        case .qwen35_08B: return "~620 MB · Ultra-fast"
-        case .qwen25VL3B: return "~2.1 GB · Best grounding"
-        case .holo1_3B: return "~1.9 GB · GUI clicks"
-        }
+        self.diffCrop = diffCrop
+        self.region = region
     }
 }
 
@@ -1211,9 +1462,9 @@ public struct VisionStatus: Codable, Equatable, Sendable {
     public var lastError: String?
 
     public init(
-        enabled: Bool = false,
-        state: String = "not_installed",
-        modelId: String = LocalVisionModelPreset.qwen25VL3B.rawValue,
+        enabled: Bool = true,
+        state: String = "ready",
+        modelId: String = "apple-vision-ocr",
         backend: String = "apple-vision-ocr",
         ocrAvailable: Bool = true,
         runtimeInstalled: Bool = false,
@@ -1232,16 +1483,6 @@ public struct VisionStatus: Codable, Equatable, Sendable {
         self.workerRunning = workerRunning
         self.installProgress = installProgress
         self.lastError = lastError
-    }
-}
-
-public struct VisionInstallParams: Codable, Equatable, Sendable {
-    public var modelId: String?
-    public var enable: Bool?
-
-    public init(modelId: String? = nil, enable: Bool? = true) {
-        self.modelId = modelId
-        self.enable = enable
     }
 }
 
@@ -1366,6 +1607,11 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
     public var readOnly: Bool?
     public var verify: String?
     public var returnImageContent: Bool?
+    public var observationMode: ObservationMode?
+    public var maxElements: Int?
+    public var includeText: Bool?
+    public var includeTables: Bool?
+    public var diffCrop: Bool?
 
     public init(
         profile: String? = nil,
@@ -1376,7 +1622,12 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
         returnDiffOnly: Bool = false,
         readOnly: Bool? = nil,
         verify: String? = nil,
-        returnImageContent: Bool? = nil
+        returnImageContent: Bool? = nil,
+        observationMode: ObservationMode? = nil,
+        maxElements: Int? = nil,
+        includeText: Bool? = nil,
+        includeTables: Bool? = nil,
+        diffCrop: Bool? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
@@ -1387,6 +1638,11 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
         self.readOnly = readOnly
         self.verify = verify
         self.returnImageContent = returnImageContent
+        self.observationMode = observationMode
+        self.maxElements = maxElements
+        self.includeText = includeText
+        self.includeTables = includeTables
+        self.diffCrop = diffCrop
     }
 
     public init(from decoder: Decoder) throws {
@@ -1400,6 +1656,11 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
         self.readOnly = try c.decodeIfPresent(Bool.self, forKey: .readOnly)
         self.verify = try c.decodeIfPresent(String.self, forKey: .verify)
         self.returnImageContent = try c.decodeIfPresent(Bool.self, forKey: .returnImageContent)
+        self.observationMode = try c.decodeIfPresent(ObservationMode.self, forKey: .observationMode)
+        self.maxElements = try c.decodeIfPresent(Int.self, forKey: .maxElements)
+        self.includeText = try c.decodeIfPresent(Bool.self, forKey: .includeText)
+        self.includeTables = try c.decodeIfPresent(Bool.self, forKey: .includeTables)
+        self.diffCrop = try c.decodeIfPresent(Bool.self, forKey: .diffCrop)
     }
 }
 

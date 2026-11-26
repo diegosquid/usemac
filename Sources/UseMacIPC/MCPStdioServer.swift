@@ -646,7 +646,7 @@ public final class MCPStdioServer: @unchecked Sendable {
             return 60_000 + approvalAllowance
         case .browserOpen, .browserExtract:
             return 45_000 + approvalAllowance
-        case .visionQuery, .visionInstall:
+        case .visionQuery:
             return 120_000
         default:
             return 35_000
@@ -948,7 +948,7 @@ public final class MCPStdioServer: @unchecked Sendable {
 
         case "usemac_vision_status":
             if let v = response.visionStatus {
-                let text = "Local Vision: state=\(v.state) | enabled=\(v.enabled) | backend=\(v.backend) | model=\(v.modelId) | ocr=\(v.ocrAvailable) | runtime=\(v.runtimeInstalled) | downloaded=\(v.modelDownloaded) | workerRunning=\(v.workerRunning)"
+                let text = "Local Vision: state=\(v.state) | enabled=\(v.enabled) | backend=\(v.backend) | ocr=\(v.ocrAvailable)"
                 return [.text(text)]
             }
             return [.text("Vision status unavailable")]
@@ -1850,7 +1850,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_vision_status",
-            description: "Check UseMac Local Vision status: `backend` says what answers usemac_vision_query now, Apple Vision OCR (the default) or the optional on-device MLX model the user can turn on.",
+            description: "Check UseMac Local Vision status (on-device Apple Vision OCR).",
             inputSchema: [
                 "type": "object",
                 "properties": [:]
@@ -1865,7 +1865,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_vision_query",
-            description: "ZERO-CLOUD-IMAGE-TOKEN on-device visual check. Apple Vision OCR answers by default: screen text with positions, in milliseconds. When the user turned on the optional on-device MLX model (result `backend: mlx-vlm`, about 2 s), it also judges icons, colors, disabled buttons and click coordinates. Prefer this BEFORE usemac_browser_screenshot to read values, confirm an action result, spot error text or find a labeled control. With `backend: apple-vision-ocr` it cannot see icons, colors or disabled states: use usemac_browser_observe, or a screenshot when the DOM does not say.",
+            description: "ZERO-CLOUD-IMAGE-TOKEN on-device Apple Vision OCR check: screen text with positions, in milliseconds. Prefer this BEFORE usemac_browser_screenshot to read values, confirm an action result, spot error text or find a labeled control. For icons, colors or disabled states, use usemac_browser_observe, or a screenshot when the DOM does not say.",
             inputSchema: [
                 "type": "object",
                 "properties": [

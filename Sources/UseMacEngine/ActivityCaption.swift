@@ -80,6 +80,15 @@ public enum ActivityCaption {
             return "Couldn't switch apps"
         case .wait:
             return "Couldn't wait\(stepSuffix)"
+        case .assert:
+            return "Check failed\(stepSuffix)"
+        case .scrollUntil:
+            return quoted.map { "Couldn't scroll to \($0)" } ?? "Couldn't find it while scrolling\(stepSuffix)"
+        case .fillForm:
+            return "Couldn't fill the form\(stepSuffix)"
+        case .menuAction:
+            if let last = clipped(step.menuPath?.last, limit: 24) { return "Couldn't choose “\(last)”" }
+            return "Couldn't use the menu\(stepSuffix)"
         }
     }
 

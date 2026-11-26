@@ -23,15 +23,15 @@ public enum AuditEntryKind: String, CaseIterable, Hashable, Sendable {
             return
         }
         switch known {
-        case .act, .browserAct, .browserOpen:
+        case .act, .browserAct, .browserOpen, .appMenu, .skillRun:
             self = .action
         case .browserExtract:
             // `AuditRedactor.evalSummary` starts every eval entry this way; the other modes only read the page.
             self = summary.hasPrefix("Eval (") ? .action : .observation
         case .observe, .screenshot, .listApps, .highlight, .browserStatus, .browserTabs, .browserObserve,
-             .browserScreenshot, .visionStatus, .visionQuery, .status, .ping, .auditLog, .debugCapture:
+             .browserScreenshot, .browserBatch, .visionStatus, .visionQuery, .skillList, .status, .ping, .auditLog, .debugCapture:
             self = .observation
-        case .setPolicy, .pairApp, .visionInstall, .taskStart, .taskComplete, .browserReloadExtension, .reportPrepare:
+        case .setPolicy, .pairApp, .skillSave, .taskStart, .taskComplete, .browserReloadExtension, .reportPrepare:
             self = .other
         }
     }

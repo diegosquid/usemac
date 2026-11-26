@@ -87,12 +87,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         socketPath: String = UseMacDefaults.defaultSocketPath,
         extensionPort: UInt16 = UseMacDefaults.defaultExtensionPort,
         bridgeKeyDirectory: URL? = nil,
-        auditStore: AuditLogStore? = nil,
-        allowsLocalVisionModel: Bool = false
+        auditStore: AuditLogStore? = nil
     ) {
         self.socketPath = socketPath
-        // Only the long-lived engine (the app, `usemac serve`) loads the local model; see LocalVisionEngine.allowsModel.
-        self.localVision = LocalVisionEngine(allowsModel: allowsLocalVisionModel)
+        self.localVision = LocalVisionEngine()
         self.auditStore = auditStore
         self.auditEntries = auditStore?.recentEntries() ?? []
         let pairingStore = bridgeKeyDirectory.map { BridgePairingStore(directory: $0) } ?? BridgePairingStore()
@@ -1092,14 +1090,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     enrichedActionResult = actionRes
                 }
 
-                // Two-Way Auto-Visual Reflex: when a scroll stalls, a click/key has no visible effect, or an overlay blocks the page,
-                // UseMac immediately diagnoses what happened locally (DOM + Apple Silicon MLX Vision) without needing a cloud screenshot.
+                // Two-Way Auto-Visual Reflex: when a scroll stalls or an overlay blocks the page,
+                // UseMac immediately diagnoses what happened locally (DOM + Apple Vision OCR) without needing a cloud screenshot.
                 if var actionRes = enrichedActionResult {
                     let blockedStep = actionRes.stepResults.last(where: { $0.blockedWarning != nil })
                     let domOverlay = actionRes.observation?.pageState?.blockingOverlay
-                    let mlxReady = localVision.currentStatus().backend == "mlx-vlm"
-                    let shouldRunNoEffectReflex = (noVisualEffectStep != nil && mlxReady && params.verify == nil)
-                    if blockedStep != nil || domOverlay != nil || shouldRunNoEffectReflex {
+                    if blockedStep != nil || domOverlay != nil {
                         if let overlay = domOverlay, (overlay.closeElementId != nil || (overlay.closeX != nil && overlay.closeY != nil)) {
                             actionRes.agentFeedback = AgentFeedback(
                                 severity: "blocked",
@@ -1297,54 +1293,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         case .visionStatus:
             let vStatus = localVision.currentStatus()
             let latencyMs = elapsedMs(since: startNs)
-            response = .success(id: request.id, latencyMs: latencyMs, visionStatus: vStatus)
-
-        case .visionInstall:
-            let params = request.visionInstall ?? VisionInstallParams()
-            if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: true) {
-                response = blockedPolicyResponse(
-                    request: request,
-                    startNs: startNs,
-                    targetApp: "Local Vision",
-                    activityTitle: "Vision install blocked",
-                    reason: blockReason
-                )
-                break
-            }
-            let allowedModels = LocalVisionModelPreset.allCases.map(\.rawValue)
-            let trimmedModelId = params.modelId?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let modelId = trimmedModelId, !modelId.isEmpty, !allowedModels.contains(modelId) {
-                let latencyMs = elapsedMs(since: startNs)
-                let message = "Unknown local vision model. Allowed: \(allowedModels.joined(separator: ", "))"
-                appendAudit(
-                    method: request.method.rawValue,
-                    targetApp: "Local Vision",
-                    summary: "Rejected model: \(modelId)",
-                    latencyMs: latencyMs,
-                    success: false
-                )
-                emitLiveActivity(LiveActivityItem(
-                    kind: .policyOrSafety,
-                    appName: "Local Vision",
-                    title: "Vision install blocked",
-                    subtitle: message,
-                    latencyMs: latencyMs,
-                    success: false,
-                    isInProgress: false
-                ))
-                response = .failure(id: request.id, code: "INVALID_MODEL", message: message, latencyMs: latencyMs)
-                break
-            }
-            let validatedModelId = (trimmedModelId?.isEmpty == false) ? trimmedModelId : params.modelId
-            let vStatus = await localVision.install(modelId: validatedModelId, enable: params.enable ?? true)
-            let latencyMs = elapsedMs(since: startNs)
-            appendAudit(
-                method: request.method.rawValue,
-                targetApp: "Local Vision",
-                summary: "Vision install (\(vStatus.modelId)): \(vStatus.state)",
-                latencyMs: latencyMs,
-                success: vStatus.lastError == nil
-            )
             response = .success(id: request.id, latencyMs: latencyMs, visionStatus: vStatus)
 
         case .visionQuery:
@@ -1603,6 +1551,15 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
             response = await handleDebugCapture(request, startNs: startNs)
+
+        case .appMenu, .browserBatch, .skillSave, .skillRun, .skillList:
+            let latencyMs = elapsedMs(since: startNs)
+            response = .failure(
+                id: request.id,
+                code: "NOT_IMPLEMENTED",
+                message: "Method '\(request.method.rawValue)' is not implemented yet.",
+                latencyMs: latencyMs
+            )
         }
 
         notifyStateChanged()
@@ -2149,9 +2106,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
     private func isMutatingStepForPolicy(_ step: ActionStep) -> Bool {
         switch step.action {
-        case .target, .scroll, .hover, .wait, .scrollIntoView, .waitFor:
+        case .target, .scroll, .hover, .wait, .scrollIntoView, .waitFor, .assert, .scrollUntil:
             return false
-        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile, .axAction:
+        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile, .axAction, .fillForm, .menuAction:
             return true
         }
     }

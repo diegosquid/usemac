@@ -204,8 +204,8 @@ final class AuditRedactionTests: XCTestCase {
             "Vision ocr [apple-vision]: read 17 chars"
         )
         XCTAssertEqual(
-            AuditRedactor.visionSummary(mode: "ask", backend: "mlx-vlm", answer: "A dialog is open", recordText: false),
-            "Vision ask [mlx-vlm]: A dialog is open"
+            AuditRedactor.visionSummary(mode: "ask", backend: "apple-vision-ocr", answer: "A dialog is open", recordText: false),
+            "Vision ask [apple-vision-ocr]: A dialog is open"
         )
     }
 

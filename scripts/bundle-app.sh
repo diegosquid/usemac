@@ -154,12 +154,6 @@ if [[ -d "$ROOT_DIR/Extension" ]]; then
   rsync -a --exclude='.DS_Store' --exclude='*.tmp' --exclude='*.bak' --exclude='*.swp' "$ROOT_DIR/Extension/" "$RESOURCES_DIR/chrome-extension/"
 fi
 
-if [[ -f "$ROOT_DIR/scripts/usemac-vision-worker.py" ]]; then
-  mkdir -p "$RESOURCES_DIR/vision"
-  cp "$ROOT_DIR/scripts/usemac-vision-worker.py" "$RESOURCES_DIR/vision/worker.py"
-  chmod +x "$RESOURCES_DIR/vision/worker.py"
-fi
-
 ICON_PLIST_ENTRY=""
 ICON_GEN_ARGS=("$RESOURCES_DIR/AppIcon.icns")
 if [[ -f "$ROOT_DIR/Assets/usemac-icon-master.png" ]]; then

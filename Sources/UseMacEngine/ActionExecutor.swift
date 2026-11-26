@@ -442,9 +442,9 @@ public final class ActionExecutor: @unchecked Sendable {
 
     private func isMutatingStep(_ step: ActionStep) -> Bool {
         switch step.action {
-        case .target, .scroll, .hover, .wait, .scrollIntoView, .waitFor:
+        case .target, .scroll, .hover, .wait, .scrollIntoView, .waitFor, .assert, .scrollUntil:
             return false
-        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile, .axAction:
+        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile, .axAction, .fillForm, .menuAction:
             return true
         }
     }
@@ -793,6 +793,8 @@ public final class ActionExecutor: @unchecked Sendable {
             outcome = performAXAction(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .uploadFile:
             outcome = await performNativeUploadFile(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+        case .assert, .scrollUntil, .fillForm, .menuAction:
+            outcome = StepOutcome(success: false, mechanism: "dispatch", message: "Step '\(step.action.rawValue)' is not implemented yet", errorCode: "NOT_IMPLEMENTED")
         case .target, .wait, .waitFor, .openURL, .navigate:
             outcome = StepOutcome(success: false, mechanism: "dispatch", message: "Unreachable step type")
         }
@@ -2437,6 +2439,18 @@ public final class ActionExecutor: @unchecked Sendable {
             return target.isEmpty ? "Performed \(name)" : "Performed \(name) on \(target)"
         case .waitFor:
             return step.gone == true ? "Waited for \(target.isEmpty ? "element" : target) to go away" : "Waited for \(target.isEmpty ? "element" : target)"
+        case .assert:
+            return "Checked expectation"
+        case .scrollUntil:
+            return target.isEmpty ? "Scrolled until match" : "Scrolled until \(target)"
+        case .fillForm:
+            let count = step.fields?.count ?? 0
+            return count == 1 ? "Filled 1 form field" : "Filled \(count) form fields"
+        case .menuAction:
+            if let path = step.menuPath, !path.isEmpty {
+                return "Chose \(clippedText(path.joined(separator: " → "), limit: 28))"
+            }
+            return "Used menu item"
         }
     }
 

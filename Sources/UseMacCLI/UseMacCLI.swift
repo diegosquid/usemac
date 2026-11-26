@@ -118,7 +118,10 @@ struct UseMacCLI {
         .act,
         .browserAct,
         .browserOpen,
-        .visionInstall,
+        .browserBatch,
+        .appMenu,
+        .skillSave,
+        .skillRun,
         .setPolicy,
         .pairApp,
         .browserReloadExtension,
@@ -163,13 +166,22 @@ struct UseMacCLI {
     private static let batchActionAllowedKeys: [String] = [
         "allowStaleSnapshot",
         "app",
+        "diffCrop",
         "expectWindowTitle",
         "foreground",
+        "foregroundFallback",
         "includeScreenshot",
+        "includeTables",
+        "includeText",
+        "maxElements",
+        "observationMode",
         "returnDiffOnly",
+        "returnImageContent",
         "returnObservation",
         "steps",
         "stopOnError",
+        "verify",
+        "waitForIdleMs",
         "window"
     ]
 
@@ -197,6 +209,11 @@ struct UseMacCLI {
     }
 
     private static let browserActAllowedKeys: [String] = [
+        "diffCrop",
+        "includeTables",
+        "includeText",
+        "maxElements",
+        "observationMode",
         "profile",
         "readOnly",
         "returnDiffOnly",
@@ -1483,7 +1500,7 @@ struct UseMacCLI {
 
     private static func handleVision(args: [String], options: GlobalOptions) async throws -> Int32 {
         guard let sub = args.first else {
-            throw CLIError.usage("Usage: usemac vision <status|install|ask|verify|describe|locate|diagnose|ocr> ...")
+            throw CLIError.usage("Usage: usemac vision <status|ask|verify|describe|locate|diagnose|ocr> ...")
         }
         let rest = Array(args.dropFirst())
         switch sub {
@@ -1503,24 +1520,9 @@ struct UseMacCLI {
                 throw CLIError.rpcFailure(code: "empty_vision_status", message: "Empty vision status response.")
             }
             print(String(format: "[%@] Local Vision: %@ | backend=%@ | enabled=%@ | rtt=%.2f ms", mode.rawValue, vs.state, vs.backend, vs.enabled ? "yes" : "no", rttMs))
-            print("Model: \(vs.modelId) | runtime=\(vs.runtimeInstalled ? "ok" : "not installed") | weights=\(vs.modelDownloaded ? "ok" : "pending") | worker=\(vs.workerRunning ? "running" : "idle") | Apple OCR=ok")
+            print("Apple Vision OCR: \(vs.ocrAvailable ? "ok" : "unavailable")")
             if let err = vs.lastError, !err.isEmpty {
                 print("Last error: \(err)")
-            }
-            return 0
-
-        case "install":
-            let parsed = try parseAppAndExtras(args: rest, valueFlags: ["--model"])
-            let params = VisionInstallParams(modelId: parsed.values["--model"], enable: true)
-            let req = RPCRequest(method: .visionInstall, visionInstall: params)
-            let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 300_000)
-            try ensureOK(res)
-            if options.json {
-                printEncodableJSON(res)
-                return 0
-            }
-            if let vs = res.visionStatus {
-                print(String(format: "[%@] Vision install complete (%.1f ms): state=%@ model=%@", mode.rawValue, rttMs, vs.state, vs.modelId))
             }
             return 0
 
@@ -1580,7 +1582,7 @@ struct UseMacCLI {
         case "help":
             return try printHelp(for: ["vision"] + rest.prefix(1))
         default:
-            throw CLIError.usage("Unknown vision subcommand: '\(sub)'. Use: status, install, ask, verify, describe, locate, diagnose, or ocr.")
+            throw CLIError.usage("Unknown vision subcommand: '\(sub)'. Use: status, ask, verify, describe, locate, diagnose, or ocr.")
         }
     }
 
@@ -1845,8 +1847,7 @@ struct UseMacCLI {
     }
 
     private static func handleServe(options: GlobalOptions) async throws -> Int32 {
-        // `serve` stands in for the app, so it is the one engine here that may load the local vision model.
-        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore(), allowsLocalVisionModel: true)
+        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore())
         let server = UnixSocketServer(socketPath: options.socketPath, service: service, onClientCountChange: nil)
         try server.start()
 
@@ -2236,10 +2237,9 @@ struct UseMacCLI {
                                                      Execute BrowserActParams or [ActionStep] in Chrome with optional local verification or screenshot
           browser reload-extension [--profile <n>] [--force]
                                                      Reload the extension so Chrome runs the code now in its folder (stops running browser work)
-          vision status                              Show Local Vision engine status (Apple OCR + MLX-VLM)
-          vision install [--model <hf-repo>]         Optional: install the MLX runtime and a local model (Apple OCR works without it)
+          vision status                              Show Local Vision engine status (Apple Vision OCR)
           vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
-                                                     Ask Apple OCR, or the on-device model when it is on, about the screen (zero cloud image tokens)
+                                                     Ask Apple Vision OCR about the screen (zero cloud image tokens)
           start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"] [--agent <name>]
                                                      Start a task (prints its taskId) keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
@@ -2311,8 +2311,7 @@ struct UseMacCLI {
     ]
 
     private static let visionSubcommands: [(String, String)] = [
-        ("status", "Show Local Vision status (Apple OCR + MLX model)"),
-        ("install", "Optional: install the MLX runtime and a preset model"),
+        ("status", "Show Local Vision status (Apple Vision OCR)"),
         ("ask", "Ask a visual question about the screen"),
         ("verify", "Check a visual assertion (YES/NO + evidence)"),
         ("describe", "Summarize the visible state (errors, values, buttons, modals)"),
@@ -2607,7 +2606,7 @@ struct UseMacCLI {
         case "vision":
             return CommandHelp(
                 usage: ["usemac vision <subcommand> [arguments]"],
-                summary: "On-device vision (Apple Vision OCR plus an optional MLX model). Images never leave the Mac.",
+                summary: "On-device vision (Apple Vision OCR). Images never leave the Mac.",
                 flags: visionSubcommands,
                 notes: ["Run 'usemac help vision <subcommand>' for its flags."],
                 examples: ["usemac vision verify \"Success banner is visible\" --tab 123"]
@@ -2615,16 +2614,9 @@ struct UseMacCLI {
         case "vision status":
             return CommandHelp(
                 usage: ["usemac vision status"],
-                summary: "Show whether OCR and the local model are ready.",
+                summary: "Show whether on-device Apple Vision OCR is ready.",
                 examples: ["usemac vision status"],
-                json: "VisionStatus {state, enabled, backend, modelId, runtimeInstalled, modelDownloaded, workerRunning, lastError}"
-            )
-        case "vision install":
-            return CommandHelp(
-                usage: ["usemac vision install [--model <hf-repo>]"],
-                summary: "Optional. Install the MLX runtime and download one of the three preset models (INVALID_MODEL otherwise). Most tasks don't need it: Apple Vision OCR reads screen text, and a model only adds icons, colors and greyed-out buttons. It loads in the UseMac app on the first visual check and unloads after 5 idle minutes.",
-                flags: [("--model <hf-repo>", "Preset model id (default: the preset selected in Settings)")],
-                examples: ["usemac vision install"]
+                json: "VisionStatus {state, enabled, backend, ocrAvailable, lastError}"
             )
         case "vision ask", "vision verify", "vision describe", "vision locate", "vision diagnose", "vision ocr":
             let mode = String(key.dropFirst("vision ".count))

@@ -75,6 +75,7 @@ extension RPCRequest {
         case .browserScreenshot: return browserScreenshot?.tabId
         case .browserAct: return browserAct?.tabId
         case .visionQuery: return visionQuery?.tabId
+        case .skillRun: return skillRun?.tabId
         case .taskStart: return taskStart?.tabId
         case .taskComplete: return taskComplete?.tabId
         default: return nil
@@ -89,7 +90,9 @@ extension RPCRequest {
         case .browserExtract: return browserExtract?.profile
         case .browserScreenshot: return browserScreenshot?.profile
         case .browserAct: return browserAct?.profile
+        case .browserBatch: return browserBatch?.profile
         case .visionQuery: return visionQuery?.profile
+        case .skillRun: return skillRun?.profile
         default: return nil
         }
     }

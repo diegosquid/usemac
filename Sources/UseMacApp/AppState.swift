@@ -251,7 +251,7 @@ public final class AppState: ObservableObject {
     private var policyBeforePause: GovernancePolicy?
 
     public init(socketPath: String = UseMacDefaults.defaultSocketPath) {
-        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore(), allowsLocalVisionModel: true)
+        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore())
         let defaults = UserDefaults.standard
 
         // Nothing saved, or an unknown mode, starts in Autonomous with the Emergency stop off (StartupSafetyStateTests).
@@ -873,10 +873,6 @@ public final class AppState: ObservableObject {
         if perms != status.permissions {
             status.permissions = perms
         }
-    }
-
-    public var isLocalVisionInstallerAvailable: Bool {
-        LocalVisionEngine.isInstallerAvailable
     }
 
     // MARK: - Agent setup prompts (shared by Settings → Connect and the setup guide)
@@ -1614,25 +1610,6 @@ public final class AppState: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: DefaultsKeys.autoShowHUDOnActivity)
         if !enabled && isHUDVisible && !isHUDManuallyPinned && !status.killSwitchTripped {
             hideHUD(userInitiated: false)
-        }
-    }
-
-    public func setLocalVisionEnabled(_ enabled: Bool) {
-        engine.localVision.setEnabled(enabled)
-        visionStatus = engine.localVision.currentStatus()
-    }
-
-    public func selectLocalVisionModel(_ preset: LocalVisionModelPreset) {
-        engine.localVision.setModelId(preset.rawValue)
-        visionStatus = engine.localVision.currentStatus()
-    }
-
-    public func installLocalVision() {
-        let modelId = visionStatus.modelId
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let updated = await self.engine.localVision.install(modelId: modelId, enable: true)
-            self.visionStatus = updated
         }
     }
 

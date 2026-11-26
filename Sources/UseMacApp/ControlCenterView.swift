@@ -348,7 +348,6 @@ public struct ControlCenterView: View {
                 livePreviewGroup
                 shortcutsGroup
                 chromeExtensionGroup
-                localVisionGroup
                 permissionsGroup
                 safetyGroup
                     .id(ControlCenterAnchor.safety)
@@ -730,70 +729,6 @@ public struct ControlCenterView: View {
                     InsetDivider(leading: 18)
                     ChromeExtensionProfileRow(appState: appState, profile: profile)
                 }
-            }
-        }
-    }
-
-    private var localVisionGroup: some View {
-        let vision = appState.visionStatus
-        let selectedPreset = LocalVisionModelPreset(rawValue: vision.modelId) ?? .qwen25VL3B
-        let isReady = vision.runtimeInstalled && vision.modelDownloaded
-        let isInstalling = vision.state == "installing"
-
-        return SettingsGroup(title: "Local Vision") {
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(isReady && vision.enabled ? UseMacTheme.statusGreen : UseMacTheme.accentActive)
-                    .frame(width: 6, height: 6)
-                Text(isReady && vision.enabled ? "MLX Ready" : (isInstalling ? "Installing…" : "Apple OCR Active"))
-                    .font(.system(size: 11.5, weight: .regular))
-                    .foregroundStyle(.secondary)
-            }
-        } content: {
-            codexRow(
-                title: "On-device GUI model",
-                subtitle: vision.installProgress
-                    ?? vision.lastError
-                    ?? (isReady
-                        ? "Checks icons, colors and greyed-out buttons on your Mac. Loads when an agent needs it, unloads after 5 idle minutes."
-                        : "Optional (\(selectedPreset.sizeHint)). Apple OCR covers most tasks; the model adds icons and colors.")
-            ) {
-                if isInstalling {
-                    ProgressView()
-                        .controlSize(.small)
-                } else if isReady {
-                    CodexToggle(
-                        isOn: Binding(
-                            get: { appState.visionStatus.enabled },
-                            set: { appState.setLocalVisionEnabled($0) }
-                        ),
-                        accessibilityLabel: "On-device GUI model"
-                    )
-                } else {
-                    Button("Install & Enable") {
-                        appState.installLocalVision()
-                    }
-                    .buttonStyle(PrimaryInkButtonStyle())
-                }
-            }
-
-            InsetDivider(leading: 18)
-
-            codexRow(
-                title: "Model preset",
-                subtitle: "Choose balance between grounding accuracy and speed on Apple Silicon."
-            ) {
-                CodexSegmentedControl(
-                    selection: Binding(
-                        get: { LocalVisionModelPreset(rawValue: appState.visionStatus.modelId) ?? .qwen25VL3B },
-                        set: { appState.selectLocalVisionModel($0) }
-                    ),
-                    options: [
-                        CodexSegmentOption(value: LocalVisionModelPreset.qwen35_08B, label: "Qwen3.5 0.8B"),
-                        CodexSegmentOption(value: LocalVisionModelPreset.qwen25VL3B, label: "Qwen2.5 3B"),
-                        CodexSegmentOption(value: LocalVisionModelPreset.holo1_3B, label: "Holo 3B")
-                    ]
-                )
             }
         }
     }

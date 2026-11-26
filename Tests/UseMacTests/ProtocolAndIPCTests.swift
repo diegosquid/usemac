@@ -670,7 +670,7 @@ final class ProtocolAndIPCTests: XCTestCase {
                 suggestedAction: "Click close X button",
                 suggestedX: 1103.3,
                 suggestedY: 279.4,
-                source: "mlx-vlm",
+                source: "apple-vision-ocr",
                 latencyMs: 320
             )
         )
@@ -1205,9 +1205,9 @@ final class ProtocolAndIPCTests: XCTestCase {
 
         let vRes = VisionQueryResult(
             mode: "verify",
-            backend: "mlx-vlm",
-            modelId: LocalVisionModelPreset.qwen35_08B.rawValue,
-            latencyMs: 312.5,
+            backend: "apple-vision-ocr",
+            modelId: nil,
+            latencyMs: 24.5,
             answer: "CNAME Record gru.rp.dezeneiro.com.br is visible with no errors.",
             verified: true
         )
@@ -1232,11 +1232,8 @@ final class ProtocolAndIPCTests: XCTestCase {
         XCTAssertEqual(decodedBatch.visualVerification?.verified, true)
         XCTAssertEqual(decodedBatch.visualVerification?.mode, "verify")
 
-        // 2. Verify Apple Vision OCR fallback handles ask / verify / describe cleanly when MLX is disabled
+        // 2. Verify Apple Vision OCR handles ask / verify / describe cleanly
         let engine = LocalVisionEngine()
-        let wasEnabled = engine.currentStatus().enabled
-        engine.setEnabled(false)
-        defer { engine.setEnabled(wasEnabled) }
 
         let tmpDir = FileManager.default.temporaryDirectory
         let blankPath = tmpDir.appendingPathComponent("usemac-ut-blank-\(UUID().uuidString).jpg").path
