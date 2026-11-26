@@ -6,6 +6,8 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0-beta.1] - 2026-11-26
+
 ### Changed
 
 - **Element and full-page screenshots no longer make Chrome enlarge the page.** They only capture what is on screen,
@@ -304,7 +306,8 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
-[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.7.0-beta.1...HEAD
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.8.0-beta.1...HEAD
+[0.8.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.7.0-beta.1...v0.8.0-beta.1
 [0.7.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.3...v0.7.0-beta.1
 [0.6.0-beta.3]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.2...v0.6.0-beta.3
 [0.6.0-beta.2]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.1...v0.6.0-beta.2
