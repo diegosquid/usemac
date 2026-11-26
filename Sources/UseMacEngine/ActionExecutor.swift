@@ -100,8 +100,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 bundleId: currentApp?.bundleId,
                 windowTitle: currentApp?.windowTitle,
                 windowBounds: currentApp?.windowBounds,
-                title: "Did not run",
-                subtitle: refusal.message,
+                title: ActivityCaption.refusedBatchTitle(stepCount: request.steps.count),
+                subtitle: ActivityCaption.reason(errorCode: refusal.errorCode, message: refusal.message) ?? refusal.message,
                 mechanism: refusal.mechanism,
                 latencyMs: 0,
                 success: false,
@@ -166,8 +166,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     bundleId: currentApp?.bundleId,
                     windowTitle: currentApp?.windowTitle,
                     windowBounds: currentApp?.windowBounds,
-                    title: "Blocked \(step.action.rawValue)",
-                    subtitle: blockReason,
+                    title: ActivityCaption.failedStepTitle(step: step, position: (index + 1, request.steps.count)),
+                    subtitle: ActivityCaption.reason(errorCode: "POLICY_BLOCKED"),
                     elementId: step.elementId,
                     mechanism: "blocked",
                     latencyMs: 0,
@@ -217,10 +217,15 @@ public final class ActionExecutor: @unchecked Sendable {
             )
             stepResults.append(result)
 
-            let stepTitle = formatStepTitle(step: step, node: outcome.node, app: currentApp)
+            // A failed step says what UseMac couldn't do and why, in plain words (ActivityCaption).
+            let stepTitle = outcome.success
+                ? formatStepTitle(step: step, node: outcome.node, app: currentApp)
+                : ActivityCaption.failedStepTitle(step: step, targetName: outcome.node?.title, position: (index + 1, request.steps.count))
             let baseSubtitle = "\(outcome.mechanism) · \(String(format: "%.1f ms", stepLatencyMs))"
             let stepSubtitle: String
-            if !outcome.success, let msg = outcome.message, !msg.isEmpty {
+            if !outcome.success, let reason = ActivityCaption.reason(errorCode: outcome.errorCode, message: outcome.message) {
+                stepSubtitle = reason
+            } else if !outcome.success, let msg = outcome.message, !msg.isEmpty {
                 stepSubtitle = "\(baseSubtitle) · \(msg)"
             } else if outcome.effect == ActionEffect.none {
                 stepSubtitle = "\(baseSubtitle) · no visible effect"

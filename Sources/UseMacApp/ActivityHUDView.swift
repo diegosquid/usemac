@@ -968,14 +968,27 @@ private struct FramelessLivePiPCard: View {
     }
 
     private func captionPill(_ caption: LiveActivityItem) -> some View {
-        HStack(spacing: 5) {
-            if (caption.isInProgress || appState.isAgentBusy) && !appState.status.killSwitchTripped {
+        // A failed caption is finished work: a failure mark and its reason, never a spinner (ActivityCaption.mark).
+        let mark = ActivityCaption.mark(
+            isInProgress: caption.isInProgress,
+            success: caption.success,
+            agentBusy: appState.isAgentBusy,
+            stopped: appState.status.killSwitchTripped
+        )
+        let reason = mark == .failed ? caption.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        return HStack(spacing: 5) {
+            switch mark {
+            case .progress:
                 ProgressView()
                     .controlSize(.mini)
                     .scaleEffect(0.6)
-            } else {
+            case .failed:
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(MinimalHUDPalette.stopRed)
+            case .done:
                 Circle()
-                    .fill(caption.success ? MinimalHUDPalette.liveGreen : MinimalHUDPalette.stopRed)
+                    .fill(MinimalHUDPalette.liveGreen)
                     .frame(width: 4.5, height: 4.5)
             }
 
@@ -996,7 +1009,17 @@ private struct FramelessLivePiPCard: View {
                 .foregroundStyle(MinimalHUDPalette.ink)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .layoutPriority(1)
+
+            if let reason, !reason.isEmpty {
+                Text(reason)
+                    .font(.system(size: 10))
+                    .foregroundStyle(MinimalHUDPalette.ink.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
         }
+        .help(reason.map { "\(caption.title): \($0)" } ?? caption.title)
         .padding(.horizontal, 7.5)
         .padding(.vertical, 3)
         .background(Color.white.opacity(0.88), in: Capsule(style: .continuous))

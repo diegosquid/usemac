@@ -342,6 +342,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let activityApp = observation?.app ?? targetApp
             let rawDiff = observation?.diff?.summary.trimmingCharacters(in: .whitespacesAndNewlines)
             let completeSubtitle = (rawDiff?.isEmpty == false) ? rawDiff : nil
+            // A failed batch names its failed step and why, in plain words (ActivityCaption).
+            let failure = actResult.success ? nil : ActivityCaption.batchFailure(
+                steps: actReq.steps,
+                results: actResult.stepResults,
+                elementName: { [axIndexer] id in activityApp.flatMap { axIndexer.node(for: id, pid: $0.pid) }?.title ?? axIndexer.node(for: id)?.node.title }
+            )
             emitLiveActivity(LiveActivityItem(
                 kind: .actionComplete,
                 appName: activityApp?.name,
@@ -349,10 +355,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 bundleId: activityApp?.bundleId,
                 windowTitle: activityApp?.windowTitle,
                 windowBounds: activityApp?.windowBounds,
-                title: actResult.success
-                    ? "Finished \(actResult.stepResults.count) step\(actResult.stepResults.count == 1 ? "" : "s")"
-                    : "Batch failed",
-                subtitle: completeSubtitle,
+                title: failure?.title
+                    ?? "Finished \(actResult.stepResults.count) step\(actResult.stepResults.count == 1 ? "" : "s")",
+                subtitle: failure.map { $0.reason } ?? completeSubtitle,
                 latencyMs: actResult.totalLatencyMs,
                 success: actResult.success,
                 isInProgress: false,
@@ -717,8 +722,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 emitLiveActivity(LiveActivityItem(
                     kind: .actionComplete,
                     appName: resolvedLabel,
-                    title: "Browser open failed",
-                    subtitle: message,
+                    title: ActivityCaption.hostOrText(params.url).map { "Couldn't open \($0)" } ?? "Couldn't open the page",
+                    subtitle: ActivityCaption.reason(errorCode: code, message: message, inBrowser: true) ?? message,
                     latencyMs: latencyMs,
                     success: false,
                     isInProgress: false
@@ -798,8 +803,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 emitLiveActivity(LiveActivityItem(
                     kind: .observe,
                     appName: resolvedLabel,
-                    title: "Browser observe failed",
-                    subtitle: message,
+                    title: "Couldn't read the page",
+                    subtitle: ActivityCaption.reason(errorCode: code, message: message, inBrowser: true) ?? message,
                     latencyMs: latencyMs,
                     success: false,
                     isInProgress: false
@@ -1213,14 +1218,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     latencyMs: latencyMs,
                     success: actionSuccess
                 )
+                let browserFailure = actionSuccess ? nil : ActivityCaption.batchFailure(
+                    steps: params.steps,
+                    results: enrichedActionResult?.stepResults ?? [],
+                    inBrowser: true,
+                    elementName: { id in (bridgeResp.snapshot ?? enrichedActionResult?.observation)?.elements.first(where: { $0.id == id })?.title }
+                )
                 emitLiveActivity(LiveActivityItem(
                     kind: .actionComplete,
                     appName: resolvedLabel,
                     windowTitle: bridgeResp.title,
-                    title: actionSuccess
-                        ? "Finished \(stepCount) browser step\(stepCount == 1 ? "" : "s")"
-                        : "Browser batch failed",
-                    subtitle: bridgeResp.url,
+                    title: browserFailure?.title
+                        ?? "Finished \(stepCount) browser step\(stepCount == 1 ? "" : "s")",
+                    subtitle: browserFailure.map { $0.reason } ?? bridgeResp.url,
                     latencyMs: enrichedActionResult?.totalLatencyMs ?? latencyMs,
                     success: actionSuccess,
                     isInProgress: false,
@@ -1241,11 +1251,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 let code = bridgeResp.error?.code ?? "BROWSER_ACT_FAILED"
                 let message = bridgeResp.error?.message ?? "Failed to execute browser action"
                 appendAudit(method: request.method.rawValue, targetApp: resolvedLabel, summary: message, latencyMs: latencyMs, success: false)
+                let failedSteps = bridgeResp.actionResult.map { ActivityCaption.batchFailure(steps: params.steps, results: $0.stepResults, inBrowser: true) }
                 emitLiveActivity(LiveActivityItem(
                     kind: .actionComplete,
                     appName: resolvedLabel,
-                    title: "Browser action failed",
-                    subtitle: message,
+                    title: failedSteps?.title ?? "Couldn't act in Chrome",
+                    subtitle: ActivityCaption.reason(errorCode: code, message: message, inBrowser: true) ?? failedSteps?.reason ?? message,
                     latencyMs: latencyMs,
                     success: false,
                     isInProgress: false
@@ -1404,6 +1415,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let latencyMs = elapsedMs(since: startNs)
             if result.answer.hasPrefix("CAPTURE_TOO_SMALL:") {
                 let message = result.answer.dropFirst("CAPTURE_TOO_SMALL:".count).trimmingCharacters(in: .whitespaces)
+                // Settle the "…locally" caption shown above; it would otherwise spin until the next activity.
+                emitLiveActivity(LiveActivityItem(
+                    kind: .observe,
+                    appName: targetLabel,
+                    windowTitle: input.title,
+                    title: "Couldn't check the screen",
+                    subtitle: ActivityCaption.reason(errorCode: "CAPTURE_TOO_SMALL"),
+                    mechanism: result.backend,
+                    latencyMs: result.latencyMs,
+                    success: false,
+                    isInProgress: false,
+                    browserTabId: input.tabId ?? params.tabId,
+                    browserProfile: input.profileName ?? params.profile
+                ))
                 response = .failure(id: request.id, code: "CAPTURE_TOO_SMALL", message: message, latencyMs: latencyMs)
                 break
             }
