@@ -107,8 +107,8 @@ public final class TaskTabRegistry: @unchecked Sendable {
         } else {
             tasks[id]?.lastActivityAt = now
         }
-        if let agent = Self.clean(agent) {
-            tasks[id]?.agent = String(agent.prefix(40))
+        if let agent = Self.cleanAgent(agent) {
+            tasks[id]?.agent = agent
         }
         return id
     }
@@ -286,6 +286,11 @@ public final class TaskTabRegistry: @unchecked Sendable {
     public var runningTaskCount: Int {
         lock.lock(); defer { lock.unlock() }
         return tasks.count
+    }
+
+    /// An agent name as the preview shows it: trimmed, at most 40 characters, nil when empty.
+    public static func cleanAgent(_ name: String?) -> String? {
+        clean(name).map { String($0.prefix(40)) }
     }
 
     /// A refusal for a safety reason, counted as blocked in the summary.

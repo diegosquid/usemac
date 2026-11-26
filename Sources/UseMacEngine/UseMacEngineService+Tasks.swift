@@ -8,7 +8,9 @@ import UseMacProtocol
 extension UseMacEngineService {
     public func handle(_ request: RPCRequest) async -> RPCResponse {
         let scope = taskTabs.scope(request)
-        let agent = request.method == .taskStart ? request.taskStart?.agent : taskTabs.agent(of: scope.taskId)
+        let agent = request.method == .taskStart
+            ? TaskTabRegistry.cleanAgent(request.taskStart?.agent)
+            : taskTabs.agent(of: scope.taskId)
         return await TaskActivityContext.$agentName.withValue(agent) {
             await handleScoped(request, scope: scope)
         }
