@@ -147,7 +147,8 @@ public final class ActivityHUDController {
 
     private let edgeMargin: CGFloat = 14
     private let peekStep: CGFloat = hudFilmstripHeight
-    private let collapsedSize = NSSize(width: 164, height: 34)
+    private let collapsedSize: NSSize = hudCollapsedPillSize
+    private let stoppedCollapsedSize: NSSize = hudStoppedPillSize
     private let regularPiPSize = NSSize(width: 268, height: 172)
     private let largePiPSize = NSSize(width: 380, height: 242)
 
@@ -161,12 +162,14 @@ public final class ActivityHUDController {
         let initialBehind = appState.isHUDCollapsed ? 0 : (appState.hudDeck.count > 1 ? 1 : 0)
         let initialSize = Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
+            killSwitchTripped: appState.status.killSwitchTripped,
             isLarge: appState.isHUDLarge,
             hasFrame: appState.videoSink.hasReceivedFrame,
             aspectRatio: appState.videoSink.frameAspectRatio,
             stackBehindCount: initialBehind,
             peekStep: peekStep,
             collapsedSize: collapsedSize,
+            stoppedCollapsedSize: stoppedCollapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
         )
@@ -214,6 +217,10 @@ public final class ActivityHUDController {
         let deckBehindPublisher = appState.$hudDeck
             .map { $0.count > 1 ? 1 : 0 }
             .removeDuplicates()
+        // The collapsed pill is wider while automation is stopped (it shows Resume), so Stop and Resume re-snap it.
+        let killSwitchPublisher = appState.$status
+            .map { $0.killSwitchTripped }
+            .removeDuplicates()
 
         Publishers.CombineLatest4(
             appState.$isHUDCollapsed.removeDuplicates(),
@@ -222,6 +229,7 @@ public final class ActivityHUDController {
             appState.videoSink.$frameAspectRatio.removeDuplicates()
         )
         .combineLatest(deckBehindPublisher)
+        .combineLatest(killSwitchPublisher)
         .dropFirst()
         .receive(on: RunLoop.main)
         .sink { [weak self] _ in
@@ -386,12 +394,14 @@ public final class ActivityHUDController {
         let behind = appState.isHUDCollapsed ? 0 : (appState.hudDeck.count > 1 ? 1 : 0)
         return Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
+            killSwitchTripped: appState.status.killSwitchTripped,
             isLarge: appState.isHUDLarge,
             hasFrame: appState.videoSink.hasReceivedFrame,
             aspectRatio: appState.videoSink.frameAspectRatio,
             stackBehindCount: behind,
             peekStep: peekStep,
             collapsedSize: collapsedSize,
+            stoppedCollapsedSize: stoppedCollapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
         )
@@ -407,17 +417,19 @@ public final class ActivityHUDController {
 
     private static func sizeFor(
         collapsed: Bool,
+        killSwitchTripped: Bool,
         isLarge: Bool,
         hasFrame: Bool,
         aspectRatio: CGFloat,
         stackBehindCount: Int,
         peekStep: CGFloat,
         collapsedSize: NSSize,
+        stoppedCollapsedSize: NSSize,
         regularPiPSize: NSSize,
         largePiPSize: NSSize
     ) -> NSSize {
         if collapsed {
-            return collapsedSize
+            return killSwitchTripped ? stoppedCollapsedSize : collapsedSize
         }
         let baseSize: NSSize
         if hasFrame && aspectRatio > 0.2 {
