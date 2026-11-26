@@ -79,12 +79,14 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 | Mode (`set_policy`) | App UI label | Behavior |
 | :--- | :--- | :--- |
 | `autonomous` | **Autonomous** | Allows all actions (still subject to URL, upload, and path guards). |
+| `ask` | **Ask** | Holds `uploadFile`, keyboard shortcuts using `⌘` or `⌃`, and `browser_extract` in `eval` mode until you click **Allow once** or **Deny** in a prompt next to the HUD. Deny returns `APPROVAL_DENIED`; no answer within 45 s returns `APPROVAL_TIMEOUT`. |
 | `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃`, and `browser_extract` in `eval` mode. |
 | `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `target`, observe, read-only extract (`auto`, `tables`, `text`, `kpis`, `downloads`), and screenshots remain allowed. |
 | `paused` | **Paused** | Blocks all automation, including reads. |
 
 - **Kill Switch (`⇧⌘⎋`)**: Immediately blocks all automation including reads and cancels any in-progress Chrome batch. While **Kill Switch** or **Paused** is active, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start`, and `task_complete` continue responding. Blocked requests return `POLICY_BLOCKED`.
 - **One-way socket policy changes**: `set_policy` over the socket can only keep or tighten the execution mode; attempting to relax it returns `POLICY_LOCKED` (only the app can relax the mode).
+- **Ask prompts answer only to you**: only a physical click with this Mac's mouse or trackpad answers an Ask prompt. It ignores clicks posted by any process (another agent, Screen Sharing, Universal Control, Voice Control) and Accessibility actions, there is no socket method or MCP tool for it, and UseMac refuses to post real input onto it. One prompt shows at a time; the others queue. Every answer, and every ignored click, goes to the audit log.
 - **Blocked by default**:
   - **URLs**: `browser_open` and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs get `https://`; everything else returns `URL_BLOCKED`).
   - **File uploads**: `uploadFile` blocks `~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, `.env` files, browser and password-manager directories in `~/Library`, shell histories, and secret/key extensions (`.pem`, `.pfx`, `.p8`, `.kdbx`, `.ovpn`, `.jks`, `.keystore`, `.tfstate`), returning `UPLOAD_BLOCKED`.
