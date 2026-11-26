@@ -19,6 +19,7 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
     private var appState: AppState!
     private var hudController: ActivityHUDController!
     private var overlayCoordinator: AgentOverlayCoordinator!
+    private var approvalPromptController: ApprovalPromptController!
     private var controlCenterController: ControlCenterWindowController!
     private var permissionHelperController: PermissionDragHelperController!
     private var setupGuideController: SetupGuideWindowController!
@@ -35,6 +36,7 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
         self.appState = state
         self.hudController = ActivityHUDController(appState: state)
         self.overlayCoordinator = AgentOverlayCoordinator(appState: state)
+        self.approvalPromptController = ApprovalPromptController(appState: state, hud: hudController)
         self.controlCenterController = ControlCenterWindowController(appState: state)
         self.permissionHelperController = PermissionDragHelperController(appState: state)
         self.setupGuideController = SetupGuideWindowController(appState: state)

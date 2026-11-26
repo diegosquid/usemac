@@ -887,6 +887,8 @@ public struct ControlCenterView: View {
         switch appState.status.policy {
         case .autonomous:
             return "Agents can read and act without asking."
+        case .ask:
+            return "Agents can act, but uploads, page scripts and ⌘/⌃ shortcuts wait for your OK in the live preview."
         case .confirmSensitive:
             return "Agents can act, but uploads, page scripts and ⌘/⌃ shortcuts are blocked."
         case .readOnly:
@@ -912,6 +914,7 @@ public struct ControlCenterView: View {
                     ),
                     options: [
                         CodexSegmentOption(value: GovernancePolicy.autonomous, label: "Autonomous"),
+                        CodexSegmentOption(value: GovernancePolicy.ask, label: "Ask"),
                         CodexSegmentOption(value: GovernancePolicy.confirmSensitive, label: "Block sensitive"),
                         CodexSegmentOption(value: GovernancePolicy.readOnly, label: "Read-only"),
                         CodexSegmentOption(value: GovernancePolicy.paused, label: "Paused")
