@@ -108,6 +108,7 @@ public final class AppState: ObservableObject {
         static let safetyPolicy = StartupSafetyState.DefaultsKey.policy
         static let safetyPolicyBeforePause = StartupSafetyState.DefaultsKey.policyBeforePause
         static let safetyKillSwitchTripped = StartupSafetyState.DefaultsKey.killSwitchTripped
+        static let safetyDebugCaptureEnabled = StartupSafetyState.DefaultsKey.debugCaptureEnabled
         static let onboardingAgentConnected = "usemac.onboarding.agentConnected"
         static let onboardingDismissed = "usemac.onboarding.dismissed"
         static let setupGuideCompleted = "usemac.onboarding.setupGuideCompleted"
@@ -130,6 +131,8 @@ public final class AppState: ObservableObject {
     @Published public var auditEntries: [AuditEntry] = []
     @Published public var isServerRunning: Bool = false
     @Published public var daemonError: String?
+    /// Agents may capture UseMac's own windows (`debug_capture`). Only the user turns it on, in Settings → Developer.
+    @Published public private(set) var isDebugCaptureEnabled: Bool
 
     // Chrome Extension bridge state
     @Published public var isBrowserStreamActive: Bool = false
@@ -241,6 +244,7 @@ public final class AppState: ObservableObject {
 
         self.engine = engineService
         self.policyBeforePause = startupSafety.policyBeforePause
+        self.isDebugCaptureEnabled = startupSafety.debugCaptureEnabled
         self.status = engineService.currentStatus()
         self.pairedApp = engineService.getPairedApp()
         self.runningApps = engineService.listRunningApps()
@@ -443,6 +447,8 @@ public final class AppState: ObservableObject {
     private func hookEngineCallbacks() {
         // `report_prepare` opens its review window (ProblemReportWindow.swift).
         ProblemReportReviewController.shared.attach(to: engine)
+        // `debug_capture` asks which window is the live preview, Settings, … (DebugCaptureWindows.swift).
+        DebugCaptureWindows.attach(to: engine)
         engine.onOverlayEvent = { [weak self] event in
             Task { @MainActor [weak self] in
                 self?.handleOverlayEvent(event)
@@ -996,6 +1002,22 @@ public final class AppState: ObservableObject {
             }
         }
         refreshState()
+    }
+
+    /// Turns on Debug capture. Only the user's physical click on Turn On in Settings gets here: a `PhysicalClick`
+    /// comes only from `ApprovalInputCheck.verifyClick` (DebugCaptureSettingsView.swift).
+    public func turnOnDebugCapture(confirmedBy click: ApprovalInputCheck.PhysicalClick) {
+        setDebugCapture(true)
+    }
+
+    public func turnOffDebugCapture() {
+        setDebugCapture(false)
+    }
+
+    private func setDebugCapture(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: DefaultsKeys.safetyDebugCaptureEnabled)
+        engine.setDebugCaptureEnabled(enabled)
+        isDebugCaptureEnabled = enabled
     }
 
     public func setKillSwitch(_ tripped: Bool) {
