@@ -25,7 +25,8 @@
 /Extension/bridge-auth.js @diegosquid
 
 # Safety engine: execution modes, Kill Switch, Ask approvals, rules, pairing, redaction, problem reports
-# (what leaves the Mac and the human-only confirmation) and the socket.
+# (what leaves the Mac and the human-only confirmation), Debug capture (the user-only switch that lets agents see
+# UseMac's own windows) and the socket.
 /Sources/UseMacEngine/KillSwitch.swift @diegosquid
 /Sources/UseMacEngine/StartupSafetyState.swift @diegosquid
 /Sources/UseMacEngine/ApprovalBroker.swift @diegosquid
@@ -44,6 +45,11 @@
 /Sources/UseMacEngine/ProblemReport.swift @diegosquid
 /Sources/UseMacEngine/UseMacEngineService+ProblemReport.swift @diegosquid
 /Sources/UseMacApp/ProblemReportWindow.swift @diegosquid
+/Sources/UseMacEngine/DebugCapture.swift @diegosquid
+/Sources/UseMacEngine/DebugCaptureCapturer.swift @diegosquid
+/Sources/UseMacEngine/UseMacEngineService+DebugCapture.swift @diegosquid
+/Sources/UseMacApp/DebugCaptureSettingsView.swift @diegosquid
+/Sources/UseMacApp/DebugCaptureWindows.swift @diegosquid
 /Sources/UseMacEngine/PermissionManager.swift @diegosquid
 /Sources/UseMacIPC/UnixSocketServer.swift @diegosquid
 
