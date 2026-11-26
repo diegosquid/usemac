@@ -1011,7 +1011,14 @@ public final class MCPStdioServer: @unchecked Sendable {
                 let urlPart = profile.streamingUrl.map { " (\($0))" } ?? ""
                 return ", streaming tab=\(tabId)\(urlPart)"
             } ?? ""
-            lines.append("  - \(profile.profileName)\(emailPart) [v\(profile.extensionVersion), tabs=\(profile.tabCount)\(streamPart)]")
+            let outdatedPart = profile.extensionOutdated == true
+                ? ", outdated: app ships \(profile.bundledExtensionVersion ?? "a newer version")"
+                : ""
+            let sourcePart = profile.extensionSource.map { ", source=\($0)" } ?? ""
+            lines.append("  - \(profile.profileName)\(emailPart) [v\(profile.extensionVersion), tabs=\(profile.tabCount)\(streamPart)\(outdatedPart)\(sourcePart)]")
+            if let note = profile.extensionNote {
+                lines.append("    \(note) Tell the user; reloading the extension stops every agent's browser work.")
+            }
         }
         return lines.joined(separator: "\n")
     }
@@ -1324,7 +1331,7 @@ public final class MCPStdioServer: @unchecked Sendable {
     private static let toolDefinitions: [MCPToolDefinition] = [
         MCPToolDefinition(
             name: "usemac_status",
-            description: "Get UseMac daemon status, governance policy, permissions, paired/frontmost app, and latency telemetry.",
+            description: "Get UseMac daemon status, governance policy, permissions, paired/frontmost app, latency telemetry, and connected Chrome profiles (flagging an extension that is outdated or loaded from another folder).",
             inputSchema: [
                 "type": "object",
                 "properties": [:]

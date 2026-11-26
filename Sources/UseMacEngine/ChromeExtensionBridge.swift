@@ -96,6 +96,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         var streamingTabId: Int?
         var streamingUrl: String?
         var streamingTitle: String?
+        let acceptedAt = Date()
+        var extensionId: String?
+        var health: ChromeExtensionHealth?
 
         init(id: String, connection: NWConnection) {
             self.id = id
@@ -137,7 +140,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
                 tabCount: tabCount,
                 streamingTabId: streamingTabId,
                 streamingUrl: streamingUrl,
-                streamingTitle: streamingTitle
+                streamingTitle: streamingTitle,
+                extensionId: extensionId,
+                extensionSource: health?.source.rawValue,
+                bundledExtensionVersion: health?.bundledVersion,
+                extensionOutdated: health?.outdated,
+                extensionReloadable: health?.reloadable,
+                extensionNote: health?.note
             )
         }
     }
@@ -155,9 +164,26 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private struct HelloPayload: Decodable {
         let `protocol`: Int?
         let extensionVersion: String?
+        /// `chrome.runtime.id`. Extensions that send it also accept `reload_extension`.
+        let extensionId: String?
         let profileName: String?
         let clientNonce: String?
         let hasKey: Bool?
+
+        private enum CodingKeys: String, CodingKey {
+            case `protocol`, extensionVersion, extensionId, profileName, clientNonce, hasKey
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.protocol = try c.decodeIfPresent(Int.self, forKey: .protocol)
+            self.extensionVersion = try c.decodeIfPresent(String.self, forKey: .extensionVersion)
+            // Optional and informational: a malformed value must never cost the extension its handshake.
+            self.extensionId = try? c.decodeIfPresent(String.self, forKey: .extensionId)
+            self.profileName = try c.decodeIfPresent(String.self, forKey: .profileName)
+            self.clientNonce = try c.decodeIfPresent(String.self, forKey: .clientNonce)
+            self.hasKey = try c.decodeIfPresent(Bool.self, forKey: .hasKey)
+        }
     }
 
     private struct AuthPayload: Decodable {
@@ -241,6 +267,22 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     private struct ReadyWireMessage: Encodable {
         let type = "ready"
+        /// Omitted when nil. What the app knows about this extension, for the extension popup.
+        var extensionStatus: ReadyExtensionStatus? = nil
+    }
+
+    private struct ReadyExtensionStatus: Encodable {
+        let source: String
+        let bundledVersion: String?
+        let outdated: Bool?
+        let reloadable: Bool
+        let note: String?
+    }
+
+    private struct ReloadExtensionWireCommand: Encodable {
+        let type = "request"
+        let id: String
+        let command = "reload_extension"
     }
 
     private struct AuthFailedWireMessage: Encodable {
@@ -385,6 +427,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var pendingRequests: [String: PendingRequest] = [:]
     private var cachedFramesByTab: [String: CachedBrowserFrame] = [:]
     private var latestCachedFrame: CachedBrowserFrame?
+    private let originLog = ExtensionOriginLog()
+    /// The extension copy inside UseMac.app: its version and the ID Chrome gives that folder when loaded unpacked.
+    public let bundledExtension: BundledChromeExtension?
 
     private var _listeningPort: UInt16 = 0
     private var _baseCommandTimeoutSeconds: UInt64 = 15
@@ -495,10 +540,12 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     public init(
         port: UInt16 = UseMacDefaults.defaultExtensionPort,
-        pairingStore: BridgePairingStore = BridgePairingStore()
+        pairingStore: BridgePairingStore = BridgePairingStore(),
+        bundledExtension: BundledChromeExtension? = BundledChromeExtension.locate()
     ) {
         self.configuredPort = port
         self.pairingStore = pairingStore
+        self.bundledExtension = bundledExtension
     }
 
     deinit {
@@ -591,6 +638,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             return
         }
 
+        let originLog = self.originLog
         let wsOptions = NWProtocolWebSocket.Options()
         wsOptions.autoReplyPing = true
         wsOptions.maximumMessageSize = 32 * 1024 * 1024
@@ -623,6 +671,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             }
             if !allowed.isEmpty && !allowed.contains(extId) {
                 return NWProtocolWebSocket.Response(status: .reject, subprotocol: nil, additionalHeaders: [("Connection", "close")])
+            }
+            if ChromeExtensionID.isValid(extId) {
+                originLog.record(extId)
             }
             return NWProtocolWebSocket.Response(status: .accept, subprotocol: nil, additionalHeaders: nil)
         }
@@ -944,6 +995,131 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
     }
 
+    // MARK: - Extension Reload
+
+    public struct ReloadOutcome: Sendable {
+        public let ok: Bool
+        /// Each reloaded profile as it reconnected (its new extension version).
+        public let profiles: [BrowserProfileStatus]
+        public let error: RPCErrorPayload?
+    }
+
+    /// Makes the extension answer, then call `chrome.runtime.reload()`, so Chrome runs the code now in its folder.
+    /// Waits until it has reconnected and paired again. `sessionId` (a `BrowserProfileStatus.id`) or `profile` picks
+    /// one profile; with neither, every connected profile reloads. Nothing reloads when a target cannot do it, or,
+    /// without `force`, while agents still have Chrome commands running in it.
+    public func reloadExtension(
+        profile: String? = nil,
+        sessionId: String? = nil,
+        force: Bool = false,
+        reconnectTimeoutSeconds: Double = 15
+    ) async -> ReloadOutcome {
+        let (plans, waitingForKey) = reloadPlans(profile: profile, sessionId: sessionId)
+
+        func failure(_ code: String, _ message: String) -> ReloadOutcome {
+            ReloadOutcome(ok: false, profiles: [], error: RPCErrorPayload(code: code, message: message))
+        }
+
+        guard !plans.isEmpty else {
+            if waitingForKey && profile == nil && sessionId == nil {
+                return failure("EXTENSION_NOT_PAIRED", Self.notPairedMessage)
+            }
+            return failure("EXTENSION_NOT_CONNECTED", profile.map { "No Chrome extension profile matched '\($0)'" }
+                ?? "No Chrome extension is connected.")
+        }
+        if let old = plans.first(where: { !$0.reloadable }) {
+            return failure("EXTENSION_RELOAD_UNSUPPORTED", Self.reloadUnsupportedMessage(profile: old.name, version: old.version))
+        }
+        if !force, let busy = plans.first(where: { $0.running > 0 }) {
+            return failure(
+                "BROWSER_BUSY",
+                "Agents have \(busy.running) Chrome command(s) running in profile '\(busy.name)'. Reloading the extension would stop them. Wait until they finish, or pass force."
+            )
+        }
+
+        var reloaded: [BrowserProfileStatus] = []
+        for plan in plans {
+            let startedAt = Date()
+            let resp = await sendCommand(profileQuery: nil, timeoutSeconds: 5, targetSessionId: plan.id) { requestId in
+                ReloadExtensionWireCommand(id: requestId)
+            }
+            // The socket can close before the answer arrives: the extension is already reloading.
+            if !resp.ok && resp.error?.code != "EXTENSION_NOT_CONNECTED" {
+                if resp.error?.code == "UNKNOWN_COMMAND" {
+                    return failure("EXTENSION_RELOAD_UNSUPPORTED", Self.reloadUnsupportedMessage(profile: plan.name, version: plan.version))
+                }
+                return ReloadOutcome(ok: false, profiles: reloaded, error: RPCErrorPayload(
+                    code: resp.error?.code ?? "EXTENSION_ERROR",
+                    message: "Profile '\(plan.name)': \(resp.error?.message ?? "the extension did not reload")"
+                ))
+            }
+            guard let status = await waitForReloadedSession(
+                profileName: plan.name,
+                acceptedAfter: startedAt,
+                timeoutSeconds: reconnectTimeoutSeconds
+            ) else {
+                return ReloadOutcome(ok: false, profiles: reloaded, error: RPCErrorPayload(
+                    code: "EXTENSION_RELOAD_TIMEOUT",
+                    message: "Chrome reloaded the extension in profile '\(plan.name)', but it did not reconnect within \(Int(reconnectTimeoutSeconds)) s. Open chrome://extensions in that profile and check UseMac Browser Bridge for errors."
+                ))
+            }
+            reloaded.append(status)
+        }
+        return ReloadOutcome(ok: true, profiles: reloaded, error: nil)
+    }
+
+    private struct ReloadPlan {
+        let id: String
+        let name: String
+        let version: String
+        let reloadable: Bool
+        /// Commands still waiting for this session's answer.
+        let running: Int
+    }
+
+    private func reloadPlans(profile: String?, sessionId: String?) -> (plans: [ReloadPlan], waitingForKey: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        let targets: [ExtensionSession]
+        if let sessionId {
+            targets = sessions[sessionId].map { $0.isReady ? [$0] : [] } ?? []
+        } else if let profile, !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            targets = resolveSessionLocked(profileQuery: profile).map { [$0] } ?? []
+        } else {
+            targets = readySessionsLocked()
+        }
+        let plans = targets.map { session in
+            ReloadPlan(
+                id: session.id,
+                name: session.profileName,
+                version: session.extensionVersion,
+                reloadable: session.health?.reloadable ?? false,
+                running: pendingRequests.values.filter { $0.sessionId == session.id }.count
+            )
+        }
+        return (plans, sessions.values.contains { $0.isPairingRequired })
+    }
+
+    private static func reloadUnsupportedMessage(profile: String, version: String) -> String {
+        "The UseMac extension in Chrome profile '\(profile)' (v\(version)) predates remote reload. Open chrome://extensions in that profile and click the reload button on UseMac Browser Bridge once. After that, UseMac can reload it for you."
+    }
+
+    private func waitForReloadedSession(profileName: String, acceptedAfter startedAt: Date, timeoutSeconds: Double) async -> BrowserProfileStatus? {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        let name = profileName.lowercased()
+        while true {
+            if let match = readySessionStatus(profileName: name, acceptedAfter: startedAt) { return match }
+            if Date() >= deadline { return nil }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    private func readySessionStatus(profileName lowercasedName: String, acceptedAfter startedAt: Date) -> BrowserProfileStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return readySessionsLocked().first { $0.acceptedAt >= startedAt && $0.profileName.lowercased() == lowercasedName }?.status
+    }
+
     // MARK: - Connection Management
 
     private func acceptConnection(_ connection: NWConnection) {
@@ -1198,6 +1374,16 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         if let version = payload.extensionVersion?.trimmingCharacters(in: .whitespacesAndNewlines), !version.isEmpty {
             session.extensionVersion = version
         }
+        let helloId = payload.extensionId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let reportsId = helloId.map(ChromeExtensionID.isValid) ?? false
+        session.extensionId = reportsId ? helloId : originLog.unambiguousId(since: session.acceptedAt)
+        session.health = ChromeExtensionHealth.evaluate(
+            extensionVersion: session.extensionVersion,
+            extensionId: session.extensionId,
+            reloadable: reportsId,
+            bundled: bundledExtension,
+            webStoreId: UseMacDefaults.chromeWebStoreExtensionId
+        )
 
         let connection = session.connection
         let hasKey = payload.hasKey ?? false
@@ -1282,10 +1468,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         session.authState = .ready
         let snapshot = readySessionsLocked().map(\.status)
         let profilesHandler = _onProfilesChanged
+        let readyMessage = ReadyWireMessage(extensionStatus: session.health.map {
+            ReadyExtensionStatus(source: $0.source.rawValue, bundledVersion: $0.bundledVersion, outdated: $0.outdated, reloadable: $0.reloadable, note: $0.note)
+        })
         lock.unlock()
 
         timeoutTask.cancel()
-        sendEncodable(ReadyWireMessage(), on: connection)
+        sendEncodable(readyMessage, on: connection)
         profilesHandler?(snapshot)
     }
 
@@ -1547,6 +1736,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         timeoutSeconds: UInt64? = nil,
         sendCancelOnTimeout: Bool = false,
         cancelTabId: Int? = nil,
+        targetSessionId: String? = nil,
         buildCommand: (String) -> Command
     ) async -> BridgeResponse {
         let requestId = UUID().uuidString
@@ -1562,7 +1752,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         return await withCheckedContinuation { continuation in
             lock.lock()
             let effectiveTimeout = timeoutSeconds ?? _baseCommandTimeoutSeconds
-            guard let session = resolveSessionLocked(profileQuery: profileQuery) else {
+            let target: ExtensionSession?
+            if let targetSessionId {
+                target = sessions[targetSessionId].flatMap { $0.isReady ? $0 : nil }
+            } else {
+                target = resolveSessionLocked(profileQuery: profileQuery)
+            }
+            guard let session = target else {
                 let readyCount = readySessionsLocked().count
                 let hasPairingRequired = sessions.values.contains { $0.isPairingRequired }
                 let port = _listeningPort == 0 ? configuredPort : _listeningPort

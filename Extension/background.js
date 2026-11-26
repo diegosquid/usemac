@@ -360,6 +360,7 @@ async function sendHello(socket = state.ws) {
     type: "hello",
     protocol: PROTOCOL_VERSION,
     extensionVersion: EXTENSION_VERSION,
+    extensionId: typeof chrome.runtime.id === "string" ? chrome.runtime.id : undefined,
     profileName: state.profileName,
     clientNonce,
     hasKey: Boolean(keyBytes)
@@ -597,6 +598,7 @@ function connectWS(force = false) {
         state.authState = "ready";
         state.awaitingAuthResult = false;
         state.nextReconnectAllowedAt = 0;
+        state.appExtensionStatus = msg.extensionStatus && typeof msg.extensionStatus === "object" ? msg.extensionStatus : null;
         sendProfileInfo();
       } else if (state.authState === "authenticating") {
         enterKeyMismatch(socket);
@@ -5129,6 +5131,10 @@ function sendCancelledResponse(req, tabId = null) {
 }
 
 function dispatchDaemonRequest(req) {
+  if (req.command === "reload_extension") {
+    handleDaemonRequest(req);
+    return;
+  }
   if (req.command === "tabs" || req.command === "close_owned_tabs" || (req.command === "extract" && String(req.mode || "").toLowerCase() === "downloads")) {
     handleDaemonRequest(req);
     return;
@@ -5196,6 +5202,37 @@ function dispatchDaemonRequest(req) {
   })();
 }
 
+// Answers first, then reloads, so the daemon gets the answer before the socket closes. Chrome restarts the service
+// worker with the code now in the extension's folder, which reconnects and pairs again on its own (the key is in
+// chrome.storage.local). Debugger sessions end, and the list of tabs UseMac opened (chrome.storage.session) is lost.
+function handleReloadExtensionCommand(req) {
+  const startedAt = Date.now();
+  const reloadWhenSent = () => {
+    const pending = state.ws && state.ws.readyState === WebSocket.OPEN ? state.ws.bufferedAmount : 0;
+    if (pending > 0 && Date.now() - startedAt < 1000) {
+      setTimeout(reloadWhenSent, 50);
+      return;
+    }
+    try {
+      chrome.runtime.reload();
+    } catch (_) {}
+  };
+  setTimeout(reloadWhenSent, 150);
+  return {
+    type: "response",
+    id: req.id,
+    ok: true,
+    tabId: null,
+    profileName: state.profileName,
+    extensionVersion: EXTENSION_VERSION,
+    url: null,
+    title: null,
+    snapshot: null,
+    actionResult: null,
+    error: null
+  };
+}
+
 async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = null) {
   await resolveProfileInfo();
   const targetTabId = preResolvedTab?.id ?? req.tabId ?? null;
@@ -5232,6 +5269,9 @@ async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = nul
         break;
       case "close_owned_tabs":
         response = await handleCloseOwnedTabsCommand(req);
+        break;
+      case "reload_extension":
+        response = handleReloadExtensionCommand(req);
         break;
       default:
         throw { code: "UNKNOWN_COMMAND", message: `Unknown command: ${req.command}` };
@@ -5285,7 +5325,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           hasKey: state.hasKey,
           profileName: state.profileName,
           tabs,
-          endpoint: BRIDGE_ENDPOINT
+          endpoint: BRIDGE_ENDPOINT,
+          extensionStatus: state.authState === "ready" ? state.appExtensionStatus || null : null
         });
       } catch (_) {
         sendResponse({

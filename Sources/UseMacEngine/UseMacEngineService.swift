@@ -515,6 +515,36 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserProfiles: profiles
             )
 
+        case .browserReloadExtension:
+            let params = request.browserReloadExtension ?? BrowserReloadExtensionParams()
+            if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {
+                response = blockedPolicyResponse(
+                    request: request,
+                    startNs: startNs,
+                    targetApp: params.profile ?? "Chrome",
+                    activityAppName: "Chrome (\(params.profile ?? "Browser"))",
+                    activityTitle: "Extension reload blocked",
+                    reason: blockReason
+                )
+                break
+            }
+            let outcome = await chromeBridge.reloadExtension(profile: params.profile, force: params.force ?? false)
+            let latencyMs = elapsedMs(since: startNs)
+            let summary = outcome.ok
+                ? "Reloaded the Chrome extension: " + outcome.profiles.map { "\($0.profileName) v\($0.extensionVersion)" }.joined(separator: ", ")
+                : (outcome.error?.message ?? "Extension reload failed")
+            appendAudit(method: request.method.rawValue, targetApp: "Chrome (\(params.profile ?? "all profiles"))", summary: summary, latencyMs: latencyMs, success: outcome.ok)
+            if outcome.ok {
+                response = .success(id: request.id, latencyMs: latencyMs, browserProfiles: outcome.profiles)
+            } else {
+                response = .failure(
+                    id: request.id,
+                    code: outcome.error?.code ?? "EXTENSION_ERROR",
+                    message: outcome.error?.message ?? "Extension reload failed",
+                    latencyMs: latencyMs
+                )
+            }
+
         case .browserTabs:
             let params = request.browserTabs ?? BrowserTabsParams()
             if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {

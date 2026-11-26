@@ -14,6 +14,9 @@ const tabsEmpty = document.getElementById("tabsEmpty");
 const stopAllBtn = document.getElementById("stopAllBtn");
 const endpointMeta = document.getElementById("endpointMeta");
 const reconnectBtn = document.getElementById("reconnectBtn");
+const extensionNotice = document.getElementById("extensionNotice");
+const extensionNoticeText = document.getElementById("extensionNoticeText");
+const reloadExtensionBtn = document.getElementById("reloadExtensionBtn");
 
 const FORMAT_ERROR_TEXT = "That doesn't look like a UseMac pairing key.";
 const MISMATCH_ERROR_TEXT = "This key doesn't match the UseMac app running on this Mac. Copy the key again.";
@@ -27,7 +30,8 @@ let lastState = null;
 
 function initVersion() {
   try {
-    const version = chrome.runtime.getManifest()?.version || "";
+    const manifest = chrome.runtime.getManifest() || {};
+    const version = manifest.version_name || manifest.version || "";
     versionText.textContent = version ? `v${version}` : "";
   } catch (_) {
     versionText.textContent = "";
@@ -93,9 +97,28 @@ function renderStatus(state) {
   }
 
   renderTabs(tabs);
+  renderExtensionNotice(authState === "ready" ? state?.extensionStatus : null);
 
   endpointMeta.textContent = state?.endpoint || "127.0.0.1:49222";
   reconnectBtn.hidden = authState === "ready";
+}
+
+// What the UseMac app reported when this extension paired: an older version than the app ships, or a copy loaded
+// from another folder (app updates never reach it). Reloading makes Chrome run the code now in the folder.
+function renderExtensionNotice(status) {
+  const outdated = status?.outdated === true;
+  const otherFolder = status?.source === "other_folder";
+  if (!outdated && !otherFolder) {
+    extensionNotice.hidden = true;
+    return;
+  }
+  extensionNotice.hidden = false;
+  extensionNotice.classList.toggle("is-outdated", outdated);
+  extensionNoticeText.textContent =
+    status.note ||
+    (outdated
+      ? `The UseMac app ships extension ${status.bundledVersion || "a newer version"}. Reload to run it.`
+      : "Loaded from another folder, app updates won't reach it.");
 }
 
 function renderTabs(tabs) {
@@ -279,6 +302,13 @@ stopAllBtn.addEventListener("click", async () => {
     await chrome.runtime.sendMessage({ type: "stopAll" });
   } catch (_) {}
   await loadState();
+});
+
+reloadExtensionBtn.addEventListener("click", () => {
+  reloadExtensionBtn.disabled = true;
+  reloadExtensionBtn.textContent = "Reloading…";
+  // Closes this popup; the extension reconnects to UseMac and pairs again on its own.
+  chrome.runtime.reload();
 });
 
 reconnectBtn.addEventListener("click", async () => {

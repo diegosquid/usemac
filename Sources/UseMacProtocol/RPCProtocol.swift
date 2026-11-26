@@ -23,6 +23,7 @@ public enum RPCMethod: String, Codable, Sendable {
     case visionQuery = "vision_query"
     case taskStart = "task_start"
     case taskComplete = "task_complete"
+    case browserReloadExtension = "browser_reload_extension"
 }
 
 public struct ObserveParams: Codable, Equatable, Sendable {
@@ -80,6 +81,7 @@ public struct RPCRequest: Codable, Sendable {
     public var visionQuery: VisionQueryParams?
     public var taskStart: TaskStartParams?
     public var taskComplete: TaskCompleteParams?
+    public var browserReloadExtension: BrowserReloadExtensionParams?
 
     public init(
         id: String = UUID().uuidString,
@@ -100,7 +102,8 @@ public struct RPCRequest: Codable, Sendable {
         visionInstall: VisionInstallParams? = nil,
         visionQuery: VisionQueryParams? = nil,
         taskStart: TaskStartParams? = nil,
-        taskComplete: TaskCompleteParams? = nil
+        taskComplete: TaskCompleteParams? = nil,
+        browserReloadExtension: BrowserReloadExtensionParams? = nil
     ) {
         self.id = id
         self.method = method
@@ -121,6 +124,7 @@ public struct RPCRequest: Codable, Sendable {
         self.visionQuery = visionQuery
         self.taskStart = taskStart
         self.taskComplete = taskComplete
+        self.browserReloadExtension = browserReloadExtension
     }
 
     public init(from decoder: Decoder) throws {
@@ -144,6 +148,7 @@ public struct RPCRequest: Codable, Sendable {
         self.visionQuery = try c.decodeIfPresent(VisionQueryParams.self, forKey: .visionQuery)
         self.taskStart = try c.decodeIfPresent(TaskStartParams.self, forKey: .taskStart)
         self.taskComplete = try c.decodeIfPresent(TaskCompleteParams.self, forKey: .taskComplete)
+        self.browserReloadExtension = try c.decodeIfPresent(BrowserReloadExtensionParams.self, forKey: .browserReloadExtension)
     }
 }
 
