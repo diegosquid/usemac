@@ -96,8 +96,8 @@ Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error
 | Mode (`set_policy`) | App UI label | Behavior |
 | :--- | :--- | :--- |
 | `autonomous` | **Autonomous** | Allows all actions (still subject to URL, upload, and path guards). |
-| `ask` | **Ask** | Holds `uploadFile`, keyboard shortcuts using `⌘` or `⌃`, and `browser_extract` in `eval` mode until you click **Allow once** or **Deny** in a prompt next to the HUD. Deny returns `APPROVAL_DENIED`; no answer within 45 s returns `APPROVAL_TIMEOUT`. |
-| `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃`, and `browser_extract` in `eval` mode. |
+| `ask` | **Ask** | Holds `uploadFile`, keyboard shortcuts using `⌘` or `⌃` (any spelling), and `browser_extract` in `eval` mode until you click **Allow once** or **Deny** in a prompt next to the HUD. Deny returns `APPROVAL_DENIED`; no answer within 45 s returns `APPROVAL_TIMEOUT`. |
+| `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃` (whatever the spelling: `cmd`, `command`, `meta`, `ctrl`, `control`), and `browser_extract` in `eval` mode. |
 | `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `target`, observe, read-only extract (`auto`, `tables`, `text`, `kpis`, `downloads`), and screenshots remain allowed. |
 | `paused` | **Paused** | Blocks all automation, including reads. |
 

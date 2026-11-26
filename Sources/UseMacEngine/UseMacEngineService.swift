@@ -943,6 +943,13 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = .failure(id: request.id, code: "INVALID_REQUEST", message: "Missing browserAct payload", latencyMs: latencyMs)
                 break
             }
+            // A setValue with no field would type into whatever has focus in the page: refuse it before anything else.
+            if let invalid = BrowserStepValidation.targetlessSetValueMessage(in: params.steps) {
+                let latencyMs = elapsedMs(since: startNs)
+                appendAudit(method: request.method.rawValue, targetApp: params.profile ?? "Chrome", summary: invalid, latencyMs: latencyMs, success: false)
+                response = .failure(id: request.id, code: "INVALID_REQUEST", message: invalid, latencyMs: latencyMs)
+                break
+            }
 
             var urlValidationError: String?
             for idx in params.steps.indices where params.steps[idx].action == .openURL || params.steps[idx].action == .navigate {
@@ -2124,14 +2131,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         if step.action == .axAction, step.actionName?.lowercased() == "axopen" {
             return true
         }
-        guard step.action == .pressKey, let modifiers = step.modifiers else {
+        guard step.action == .pressKey else {
             return false
         }
-        let lower = Set(modifiers.map { $0.lowercased() })
-        return lower.contains("cmd")
-            || lower.contains("command")
-            || lower.contains("ctrl")
-            || lower.contains("control")
+        // Any spelling either path presses as ⌘ or ⌃, "meta" included (ModifierAliases).
+        return ModifierAliases.isSensitive(step.modifiers)
     }
 
     private func incrementRequestCount() {

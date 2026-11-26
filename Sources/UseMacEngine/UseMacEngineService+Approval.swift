@@ -263,12 +263,9 @@ enum ApprovalText {
     static func kind(of step: ActionStep) -> ApprovalKind? {
         if step.action == .uploadFile { return .upload }
         if step.action == .axAction, step.actionName?.lowercased() == "axopen" { return .upload }
-        guard step.action == .pressKey, let modifiers = step.modifiers else { return nil }
-        let lower = Set(modifiers.map { $0.lowercased() })
-        if lower.contains("cmd") || lower.contains("command") || lower.contains("ctrl") || lower.contains("control") {
-            return .shortcut
-        }
-        return nil
+        guard step.action == .pressKey else { return nil }
+        // Every spelling of ⌘ and ⌃ (meta, command, control, …), the same list the policy checks use.
+        return ModifierAliases.isSensitive(step.modifiers) ? .shortcut : nil
     }
 
     static func describe(_ step: ActionStep) -> String {
@@ -304,13 +301,7 @@ enum ApprovalText {
 
     /// "⌃⌥⇧⌘S" in Apple's modifier order.
     static func shortcut(key: String?, modifiers: [String]?) -> String {
-        let lower = Set((modifiers ?? []).map { $0.lowercased() })
-        var symbols = ""
-        if lower.contains("ctrl") || lower.contains("control") { symbols += "⌃" }
-        if lower.contains("alt") || lower.contains("option") || lower.contains("opt") { symbols += "⌥" }
-        if lower.contains("shift") { symbols += "⇧" }
-        if lower.contains("cmd") || lower.contains("command") { symbols += "⌘" }
-        return symbols + keyName(key)
+        ModifierAliases.symbols(modifiers) + keyName(key)
     }
 
     static func keyName(_ key: String?) -> String {
