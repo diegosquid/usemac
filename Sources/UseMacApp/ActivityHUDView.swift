@@ -452,7 +452,8 @@ private struct FramelessLivePiPCard: View {
     @ObservedObject var videoSink: LiveVideoSink
     /// The card's task color: the click ripple uses it.
     let accent: Color
-    /// The color of the soft tag along the card's top, or nil for no tag (a preview with no task).
+    /// The color of the soft tag along the card's top: every deck card has one. Nil only for the live card shown
+    /// with an empty deck (a pinned preview or the full display), which has no tag.
     let tag: Color?
 
     @State private var isHovering = false

@@ -15,7 +15,8 @@ All notable changes to UseMac are documented here. The format follows
   to the back and the next card with new work comes forward. It doesn't shuffle while the pointer is over the preview
   or automation is stopped, and with Reduce Motion the switch is a short fade. When an agent behind clicks, types or
   scrolls, its card's edge brightens for a moment. The panel grows by 7 pt per card behind (14 pt at most) instead of
-  46 pt. The thumbnail strip, the title chip and the blue ring of a switch are gone.
+  46 pt, plus the front card's 7 pt task tag. The thumbnail strip, the title chip and the blue ring of a switch are
+  gone.
 - **Each task has its own color in the preview.** It shows as a soft pastel tag along the top of the front card and
   on the edges of the cards behind; the page itself is never tinted. The click ripple uses it too. Two sessions of the
   same agent are two tasks, so they get two colors, and a task's tabs share one. Green, amber and red stay reserved

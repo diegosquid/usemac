@@ -217,7 +217,8 @@ public final class ActivityHUDController {
             self?.snap(to: corner, animated: true)
         }
 
-        // Each card behind the front one (two at most) grows the panel by its visible edge.
+        // Each card behind the front one (two at most) grows the panel by its visible edge, and a deck with a card
+        // adds the front card's task tag. The picture never changes the panel's size.
         let deckBehindPublisher = appState.$hudDeck
             .map { Self.cardsBehind($0.count) }
             .removeDuplicates()
@@ -225,10 +226,9 @@ public final class ActivityHUDController {
         Publishers.CombineLatest4(
             appState.$isHUDCollapsed.removeDuplicates(),
             appState.$isHUDLarge.removeDuplicates(),
-            appState.videoSink.$hasReceivedFrame.removeDuplicates(),
-            appState.videoSink.$frameAspectRatio.removeDuplicates()
+            appState.$hudDeck.map(\.isEmpty).removeDuplicates(),
+            deckBehindPublisher
         )
-        .combineLatest(deckBehindPublisher)
         .dropFirst()
         .receive(on: RunLoop.main)
         .sink { [weak self] _ in

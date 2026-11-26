@@ -1369,14 +1369,7 @@ public final class AppState: ObservableObject {
         } else if isBrowser,
                   let browserTabId,
                   !hudDeck.contains(where: { $0.isBrowser && $0.browserTabId == browserTabId }),
-                  let pendingIdx = hudDeck.firstIndex(where: { card in
-                      card.isBrowser && card.browserTabId == nil && (
-                          browserProfile == nil ||
-                          card.browserProfile == nil ||
-                          card.browserProfile?.caseInsensitiveCompare("Browser") == .orderedSame ||
-                          card.browserProfile?.caseInsensitiveCompare(browserProfile!) == .orderedSame
-                      )
-                  }) {
+                  let pendingIdx = pendingBrowserPlaceholderIndex(profile: browserProfile, taskId: taskId) {
             let existing = hudDeck[pendingIdx]
             var upgraded = HUDSessionCard(
                 id: id,
@@ -1455,6 +1448,24 @@ public final class AppState: ObservableObject {
             isBusy: front.isBusy,
             isCompleted: front.isCompleted
         )
+    }
+
+    /// The placeholder card (a tab still opening) a tab's first activity takes over: one of the same profile, and of
+    /// the same task when one is, so two tasks opening tabs at once don't swap placeholders.
+    private func pendingBrowserPlaceholderIndex(profile: String?, taskId: String?) -> Int? {
+        let candidates = hudDeck.indices.filter { idx in
+            let card = hudDeck[idx]
+            return card.isBrowser && card.browserTabId == nil && (
+                profile == nil ||
+                card.browserProfile == nil ||
+                card.browserProfile?.caseInsensitiveCompare("Browser") == .orderedSame ||
+                card.browserProfile?.caseInsensitiveCompare(profile!) == .orderedSame
+            )
+        }
+        if let taskId, !taskId.isEmpty, let sameTask = candidates.first(where: { hudDeck[$0].taskId == taskId }) {
+            return sameTask
+        }
+        return candidates.first
     }
 
     /// Keeps the deck at `maxDeckCards` by dropping the cards that have been quiet longest, never the front one.
