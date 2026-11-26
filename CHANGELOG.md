@@ -6,6 +6,13 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0-beta.2] - 2026-11-25
+
+Fixes from the first days of the beta, mostly in Chrome and the live preview.
+
+This beta is not notarized yet: the first time, open it with right-click > Open, or allow it in
+System Settings > Privacy & Security ("Open Anyway"). If you installed 0.6.0-beta.1, it updates itself.
+
 ### Fixed
 
 - A Chrome tab UseMac controls now keeps its real width and no longer flickers while you are looking at it.
@@ -91,6 +98,7 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
-[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.1...HEAD
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.2...HEAD
+[0.6.0-beta.2]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.1...v0.6.0-beta.2
 [0.6.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.5.0...v0.6.0-beta.1
 [0.5.0]: https://github.com/diegosquid/usemac/releases/tag/v0.5.0

@@ -6,6 +6,32 @@
     <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 0.6.0-beta.2</title>
+      <sparkle:version>61</sparkle:version>
+      <sparkle:shortVersionString>0.6.0-beta.2</sparkle:shortVersionString>
+      <sparkle:channel>beta</sparkle:channel>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 26 Nov 2026 00:39:41 GMT</pubDate>
+      <description><![CDATA[
+        <h3>What's New in UseMac 0.6.0 Beta 2</h3>
+        <ul>
+          <li>The Chrome tab UseMac works in keeps its real width and no longer flickers while you look at it.</li>
+          <li>The preview never shows another app (such as your own screen) when an agent's activity names no app, and each Chrome tab appears once in the filmstrip.</li>
+          <li>The Resume button in the Stopped pill fits on one line.</li>
+          <li>The Chrome extension reports its real version.</li>
+        </ul>
+        <p>After updating, reload the UseMac Browser Bridge in <code>chrome://extensions</code> so Chrome picks up the new extension.</p>
+        <p>This is a beta. Please report problems at <a href="https://github.com/diegosquid/usemac/issues">github.com/diegosquid/usemac/issues</a>.</p>
+      ]]></description>
+      <enclosure
+        url="https://github.com/diegosquid/usemac/releases/download/v0.6.0-beta.2/usemac-0.6.0-beta.2-arm64.dmg"
+        sparkle:edSignature="KMMy3DWdD1RQkru6QTjea6C7YZj/6ye73IRrMFnTJ91laSUqsZXpBo/JC3uC5OItRCEUyopnAAehvcS4QuGWAQ=="
+        length="7105000"
+        type="application/octet-stream"
+        sparkle:os="macos"
+      />
+    </item>
+    <item>
       <title>Version 0.6.0-beta.1</title>
       <sparkle:version>60</sparkle:version>
       <sparkle:shortVersionString>0.6.0-beta.1</sparkle:shortVersionString>
