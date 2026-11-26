@@ -394,6 +394,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var _onBrowserStreamPaused: (@Sendable (_ profileName: String, _ tabId: Int) -> Void)?
     private var _onProfilesChanged: (@Sendable ([BrowserProfileStatus]) -> Void)?
     private var _onPairingStateChanged: (@Sendable () -> Void)?
+    private var _onTabStreamEnded: (@Sendable (_ profileName: String, _ tabId: Int, _ reason: String?) -> Void)?
 
     internal var baseCommandTimeoutSeconds: UInt64 {
         get {
@@ -463,6 +464,21 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         set {
             lock.lock()
             _onBrowserStreamStopped = newValue
+            lock.unlock()
+        }
+    }
+
+    /// Every `stream_stopped` that names a tab, with the extension's reason ("closed" when the tab is gone; older
+    /// extensions send none). The engine forgets closed tabs with it; the preview uses onBrowserStreamStopped/Paused.
+    public var onTabStreamEnded: (@Sendable (_ profileName: String, _ tabId: Int, _ reason: String?) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _onTabStreamEnded
+        }
+        set {
+            lock.lock()
+            _onTabStreamEnded = newValue
             lock.unlock()
         }
     }
@@ -1416,9 +1432,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let profilesHandler = _onProfilesChanged
         let stoppedHandler = _onBrowserStreamStopped
         let pausedHandler = _onBrowserStreamPaused
+        let endedHandler = _onTabStreamEnded
         lock.unlock()
 
         profilesHandler?(snapshot)
+        if let tabId = payload?.tabId {
+            endedHandler?(profileName, tabId, payload?.reason)
+        }
         let stillOpen = payload?.reason == "idle" || payload?.reason == "evicted"
         if stillOpen, let stoppedTabId, let pausedHandler {
             pausedHandler(profileName, stoppedTabId)
