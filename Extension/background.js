@@ -3,7 +3,15 @@ importScripts("bridge-auth.js");
 const WS_URL = "ws://127.0.0.1:49222/usemac-bridge";
 const BRIDGE_ENDPOINT = "127.0.0.1:49222";
 const PROTOCOL_VERSION = 2;
-const EXTENSION_VERSION = "0.5.0";
+// Reported to the UseMac app in the hello message; read from the manifest so it never goes stale.
+const EXTENSION_VERSION = (() => {
+  try {
+    const manifest = chrome.runtime.getManifest();
+    return manifest.version_name || manifest.version || "unknown";
+  } catch (_) {
+    return "unknown";
+  }
+})();
 const KEEPALIVE_ALARM = "usemac-keepalive";
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 800;

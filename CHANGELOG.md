@@ -10,6 +10,8 @@ All notable changes to UseMac are documented here. The format follows
 
 - A Chrome tab UseMac controls now keeps its real width and no longer flickers while you are looking at it.
 - The Resume button in the HUD's "Stopped" pill no longer wraps onto two lines.
+- The preview filmstrip no longer shows the same Chrome tab twice when an agent does not name the Chrome profile.
+- The Chrome extension reports its real version to the app instead of a fixed "0.5.0".
 
 ## [0.6.0-beta.1] - 2026-11-25
 

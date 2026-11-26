@@ -658,6 +658,25 @@ public final class AppState: ObservableObject {
     /// Cards kept in the preview deck; the filmstrip shows up to 8 and summarizes the rest as "+N".
     static let maxDeckCards = 12
 
+    /// One card per Chrome tab: tab ids are unique within the browser, so an existing card for the tab is
+    /// reused even when an activity names the profile differently (agents that omit `profile` get the
+    /// placeholder "Browser"), instead of showing the same tab twice in the filmstrip.
+    private func browserCardIdForTab(_ tabId: Int?) -> String? {
+        guard let tabId else { return nil }
+        return hudDeck.first(where: { $0.isBrowser && $0.browserTabId == tabId })?.id
+    }
+
+    /// Maps the placeholder profile names used before the extension answers ("Browser", "Chrome") to the
+    /// connected profile when there is exactly one.
+    private func resolvedBrowserProfile(_ name: String) -> String {
+        let placeholder = name.isEmpty || name.caseInsensitiveCompare("Browser") == .orderedSame
+            || name.caseInsensitiveCompare("Chrome") == .orderedSame
+        if placeholder, connectedBrowserProfiles.count == 1 {
+            return connectedBrowserProfiles[0].profileName
+        }
+        return name
+    }
+
     private static func browserCardId(profile: String, tabId: Int?) -> String {
         if let tabId {
             return "browser:\(profile):\(tabId)"
@@ -673,7 +692,7 @@ public final class AppState: ObservableObject {
         profileName: String,
         title: String
     ) {
-        let cardId = Self.browserCardId(profile: profileName, tabId: tabId)
+        let cardId = browserCardIdForTab(tabId) ?? Self.browserCardId(profile: profileName, tabId: tabId)
         let displayTitle = title.isEmpty ? "Chrome (\(profileName))" : title
         let bounds = ScreenRect(x: 0, y: 0, width: Double(width), height: Double(height))
         let aspect = width > 0 && height > 0 ? min(max(CGFloat(width) / CGFloat(height), 0.62), 2.15) : (268.0 / 172.0)
@@ -1787,11 +1806,12 @@ public final class AppState: ObservableObject {
         var cardAppDescriptor: AppDescriptor?
 
         if isChromeBridgeActivity {
-            let prof = cardProfile ?? item.appName?
+            let rawProfile = cardProfile ?? item.appName?
                 .replacingOccurrences(of: "Chrome (", with: "")
                 .replacingOccurrences(of: ")", with: "") ?? connectedBrowserProfiles.first?.profileName ?? "Chrome"
+            let prof = resolvedBrowserProfile(rawProfile)
             cardProfile = prof
-            cardId = Self.browserCardId(profile: prof, tabId: item.browserTabId)
+            cardId = browserCardIdForTab(item.browserTabId) ?? Self.browserCardId(profile: prof, tabId: item.browserTabId)
         } else {
             showingFrozenBrowserFrame = false
             // Drop any empty browser placeholder created by a generic task_start before targeting a native app
