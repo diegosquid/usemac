@@ -24,6 +24,14 @@ public struct HUDSessionCard: Identifiable {
     public var cursorPoint: CGPoint?
     public var cursorLabel: String?
     public var lastActivityDate: Date
+    /// The task whose work the card shows, when UseMac could tell. Its cards share the task's color.
+    public var taskId: String?
+    /// When the card's agent last did something there (a step, an observe, a screenshot). Frames don't count.
+    public var lastStepDate: Date?
+    /// When the card last left the front of the deck.
+    public var lastShownDate: Date?
+    /// Goes up on each step while the card is behind the front one: its edge flashes in the stack.
+    public var backgroundStepCount: Int = 0
 
     public init(
         id: String,
@@ -154,7 +162,22 @@ public final class AppState: ObservableObject {
 
     // Live Activity HUD & PiP Stream state
     @Published public var liveActivities: [LiveActivityItem] = []
-    @Published public var hudDeck: [HUDSessionCard] = []
+    @Published public var hudDeck: [HUDSessionCard] = [] {
+        didSet {
+            // Each card id at most once: the preview draws cards by id, and two cards under one id put a card from
+            // the back of the deck on top of the front one. Assigning here doesn't run didSet again.
+            if PreviewDeckFocus.hasDuplicateIds(hudDeck.map(\.id)) {
+                hudDeck = PreviewDeckFocus.firstOfEachId(hudDeck, id: \.id)
+            }
+            deckDidChange(from: oldValue)
+        }
+    }
+    /// Palette slot of each task in the deck (PreviewTaskColors), by `PreviewTaskColors.key`.
+    @Published public internal(set) var hudTaskColorSlots: [String: Int] = [:]
+    /// True while the pointer is over the preview: the deck doesn't shuffle under it.
+    @Published public var isHUDHovered: Bool = false
+    /// True for the short dip the front card makes before it goes to the back of the deck.
+    @Published public internal(set) var isDeckFrontDipping: Bool = false
     @Published public var isAgentBusy: Bool = false
     @Published public var isActivityIndicatorLit: Bool = false
     @Published public var activeTargetApp: AppDescriptor?
@@ -207,11 +230,12 @@ public final class AppState: ObservableObject {
     private var activityIndicatorHoldTask: Task<Void, Never>?
     private var hudAutoHideTask: Task<Void, Never>?
     /// Removes finished cards after the completion check. Separate from hudAutoHideTask so another agent's activity,
-    /// which cancels auto-hide, never keeps a finished card in the filmstrip.
+    /// which cancels auto-hide, never keeps a finished card in the deck.
     private var completionCleanupTask: Task<Void, Never>?
     private var taskIdleSettleTask: Task<Void, Never>?
     /// Ghost-card cleanup and background card stills (AppState+DeckHygiene.swift).
     var deckHygiene = DeckHygieneState()
+    var deckShuffle = DeckShuffleState()
     var isHUDManuallyPinned: Bool = false
     private var isHUDShowingStoppedPill: Bool = false
     private var wasHUDCollapsedBeforeKillSwitch: Bool = false
@@ -511,7 +535,7 @@ public final class AppState: ObservableObject {
             }
         }
 
-        // Stop in the pill on a Chrome tab UseMac controls does what Stop in the HUD does (toggleKillSwitch), but
+        // Stop in the pill on a Chrome tab UseMac controls does what the emergency stop does (toggleKillSwitch, ⌘⇧⎋), but
         // only ever stops: when the agent is already stopped or paused it changes nothing.
         engine.chromeBridge.onUserStopRequested = { [weak self] _, _ in
             Task { @MainActor [weak self] in
@@ -638,7 +662,7 @@ public final class AppState: ObservableObject {
         }
     }
 
-    /// Cards kept in the preview deck; the filmstrip shows up to 8 and summarizes the rest as "+N".
+    /// Cards kept in the preview deck. The stack draws the front card and two behind it; the rest wait their turn.
     static let maxDeckCards = 12
 
     /// The browser card of the UseMac tab a Chrome window is showing (matched by title, as Chrome titles the
@@ -654,7 +678,7 @@ public final class AppState: ObservableObject {
 
     /// One card per Chrome tab: tab ids are unique within the browser, so an existing card for the tab is
     /// reused even when an activity names the profile differently (agents that omit `profile` get the
-    /// placeholder "Browser"), instead of showing the same tab twice in the filmstrip.
+    /// placeholder "Browser"), instead of showing the same tab twice in the deck.
     private func browserCardIdForTab(_ tabId: Int?) -> String? {
         guard let tabId else { return nil }
         return hudDeck.first(where: { $0.isBrowser && $0.browserTabId == tabId })?.id
@@ -686,13 +710,17 @@ public final class AppState: ObservableObject {
         profileName: String,
         title: String
     ) {
-        let cardId = browserCardIdForTab(tabId) ?? Self.browserCardId(profile: profileName, tabId: tabId)
+        let shownCardId = browserCardIdForTab(tabId)
+        let cardId = shownCardId ?? Self.browserCardId(profile: profileName, tabId: tabId)
         let displayTitle = title.isEmpty ? "Chrome (\(profileName))" : title
         let bounds = ScreenRect(x: 0, y: 0, width: Double(width), height: Double(height))
         let aspect = width > 0 && height > 0 ? min(max(CGFloat(width) / CGFloat(height), 0.62), 2.15) : (268.0 / 172.0)
 
-        // Attach to pending placeholder card for same profile without tabId yet, if any
+        // Attach to a pending placeholder card for the same profile without a tab yet, if any, but only when no card
+        // shows this tab already: with several tasks, that placeholder is another task's, and taking it made a
+        // second card under this tab's id.
         if let tabId,
+           shownCardId == nil,
            let pendingIdx = hudDeck.firstIndex(where: { $0.isBrowser && $0.browserTabId == nil && $0.browserProfile?.caseInsensitiveCompare(profileName) == .orderedSame }) {
             let existing = hudDeck[pendingIdx]
             hudDeck[pendingIdx] = HUDSessionCard(
@@ -711,7 +739,7 @@ public final class AppState: ObservableObject {
                 cursorPoint: existing.cursorPoint,
                 cursorLabel: existing.cursorLabel,
                 lastActivityDate: Date()
-            )
+            ).carryingDeckState(of: existing)
         } else {
             let isNew = !hudDeck.contains(where: { $0.id == cardId })
             upsertHUDCard(
@@ -1121,24 +1149,13 @@ public final class AppState: ObservableObject {
         }
         engine.chromeBridge.stopActiveStreams()
         hudDeck.removeAll()
+        // A hidden panel gets no mouse-exited event: don't leave the next deck paused.
+        isHUDHovered = false
         isHUDVisible = false
         isHUDCollapsed = false
         onHideHUD?()
         videoSink.reset()
         syncLiveStream()
-    }
-
-    public func promoteHUDCard(id: String) {
-        markControlTap()
-        guard let idx = hudDeck.firstIndex(where: { $0.id == id }) else { return }
-        // The pick holds until the user picks again, the card goes away or its task finishes (PreviewDeckFocus).
-        if idx > 0 {
-            withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
-                let card = hudDeck.remove(at: idx)
-                hudDeck.insert(card, at: 0)
-            }
-        }
-        syncFrontCardToUI()
     }
 
     public func dismissFrontHUDCard() {
@@ -1314,9 +1331,12 @@ public final class AppState: ObservableObject {
         caption: LiveActivityItem? = nil,
         cursorPoint: CGPoint? = nil,
         cursorLabel: String? = nil,
+        taskId: String? = nil,
+        isStep: Bool = false,
         promote: Bool
     ) {
-        // Agent activity never takes the front from a card that is still working: only the user switches cards.
+        // Agent activity never takes the front from a card that is still working: the deck's shuffle brings the
+        // other cards forward in turn (PreviewDeckFocus.shuffleTarget).
         let frontYields = PreviewDeckFocus.frontYieldsToActivity(deckFront)
         let canPromote = promote && frontYields
         if let existingIdx = hudDeck.firstIndex(where: { $0.id == id }) {
@@ -1335,6 +1355,7 @@ public final class AppState: ObservableObject {
             if let cursorPoint { card.cursorPoint = cursorPoint }
             if let cursorLabel { card.cursorLabel = cursorLabel }
             card.lastActivityDate = Date()
+            card.recordDeckActivity(taskId: taskId, isStep: isStep, isFront: existingIdx == 0)
 
             if canPromote && existingIdx > 0 {
                 withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
@@ -1347,16 +1368,10 @@ public final class AppState: ObservableObject {
             }
         } else if isBrowser,
                   let browserTabId,
-                  let pendingIdx = hudDeck.firstIndex(where: { card in
-                      card.isBrowser && card.browserTabId == nil && (
-                          browserProfile == nil ||
-                          card.browserProfile == nil ||
-                          card.browserProfile?.caseInsensitiveCompare("Browser") == .orderedSame ||
-                          card.browserProfile?.caseInsensitiveCompare(browserProfile!) == .orderedSame
-                      )
-                  }) {
+                  !hudDeck.contains(where: { $0.isBrowser && $0.browserTabId == browserTabId }),
+                  let pendingIdx = pendingBrowserPlaceholderIndex(profile: browserProfile, taskId: taskId) {
             let existing = hudDeck[pendingIdx]
-            let upgraded = HUDSessionCard(
+            var upgraded = HUDSessionCard(
                 id: id,
                 isBrowser: true,
                 browserProfile: browserProfile ?? existing.browserProfile,
@@ -1373,7 +1388,8 @@ public final class AppState: ObservableObject {
                 cursorPoint: cursorPoint ?? existing.cursorPoint,
                 cursorLabel: cursorLabel ?? existing.cursorLabel,
                 lastActivityDate: Date()
-            )
+            ).carryingDeckState(of: existing)
+            upgraded.recordDeckActivity(taskId: taskId, isStep: isStep, isFront: pendingIdx == 0)
             if canPromote && pendingIdx > 0 {
                 withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
                     hudDeck.remove(at: pendingIdx)
@@ -1387,7 +1403,7 @@ public final class AppState: ObservableObject {
                 }
             }
         } else {
-            let newCard = HUDSessionCard(
+            var newCard = HUDSessionCard(
                 id: id,
                 isBrowser: isBrowser,
                 browserProfile: browserProfile,
@@ -1405,7 +1421,8 @@ public final class AppState: ObservableObject {
                 cursorLabel: cursorLabel,
                 lastActivityDate: Date()
             )
-            // A new card only takes the front when the front card yields; otherwise it joins the filmstrip.
+            newCard.recordDeckActivity(taskId: taskId, isStep: isStep, isFront: frontYields)
+            // A new card only takes the front when the front card yields; otherwise it joins the stack behind it.
             withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
                 if frontYields {
                     hudDeck.insert(newCard, at: 0)
@@ -1431,6 +1448,24 @@ public final class AppState: ObservableObject {
             isBusy: front.isBusy,
             isCompleted: front.isCompleted
         )
+    }
+
+    /// The placeholder card (a tab still opening) a tab's first activity takes over: one of the same profile, and of
+    /// the same task when one is, so two tasks opening tabs at once don't swap placeholders.
+    private func pendingBrowserPlaceholderIndex(profile: String?, taskId: String?) -> Int? {
+        let candidates = hudDeck.indices.filter { idx in
+            let card = hudDeck[idx]
+            return card.isBrowser && card.browserTabId == nil && (
+                profile == nil ||
+                card.browserProfile == nil ||
+                card.browserProfile?.caseInsensitiveCompare("Browser") == .orderedSame ||
+                card.browserProfile?.caseInsensitiveCompare(profile!) == .orderedSame
+            )
+        }
+        if let taskId, !taskId.isEmpty, let sameTask = candidates.first(where: { hudDeck[$0].taskId == taskId }) {
+            return sameTask
+        }
+        return candidates.first
     }
 
     /// Keeps the deck at `maxDeckCards` by dropping the cards that have been quiet longest, never the front one.
@@ -2003,6 +2038,8 @@ public final class AppState: ObservableObject {
                 isBusy: busyState,
                 isCompleted: completedState,
                 caption: item,
+                taskId: item.taskId,
+                isStep: [.actionStart, .actionStep, .observe, .screenshot].contains(item.kind),
                 promote: shouldPromote
             )
             if hudDeck.first?.id == cardId {

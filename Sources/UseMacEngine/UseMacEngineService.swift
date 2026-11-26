@@ -97,7 +97,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             workspaceMonitor: workspaceMonitor,
             killSwitch: killSwitch
         )
-        // Stop in the pill on a controlled Chrome tab. The app replaces this with the HUD's Stop (AppState).
+        // Stop in the pill on a controlled Chrome tab. The app replaces this with its emergency stop (AppState).
         self.chromeBridge.onUserStopRequested = { [weak self] _, _ in
             self?.tripKillSwitch(true)
         }

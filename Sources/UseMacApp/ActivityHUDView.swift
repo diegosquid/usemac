@@ -13,10 +13,49 @@ private enum MinimalHUDPalette {
     static let hairline = Color.black.opacity(0.055)
     static let stopRed = Color(red: 0.863, green: 0.149, blue: 0.149)      // #DC2626
     static let liveGreen = Color(red: 0.086, green: 0.639, blue: 0.290)    // #16A34A
-    static let activeSkyLight = Color(red: 0.490, green: 0.788, blue: 0.988) // #7DC9FC
     static let activeSky = Color(red: 0.231, green: 0.549, blue: 0.961)      // #3B8CF5
     static let cursorInkTop = Color(red: 0.155, green: 0.159, blue: 0.175)   // #27282D
     static let cursorInkBottom = Color(red: 0.075, green: 0.078, blue: 0.090)// #131417
+}
+
+/// One color per task in the preview (PreviewTaskColors gives the slot). Green, amber and red are left out: they mean
+/// done, paused and stopped.
+enum HUDTaskPalette {
+    static let colors: [Color] = [
+        Color(red: 0.545, green: 0.361, blue: 0.965), // #8B5CF6 violet
+        Color(red: 0.078, green: 0.722, blue: 0.651), // #14B8A6 teal
+        Color(red: 0.925, green: 0.282, blue: 0.600), // #EC4899 pink
+        Color(red: 0.055, green: 0.647, blue: 0.914), // #0EA5E9 sky
+        Color(red: 1.000, green: 0.478, blue: 0.349), // #FF7A59 coral
+        Color(red: 0.310, green: 0.275, blue: 0.898)  // #4F46E5 indigo
+    ]
+
+    /// The slot's color, or the preview's blue for a card with no slot.
+    static func color(slot: Int?) -> Color {
+        guard let slot else { return MinimalHUDPalette.activeSky }
+        return colors[((slot % colors.count) + colors.count) % colors.count]
+    }
+
+    /// How strongly a card's tag shows its task color over white: a pastel that stays at the edge of the eye.
+    static let tagOpacity: Double = 0.22
+    /// A tag behind the front card brightens to this for a moment when its agent does something.
+    static let tagFlashOpacity: Double = 0.40
+}
+
+/// Transparent margin around the HUD that its own soft shadow draws into. The panel has no system shadow, and
+/// ActivityHUDController makes the panel this much larger on every side.
+let hudShadowInset: CGFloat = 18
+
+private extension View {
+    /// The HUD's shadow: a 1.5 pt contact shadow, plus a soft ambient one under the front card and the pill.
+    func hudSoftShadow<S: Shape>(_ shape: S, ambient: Bool) -> some View {
+        background(
+            shape
+                .fill(Color.white)
+                .shadow(color: Color.black.opacity(0.07), radius: 0.75, x: 0, y: 0.5)
+                .shadow(color: Color.black.opacity(ambient ? 0.11 : 0), radius: 8, x: 0, y: 5)
+        )
+    }
 }
 
 public struct ActivityHUDView: View {
@@ -34,6 +73,7 @@ public struct ActivityHUDView: View {
                 StackedPiPDeckView(appState: appState, videoSink: appState.videoSink)
             }
         }
+        .padding(hudShadowInset)
     }
 }
 
@@ -42,15 +82,24 @@ public struct ActivityHUDView: View {
 private final class LiveVideoContainerView: NSView {
     let videoLayer = CALayer()
 
+    /// The size of what the frames show (the page or the window). The picture fills the card from its top-left
+    /// corner at this aspect, and what does not fit is cut off (LivePreviewGeometry.displayedRect).
+    var sourceSize: CGSize = .zero {
+        didSet {
+            if sourceSize != oldValue { needsLayout = true }
+        }
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
 
         let containerLayer = CALayer()
         containerLayer.backgroundColor = NSColor.white.cgColor
+        containerLayer.masksToBounds = true
         self.layer = containerLayer
 
-        videoLayer.contentsGravity = .resizeAspect
+        videoLayer.contentsGravity = .resizeAspectFill
         videoLayer.magnificationFilter = .trilinear
         videoLayer.minificationFilter = .trilinear
         videoLayer.masksToBounds = true
@@ -70,22 +119,41 @@ private final class LiveVideoContainerView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        videoLayer.frame = bounds
+        let shown = LivePreviewGeometry.displayedRect(sourceSize: sourceSize, in: bounds.size)
+        if shown.isEmpty {
+            videoLayer.frame = bounds
+        } else {
+            // This view is not flipped, so its layer's origin is the bottom-left corner: keep the picture's top
+            // edge on the card's top edge and let the bottom run past it.
+            videoLayer.frame = CGRect(
+                x: shown.minX,
+                y: bounds.height - shown.maxY,
+                width: shown.width,
+                height: shown.height
+            )
+        }
         CATransaction.commit()
     }
 }
 
 private struct LiveVideoSurfaceView: NSViewRepresentable {
-    let videoSink: LiveVideoSink
+    @ObservedObject var videoSink: LiveVideoSink
 
     func makeNSView(context: Context) -> LiveVideoContainerView {
         let view = LiveVideoContainerView()
         videoSink.attach(layer: view.videoLayer)
+        view.sourceSize = Self.sourceSize(of: videoSink)
         return view
     }
 
     func updateNSView(_ nsView: LiveVideoContainerView, context: Context) {
         videoSink.attach(layer: nsView.videoLayer)
+        nsView.sourceSize = Self.sourceSize(of: videoSink)
+    }
+
+    private static func sourceSize(of sink: LiveVideoSink) -> CGSize {
+        guard let bounds = sink.sourceBounds else { return .zero }
+        return CGSize(width: bounds.width, height: bounds.height)
     }
 }
 
@@ -122,27 +190,23 @@ private struct WhisperIconButton: View {
     }
 }
 
-// MARK: - Collapsed Micro-Pill (164 x 34, 200 x 34 while stopped)
+// MARK: - Collapsed Micro-Pill (164 x 34)
 
-/// Size of the collapsed pill. ActivityHUDController sizes the panel with the same values. While automation is
-/// stopped the pill is wider, so "Stopped", Resume and the close button fit on one line.
+/// Size of the collapsed pill. ActivityHUDController sizes the panel with the same values. The pill only shows what is
+/// happening: stopping and resuming are in the UseMac menu and on ⌘⇧⎋.
 let hudCollapsedPillSize = CGSize(width: 164, height: 34)
-let hudStoppedPillSize = CGSize(width: 200, height: 34)
 
 private struct CollapsedMicroPill: View {
     @ObservedObject var appState: AppState
     @ObservedObject var videoSink: LiveVideoSink
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var pulseActive = false
-    @State private var isResumeHovered = false
-
-    private let resumeGreen = Color(red: 0.118, green: 0.659, blue: 0.431) // #1EA86E
 
     var body: some View {
         let isStopped = appState.status.killSwitchTripped
-        let pillSize = isStopped ? hudStoppedPillSize : hudCollapsedPillSize
+        let pillSize = hudCollapsedPillSize
 
-        HStack(spacing: isStopped ? 5 : 6) {
+        HStack(spacing: 6) {
             Circle()
                 .fill(statusColor)
                 .frame(width: 5, height: 5)
@@ -153,46 +217,16 @@ private struct CollapsedMicroPill: View {
                 .foregroundStyle(MinimalHUDPalette.ink)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .fixedSize(horizontal: isStopped, vertical: false)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: isStopped ? 2 : 0) {
-                if isStopped {
-                    Button {
-                        appState.markControlTap()
-                        appState.toggleKillSwitch()
-                    } label: {
-                        Text("Resume")
-                            .font(.system(size: 11, weight: .medium))
-                            .lineLimit(1)
-                            .fixedSize()
-                            .foregroundStyle(isResumeHovered ? .white : resumeGreen)
-                            .padding(.horizontal, 7)
-                            .frame(minHeight: 24)
-                            .background(
-                                isResumeHovered ? resumeGreen : resumeGreen.opacity(0.12),
-                                in: Capsule(style: .continuous)
-                            )
-                            .contentShape(Capsule(style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .focusEffectDisabled()
-                    .onHover { hovering in
-                        withAnimation(.easeOut(duration: 0.14)) {
-                            isResumeHovered = hovering
-                        }
-                    }
-                    .help("Resume Automation (⌘⇧⎋)")
-                    .accessibilityLabel("Resume")
-                } else {
-                    WhisperIconButton(
-                        systemName: expandSymbol,
-                        showGlassBackdrop: false,
-                        help: "Expand Live View"
-                    ) {
-                        appState.markControlTap()
-                        appState.toggleHUDCollapsed()
-                    }
+            HStack(spacing: 0) {
+                WhisperIconButton(
+                    systemName: expandSymbol,
+                    showGlassBackdrop: false,
+                    help: "Expand Live View"
+                ) {
+                    appState.markControlTap()
+                    appState.toggleHUDCollapsed()
                 }
 
                 WhisperIconButton(
@@ -208,7 +242,7 @@ private struct CollapsedMicroPill: View {
                 }
             }
         }
-        .padding(.leading, isStopped ? 9 : 10)
+        .padding(.leading, 10)
         .padding(.trailing, 5)
         .frame(width: pillSize.width, height: pillSize.height)
         .background(Color.white.opacity(0.97), in: Capsule(style: .continuous))
@@ -222,6 +256,7 @@ private struct CollapsedMicroPill: View {
                 )
         )
         .clipShape(Capsule(style: .continuous))
+        .hudSoftShadow(Capsule(style: .continuous), ambient: true)
         .environment(\.colorScheme, .light)
         .onAppear { updatePulse() }
         .onChange(of: appState.isAgentBusy) { _, _ in updatePulse() }
@@ -266,214 +301,125 @@ private struct CollapsedMicroPill: View {
     }
 }
 
-// MARK: - Non-Dragging First-Mouse Click Surface for Peeking Deck Lips
+// MARK: - Multi-Agent PiP Deck (a stack that shuffles itself)
 
-private final class NonDraggingClickNSView: NSView {
-    var onClick: (() -> Void)?
-    var onHoverChange: ((Bool) -> Void)?
-    private var trackingArea: NSTrackingArea?
+/// Edge of each card behind the front one that shows above (or below) it. ActivityHUDController grows the panel by
+/// this much per card behind.
+let hudDeckPeek: CGFloat = 7
+/// Most cards drawn behind the front one.
+let hudDeckMaxBehind = 2
+/// The soft task-color tag along the top of the front card. ActivityHUDController adds it to the panel's height so
+/// the live picture keeps its size.
+let hudTagHeight: CGFloat = 7
 
-    override var mouseDownCanMoveWindow: Bool { false }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
-        }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        NSCursor.pointingHand.set()
-        onHoverChange?(true)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        NSCursor.arrow.set()
-        onHoverChange?(false)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        // Consume mouseDown immediately so NSPanel.isMovableByWindowBackground cannot hijack it
-        onClick?()
-    }
-}
-
-private struct DeckLipClickOverlay: NSViewRepresentable {
-    let onClick: () -> Void
-    let onHoverChange: (Bool) -> Void
-
-    func makeNSView(context: Context) -> NonDraggingClickNSView {
-        let view = NonDraggingClickNSView()
-        view.onClick = onClick
-        view.onHoverChange = onHoverChange
-        return view
-    }
-
-    func updateNSView(_ nsView: NonDraggingClickNSView, context: Context) {
-        nsView.onClick = onClick
-        nsView.onHoverChange = onHoverChange
-    }
-}
-
-// MARK: - Multi-Agent PiP Deck (front card + filmstrip)
-
-/// Height the filmstrip adds under the front card when more than one tab/app is in the deck.
-/// ActivityHUDController grows the panel by this much.
-let hudFilmstripHeight: CGFloat = 46
-
-/// The active tab/app is shown large; every other one stays visible as a live thumbnail in a strip below,
-/// in a stable order, so the user can see what each agent tab is doing and bring any of them forward.
+/// The front card is the live preview under a thin tag in its task's color; up to two more cards sit behind it, each
+/// with a 7 pt edge showing. They are only there to show that more work is going on: no titles, no pictures, no click
+/// targets. Their edge is a soft tag in their task's color that brightens for a moment when their agent does
+/// something, and the deck shuffles them forward in turn (AppState+DeckShuffle). The stack grows up from a bottom
+/// corner and down from a top corner.
 private struct StackedPiPDeckView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var videoSink: LiveVideoSink
 
-    // Front-card switch feedback: the new card rises from the strip, an accent ring flashes and a title
-    // chip names the tab that just came forward.
-    @State private var riseOffset: CGFloat = 0
-    @State private var riseScale: CGFloat = 1
-    @State private var ringOpacity: Double = 0
-    @State private var switchTitle: String?
-    @State private var switchGeneration = 0
-    @State private var lastFrontId: String?
-    /// Card ids in the order they first appeared, so thumbnails do not jump around on every switch.
-    @State private var stripOrder: [String] = []
-
     var body: some View {
         let deck = appState.hudDeck
-        let showStrip = deck.count > 1 && !appState.isHUDCollapsed
-        let frontId = deck.first?.id
+        let depth = min(max(deck.count - 1, 0), hudDeckMaxBehind)
+        let growsUp = appState.hudCorner == .bottomLeading || appState.hudCorner == .bottomTrailing
+        let cardShape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
         GeometryReader { geo in
-            let stripHeight = showStrip ? hudFilmstripHeight : 0
-            let frontHeight = max(120, geo.size.height - stripHeight)
-            let cardShape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+            let cardHeight = max(120, geo.size.height - CGFloat(depth) * hudDeckPeek)
+            let frontY = growsUp ? CGFloat(depth) * hudDeckPeek : 0
 
-            VStack(spacing: 0) {
-                FramelessLivePiPCard(appState: appState, videoSink: videoSink)
-                    .frame(width: geo.size.width, height: frontHeight)
-                    .overlay(
-                        cardShape
-                            .strokeBorder(MinimalHUDPalette.activeSky, lineWidth: 2)
-                            .opacity(ringOpacity)
-                            .allowsHitTesting(false)
+            ZStack(alignment: .topLeading) {
+                if deck.isEmpty {
+                    // Nothing in the deck yet (a pinned preview, the full display): the live card on its own.
+                    FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: HUDTaskPalette.color(slot: nil), tag: nil)
+                        .hudSoftShadow(cardShape, ambient: true)
+                        .frame(width: geo.size.width, height: cardHeight)
+                }
+                ForEach(Array(deck.enumerated()), id: \.element.id) { index, card in
+                    let step = CGFloat(min(index, hudDeckMaxBehind))
+                    let dips = index == 0 && appState.isDeckFrontDipping
+                    DeckCardView(
+                        appState: appState,
+                        videoSink: videoSink,
+                        card: card,
+                        position: index,
+                        accent: HUDTaskPalette.color(slot: appState.taskColorSlot(for: card))
                     )
-                    .overlay(alignment: .topLeading) {
-                        if let switchTitle {
-                            DeckSwitchChip(title: switchTitle)
-                                .padding(8)
-                                .transition(.opacity.combined(with: .move(edge: .top)))
-                                .id(switchGeneration)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .scaleEffect(riseScale, anchor: .bottom)
-                    .offset(y: riseOffset)
-                    .zIndex(2)
-
-                if showStrip {
-                    DeckFilmstrip(
-                        cards: orderedCards(deck),
-                        activeId: frontId,
-                        onSelect: { appState.promoteHUDCard(id: $0) }
-                    )
-                    .frame(width: geo.size.width, height: stripHeight)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    .zIndex(1)
+                    .frame(width: geo.size.width, height: cardHeight)
+                    .scaleEffect(dips ? 0.97 : 1 - 0.06 * step, anchor: growsUp ? .top : .bottom)
+                    .offset(y: frontY + (growsUp ? -1 : 1) * step * hudDeckPeek + (dips ? (growsUp ? 10 : -10) : 0))
+                    .opacity(index > hudDeckMaxBehind ? 0 : 1)
+                    .zIndex(Double(deck.count - index))
+                    .allowsHitTesting(index == 0)
                 }
             }
-            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
-            .animation(.spring(response: 0.32, dampingFraction: 0.86), value: showStrip)
-            .onAppear {
-                lastFrontId = frontId
-                syncStripOrder(deck)
-            }
-            .onChange(of: deck.map(\.id)) { _ in
-                syncStripOrder(appState.hudDeck)
-            }
-            .onChange(of: frontId) { newFront in
-                let previous = lastFrontId
-                lastFrontId = newFront
-                guard let newFront, let previous, previous != newFront else { return }
-                // A tab that was still opening getting its real id is the same card, not a switch; and a card
-                // with no tab yet only has a placeholder title.
-                let card = appState.hudDeck.first(where: { $0.id == newFront })
-                let upgradedFromPending = newFront.hasPrefix(previous + ":")
-                let isPlaceholder = card?.isBrowser == true && card?.browserTabId == nil
-                guard !upgradedFromPending, !isPlaceholder else { return }
-                playSwitch(title: card?.title)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .onHover { hovering in
+                appState.isHUDHovered = hovering
             }
         }
     }
+}
 
-    private func orderedCards(_ deck: [HUDSessionCard]) -> [HUDSessionCard] {
-        let byId = Dictionary(deck.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let known = stripOrder.compactMap { byId[$0] }
-        let extra = deck.filter { !stripOrder.contains($0.id) }
-        return known + extra
+/// One card of the deck: the live preview in front, a soft tag in its task's color behind.
+private struct DeckCardView: View {
+    @ObservedObject var appState: AppState
+    @ObservedObject var videoSink: LiveVideoSink
+    let card: HUDSessionCard
+    let position: Int
+    let accent: Color
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var flash = false
+    @State private var frontFade: Double = 1
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        let isFront = position == 0
+
+        // A card swaps faces at once when it reaches or leaves the front (it still slides into place): a cross-fade
+        // drew both faces at the same time, with the caption twice and the card washed in its tag color.
+        ZStack {
+            if isFront {
+                FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: accent, tag: accent)
+                    .opacity(frontFade)
+                    .transition(.identity)
+            } else {
+                backFace(shape: shape, depth: min(position, hudDeckMaxBehind))
+                    .transition(.identity)
+            }
+        }
+        .hudSoftShadow(shape, ambient: isFront)
+        .onChange(of: card.backgroundStepCount) { _, _ in
+            guard !isFront else { return }
+            var start = Transaction()
+            start.disablesAnimations = true
+            withTransaction(start) { flash = true }
+            withAnimation(.easeOut(duration: 0.6).delay(0.09)) { flash = false }
+        }
+        .onChange(of: isFront) { _, nowFront in
+            // With Reduce Motion the cards change places without moving; the new front fades in instead.
+            guard nowFront, reduceMotion else { return }
+            var start = Transaction()
+            start.disablesAnimations = true
+            withTransaction(start) { frontFade = 0 }
+            withAnimation(.easeInOut(duration: 0.25)) { frontFade = 1 }
+        }
     }
 
-    private func syncStripOrder(_ deck: [HUDSessionCard]) {
-        let ids = Set(deck.map(\.id))
-        var order: [String] = []
-        for id in stripOrder {
-            if ids.contains(id) {
-                order.append(id)
-            } else if let upgraded = deck.first(where: { $0.id.hasPrefix(id + ":") && !stripOrder.contains($0.id) }) {
-                // A card that was still opening got its real tab id: it keeps its slot.
-                order.append(upgraded.id)
-            }
+    /// A card behind the front one: only its edge shows, as a soft tag in its task's color. The card further back is a
+    /// little paler.
+    private func backFace(shape: RoundedRectangle, depth: Int) -> some View {
+        let base = HUDTaskPalette.tagOpacity * (depth <= 1 ? 1 : 0.75)
+        return ZStack {
+            Color.white
+            accent.opacity(flash ? HUDTaskPalette.tagFlashOpacity : base)
         }
-        for card in deck where !order.contains(card.id) {
-            order.append(card.id)
-        }
-        if order != stripOrder {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                stripOrder = order
-            }
-        }
-    }
-
-    private func playSwitch(title: String?) {
-        switchGeneration += 1
-        let generation = switchGeneration
-        // Start a little below and smaller, as if lifted out of the strip, then spring into place.
-        var start = Transaction()
-        start.disablesAnimations = true
-        withTransaction(start) {
-            riseOffset = 18
-            riseScale = 0.94
-            ringOpacity = 1
-        }
-        withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
-            riseOffset = 0
-            riseScale = 1
-        }
-        withAnimation(.easeOut(duration: 0.18)) {
-            switchTitle = (title?.isEmpty == false) ? title : nil
-        }
-        withAnimation(.easeOut(duration: 0.9).delay(0.25)) {
-            ringOpacity = 0
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-            guard generation == switchGeneration else { return }
-            withAnimation(.easeIn(duration: 0.22)) {
-                switchTitle = nil
-            }
-        }
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color.black.opacity(0.07), lineWidth: 0.75))
     }
 }
 
@@ -499,211 +445,19 @@ private struct PrivatePreviewPlaceholder: View {
     }
 }
 
-/// Small chip naming the tab/app that just came to the front.
-private struct DeckSwitchChip: View {
-    let title: String
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "arrow.up.square.fill")
-                .font(.system(size: 9.5, weight: .semibold))
-                .foregroundStyle(MinimalHUDPalette.activeSky)
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(MinimalHUDPalette.ink)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            Capsule(style: .continuous)
-                .fill(Color.white.opacity(0.94))
-                .shadow(color: Color.black.opacity(0.14), radius: 4, x: 0, y: 1)
-        )
-        .overlay(Capsule(style: .continuous).strokeBorder(MinimalHUDPalette.hairline, lineWidth: 0.5))
-        .frame(maxWidth: 210, alignment: .leading)
-    }
-}
-
-/// Strip of live thumbnails under the front card. The active one is outlined; busy ones pulse a dot.
-/// Thumbnails shrink to fit up to 8 cards; past that the rest is summarized as "+N" (titles in the tooltip).
-private struct DeckFilmstrip: View {
-    let cards: [HUDSessionCard]
-    let activeId: String?
-    let onSelect: (String) -> Void
-
-    private let horizontalPadding: CGFloat = 8
-    private let maxThumbWidth: CGFloat = 48
-    private let minThumbWidth: CGFloat = 26
-
-    var body: some View {
-        GeometryReader { geo in
-            let layout = Self.layout(
-                count: cards.count,
-                available: geo.size.width - horizontalPadding * 2,
-                maxThumbWidth: maxThumbWidth,
-                minThumbWidth: minThumbWidth
-            )
-            let overflow = cards.count > layout.capacity
-            let visible = overflow ? Array(cards.prefix(layout.capacity - 1)) : cards
-            // Never hide the active card behind "+N".
-            let shown: [HUDSessionCard] = {
-                guard overflow, let activeId, !visible.contains(where: { $0.id == activeId }),
-                      let active = cards.first(where: { $0.id == activeId }) else { return visible }
-                return Array(visible.dropLast()) + [active]
-            }()
-            let hidden = cards.filter { card in !shown.contains(where: { $0.id == card.id }) }
-
-            HStack(spacing: layout.spacing) {
-                ForEach(shown) { card in
-                    DeckThumbnail(
-                        card: card,
-                        isActive: card.id == activeId,
-                        width: layout.thumbWidth,
-                        height: layout.thumbHeight,
-                        compact: layout.thumbWidth < 36
-                    ) {
-                        onSelect(card.id)
-                    }
-                    .transition(.scale(scale: 0.6).combined(with: .opacity))
-                }
-                if overflow {
-                    Text("+\(hidden.count)")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(MinimalHUDPalette.softIcon)
-                        .frame(width: layout.thumbWidth, height: layout.thumbHeight)
-                        .background(
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .fill(MinimalHUDPalette.softPillBg)
-                        )
-                        .help(hidden.map(\.title).joined(separator: "\n"))
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, horizontalPadding)
-            .frame(width: geo.size.width, height: geo.size.height - 6)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.white.opacity(0.92))
-                    .shadow(color: Color.black.opacity(0.10), radius: 5, x: 0, y: 1)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(MinimalHUDPalette.hairline, lineWidth: 0.5)
-            )
-            .offset(y: 6)
-            .animation(.spring(response: 0.3, dampingFraction: 0.85), value: shown.map(\.id))
-            .animation(.spring(response: 0.3, dampingFraction: 0.85), value: layout.thumbWidth)
-        }
-    }
-
-    struct Layout: Equatable {
-        var thumbWidth: CGFloat
-        var thumbHeight: CGFloat
-        var spacing: CGFloat
-        /// How many slots fit (including the "+N" slot when overflowing).
-        var capacity: Int
-    }
-
-    /// Fits every card when they can be at least `minThumbWidth` wide; otherwise uses the minimum size and
-    /// reserves the last slot for "+N".
-    static func layout(count: Int, available: CGFloat, maxThumbWidth: CGFloat, minThumbWidth: CGFloat) -> Layout {
-        let n = max(1, count)
-        let spacing: CGFloat = n > 5 ? 4 : 6
-        let fitWidth = floor((available - spacing * CGFloat(n - 1)) / CGFloat(n))
-        if fitWidth >= minThumbWidth {
-            let width = min(maxThumbWidth, fitWidth)
-            return Layout(thumbWidth: width, thumbHeight: round(width / 1.6), spacing: spacing, capacity: n)
-        }
-        let capacity = max(2, Int((available + spacing) / (minThumbWidth + spacing)))
-        return Layout(thumbWidth: minThumbWidth, thumbHeight: round(minThumbWidth / 1.6), spacing: spacing, capacity: capacity)
-    }
-}
-
-private struct DeckThumbnail: View {
-    let card: HUDSessionCard
-    let isActive: Bool
-    let width: CGFloat
-    let height: CGFloat
-    var compact = false
-    let onSelect: () -> Void
-
-    @State private var isHovered = false
-    @State private var pulse = false
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 5, style: .continuous)
-        ZStack(alignment: .topTrailing) {
-            ZStack {
-                Color(red: 0.95, green: 0.95, blue: 0.96)
-                if let cgImage = card.previewImage {
-                    Image(decorative: cgImage, scale: 2.0)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: width, height: height, alignment: .top)
-                        .clipped()
-                } else {
-                    Image(systemName: card.isBrowser ? "globe" : "macwindow")
-                        .font(.system(size: 11, weight: .regular))
-                        .foregroundStyle(MinimalHUDPalette.whisper)
-                }
-                // Inactive thumbnails sit back a little so the active one reads first.
-                Color.white.opacity(isActive || isHovered ? 0 : 0.18)
-            }
-            .frame(width: width, height: height)
-            .clipShape(shape)
-            .overlay(
-                shape.strokeBorder(
-                    isActive ? MinimalHUDPalette.activeSky : Color.black.opacity(isHovered ? 0.22 : 0.10),
-                    lineWidth: isActive ? 1.6 : 0.6
-                )
-            )
-
-            if card.isBusy && !isActive {
-                Circle()
-                    .fill(MinimalHUDPalette.activeSky)
-                    .frame(width: compact ? 4.5 : 6, height: compact ? 4.5 : 6)
-                    .scaleEffect(pulse ? 1.25 : 0.85)
-                    .opacity(pulse ? 1 : 0.6)
-                    .offset(x: 2, y: -2)
-                    .onAppear {
-                        withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
-                            pulse = true
-                        }
-                    }
-            } else if card.isCompleted {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: compact ? 7 : 9, weight: .bold))
-                    .foregroundStyle(MinimalHUDPalette.liveGreen, Color.white)
-                    .offset(x: 3, y: -3)
-            }
-
-            DeckLipClickOverlay(
-                onClick: onSelect,
-                onHoverChange: { hovering in
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        isHovered = hovering
-                    }
-                }
-            )
-            .frame(width: width, height: height)
-        }
-        .scaleEffect(isHovered && !isActive ? 1.06 : 1)
-        .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isActive)
-        .help(card.caption?.agentName.map { "\($0) · \(card.title)" } ?? card.title)
-    }
-}
-
 // MARK: - Frameless Edge-to-Edge Live PiP Card (280px / 400px)
 
 private struct FramelessLivePiPCard: View {
     @ObservedObject var appState: AppState
     @ObservedObject var videoSink: LiveVideoSink
+    /// The card's task color: the click ripple uses it.
+    let accent: Color
+    /// The color of the soft tag along the card's top: every deck card has one. Nil only for the live card shown
+    /// with an empty deck (a pinned preview or the full display), which has no tag.
+    let tag: Color?
 
     @State private var isHovering = false
     @State private var isEnableHovered = false
-    @State private var isStopHovered = false
     @State private var completionReveal: Bool = false
     @State private var completionRingScale: CGFloat = 0.65
     @State private var completionRingOpacity: Double = 0.0
@@ -719,43 +473,48 @@ private struct FramelessLivePiPCard: View {
         let isBusy = appState.isAgentBusy && !isStopped
         let isCompleted = appState.hasCompletedHUDAction && !isStopped && !isBusy
 
-        ZStack {
-            Color.white
+        VStack(spacing: 0) {
+            if let tag {
+                taskTag(tag)
+            }
+            ZStack {
+                Color.white
 
-            if appState.chromePreviewHidden && !appState.isBrowserStreamActive {
-                PrivatePreviewPlaceholder()
-                    .transition(.opacity)
-            } else if videoSink.hasReceivedFrame {
-                LiveVideoSurfaceView(videoSink: videoSink)
-                    .transition(.opacity)
+                if appState.chromePreviewHidden && !appState.isBrowserStreamActive {
+                    PrivatePreviewPlaceholder()
+                        .transition(.opacity)
+                } else if videoSink.hasReceivedFrame {
+                    LiveVideoSurfaceView(videoSink: videoSink)
+                        .transition(.opacity)
 
-                if !isCompleted {
-                    videoSpatialOverlay
-                        .allowsHitTesting(false)
+                    if !isCompleted {
+                        videoSpatialOverlay
+                            .allowsHitTesting(false)
+                            .transition(.opacity)
+                    }
+                } else {
+                    softOnboardingState
                         .transition(.opacity)
                 }
-            } else {
-                softOnboardingState
-                    .transition(.opacity)
-            }
 
-            // Keep active preview frameless and calm; only show a soft red aura when Emergency Stop is tripped
-            if isStopped {
-                cardShape
-                    .stroke(MinimalHUDPalette.stopRed.opacity(0.20), lineWidth: 4.0)
-                    .blur(radius: 3.5)
-                    .clipShape(cardShape)
-                    .allowsHitTesting(false)
-            }
+                // Keep active preview frameless and calm; only show a soft red aura when Emergency Stop is tripped
+                if isStopped {
+                    cardShape
+                        .stroke(MinimalHUDPalette.stopRed.opacity(0.20), lineWidth: 4.0)
+                        .blur(radius: 3.5)
+                        .clipShape(cardShape)
+                        .allowsHitTesting(false)
+                }
 
-            // OpenAI-style airy translucent white frosted completion overlay + soft light-green check
-            if isCompleted {
-                completionVeilOverlay
-                    .transition(.opacity)
-                    .allowsHitTesting(false)
-            }
+                // OpenAI-style airy translucent white frosted completion overlay + soft light-green check
+                if isCompleted {
+                    completionVeilOverlay
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
 
-            whisperFloatingChrome(isCompleted: isCompleted)
+                whisperFloatingChrome(isCompleted: isCompleted)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(cardShape)
@@ -899,6 +658,18 @@ private struct FramelessLivePiPCard: View {
         }
     }
 
+    /// The card's task color as a thin pastel band along its top, so cards of different tasks tell apart at a glance
+    /// without coloring the picture.
+    private func taskTag(_ color: Color) -> some View {
+        ZStack(alignment: .bottom) {
+            Color.white
+            color.opacity(HUDTaskPalette.tagOpacity)
+            color.opacity(0.16)
+                .frame(height: 0.5)
+        }
+        .frame(height: hudTagHeight)
+    }
+
     // MARK: - Whisper-Quiet Floating Chrome (No Screen Pill, Nearly Invisible CTAs)
 
     private func whisperFloatingChrome(isCompleted: Bool) -> some View {
@@ -950,18 +721,14 @@ private struct FramelessLivePiPCard: View {
 
             Spacer(minLength: 0)
 
+            // Only what is happening: stopping and resuming are in the UseMac menu and on ⌘⇧⎋.
             HStack(spacing: 6) {
                 if !isCompleted, let caption = appState.latestCaptionItem {
                     captionPill(caption)
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
 
-                Spacer(minLength: 4)
-
-                if appState.isAgentBusy || appState.status.killSwitchTripped {
-                    stopPill
-                        .transition(.opacity)
-                }
+                Spacer(minLength: 0)
             }
         }
         .padding(7)
@@ -1028,53 +795,6 @@ private struct FramelessLivePiPCard: View {
                 .strokeBorder(Color.black.opacity(0.05), lineWidth: 0.5)
         )
         .shadow(color: Color.black.opacity(0.07), radius: 3, x: 0, y: 1)
-    }
-
-    private var stopPill: some View {
-        let tripped = appState.status.killSwitchTripped
-        let resumeGreen = Color(red: 0.118, green: 0.659, blue: 0.431) // #1EA86E
-        let fgColor: Color = {
-            if tripped { return isStopHovered ? .white : resumeGreen }
-            return isStopHovered ? .white : MinimalHUDPalette.ink.opacity(0.80)
-        }()
-        let bgColor: Color = {
-            if tripped { return isStopHovered ? resumeGreen : Color.white.opacity(0.92) }
-            return isStopHovered ? MinimalHUDPalette.cursorInkBottom : Color.white.opacity(0.90)
-        }()
-        let borderColor: Color = {
-            if tripped { return resumeGreen.opacity(isStopHovered ? 0.0 : 0.24) }
-            return Color.black.opacity(isStopHovered ? 0.0 : 0.07)
-        }()
-
-        return Button {
-            appState.markControlTap()
-            appState.toggleKillSwitch()
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: tripped ? "play.fill" : "stop.fill")
-                    .font(.system(size: 7.5, weight: .semibold))
-                Text(tripped ? "Resume" : "Stop")
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .foregroundStyle(fgColor)
-            .padding(.horizontal, 9)
-            .frame(minHeight: 24)
-            .background(bgColor, in: Capsule(style: .continuous))
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(borderColor, lineWidth: 0.5)
-            )
-            .shadow(color: Color.black.opacity(0.07), radius: 3, x: 0, y: 1)
-            .contentShape(Capsule(style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.14)) {
-                isStopHovered = hovering
-            }
-        }
-        .help(tripped ? "Resume Automation (⌘⇧⎋)" : "Stop Automation (⌘⇧⎋)")
-        .accessibilityLabel(tripped ? "Resume" : "Stop")
     }
 
     // MARK: - Soft, Gentle Onboarding State
@@ -1208,7 +928,7 @@ private struct FramelessLivePiPCard: View {
             ZStack(alignment: .topLeading) {
                 if outerRippleOpacity > 0.01 {
                     Circle()
-                        .stroke(MinimalHUDPalette.activeSky, lineWidth: 1.25)
+                        .stroke(accent, lineWidth: 1.25)
                         .frame(width: 13, height: 13)
                         .scaleEffect(outerRippleScale)
                         .opacity(outerRippleOpacity)
@@ -1217,10 +937,10 @@ private struct FramelessLivePiPCard: View {
 
                 if innerRippleOpacity > 0.01 {
                     Circle()
-                        .fill(MinimalHUDPalette.activeSkyLight.opacity(0.20))
+                        .fill(accent.opacity(0.20))
                         .overlay(
                             Circle()
-                                .stroke(MinimalHUDPalette.activeSkyLight.opacity(0.85), lineWidth: 1.0)
+                                .stroke(accent.opacity(0.55), lineWidth: 1.0)
                         )
                         .frame(width: 10, height: 10)
                         .scaleEffect(innerRippleScale)

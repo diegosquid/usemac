@@ -1669,15 +1669,15 @@ public final class MCPStdioServer: @unchecked Sendable {
                     ],
                     "viewportWidth": [
                         "type": "integer",
-                        "description": "Optional emulated viewport width in pixels (e.g. 1440 for wide dashboards)."
+                        "description": "Ignored. UseMac never resizes a tab: it is observed at the size Chrome gives it."
                     ],
                     "viewportHeight": [
                         "type": "integer",
-                        "description": "Optional emulated viewport height in pixels (e.g. 900)."
+                        "description": "Ignored. UseMac never resizes a tab."
                     ],
                     "deviceScaleFactor": [
                         "type": "number",
-                        "description": "Optional pixel density scale factor (1..3, e.g. 2 for crisp Retina text/charts)."
+                        "description": "Ignored. UseMac never resizes a tab."
                     ]
                 ]
             ],
@@ -1762,15 +1762,15 @@ public final class MCPStdioServer: @unchecked Sendable {
                     ],
                     "viewportWidth": [
                         "type": "integer",
-                        "description": "Optional viewport width (e.g. 1440)."
+                        "description": "Optional maximum image width in pixels (e.g. 1280). A bigger capture is scaled down to fit, keeping its aspect ratio. The tab itself is never resized."
                     ],
                     "viewportHeight": [
                         "type": "integer",
-                        "description": "Optional viewport height (e.g. 900)."
+                        "description": "Optional maximum image height in pixels (e.g. 800). A bigger capture is scaled down to fit, keeping its aspect ratio. The tab itself is never resized."
                     ],
                     "deviceScaleFactor": [
                         "type": "number",
-                        "description": "Optional Retina scale factor (1..3, e.g. 2)."
+                        "description": "Ignored. The capture uses the tab's own pixel density."
                     ],
                     "quality": [
                         "type": "integer",

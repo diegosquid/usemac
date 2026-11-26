@@ -12,7 +12,9 @@ extension UseMacEngineService {
             ? TaskTabRegistry.cleanAgent(request.taskStart?.agent)
             : taskTabs.agent(of: scope.taskId)
         let response = await TaskActivityContext.$agentName.withValue(agent) {
-            await handleScoped(request, scope: scope)
+            await TaskActivityContext.$taskId.withValue(scope.taskId) {
+                await handleScoped(request, scope: scope)
+            }
         }
         // Audit entries don't carry error codes; a problem report lists them from here.
         problemReports.record(response, of: request, taskId: scope.taskId)
@@ -107,16 +109,20 @@ extension UseMacEngineService {
     }
 }
 
-/// The agent of the request being handled. Every live activity item the request emits carries it, so its preview card
-/// shows which agent is working there.
+/// The agent and task of the request being handled. Every live activity item the request emits carries them, so its
+/// preview card shows which agent is working there and takes its task's color.
 enum TaskActivityContext {
     @TaskLocal static var agentName: String?
+    @TaskLocal static var taskId: String?
 
     static func labeling(_ forward: @escaping @Sendable (LiveActivityItem) -> Void) -> @Sendable (LiveActivityItem) -> Void {
         { item in
-            guard item.agentName == nil, let agent = agentName else { return forward(item) }
+            let agent = item.agentName == nil ? agentName : nil
+            let task = item.taskId == nil ? taskId : nil
+            guard agent != nil || task != nil else { return forward(item) }
             var labeled = item
-            labeled.agentName = agent
+            if let agent { labeled.agentName = agent }
+            if let task { labeled.taskId = task }
             forward(labeled)
         }
     }

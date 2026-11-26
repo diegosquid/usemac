@@ -821,7 +821,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     private var _onUserStopRequested: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)?
 
-    /// The user pressed Stop in the pill on a controlled tab. The app handles it like Stop in the HUD.
+    /// The user pressed Stop in the pill on a controlled tab. The app handles it like its emergency stop (⌘⇧⎋).
     public var onUserStopRequested: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)? {
         get {
             lock.lock()
