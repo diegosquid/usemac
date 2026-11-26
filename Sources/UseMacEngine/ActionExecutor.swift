@@ -758,7 +758,7 @@ public final class ActionExecutor: @unchecked Sendable {
         case .hover:
             outcome = performHover(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .setValue:
-            outcome = performSetValue(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+            outcome = await performSetValue(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .type:
             outcome = performType(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .pressKey:
@@ -1295,7 +1295,7 @@ public final class ActionExecutor: @unchecked Sendable {
         resolved: ResolvedElement,
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
-    ) -> StepOutcome {
+    ) async -> StepOutcome {
         let text = step.text ?? ""
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
         let omniboxWarning = isChromiumApp(targetApp) && Self.isAddressBar(resolved.node)
@@ -1306,13 +1306,24 @@ public final class ActionExecutor: @unchecked Sendable {
             highlight(resolved.node, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
             // IMPORTANT: Never set kAXFocusedAttribute while app is in background!
             // In Chromium/Electron, kAXFocusedAttribute calls Widget::Activate() and steals focus/Spaces.
-            if bgPid == nil {
+            // The same goes for a window of the app in front that is not its focused window (one UseMac opened
+            // behind the user's): focusing it would bring it over the user's window and take their keys.
+            if bgPid == nil, keyWindowGuard(targetApp, input: "typing") == nil {
                 _ = AXUIElementSetAttributeValue(axEl, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             }
             if AXUIElementSetAttributeValue(axEl, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
-                let readBack = Self.axString(axEl, kAXValueAttribute)
+                var readBack = Self.axString(axEl, kAXValueAttribute)
                 let isToggle = ["AXCheckBox", "AXRadioButton", "AXSwitch"].contains(resolved.node?.role ?? "")
                 let isSecure = Self.axString(axEl, kAXSubroleAttribute) == "AXSecureTextField"
+                // Chromium sets the value in the page and updates its accessibility tree a moment later: wait for
+                // that before calling the value rejected.
+                var waitedMs = 0
+                while !isToggle, !isSecure, let current = readBack,
+                      ElementMatcher.normalize(current) != ElementMatcher.normalize(text), waitedMs < 300 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    waitedMs += 50
+                    readBack = Self.axString(axEl, kAXValueAttribute)
+                }
                 if !isToggle, !isSecure, let readBack, ElementMatcher.normalize(readBack) != ElementMatcher.normalize(text) {
                     return StepOutcome(
                         success: true,
