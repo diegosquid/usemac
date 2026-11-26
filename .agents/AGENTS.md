@@ -92,9 +92,9 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `browser_screenshot` | JPEG of a Chrome tab, an element or the whole page (stitched), saved to a private temp folder (pruned after 30 minutes). |
 | `browser_act` | DOM action steps in a Chrome tab, with optional `readOnly`, on-device `verify` or post-action screenshot. |
 | `browser_reload_extension` | Reload the Chrome extension so it runs the code now in its folder, then wait until it has paired again (`profile` optional, `force` to interrupt running commands). Stops every agent's browser work: only when the user asks or nothing else uses Chrome. |
-| `vision_status` | Local vision readiness (Apple Vision OCR plus optional on-device MLX model). |
+| `vision_status` | Local vision readiness. `backend` says what answers `vision_query` now: Apple Vision OCR (the default) or the optional on-device MLX model, once the user installed and turned it on. |
 | `vision_install` | Install the optional MLX runtime and one of the three preset models (`INVALID_MODEL` otherwise). |
-| `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. |
+| `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. Apple Vision OCR reads text only; icons, colors and disabled states need the optional model. |
 | `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request; `agent` names you on the preview cards. |
 | `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. |
 | `report_prepare` | Prepare a problem report the user reviews in UseMac before anything is sent (`reportPrepare`: `summary` required, `title`, `taskId`). Answers at once with `problemReport.status` `awaiting_user_review`. See [section 8](#8-reporting-a-problem). |

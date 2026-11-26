@@ -15,6 +15,15 @@ All notable changes to UseMac are documented here. The format follows
   16384 CSS px (it was 6000); fixed or sticky headers show in every viewport. When the image doesn't show everything,
   the result has `truncated: true` and MCP and the CLI print a `Truncated:` line.
 
+- **Local Vision's on-device model is opt-in and loads only when it is used.** Most tasks don't need it: UseMac
+  reads apps and pages as text, and Apple Vision OCR reads the rest; a model only adds icons, colors and greyed-out
+  buttons. So Apple Vision OCR answers until you install a model and turn it on, and the setup guide now says the model
+  is optional and starts on **Text only**. A model found in the Hugging Face
+  cache no longer turns it on by itself. The model no longer loads when a task starts: it loads on the first visual
+  check that needs it and unloads after 5 idle minutes, so a task that never asks costs no memory. Only the UseMac app
+  (and `usemac serve`) loads it, one copy shared by every agent; with the app closed, or with `--standalone`,
+  `vision_query` answers with Apple Vision OCR instead of each agent loading its own copy (about 3 GB each).
+
 ### Security
 
 - **UseMac notices safety settings changed outside it.** The execution mode, the Emergency stop and Debug capture

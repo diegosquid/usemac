@@ -14,7 +14,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let screenCapturer = FastScreenCapturer()
     public let liveStreamer = LiveScreenStreamer()
     public let chromeBridge: ChromeExtensionBridge
-    public let localVision = LocalVisionEngine()
+    public let localVision: LocalVisionEngine
     private let actionExecutor: ActionExecutor
     /// Ask mode: sensitive requests waiting for the user's answer in the HUD.
     public let approvals = ApprovalBroker()
@@ -87,9 +87,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         socketPath: String = UseMacDefaults.defaultSocketPath,
         extensionPort: UInt16 = UseMacDefaults.defaultExtensionPort,
         bridgeKeyDirectory: URL? = nil,
-        auditStore: AuditLogStore? = nil
+        auditStore: AuditLogStore? = nil,
+        allowsLocalVisionModel: Bool = false
     ) {
         self.socketPath = socketPath
+        // Only the long-lived engine (the app, `usemac serve`) loads the local model; see LocalVisionEngine.allowsModel.
+        self.localVision = LocalVisionEngine(allowsModel: allowsLocalVisionModel)
         self.auditStore = auditStore
         self.auditEntries = auditStore?.recentEntries() ?? []
         let pairingStore = bridgeKeyDirectory.map { BridgePairingStore(directory: $0) } ?? BridgePairingStore()
@@ -1129,7 +1132,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                                     windowTitle: bridgeResp.title,
                                     title: "Checking screen locally…",
                                     subtitle: "local-vision-reflex",
-                                    mechanism: "mlx-vlm",
+                                    mechanism: localVision.currentStatus().backend,
                                     success: true,
                                     isInProgress: true,
                                     browserTabId: bridgeResp.tabId ?? params.tabId,
@@ -1531,7 +1534,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserTabId: params.tabId,
                 browserProfile: resolvedProfile
             ))
-            localVision.warmupIfReady()
             response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: taskId)
 
         case .taskComplete:

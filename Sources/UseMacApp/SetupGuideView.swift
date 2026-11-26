@@ -148,10 +148,7 @@ public struct SetupGuideView: View {
         self.onRequestFocus = onRequestFocus
         self.appIconOverride = appIcon
         _step = State(initialValue: initialStep)
-        _visionChoice = State(initialValue: SetupVisionChoice.initial(
-            status: appState.visionStatus,
-            installerAvailable: appState.isLocalVisionInstallerAvailable
-        ))
+        _visionChoice = State(initialValue: SetupVisionChoice.initial(status: appState.visionStatus))
     }
 
     public var body: some View {
@@ -394,8 +391,8 @@ public struct SetupGuideView: View {
         return VStack(spacing: 22) {
             stepHeader(
                 symbol: "eye.circle",
-                title: "Let agents see on your Mac",
-                subtitle: "Apple's built-in OCR already reads on-screen text. Add an on-device model so agents can check what they see without sending screenshots to the cloud."
+                title: "On-device vision is optional",
+                subtitle: "Most tasks don't need it: UseMac reads apps and pages as text, and Apple's OCR reads the rest. A model only adds icons, colors and greyed-out buttons."
             )
 
             VStack(spacing: 7) {
@@ -416,7 +413,7 @@ public struct SetupGuideView: View {
             .frame(width: 540)
 
             Text(installerAvailable
-                 ? "Runs only on your Mac. The model downloads from Hugging Face; the runtime (about 700 MB) from PyPI."
+                 ? "It runs only on your Mac, so those checks never send a screenshot to the cloud. Model from Hugging Face, runtime (about 700 MB) from PyPI."
                  : "On-device models need the free uv installer. Run brew install uv, then pick a model in Settings → General → Local Vision.")
                 .font(.system(size: 11.5))
                 .foregroundStyle(.tertiary)
@@ -812,12 +809,13 @@ enum SetupVisionChoice: Hashable {
         .model(.holo1_3B)
     ]
 
-    static func initial(status: VisionStatus, installerAvailable: Bool) -> SetupVisionChoice {
+    /// Text only unless a model is already installed and on: the model is an opt-in download.
+    static func initial(status: VisionStatus) -> SetupVisionChoice {
         let current = LocalVisionModelPreset(rawValue: status.modelId)
         if status.runtimeInstalled && status.modelDownloaded, let current {
             return status.enabled ? .model(current) : .textOnly
         }
-        return installerAvailable ? .model(.qwen25VL3B) : .textOnly
+        return .textOnly
     }
 
     static func downloadSize(_ preset: LocalVisionModelPreset) -> String {
@@ -839,7 +837,7 @@ enum SetupVisionChoice: Hashable {
 
     var detail: String {
         switch self {
-        case .textOnly: return "Built-in Apple OCR reads text on screen."
+        case .textOnly: return "Reads apps, pages and screen text. Enough for most tasks."
         case .model(.qwen35_08B): return "Fastest. Good for quick visual checks."
         case .model(.qwen25VL3B): return "Best balance of speed and accuracy."
         case .model(.holo1_3B): return "Tuned for finding buttons and controls."
@@ -849,7 +847,6 @@ enum SetupVisionChoice: Hashable {
     var badge: SetupBadge? {
         switch self {
         case .textOnly: return SetupBadge(text: "Included", tint: UseMacTheme.statusGreen)
-        case .model(.qwen25VL3B): return SetupBadge(text: "Recommended", tint: UseMacTheme.accentActive)
         default: return nil
         }
     }

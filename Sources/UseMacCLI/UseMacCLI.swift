@@ -1845,7 +1845,8 @@ struct UseMacCLI {
     }
 
     private static func handleServe(options: GlobalOptions) async throws -> Int32 {
-        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore())
+        // `serve` stands in for the app, so it is the one engine here that may load the local vision model.
+        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore(), allowsLocalVisionModel: true)
         let server = UnixSocketServer(socketPath: options.socketPath, service: service, onClientCountChange: nil)
         try server.start()
 
@@ -2236,9 +2237,9 @@ struct UseMacCLI {
           browser reload-extension [--profile <n>] [--force]
                                                      Reload the extension so Chrome runs the code now in its folder (stops running browser work)
           vision status                              Show Local Vision engine status (Apple OCR + MLX-VLM)
-          vision install [--model <hf-repo>]         Install the MLX runtime and download the local model on demand
+          vision install [--model <hf-repo>]         Optional: install the MLX runtime and a local model (Apple OCR works without it)
           vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
-                                                     Ask the on-device vision model + Apple OCR about the screen (zero cloud image tokens)
+                                                     Ask Apple OCR, or the on-device model when it is on, about the screen (zero cloud image tokens)
           start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"] [--agent <name>]
                                                      Start a task (prints its taskId) keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
@@ -2311,7 +2312,7 @@ struct UseMacCLI {
 
     private static let visionSubcommands: [(String, String)] = [
         ("status", "Show Local Vision status (Apple OCR + MLX model)"),
-        ("install", "Install the MLX runtime and download a preset model"),
+        ("install", "Optional: install the MLX runtime and a preset model"),
         ("ask", "Ask a visual question about the screen"),
         ("verify", "Check a visual assertion (YES/NO + evidence)"),
         ("describe", "Summarize the visible state (errors, values, buttons, modals)"),
@@ -2621,8 +2622,8 @@ struct UseMacCLI {
         case "vision install":
             return CommandHelp(
                 usage: ["usemac vision install [--model <hf-repo>]"],
-                summary: "Install the MLX runtime and download one of the three preset models (INVALID_MODEL otherwise).",
-                flags: [("--model <hf-repo>", "Preset model id (default: the recommended preset)")],
+                summary: "Optional. Install the MLX runtime and download one of the three preset models (INVALID_MODEL otherwise). Most tasks don't need it: Apple Vision OCR reads screen text, and a model only adds icons, colors and greyed-out buttons. It loads in the UseMac app on the first visual check and unloads after 5 idle minutes.",
+                flags: [("--model <hf-repo>", "Preset model id (default: the preset selected in Settings)")],
                 examples: ["usemac vision install"]
             )
         case "vision ask", "vision verify", "vision describe", "vision locate", "vision diagnose", "vision ocr":

@@ -1740,7 +1740,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_browser_screenshot",
-            description: "TOKEN-HEAVY fallback (~1,500-3,000 cloud image tokens): capture a JPEG screenshot of a background Chrome tab (or crop around a selector/@bID) as an inline image block. Prefer usemac_browser_observe/usemac_browser_extract for DOM data and usemac_vision_query(mode: 'ask'|'verify'|'describe') for fast on-device Qwen visual checks FIRST; reserve usemac_browser_screenshot only for pixel-level creative, complex chart, or visual design inspection.",
+            description: "TOKEN-HEAVY fallback (~1,500-3,000 cloud image tokens): capture a JPEG screenshot of a background Chrome tab (or crop around a selector/@bID) as an inline image block. Prefer usemac_browser_observe/usemac_browser_extract for DOM data and usemac_vision_query(mode: 'ask'|'verify'|'describe') for on-device checks FIRST; reserve usemac_browser_screenshot only for pixel-level creative, complex chart, or visual design inspection.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -1831,7 +1831,7 @@ public final class MCPStdioServer: @unchecked Sendable {
                     ],
                     "verify": [
                         "type": "string",
-                        "description": "Optional visual condition checked locally by on-device MLX Vision + Apple OCR right after the steps finish (e.g. 'CNAME record values appeared with no errors'), returning pass/fail + evidence with 0 cloud image tokens."
+                        "description": "Optional visual condition checked on this Mac (Apple Vision OCR, plus the on-device model when the user turned it on) right after the steps finish (e.g. 'CNAME record values appeared with no errors'), returning pass/fail + evidence with 0 cloud image tokens."
                     ],
                     "returnImageContent": [
                         "type": "boolean",
@@ -1850,7 +1850,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_vision_status",
-            description: "Check UseMac Local Vision status (Apple Vision OCR + on-device Apple Silicon MLX VLM readiness).",
+            description: "Check UseMac Local Vision status: `backend` says what answers usemac_vision_query now, Apple Vision OCR (the default) or the optional on-device MLX model the user can turn on.",
             inputSchema: [
                 "type": "object",
                 "properties": [:]
@@ -1865,7 +1865,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_vision_query",
-            description: "FAST, ZERO-CLOUD-IMAGE-TOKEN on-device visual assistant (Apple Silicon MLX Qwen VLM + Apple Vision OCR hybrid). Prefer this BEFORE usemac_browser_screenshot whenever you need to ask what is visually on screen, verify an action result, check for red validation errors/disabled buttons/toasts/badges, summarize a screen/chart, locate icon/canvas coordinates, or diagnose blocking overlays.",
+            description: "ZERO-CLOUD-IMAGE-TOKEN on-device visual check. Apple Vision OCR answers by default: screen text with positions, in milliseconds. When the user turned on the optional on-device MLX model (result `backend: mlx-vlm`, about 2 s), it also judges icons, colors, disabled buttons and click coordinates. Prefer this BEFORE usemac_browser_screenshot to read values, confirm an action result, spot error text or find a labeled control. With `backend: apple-vision-ocr` it cannot see icons, colors or disabled states: use usemac_browser_observe, or a screenshot when the DOM does not say.",
             inputSchema: [
                 "type": "object",
                 "properties": [
