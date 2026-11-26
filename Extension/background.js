@@ -1,4 +1,5 @@
 importScripts("bridge-auth.js");
+importScripts("tab-indicator.js");
 
 const WS_URL = "ws://127.0.0.1:49222/usemac-bridge";
 const BRIDGE_ENDPOINT = "127.0.0.1:49222";
@@ -618,6 +619,11 @@ function connectWS(force = false) {
       return;
     }
 
+    if (msg.type === "tab_control") {
+      handleTabControlMessage(msg);
+      return;
+    }
+
     if (msg.type === "request" && msg.id && msg.command) {
       dispatchDaemonRequest(msg);
     }
@@ -655,6 +661,7 @@ function ensureConnected() {
 }
 
 async function sendCDP(tabId, method, params = {}, cdpSessionId = null) {
+  if (!cdpSessionId && TAB_INDICATOR_POINTER_METHODS.has(method)) await tabIndicatorBeforeAgentPointer(tabId, method, params);
   const target = cdpSessionId ? { tabId, sessionId: cdpSessionId } : { tabId };
   return chrome.debugger.sendCommand(target, method, params);
 }
@@ -736,6 +743,7 @@ function resetIdleTimer(tabId) {
   const session = state.tabSessions.get(tabId);
   if (!session) return;
   clearIdleTimer(session);
+  markTabControlled(tabId);
   session.lastActiveAt = Date.now();
   session.idleTimer = setTimeout(() => {
     session.idleTimer = null;
@@ -774,7 +782,8 @@ async function captureAndEmitFrame(tabId) {
         title: tab?.title || session.title,
         viewportWidth: viewport.width,
         viewportHeight: viewport.height,
-        jpegBase64: res.data
+        jpegBase64: res.data,
+        indicator: tabIndicatorFrameFlag(tabId)
       });
     }
   } catch (_) {
@@ -835,6 +844,7 @@ async function stopStreamingAndDetach(tabId, emitStopped = true, reason = "stopp
   const session = state.tabSessions.get(tabId);
   if (!session) return;
 
+  await tabIndicatorBeforeDetach(tabId, session);
   clearIdleTimer(session);
   stopCapturePump(session);
   clearPendingFileChooser(session, null);
@@ -1233,7 +1243,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       title: session.title,
       viewportWidth: viewport.width,
       viewportHeight: viewport.height,
-      jpegBase64: params.data
+      jpegBase64: params.data,
+      indicator: tabIndicatorFrameFlag(source.tabId)
     });
   }
 });
@@ -2869,11 +2880,11 @@ async function observeTabNow(tabId, maxElements = 280, options = {}) {
   let screenshotBase64 = null;
   if (options.includeScreenshot) {
     try {
-      const cap = await sendCDP(tabId, "Page.captureScreenshot", {
+      const cap = await withTabIndicatorHidden(tabId, () => sendCDP(tabId, "Page.captureScreenshot", {
         format: "jpeg",
         quality: 82,
         fromSurface: true
-      });
+      }));
       if (cap?.data) {
         screenshotBase64 = cap.data;
       }
@@ -2909,6 +2920,7 @@ async function observeTabNow(tabId, maxElements = 280, options = {}) {
 }
 
 function emitCursor(tabId, x, y, phase, label = null) {
+  noteTabIndicatorStep(tabId, label);
   const viewport = effectiveViewport(state.tabSessions.get(tabId));
   sendWS({
     type: "cursor",
@@ -4502,7 +4514,7 @@ async function captureTabScreenshot(req, tab, start) {
     capParams.captureBeyondViewport = true;
   }
 
-  const cap = await sendCDP(tab.id, "Page.captureScreenshot", capParams);
+  const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", capParams));
   if (!cap?.data) {
     throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
   }
@@ -5018,11 +5030,11 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
   } else if (req.includeScreenshot === true) {
     const shotStart = performance.now();
     try {
-      const cap = await sendCDP(tab.id, "Page.captureScreenshot", {
+      const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", {
         format: "jpeg",
         quality: 82,
         fromSurface: true
-      });
+      }));
       if (cap?.data) {
         screenshotBase64 = cap.data;
         const viewport = effectiveViewport(session);
