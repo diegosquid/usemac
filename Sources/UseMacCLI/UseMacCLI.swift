@@ -1661,7 +1661,8 @@ struct UseMacCLI {
             }
             sinceMs = parsedSince
         }
-        let taskId = parsed.values["--task"]
+        // The global option parser takes `--task` before this command sees it, so read it from there too.
+        let taskId = parsed.values["--task"] ?? options.taskFlag
         let filtered = limit != nil || sinceMs != nil || taskId != nil
         let req = RPCRequest(
             method: .auditLog,

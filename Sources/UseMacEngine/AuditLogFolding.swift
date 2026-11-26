@@ -8,8 +8,8 @@ public enum AuditEntryKind: String, CaseIterable, Hashable, Sendable {
     case action
     /// Only read: observe, screenshots, tab lists, extracts, vision queries, status.
     case observation
-    /// Neither: tasks starting and ending, policy and pairing changes, approvals, installs. A method UseMac
-    /// doesn't know lands here too, so a new kind of request is never hidden with the observations.
+    /// Neither: tasks starting and ending, policy and pairing changes, approvals, installs, problem reports. A
+    /// method UseMac doesn't know lands here too, so a new kind of request is never hidden with the observations.
     case other
 
     public init(_ entry: AuditEntry) {
@@ -31,7 +31,7 @@ public enum AuditEntryKind: String, CaseIterable, Hashable, Sendable {
         case .observe, .screenshot, .listApps, .highlight, .browserStatus, .browserTabs, .browserObserve,
              .browserScreenshot, .visionStatus, .visionQuery, .status, .ping, .auditLog:
             self = .observation
-        case .setPolicy, .pairApp, .visionInstall, .taskStart, .taskComplete, .browserReloadExtension:
+        case .setPolicy, .pairApp, .visionInstall, .taskStart, .taskComplete, .browserReloadExtension, .reportPrepare:
             self = .other
         }
     }
