@@ -181,6 +181,9 @@ function getOrCreateTabSession(tabId) {
       // keeps its real window size, measured into liveViewport ({ width, height, scale }).
       visibleToUser: false,
       metricsOverridden: false,
+      // A hidden tab the user has seen is emulated at its last on-screen size (see hiddenTabMetrics).
+      metricsKeepLiveLayout: false,
+      explicitViewport: false,
       liveViewport: null,
       visibilitySyncQueued: false,
       visibilitySyncRemeasure: false,
@@ -871,8 +874,9 @@ async function evictOldestSessionIfNeeded(keepingTabId) {
 }
 
 // --- Visible vs hidden tabs ---------------------------------------------------------------------------------------
-// Chrome does not paint a background tab at a useful size, so a hidden tab gets a fixed metrics override (1280x800
-// unless an explicit viewport request set another size) and a screenshot pump that keeps the preview fresh. A tab the
+// Chrome does not paint a background tab at a useful size, so a hidden tab gets a metrics override and a screenshot
+// pump that keeps the preview fresh. The override is the size the tab last had on screen, so switching away does not
+// reflow it (1280x800 for a tab never seen, or an explicit viewport request's size). A tab the
 // user is looking at keeps its real window size: no override (forcing 1280 px there leaves white space beside the
 // page) and no pump (polling screenshots there forces repaints, which flicker). Its preview comes from the screencast.
 
@@ -883,8 +887,17 @@ function hasExplicitViewport(opts) {
 // CSS-pixel size and pixel ratio the page lays out into right now: the real window of a visible tab, otherwise the
 // emulated metrics.
 function effectiveViewport(session) {
-  if (session && !session.metricsOverridden && session.liveViewport) {
+  if (session?.liveViewport && !session.metricsOverridden) {
     return session.liveViewport;
+  }
+  if (session?.liveViewport && session.metricsKeepLiveLayout) {
+    // Hidden, but emulating the size it had on screen: same layout, rendered at the override's pixel ratio.
+    const zoom = session.liveViewport.zoom || 1;
+    return {
+      width: session.liveViewport.width,
+      height: session.liveViewport.height,
+      scale: (session.deviceScaleFactor || 1) * zoom
+    };
   }
   return {
     width: session?.viewportWidth || VIEWPORT_WIDTH,
@@ -914,13 +927,39 @@ async function refreshLiveViewport(tabId, session) {
     });
     const v = res?.result?.value;
     if (v && Number(v.width) > 0 && Number(v.height) > 0) {
+      // The page zoom turns window pixels into CSS pixels (at 90%, a 1512 px window lays out 1680 px wide).
+      let zoom = 1;
+      try {
+        const z = Number(await chrome.tabs.getZoom(tabId));
+        if (z > 0) zoom = z;
+      } catch (_) {}
       session.liveViewport = {
         width: Math.round(Number(v.width)),
         height: Math.round(Number(v.height)),
-        scale: Number(v.scale) > 0 ? Number(v.scale) : 1
+        scale: Number(v.scale) > 0 ? Number(v.scale) : 1,
+        zoom
       };
     }
   } catch (_) {}
+}
+
+// The metrics a hidden tab is emulated at. An explicit viewport request wins. A tab the user has seen keeps the
+// size it had on screen, so leaving it does not reflow the page under the agent or the user. A tab never seen
+// gets 1280x800.
+function hiddenTabMetrics(session) {
+  const live = session.liveViewport;
+  if (!session.explicitViewport && live) {
+    const zoom = live.zoom || 1;
+    const width = Math.round(live.width * zoom);
+    const height = Math.round(live.height * zoom);
+    const fits = width >= 400 && width <= 3840 && height >= 300 && height <= 2400;
+    if (fits) return { width, height, keepsLiveLayout: true };
+  }
+  return {
+    width: session.viewportWidth || VIEWPORT_WIDTH,
+    height: session.viewportHeight || VIEWPORT_HEIGHT,
+    keepsLiveLayout: false
+  };
 }
 
 // Puts an attached tab's metrics and capture pump in line with session.visibleToUser.
@@ -929,17 +968,20 @@ async function applyVisibilityMetrics(tabId, session) {
     stopCapturePump(session);
     await sendCDP(tabId, "Emulation.clearDeviceMetricsOverride");
     session.metricsOverridden = false;
+    session.metricsKeepLiveLayout = false;
     await sleep(METRICS_SETTLE_MS);
     await refreshLiveViewport(tabId, session);
     return;
   }
+  const metrics = hiddenTabMetrics(session);
   await sendCDP(tabId, "Emulation.setDeviceMetricsOverride", {
-    width: session.viewportWidth || VIEWPORT_WIDTH,
-    height: session.viewportHeight || VIEWPORT_HEIGHT,
+    width: metrics.width,
+    height: metrics.height,
     deviceScaleFactor: session.deviceScaleFactor || 1,
     mobile: false
   });
   session.metricsOverridden = true;
+  session.metricsKeepLiveLayout = metrics.keepsLiveLayout;
   if (session.streaming && !session.capturePumpTimer) {
     startCapturePump(tabId);
   }
@@ -1005,6 +1047,7 @@ async function applyViewportMetrics(tabId, width = null, height = null, scale = 
   if (
     session.attached &&
     session.metricsOverridden &&
+    session.explicitViewport &&
     nextW === session.viewportWidth &&
     nextH === session.viewportHeight &&
     Math.abs(nextScale - session.deviceScaleFactor) < 0.01
@@ -1015,6 +1058,9 @@ async function applyViewportMetrics(tabId, width = null, height = null, scale = 
   session.viewportWidth = nextW;
   session.viewportHeight = nextH;
   session.deviceScaleFactor = nextScale;
+  // From now on this size is also the tab's hidden size, as before (see hiddenTabMetrics).
+  session.explicitViewport = true;
+  session.metricsKeepLiveLayout = false;
 
   if (session.attached) {
     await sendCDP(tabId, "Emulation.setDeviceMetricsOverride", {

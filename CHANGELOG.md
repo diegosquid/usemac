@@ -6,6 +6,15 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- With several agents working at once, the preview no longer jumps between their cards every second. The card in
+  front stays until you pick another one, it goes away or its task finishes. The others keep updating in the
+  filmstrip, and their captions, cursor and clicks no longer show up on the card you are watching.
+- A Chrome tab no longer changes size when you switch away from it while an agent works there. In the
+  background it keeps the size it had on screen instead of jumping to 1280×800, so the page doesn't reflow and
+  the agent's clicks land where it measured them.
+
 ### Security
 
 - Agents can no longer observe or act on UseMac's own windows, such as Settings. Requests that name UseMac

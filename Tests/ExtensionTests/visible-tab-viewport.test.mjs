@@ -239,3 +239,55 @@ test("a visible tab reports its real window size to the preview and does not cla
   assert.equal(response.ok, true, JSON.stringify(response.error));
   assert.deepEqual(mouse, [[1500, 900]]);
 });
+
+// A page zoomed to 90% in a 1512x680 window lays out at 1680x756 CSS pixels.
+const LIVE = { width: 1680, height: 756, scale: 1.8 };
+const ZOOM = 0.9;
+const liveViewportCdp = (overrides, extra = () => undefined) => (tabId, method, params) => {
+  if (method === SET) overrides.push([tabId, params.width, params.height]);
+  if (method === "Runtime.evaluate" && String(params?.expression || "").includes("window.innerWidth, height: window.innerHeight")) {
+    return { result: { value: LIVE } };
+  }
+  return extra(tabId, method, params);
+};
+
+test("a tab the user has seen keeps its on-screen layout when it goes to the background", async (t) => {
+  const overrides = [];
+  const sb = withSandbox(t, { cdp: liveViewportCdp(overrides), zoom: () => ZOOM });
+  await observe(sb, VISIBLE);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+
+  sb.activateTab(HIDDEN);
+  await queuesIdle(sb);
+
+  // Emulated at the window size it had (1680x756 CSS at 90% = 1512x680), not 1280x800, so nothing reflows.
+  assert.deepEqual(overrides.filter(([id]) => id === VISIBLE), [[VISIBLE, 1512, 680]]);
+  const viewport = JSON.parse(sb.eval(`JSON.stringify(effectiveViewport(state.tabSessions.get(${VISIBLE})))`));
+  assert.equal(viewport.width, 1680, "coordinates still use the on-screen layout");
+  assert.equal(viewport.height, 756);
+  await assertPumpPolls(sb, VISIBLE);
+
+  sb.activateTab(VISIBLE);
+  await queuesIdle(sb);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
+  await assertNoPolling(sb, VISIBLE);
+});
+
+test("a tab opened in the background, never seen, still gets 1280x800", async (t) => {
+  const overrides = [];
+  const sb = withSandbox(t, { cdp: liveViewportCdp(overrides), zoom: () => ZOOM });
+  await observe(sb, HIDDEN);
+  assert.deepEqual(overrides, [[HIDDEN, 1280, 800]]);
+});
+
+test("an explicit viewport request still sets a seen tab's hidden size", async (t) => {
+  const overrides = [];
+  const sb = withSandbox(t, { cdp: liveViewportCdp(overrides), zoom: () => ZOOM });
+  await observe(sb, VISIBLE);
+  await observe(sb, VISIBLE, { viewportWidth: 1100, viewportHeight: 700 });
+
+  sb.activateTab(HIDDEN);
+  await queuesIdle(sb);
+
+  assert.deepEqual(overrides.filter(([id]) => id === VISIBLE), [[VISIBLE, 1100, 700], [VISIBLE, 1100, 700]]);
+});

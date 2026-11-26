@@ -211,7 +211,6 @@ public final class AppState: ObservableObject {
     private var isHUDShowingStoppedPill: Bool = false
     private var wasHUDCollapsedBeforeKillSwitch: Bool = false
     private var showingFrozenBrowserFrame: Bool = false
-    private var userPromotedLockUntil: Date?
     private var dismissedDuringActiveRun: Bool = false
     private var lastUserDismissDate: Date?
     private var isStreamActive: Bool = false
@@ -578,7 +577,6 @@ public final class AppState: ObservableObject {
                 switch event.phase {
                 case "click":
                     label = event.label ?? "Clicking"
-                    self.virtualClickPulseId = UUID()
                 case "type":
                     label = "Typing…"
                 case "scroll":
@@ -597,11 +595,14 @@ public final class AppState: ObservableObject {
                     cursorLabel: label,
                     promote: true
                 )
-                if self.hudDeck.first?.id == cardId {
-                    self.virtualAgentMoveTask?.cancel()
-                    self.virtualAgentPoint = pt
-                    self.virtualAgentLabel = label
+                // Another agent's cursor in a background tab only updates that tab's thumbnail.
+                guard self.hudDeck.first?.id == cardId else { return }
+                if event.phase == "click" {
+                    self.virtualClickPulseId = UUID()
                 }
+                self.virtualAgentMoveTask?.cancel()
+                self.virtualAgentPoint = pt
+                self.virtualAgentLabel = label
                 self.scheduleVirtualAgentFade()
             }
         }
@@ -1148,7 +1149,7 @@ public final class AppState: ObservableObject {
     public func promoteHUDCard(id: String) {
         markControlTap()
         guard let idx = hudDeck.firstIndex(where: { $0.id == id }) else { return }
-        userPromotedLockUntil = Date().addingTimeInterval(8.0)
+        // The pick holds until the user picks again, the card goes away or its task finishes (PreviewDeckFocus).
         if idx > 0 {
             withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
                 let card = hudDeck.remove(at: idx)
@@ -1333,7 +1334,9 @@ public final class AppState: ObservableObject {
         cursorLabel: String? = nil,
         promote: Bool
     ) {
-        let canPromote = promote && (userPromotedLockUntil.map { Date() >= $0 } ?? true)
+        // Agent activity never takes the front from a card that is still working: only the user switches cards.
+        let frontYields = PreviewDeckFocus.frontYieldsToActivity(deckFront)
+        let canPromote = promote && frontYields
         if let existingIdx = hudDeck.firstIndex(where: { $0.id == id }) {
             var card = hudDeck[existingIdx]
             if let browserProfile { card.browserProfile = browserProfile }
@@ -1420,13 +1423,39 @@ public final class AppState: ObservableObject {
                 cursorLabel: cursorLabel,
                 lastActivityDate: Date()
             )
+            // A new card only takes the front when the front card yields; otherwise it joins the filmstrip.
             withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
-                hudDeck.insert(newCard, at: 0)
-                if hudDeck.count > Self.maxDeckCards {
-                    hudDeck.removeLast(hudDeck.count - Self.maxDeckCards)
+                if frontYields {
+                    hudDeck.insert(newCard, at: 0)
+                } else {
+                    hudDeck.append(newCard)
                 }
+                trimDeckToLimit()
             }
-            syncFrontCardToUI()
+            if frontYields {
+                syncFrontCardToUI()
+            }
+        }
+    }
+
+    /// The front card as `PreviewDeckFocus` sees it.
+    private var deckFront: PreviewDeckFocus.Front? {
+        guard let front = hudDeck.first else { return nil }
+        return PreviewDeckFocus.Front(
+            isBrowser: front.isBrowser,
+            browserTabId: front.browserTabId,
+            appPid: front.appDescriptor?.pid,
+            hasPreview: front.previewImage != nil,
+            isBusy: front.isBusy,
+            isCompleted: front.isCompleted
+        )
+    }
+
+    /// Keeps the deck at `maxDeckCards` by dropping the cards that have been quiet longest, never the front one.
+    private func trimDeckToLimit() {
+        while hudDeck.count > Self.maxDeckCards,
+              let stalest = hudDeck.indices.dropFirst().min(by: { hudDeck[$0].lastActivityDate < hudDeck[$1].lastActivityDate }) {
+            hudDeck.remove(at: stalest)
         }
     }
 
@@ -1732,6 +1761,15 @@ public final class AppState: ObservableObject {
             liveActivities.removeFirst(liveActivities.count - 80)
         }
 
+        // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
+        // cursor or stream target on the large preview of the card the user is watching.
+        let isBackgroundActivity = PreviewDeckFocus.isBackgroundActivity(
+            front: deckFront,
+            tabId: item.browserTabId,
+            appPid: item.appPid,
+            isChromiumApp: resolveTargetApp(from: item).map(Self.isChromium) ?? false
+        )
+
         switch item.kind {
         case .taskStart:
             if !engine.isKillSwitchTripped() && status.policy != .paused {
@@ -1780,11 +1818,15 @@ public final class AppState: ObservableObject {
             }
         }
 
-        latestCaptionItem = item
-        scheduleCaptionClearIfIdle()
+        if !isBackgroundActivity {
+            latestCaptionItem = item
+            scheduleCaptionClearIfIdle()
+        }
 
         let friendlyLabel = friendlyActionLabel(for: item)
-        if let frame = item.elementFrame {
+        if isBackgroundActivity {
+            // The virtual cursor and click pulse belong to the front card's agent.
+        } else if let frame = item.elementFrame {
             let targetPoint = CGPoint(x: frame.centerX, y: frame.centerY)
             if virtualAgentPoint == nil, let bounds = item.windowBounds ?? activeTargetApp?.windowBounds {
                 virtualAgentPoint = CGPoint(x: bounds.centerX, y: bounds.centerY)
@@ -1807,7 +1849,7 @@ public final class AppState: ObservableObject {
             clearVirtualPointerSmoothly()
         }
 
-        if item.kind == .actionStep && shouldEmitClickPulse(for: item) {
+        if !isBackgroundActivity && item.kind == .actionStep && shouldEmitClickPulse(for: item) {
             virtualClickPulseId = UUID()
         }
 
@@ -1824,14 +1866,17 @@ public final class AppState: ObservableObject {
             cardProfile = prof
             cardId = browserCardIdForTab(item.browserTabId) ?? Self.browserCardId(profile: prof, tabId: item.browserTabId)
         } else if let resolvedTarget = resolveTargetApp(from: item), resolvedTarget.pid > 0 {
-            showingFrozenBrowserFrame = false
             // Drop any empty browser placeholder created by a generic task_start before targeting a native app
             hudDeck.removeAll { $0.isBrowser && $0.browserTabId == nil && $0.previewImage == nil }
             cardAppDescriptor = resolvedTarget
-            if activeTargetApp != resolvedTarget {
-                activeTargetApp = resolvedTarget
-                if isHUDVisible {
-                    syncLiveStream()
+            // Work in a background card's app must not switch the large preview's stream away from the front card.
+            if !isBackgroundActivity {
+                showingFrozenBrowserFrame = false
+                if activeTargetApp != resolvedTarget {
+                    activeTargetApp = resolvedTarget
+                    if isHUDVisible {
+                        syncLiveStream()
+                    }
                 }
             }
             cardId = "app:\(resolvedTarget.pid)"
