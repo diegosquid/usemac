@@ -23,6 +23,11 @@ All notable changes to UseMac are documented here. The format follows
   History, and says so in the menu bar menu and **Settings → Safety**. Only you resume. The first launch of this
   version seals your current settings and turns Debug capture off; turn it on again in **Settings → Developer** if
   you use it.
+- **The app and site rules and Record typed text are sealed too.** They are saved with the same seal, and UseMac no
+  longer reads Record typed text from its preferences while it runs. If they are changed outside UseMac (for example
+  an emptied list of blocked apps, which would let agents reach your password manager), UseMac starts Paused with the
+  default rules and Record typed text off. Updating seals your current rules as they are and turns Record typed text
+  off; turn it on again in **Settings → General → History** if you use it.
 
 ## [0.7.0-beta.1] - 2026-11-26
 

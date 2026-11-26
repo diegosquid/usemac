@@ -679,10 +679,13 @@ struct AuditLogView: View {
 /// Settings → General → History: how long the audit log is kept and whether it records typed text.
 struct AuditLogSettingsGroup: View {
     let store: AuditLogStore?
+    /// Record typed text is sealed with the safety settings, so it is read and saved through AppState, never through
+    /// the preferences directly.
+    let recordsTypedText: Bool
+    let setRecordsTypedText: (Bool) -> Void
     let onOpenHistory: () -> Void
 
     @AppStorage(AuditLogSettings.retentionDaysKey) private var retentionDays = AuditLogSettings.defaultRetentionDays
-    @AppStorage(AuditLogSettings.recordTypedTextKey) private var recordsTypedText = false
     @State private var pendingRetention: Int?
 
     var body: some View {
@@ -723,7 +726,10 @@ struct AuditLogSettingsGroup: View {
                     ? "On: typed text, set values and page scripts are saved in the history as written."
                     : "Off: typed text, set values and page scripts are saved only as their length."
             ) {
-                CodexToggle(isOn: $recordsTypedText, accessibilityLabel: "Record typed text")
+                CodexToggle(
+                    isOn: Binding(get: { recordsTypedText }, set: { setRecordsTypedText($0) }),
+                    accessibilityLabel: "Record typed text"
+                )
             }
 
             InsetDivider(leading: 18)

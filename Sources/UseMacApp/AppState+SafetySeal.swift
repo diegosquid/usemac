@@ -7,6 +7,26 @@ extension AppState {
     func dismissSafetySealNotice() {
         safetySealNotice = nil
     }
+
+    /// Puts the sealed app and site rules and Record typed text in force at launch, before the socket opens, and
+    /// saves later rule changes through the sealed store. Neither is ever read from or written to the preferences
+    /// directly, so a `defaults write` can't loosen them.
+    static func applySealedSettings(_ launch: SafetySettingsStore.Launch, store: SafetySettingsStore) {
+        TargetRulesStore.shared.update(launch.rules, persist: false)
+        TargetRulesStore.shared.persistHandler = { [weak store] rules in
+            let save: () -> Void = { store?.saveRules(rules) }
+            if Thread.isMainThread { save() } else { DispatchQueue.main.async(execute: save) }
+        }
+        AuditLogSettings.recordsTypedText = launch.recordsTypedText
+    }
+
+    /// Settings → History → Record typed text.
+    func setRecordsTypedText(_ enabled: Bool) {
+        guard enabled != recordsTypedText else { return }
+        AuditLogSettings.recordsTypedText = enabled
+        safetySettings.saveRecordTypedText(enabled)
+        recordsTypedText = enabled
+    }
 }
 
 /// The notice at the top of Settings → Safety after UseMac found its safety settings changed outside it and started
