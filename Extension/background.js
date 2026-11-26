@@ -185,6 +185,12 @@ function getOrCreateTabSession(tabId) {
       metricsKeepLiveLayout: false,
       explicitViewport: false,
       liveViewport: null,
+      // A visible tab whose window is covered polls again (see checkCoveredWhileVisible).
+      lastScreencastFrameAt: 0,
+      coveredWhileVisible: false,
+      coverProbeAt: 0,
+      coverProbeInFlight: false,
+      stallWatchTimer: null,
       visibilitySyncQueued: false,
       visibilitySyncRemeasure: false,
       cursor: { x: 640, y: 400 },
@@ -789,7 +795,9 @@ function startCapturePump(tabId) {
   stopCapturePump(session);
   session.capturePumpTimer = setInterval(() => {
     // A tab the user can see gets its frames from the screencast; polling screenshots there forces repaints.
-    if (!session.streaming || !session.attached || session.captureInFlight || session.visibleToUser) {
+    // A covered window's tab is the exception (see checkCoveredWhileVisible).
+    const onScreen = session.visibleToUser && !session.coveredWhileVisible;
+    if (!session.streaming || !session.attached || session.captureInFlight || onScreen) {
       return;
     }
     if (Date.now() - session.lastFrameAt > CAPTURE_STALE_MS) {
@@ -1038,6 +1046,83 @@ async function restoreVisibleViewport(tabId) {
   } catch (_) {}
 }
 
+// --- Covered windows ----------------------------------------------------------------------------------------------
+// isTabVisibleToUser cannot tell a window covered by other windows (or on another Space) from one on screen, and
+// Chrome stops painting a page it knows is occluded, so its screencast goes quiet and the preview froze until the
+// next command. A quiet screencast alone proves nothing (a static page sends no frames either, and polling a tab
+// on screen flickers), so when frames stop the watch asks the page: document.visibilityState is "hidden" only when
+// Chrome is not showing it. Then the tab goes back to screenshot polling, keeping its real size (no metrics
+// override, so nothing reflows), until the page reports "visible" again.
+const SCREENCAST_STALL_MS = 1000;
+const COVER_CHECK_INTERVAL_MS = CAPTURE_INTERVAL_MS;
+const COVER_PROBE_INTERVAL_MS = 1000;
+
+function startScreencastStallWatch(tabId) {
+  const session = state.tabSessions.get(tabId);
+  if (!session || session.stallWatchTimer) return;
+  session.stallWatchTimer = setInterval(() => {
+    if (state.tabSessions.get(tabId) !== session || !session.attached || !session.streaming) {
+      clearInterval(session.stallWatchTimer);
+      session.stallWatchTimer = null;
+      session.coveredWhileVisible = false;
+      return;
+    }
+    checkCoveredWhileVisible(tabId, session).catch(() => {});
+  }, COVER_CHECK_INTERVAL_MS);
+}
+
+async function probePageHidden(tabId) {
+  try {
+    const res = await sendCDP(tabId, "Runtime.evaluate", {
+      expression: "document.visibilityState",
+      returnByValue: true
+    });
+    const value = res?.result?.value;
+    return value === "hidden" ? true : value === "visible" ? false : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function checkCoveredWhileVisible(tabId, session) {
+  if (!session.visibleToUser) {
+    // Hidden tabs already poll (applyVisibilityMetrics); the cover state starts over when the tab is shown again.
+    session.coveredWhileVisible = false;
+    return;
+  }
+  if (session.coverProbeInFlight) return;
+  const now = Date.now();
+  const lastScreencastFrameAt = session.lastScreencastFrameAt || 0;
+  if (session.coveredWhileVisible) {
+    if (!session.capturePumpTimer) startCapturePump(tabId);
+    // Re-check about once a second, and at once when the screencast speaks again (the window may be back on top).
+    const frameSinceProbe = lastScreencastFrameAt > (session.coverProbeAt || 0);
+    if (!frameSinceProbe && now - (session.coverProbeAt || 0) < COVER_PROBE_INTERVAL_MS) return;
+  } else {
+    if (now - lastScreencastFrameAt < SCREENCAST_STALL_MS) return;
+    if (now - (session.coverProbeAt || 0) < COVER_PROBE_INTERVAL_MS) return;
+  }
+  session.coverProbeInFlight = true;
+  session.coverProbeAt = now;
+  let hidden;
+  try {
+    hidden = await probePageHidden(tabId);
+  } finally {
+    session.coverProbeInFlight = false;
+  }
+  if (state.tabSessions.get(tabId) !== session || !session.attached || !session.streaming || !session.visibleToUser) {
+    return;
+  }
+  if (hidden === true && !session.coveredWhileVisible) {
+    session.coveredWhileVisible = true;
+    startCapturePump(tabId);
+    await captureAndEmitFrame(tabId);
+  } else if (hidden === false && session.coveredWhileVisible) {
+    session.coveredWhileVisible = false;
+    stopCapturePump(session);
+  }
+}
+
 async function applyViewportMetrics(tabId, width = null, height = null, scale = null) {
   const session = getOrCreateTabSession(tabId);
   const nextW = width != null ? clamp(Math.round(Number(width)), 400, 3840) : session.viewportWidth;
@@ -1135,6 +1220,7 @@ async function ensureStreaming(tabId) {
     if (!session.visibleToUser) {
       startCapturePump(tabId);
     }
+    startScreencastStallWatch(tabId);
     await captureAndEmitFrame(tabId);
   }
   resetIdleTimer(tabId);
@@ -1224,6 +1310,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       sendCDP(source.tabId, "Page.screencastFrameAck", { sessionId }).catch(() => {});
     }
     session.lastFrameAt = Date.now();
+    session.lastScreencastFrameAt = session.lastFrameAt;
     const viewport = effectiveViewport(session);
     sendWS({
       type: "frame",
