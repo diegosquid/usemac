@@ -63,6 +63,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 - One UTF-8 JSON object per line in each direction. Requests over 16 MiB are rejected with `message_too_large`.
 - `id` is optional. On `act` and `browser_act`, booleans default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, `includeScreenshot: false`; `steps` is required.
 - Keep one connection open across a multi-step task to reuse the Accessibility hot cache.
+- A failure answers `{"id": "…", "ok": false, "error": {"code": "…", "message": "…", "hint": "…"}}`. `hint` is optional: UseMac sends it when it knows what you should do next. On `POLICY_BLOCKED` it names the execution mode, pause or Kill Switch that refused the request; on `POLICY_LOCKED`, the current mode.
 
 ### All 23 methods
 
@@ -92,7 +93,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request; `agent` names you on the preview cards. |
 | `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. |
 
-While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`.
+While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`. UseMac starts in **Autonomous** unless the user picked another mode. Any other mode shows in UseMac's menu bar menu ("Mode: Read-only"), and only the user can relax it or resume.
 
 ### Ask mode
 
@@ -347,6 +348,8 @@ A failed batch exits with the code of its first failed step. With `--json`, succ
 {"ok": false, "error": {"code": "POLICY_BLOCKED", "message": "...", "hint": "..."}}
 ```
 
+`hint` (`Next:` without `--json`) is the daemon's own advice when it sends one (for `POLICY_BLOCKED`: which mode, pause or Kill Switch refused it), else the CLI's advice for the code.
+
 ---
 
 ## 6. Acting reliably
@@ -420,8 +423,8 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 
 | Code | Meaning | What the agent should do |
 | :--- | :--- | :--- |
-| `POLICY_BLOCKED` | The execution mode (`confirmSensitive`, `readOnly`, `paused`) or the Kill Switch blocked the request. | Stop and tell the user. Don't retry or look for another route. |
-| `POLICY_LOCKED` | `set_policy` tried to relax the execution mode. | Stop and tell the user; only they can relax it in UseMac Settings. |
+| `POLICY_BLOCKED` | The execution mode (`confirmSensitive`, `readOnly`, `paused`) or the Kill Switch blocked the request. The message and `hint` say which. (With `browser_act` `readOnly: true`, your own flag blocked it: the hint says so.) | Stop and tell the user which mode blocked you: only they can change it, in **UseMac → Settings → Safety** (or **Resume Agents** in UseMac's menu bar menu). Don't retry or look for another route. |
+| `POLICY_LOCKED` | `set_policy` tried to relax the execution mode. The `hint` names the current mode. | Stop and tell the user; only they can relax it, in **UseMac → Settings → Safety**. |
 | `APPROVAL_DENIED` | Ask mode: the user denied the sensitive step in UseMac's prompt. Nothing ran. | Stop and tell the user. Retry only if they ask you to. |
 | `APPROVAL_TIMEOUT` | Ask mode: nobody answered UseMac's prompt in time. Nothing ran. | Tell the user what needs their OK; retry once they say they are at the Mac. |
 | `URL_BLOCKED` | The URL scheme is not `http://`, `https://` or `about:blank`. | Stop and tell the user. |

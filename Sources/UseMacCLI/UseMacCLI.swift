@@ -2156,6 +2156,8 @@ struct UseMacCLI {
           Success prints the result object itself: observe → WindowSnapshot, find → {"app","count","matches"},
           act/click/set/type/key → BatchActionResult, apps → [AppDescriptor], status → DaemonStatus.
           Errors print {"ok":false,"error":{"code":"…","message":"…","hint":"…"}} to stdout; the exit code is set as above.
+          "hint" ("Next:" without --json) says what to do next; for POLICY_BLOCKED it names the execution mode, pause
+          or Kill Switch that refused the request, which only the user can change (UseMac → Settings → Safety).
           Run 'usemac help <command>' for that command's fields.
         """)
     }

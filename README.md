@@ -78,7 +78,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 
 ### Error codes
 
-Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error-codes) explains each one and what the agent should do next.
+Failed requests carry an error `code` and `message`, and an optional `hint` when UseMac knows what the agent should do next (for `POLICY_BLOCKED`, which execution mode, pause or Kill Switch refused it). The [Agent Guide](.agents/AGENTS.md#error-codes) explains each code and what the agent should do next.
 
 - **Stop and tell the user** (a safety rule blocked it, or UseMac isn't running): `POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DAEMON_REQUIRED`.
 - **The screen changed** (observe again): `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`.
@@ -100,6 +100,8 @@ Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error
 | `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃` (whatever the spelling: `cmd`, `command`, `meta`, `ctrl`, `control`), and `browser_extract` in `eval` mode. |
 | `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `target`, observe, read-only extract (`auto`, `tables`, `text`, `kpis`, `downloads`), and screenshots remain allowed. |
 | `paused` | **Paused** | Blocks all automation, including reads. |
+
+UseMac starts in **Autonomous** until you pick another mode in **Settings → General → Safety**. Any other mode shows in the menu bar: Read-only badges the icon with an eye, Paused and the Kill Switch with pause bars, and the menu says "Mode: …" with a link back to Safety. Agents that a mode refuses get a `POLICY_BLOCKED` hint that names it and tells them to ask you.
 
 - **Kill Switch (`⇧⌘⎋`)**: Immediately blocks all automation including reads and cancels any in-progress Chrome batch. While **Kill Switch** or **Paused** is active, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start`, and `task_complete` continue responding. Blocked requests return `POLICY_BLOCKED`.
 - **One-way socket policy changes**: `set_policy` over the socket can only keep or tighten the execution mode; attempting to relax it returns `POLICY_LOCKED` (only the app can relax the mode).
