@@ -2496,33 +2496,54 @@ button:focus-visible,
   color: #04130d;
 }
 
-/* ---------- Quiet Editorial Founder Note ---------- */
+/* ---------- Quiet Editorial Mission & Founder Note ---------- */
 .note-band {
   background: var(--obsidian);
   padding: 108px 24px 88px;
 }
 
 .note-inner {
-  max-width: 720px;
+  max-width: 740px;
   margin: 0 auto;
   text-align: center;
-  padding: 44px 20px;
+  padding: 48px 24px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.note-inner p {
-  margin: 0;
-  font-size: clamp(1.22rem, 2.4vw, 1.56rem);
-  font-weight: 500;
-  line-height: 1.52;
-  letter-spacing: -0.025em;
-  color: rgba(248, 250, 252, 0.92);
+.note-kicker {
+  display: inline-block;
+  margin-bottom: 18px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--glacier-light);
 }
 
-.note-inner span {
+.note-inner p.note-quote {
+  margin: 0;
+  font-size: clamp(1.24rem, 2.4vw, 1.58rem);
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: -0.025em;
+  color: rgba(248, 250, 252, 0.94);
+}
+
+.note-inner p.note-sub {
+  margin: 20px auto 0;
+  max-width: 620px;
+  font-size: 0.98rem;
+  font-weight: 400;
+  line-height: 1.66;
+  letter-spacing: -0.005em;
+  color: var(--text-light-secondary);
+}
+
+.note-inner span.note-sig {
   display: inline-block;
-  margin-top: 20px;
+  margin-top: 24px;
   font-family: var(--font-mono);
   font-size: 0.78rem;
   color: var(--text-light-muted);
