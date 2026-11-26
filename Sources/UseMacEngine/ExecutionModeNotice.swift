@@ -8,15 +8,9 @@ import UseMacProtocol
 /// but Autonomous shows in the menu bar, and every refusal tells the agent which mode refused it and that only the user
 /// can change it.
 public enum ExecutionModeNotice {
-    /// The mode's name as Settings → Safety shows it. Keep it the same as `ExecutionModeChoices.name`.
+    /// The mode's name as Settings → Safety shows it.
     public static func name(of policy: GovernancePolicy) -> String {
-        switch policy {
-        case .autonomous: return "Autonomous"
-        case .ask: return "Ask"
-        case .confirmSensitive: return "Block sensitive"
-        case .readOnly: return "Read-only"
-        case .paused: return "Paused"
-        }
+        ExecutionModeChoices.name(policy)
     }
 
     // MARK: - Menu bar
@@ -43,13 +37,7 @@ public enum ExecutionModeNotice {
 
     /// The line under `menuTitle`: what the mode lets agents do, in the words Settings → Safety uses.
     public static func menuSubtitle(policy: GovernancePolicy) -> String? {
-        switch policy {
-        case .autonomous: return nil
-        case .ask: return "Uploads, page scripts and ⌘/⌃ shortcuts wait for your OK."
-        case .confirmSensitive: return "Uploads, page scripts and ⌘/⌃ shortcuts are blocked."
-        case .readOnly: return "Agents can look and scroll. Clicks, typing and uploads are blocked."
-        case .paused: return "Agents can't read the screen or act until you resume."
-        }
+        policy == .autonomous ? nil : ExecutionModeChoices.summary(policy)
     }
 
     /// The menu bar icon's tooltip.
