@@ -1,0 +1,96 @@
+name: Bug report
+description: Something in UseMac, the CLI, the MCP server or the Chrome extension doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues are public. Before you paste logs, History exports or screenshots, remove anything private:
+        names, email addresses, URLs with tokens, typed text, file paths you don't want to share.
+        For security problems, use [private vulnerability reporting](https://github.com/diegosquid/usemac/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you or the agent did, and what UseMac did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps, requests or CLI commands that shows the problem.
+      placeholder: |
+        1. Open TextEdit
+        2. Run `usemac observe --app TextEdit`
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: usemac-version
+    attributes:
+      label: UseMac version
+      description: In UseMac → Settings, or `usemac --version`.
+      placeholder: 0.6.0-beta.2
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: "15.6"
+    validations:
+      required: true
+  - type: input
+    id: chrome-version
+    attributes:
+      label: Chrome and extension versions
+      description: Only for browser problems. The extension version is in its popup.
+      placeholder: Chrome 142, extension 0.6.0 beta 2
+  - type: dropdown
+    id: transport
+    attributes:
+      label: How the agent connects
+      options:
+        - Unix socket
+        - MCP
+        - CLI
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent host
+      description: For example Claude Code, Codex, Cursor or a custom agent.
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Execution mode
+      description: In UseMac → Settings → Safety.
+      options:
+        - Autonomous
+        - Ask
+        - Block sensitive
+        - Read-only
+        - Paused
+        - Not sure
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: The error code and message the agent got, or the relevant History entries. Remove private data first.
+      render: shell
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed private data from everything I pasted above.
+          required: true

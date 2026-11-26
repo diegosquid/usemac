@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/diegosquid/usemac/security/advisories/new
+    about: Report security problems privately. Don't open a public issue for them.
+  - name: Agent guide
+    url: https://github.com/diegosquid/usemac/blob/main/.agents/AGENTS.md
+    about: How agents connect to UseMac (socket, MCP, CLI), error codes and how to act reliably.

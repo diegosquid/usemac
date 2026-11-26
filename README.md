@@ -193,6 +193,13 @@ node --test Tests/ExtensionTests/*.test.mjs
 - [Live smoke run](docs/SMOKE.md): `scripts/smoke.sh`, run before every release
 - [Chrome Web Store release](docs/CHROME-WEB-STORE.md): the store ID (`USEMAC_CHROME_EXTENSION_ID`), packaging and submitting the extension
 
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first. [GOVERNANCE.md](GOVERNANCE.md) explains
+how changes are reviewed and released, and everyone follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Report security problems privately, as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 UseMac is released under the [MIT License](LICENSE).

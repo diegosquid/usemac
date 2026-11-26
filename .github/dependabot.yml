@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Sparkle is the only dependency. Its updates touch Package.resolved, a safety-critical path.
+  - package-ecosystem: swift
+    directory: /
+    schedule:
+      interval: weekly

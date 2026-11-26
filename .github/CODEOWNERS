@@ -1,0 +1,48 @@
+# The maintainer reviews every change.
+* @diegosquid
+
+# Safety-critical paths (level 2 in GOVERNANCE.md). Each change here gets a line-by-line review by the
+# maintainer and a test in an isolated environment; a review by an AI agent alone is never enough.
+# GOVERNANCE.md explains why each group is critical.
+
+# Updates and releases: what every installed app downloads and trusts.
+/scripts/sparkle-public-key.txt @diegosquid
+/scripts/release-dmg.sh @diegosquid
+/scripts/bundle-app.sh @diegosquid
+/scripts/appcast_add_item.py @diegosquid
+/scripts/package-extension.sh @diegosquid
+/website/public/appcast.xml @diegosquid
+/website/public/_redirects @diegosquid
+/website/public/_headers @diegosquid
+/website/wrangler.jsonc @diegosquid
+
+# Agent instructions: bundled into the app and installed into every user's agents.
+/.agents/ @diegosquid
+
+# Chrome extension: permissions, pairing and the bridge to the app.
+/Extension/manifest.json @diegosquid
+/Extension/background.js @diegosquid
+/Extension/bridge-auth.js @diegosquid
+
+# Safety engine: execution modes, Kill Switch, approvals, rules, pairing, redaction and the socket.
+/Sources/UseMacEngine/KillSwitch.swift @diegosquid
+/Sources/UseMacEngine/ApprovalBroker.swift @diegosquid
+/Sources/UseMacEngine/ApprovalInputCheck.swift @diegosquid
+/Sources/UseMacEngine/UseMacEngineService+Approval.swift @diegosquid
+/Sources/UseMacEngine/GovernanceResume.swift @diegosquid
+/Sources/UseMacEngine/TargetRules.swift @diegosquid
+/Sources/UseMacEngine/NavigationPolicy.swift @diegosquid
+/Sources/UseMacEngine/BridgeOriginPolicy.swift @diegosquid
+/Sources/UseMacEngine/BridgePairing.swift @diegosquid
+/Sources/UseMacEngine/ChromeExtensionBridge.swift @diegosquid
+/Sources/UseMacEngine/ChromeExtensionBridge+TargetRules.swift @diegosquid
+/Sources/UseMacEngine/AuditRedaction.swift @diegosquid
+/Sources/UseMacEngine/AuditLogStore.swift @diegosquid
+/Sources/UseMacEngine/PermissionManager.swift @diegosquid
+/Sources/UseMacIPC/UnixSocketServer.swift @diegosquid
+
+# Build, CI and entitlements: what runs in CI and what the signed app may do.
+/.github/ @diegosquid
+/Package.swift @diegosquid
+/Package.resolved @diegosquid
+/Assets/usemac.entitlements @diegosquid
