@@ -11,7 +11,17 @@ final class MCPTaskScope: @unchecked Sendable {
     static let idleExpiry: TimeInterval = 30 * 60
 
     private var openTasks: [String: Date] = [:]
+    private var _clientName: String?
     private let lock = NSLock()
+
+    /// The MCP client's name from `initialize` (`clientInfo.name`): the default agent name on its preview cards.
+    var clientName: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _clientName }
+        set {
+            let trimmed = newValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            lock.lock(); _clientName = (trimmed?.isEmpty == false) ? trimmed : nil; lock.unlock()
+        }
+    }
 
     /// The task a request of this connection belongs to, when there is exactly one.
     func currentTaskId(now: Date = Date()) -> String? {

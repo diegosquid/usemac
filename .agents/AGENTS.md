@@ -87,7 +87,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `vision_status` | Local vision readiness (Apple Vision OCR plus optional on-device MLX model). |
 | `vision_install` | Install the optional MLX runtime and one of the three preset models (`INVALID_MODEL` otherwise). |
 | `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. |
-| `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request. |
+| `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request; `agent` names you on the preview cards. |
 | `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. |
 
 While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`.
@@ -175,6 +175,16 @@ Several agents can work at the same time. The `taskId` is how UseMac knows which
 - `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed.
 - Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task. When it can't tell, it closes nothing that a running task owns. A `taskId` that names no running task (finished, or idle for 30 minutes) belongs to no task.
 - If your task's last tab was closed, a read (`browser_observe`, `browser_extract`, `browser_screenshot`, `vision_query`) runs on your task's previous tab; an action fails with `NO_USEMAC_TAB` instead of moving to another tab.
+- The windows and tabs your task acts in are yours until it finishes. Another running task's action there fails with `TARGET_BUSY` (see below).
+- Pass `"agent":"<your name>"` to `task_start` (CLI `--agent`; MCP uses the client's name) so the user sees which agent works on each preview card.
+
+**Leases (`TARGET_BUSY`).** The first time a task acts in a window or tab, it leases it:
+- Acting means `act` (except a batch that only has `wait`/`waitFor` steps), `browser_act`, `browser_open` on an existing `tabId`, and `browser_extract` in `eval` mode. A task also holds the tabs it opened.
+- While the task runs, another task's action in the same window (same app and window; the whole app when UseMac can't tell the window) or tab fails at once with `TARGET_BUSY`, and nothing runs. The message names the task holding it.
+- `observe`, `screenshot`, other `browser_extract` modes, `browser_observe`, `browser_screenshot` and `vision_query` never wait.
+- A lease ends with the task's `task_complete`, or when the task has been idle for 30 minutes.
+- Requests UseMac can't tie to a task (no `taskId` while several tasks run, or no task at all) are never refused, so callers that don't use tasks keep working. With one task running, a request without `taskId` counts as that task's. A `taskId` that names no running task is refused like any other task, but leases nothing.
+- On `TARGET_BUSY`, wait and retry later, or work in your own window or tab (`browser_open` opens a new one). Never close or take over the other task's window.
 
 In the CLI, `usemac start` prints the id: pass it as `--task <id>` to every command, or `export USEMAC_TASK=<id>`. The MCP server does this for you: while the connection has started one task, its tool calls belong to it.
 
@@ -246,7 +256,7 @@ Every tool carries MCP `annotations` (`readOnlyHint`, `destructiveHint`). On a t
 | `usemac_browser_act` | DOM action steps with optional `readOnly`, `verify` or inline screenshot. |
 | `usemac_vision_status` | Local vision readiness. |
 | `usemac_vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`). |
-| `usemac_task_start` | Hold the floating live preview open across a task; later calls on this connection belong to it. |
+| `usemac_task_start` | Hold the floating live preview open across a task; later calls on this connection belong to it. `agent` defaults to the MCP client's name. |
 | `usemac_task_complete` | Finish the task, close the preview and report what the task did. |
 
 Install the skill too (section 1): MCP gives the tools, the skill teaches how to use them well.
@@ -301,7 +311,7 @@ When `UseMac.app` is closed, action commands (`act`, `click`, `set`, `type`, `ke
 | `3` | Daemon required (`DAEMON_REQUIRED`). |
 | `4` | Blocked by a safety rule (`POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`). |
 | `5` | The screen is not what you expected (`STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`). |
-| `6` | The step needs the app in front, or the user is busy (`TARGET_NOT_FRONTMOST`, `USER_ACTIVE`). |
+| `6` | The step needs the app in front, or the user or another task is busy there (`TARGET_NOT_FRONTMOST`, `USER_ACTIVE`, `TARGET_BUSY`). |
 | `7` | This route can't reach it (`RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`). |
 
 A failed batch exits with the code of its first failed step. With `--json`, success prints the result object itself (`observe` → `WindowSnapshot`, `find` → `{"app","count","matches"}`, `act`/`click`/`set`/`type`/`key` → `BatchActionResult` with `stepResults[].errorCode`, `effect`, `warning`, `resolvedElementId`), and errors go to stdout as:
@@ -378,6 +388,7 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 | `WAIT_TIMEOUT` | `waitFor` ran out of time. | Observe to see the current state before retrying. |
 | `TARGET_NOT_FRONTMOST` | A step needed real input but the app was not in front. Nothing was sent. | Use a background step, or rerun those steps with `foreground: true`. |
 | `USER_ACTIVE` | A foreground burst was refused because the user is typing or using the mouse. | Wait and retry later; never force it. |
+| `TARGET_BUSY` | Another running task is working in this window or tab (it leased it with its first action). Nothing ran. | Wait and retry once it finishes, or work in your own window or tab. Observe and screenshot still work. |
 | `RESTRICTED_PAGE` | The Chrome extension can't script this page (Chrome Web Store, `chrome://`). | Use the hybrid flow above. |
 | `CAPTURE_TOO_SMALL` | The captured window is too small to trust (a helper strip or hidden window). | Don't answer from that image. Observe the app, or bring up the right window and retry. |
 | `EXTENSION_NOT_CONNECTED` | No paired Chrome extension is connected, or `profile` didn't match. | Check `browser_status`, or ask the user to open Chrome with the extension enabled. |

@@ -1475,19 +1475,23 @@ public struct TaskStartParams: Codable, Equatable, Sendable {
     public var summary: String?
     /// Optional id for the task; UseMac makes one when omitted. The response's `taskId` is the one to pass on.
     public var taskId: String?
+    /// Optional agent or client name shown on the task's preview cards (MCP: the client's name by default).
+    public var agent: String?
 
     public init(
         profile: String? = nil,
         tabId: Int? = nil,
         app: String? = nil,
         summary: String? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        agent: String? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
         self.app = app
         self.summary = summary
         self.taskId = taskId
+        self.agent = agent
     }
 }
 
@@ -1562,6 +1566,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     /// On `taskComplete`: the tabs of the task that finished, so the preview marks only their cards as done. Nil when
     /// UseMac could not tell which task finished and no other task is running (every card is that task's).
     public var taskTabIds: [Int]?
+    /// The agent or client of the task the item belongs to, shown on its preview card.
+    public var agentName: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -1583,7 +1589,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         browserTabId: Int? = nil,
         browserProfile: String? = nil,
         targetGuessed: Bool? = nil,
-        taskTabIds: [Int]? = nil
+        taskTabIds: [Int]? = nil,
+        agentName: String? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1605,6 +1612,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.browserProfile = browserProfile
         self.targetGuessed = targetGuessed
         self.taskTabIds = taskTabIds
+        self.agentName = agentName
     }
 }
 

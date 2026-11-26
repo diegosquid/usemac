@@ -3,6 +3,8 @@ import Foundation
 /// What a task did, returned by `task_complete` (`taskSummary`).
 public struct TaskSummary: Codable, Equatable, Sendable {
     public var taskId: String
+    /// The name the task's preview cards showed (`task_start` `agent`, or the MCP client's name).
+    public var agent: String?
     /// Requests tied to the task, not counting `task_start` and `task_complete`.
     public var requests: Int
     /// `act` and `browser_act` steps that ran.
@@ -23,6 +25,7 @@ public struct TaskSummary: Codable, Equatable, Sendable {
 
     public init(
         taskId: String,
+        agent: String? = nil,
         requests: Int = 0,
         actions: Int = 0,
         failedActions: Int = 0,
@@ -33,6 +36,7 @@ public struct TaskSummary: Codable, Equatable, Sendable {
         durationMs: Int = 0
     ) {
         self.taskId = taskId
+        self.agent = agent
         self.requests = requests
         self.actions = actions
         self.failedActions = failedActions
@@ -142,6 +146,25 @@ extension RPCRequest {
             break
         }
         return copy
+    }
+
+    /// True when the request changes what another agent sees in a window or tab: `act` and `browser_act` (unless they
+    /// only wait), `browser_open` on an existing tab, and `browser_extract` in `eval` mode. Observe, screenshot,
+    /// other extracts and vision only read, so they never wait for another task.
+    public var actsOnTarget: Bool {
+        let onlyWaits: ([ActionStep]) -> Bool = { steps in steps.allSatisfy { $0.action == .wait || $0.action == .waitFor } }
+        switch method {
+        case .act:
+            return act.map { !onlyWaits($0.steps) } ?? false
+        case .browserAct:
+            return browserAct.map { !onlyWaits($0.steps) } ?? false
+        case .browserOpen:
+            return browserOpen?.tabId != nil
+        case .browserExtract:
+            return browserExtract.map { $0.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "eval" } ?? false
+        default:
+            return false
+        }
     }
 
     /// Whether the request only reads (so it is safe to run again on another tab).

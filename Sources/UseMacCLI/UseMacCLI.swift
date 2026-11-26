@@ -138,10 +138,12 @@ struct UseMacCLI {
         "WAIT_TIMEOUT"
     ]
 
-    /// Exit code 6: the step needs the app in front, or the user is busy. Use a background step or retry later.
+    /// Exit code 6: the step needs the app in front, or the user or another task is busy there. Use a background
+    /// step, or wait and retry.
     private static let focusCodes: Set<String> = [
         "TARGET_NOT_FRONTMOST",
-        "USER_ACTIVE"
+        "USER_ACTIVE",
+        "TARGET_BUSY"
     ]
 
     /// Exit code 7: this route cannot reach the content. Switch route (hybrid Chrome flow, observe instead of a capture).
@@ -1518,7 +1520,7 @@ struct UseMacCLI {
     private static func handleTaskStart(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--app", "--summary"]
+            valueFlags: ["--profile", "--tab", "--app", "--summary", "--agent"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let summary = parsed.values["--summary"] ?? (parsed.positionals.isEmpty ? nil : parsed.positionals.joined(separator: " "))
@@ -1527,7 +1529,8 @@ struct UseMacCLI {
             tabId: tabId,
             app: parsed.values["--app"],
             summary: summary,
-            taskId: options.taskFlag
+            taskId: options.taskFlag,
+            agent: parsed.values["--agent"]
         )
         let req = RPCRequest(method: .taskStart, taskStart: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -2029,8 +2032,8 @@ struct UseMacCLI {
           vision install [--model <hf-repo>]         Install the MLX runtime and download the local model on demand
           vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
                                                      Ask the on-device vision model + Apple OCR about the screen (zero cloud image tokens)
-          start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
-                                                     Start a continuous session keeping the live preview open between steps
+          start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"] [--agent <name>]
+                                                     Start a task (prints its taskId) keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
                                                      Finish the task with a completion overlay and smoothly close the preview
           serve                                      Start the Unix socket RPC daemon
@@ -2046,7 +2049,7 @@ struct UseMacCLI {
           3  Daemon required (DAEMON_REQUIRED): ask the user to open UseMac
           4  Blocked by a safety rule (POLICY_BLOCKED, POLICY_LOCKED, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED): stop and tell the user
           5  The screen is not what you expected (STALE_SNAPSHOT, ELEMENT_NOT_FOUND, WAIT_TIMEOUT): observe again, then retry
-          6  Needs the app in front, or the user is busy (TARGET_NOT_FRONTMOST, USER_ACTIVE): use a background step, or wait and retry
+          6  Needs the app in front, or the user or another task is busy there (TARGET_NOT_FRONTMOST, USER_ACTIVE, TARGET_BUSY): use a background step, or wait and retry
           7  This route cannot reach it (RESTRICTED_PAGE, CAPTURE_TOO_SMALL): switch route (see 'usemac help browser')
 
         JSON output (--json):
@@ -2400,9 +2403,9 @@ struct UseMacCLI {
             )
         case "start":
             return CommandHelp(
-                usage: ["usemac start [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>] [--task <taskId>]"],
-                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps. Prints a taskId: pass it as --task to every later command (or export USEMAC_TASK=<taskId>). When several agents work at once, a browser command without --tab then goes to this task's own last tab, not another agent's, and finishing this task only closes the tabs it opened.",
-                examples: ["usemac start --summary \"Reviewing dashboard\""]
+                usage: ["usemac start [--summary \"<text>\"] [--agent <name>] [--app <name>] [--profile <name>] [--tab <id>] [--task <taskId>]"],
+                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps. Prints a taskId: pass it as --task to every later command (or export USEMAC_TASK=<taskId>). When several agents work at once, a browser command without --tab then goes to this task's own last tab, not another agent's, and finishing this task only closes the tabs it opened. While the task runs, the windows and tabs it acts in are its own: another task's act there fails with TARGET_BUSY (exit 6) until this one is done. --agent names the agent on its preview cards.",
+                examples: ["usemac start --summary \"Reviewing dashboard\" --agent \"Claude Code\""]
             )
         case "stop", "done", "complete":
             return CommandHelp(

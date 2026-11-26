@@ -104,7 +104,8 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   {"id":"b1","method":"browser_observe","taskId":"<taskId from task_start>","browserObserve":{}}
   {"id":"d1","method":"task_complete","taskComplete":{"taskId":"<taskId from task_start>","summary":"Analysis complete"}}
   ```
-  `task_start` returns a `taskId`. Put it at the top level of every later request (any method takes it): other agents may be working at the same time, and the `taskId` is how UseMac sends your requests without `tabId` to your own last tab, closes only your tabs, and marks only your preview cards done. `task_complete` returns a `taskSummary` (`requests`, `actions`, `failedActions`, `blocked`, `tabsOpened`, `tabsClosed`, `tabsClosing`, `durationMs`).
+  `task_start` returns a `taskId`. Put it at the top level of every later request (any method takes it): other agents may be working at the same time, and the `taskId` is how UseMac sends your requests without `tabId` to your own last tab, closes only your tabs, and marks only your preview cards done. `task_complete` returns a `taskSummary` (`agent`, `requests`, `actions`, `failedActions`, `blocked`, `tabsOpened`, `tabsClosed`, `tabsClosing`, `durationMs`). Pass `"agent":"<your name>"` to `task_start` (CLI `--agent`; MCP defaults to the client name) so each preview card shows which agent works there.
+  The windows and tabs your task acts in (act, browser_act, browser_open on a tabId, eval) are leased to it until `task_complete` (or 30 idle minutes): another task's action there gets `TARGET_BUSY` and nothing runs. Reads (observe, screenshot, extract, vision) never wait, and requests of no task are never refused.
 
 Quick one-liner via `nc` or persistent Python `AF_UNIX` socket:
 ```bash
@@ -112,7 +113,7 @@ printf '{"id":"1","method":"browser_status"}\n' | nc -U "{{USEMAC_SOCKET}}"
 ```
 
 ### Option B — CLI (`{{USEMAC_BIN}}`)
-Use when running quick shell commands. When `UseMac.app` is closed, the CLI is read-only and action commands return `DAEMON_REQUIRED` (exit code `3`). `"$USEMAC" help <command>` prints the flags, an example and the `--json` shape of any command. Exit codes: `5` = observe again (`STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`), `6` = needs the app in front or the user is busy (`TARGET_NOT_FRONTMOST`, `USER_ACTIVE`), `7` = switch route (`RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`).
+Use when running quick shell commands. When `UseMac.app` is closed, the CLI is read-only and action commands return `DAEMON_REQUIRED` (exit code `3`). `"$USEMAC" help <command>` prints the flags, an example and the `--json` shape of any command. Exit codes: `5` = observe again (`STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`), `6` = needs the app in front, or the user or another task is busy there (`TARGET_NOT_FRONTMOST`, `USER_ACTIVE`, `TARGET_BUSY`): wait and retry, `7` = switch route (`RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`).
 ```bash
 USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" help act
@@ -195,6 +196,7 @@ Each tool exposes MCP `annotations` (`readOnlyHint`, `destructiveHint`). On time
 11. **Wrap Multi-Step Tasks with `task_start` → `task_complete` (Never Flap Preview)**:
    - Call `task_start` (`usemac_task_start` / `usemac start --summary "..."`) **once** when beginning a task so the floating live preview opens once and stays continuously open across turns.
    - Call `task_complete` (`usemac_task_complete` / `usemac done --summary "..."`) **only once** at the very end when the entire user request is finished — this plays the completion overlay once and smoothly closes the preview.
+   - On `TARGET_BUSY`, another agent's task owns that window or tab: wait and retry later, or work in your own window or tab. Never close or take over the other task's window.
    - Pass the `taskId` that `task_start` returned on every later request (socket: top-level `"taskId"`; CLI: `usemac start` prints it, then `--task <id>` on every command or `export USEMAC_TASK=<id>`; MCP: automatic while the connection started one task). Other agents may be running: with the `taskId`, a browser call without `tabId` goes to your own last tab, and finishing closes only the tabs your task opened, never theirs.
    - About 2 s later UseMac closes the Chrome tabs your task opened (never the user's own tabs, the tab the user is looking at, or tabs with a running download). If the user should see a result page or work is pending there, keep it: `"keepTabIds": [123]` (CLI `--keep-tab 123`), or `"keepTabs": true` (CLI `--keep-tabs`).
 
@@ -245,6 +247,7 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 | `WAIT_TIMEOUT` | `waitFor` ran out of time. | Observe to see the current state before retrying. |
 | `TARGET_NOT_FRONTMOST` | A step needed real input but the app was not in front. Nothing was sent. | Use a background step, or rerun those steps with `"foreground": true`. |
 | `USER_ACTIVE` | A foreground burst was refused because the user is typing or using the mouse. | Wait and retry later; never force it. |
+| `TARGET_BUSY` | Another running task is working in this window or tab (it leased it with its first action). Nothing ran. | Wait and retry once it finishes, or work in your own window or tab. Observe and screenshot still work. |
 | `RESTRICTED_PAGE` | The Chrome extension can't script this page (Chrome Web Store, `chrome://`). | Use the hybrid flow (section 2, item 10). |
 | `CAPTURE_TOO_SMALL` | The captured window is too small to trust (a helper strip or hidden window). | Don't answer from that image. Observe the app, or bring up the right window and retry. |
 
