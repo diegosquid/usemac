@@ -255,12 +255,12 @@ close_tab_by_script() {
   wait_until 3 tab_is_gone "$1"
 }
 
-# own_page_tabs: ids of open tabs showing this run's test pages (served from a port only this run uses), from the
-# last load_tabs. Catches tabs whose browser open failed before it returned an id.
+# own_page_tabs: ids of open tabs showing a smoke test page (a local page named with t=usemac-smoke-...), from the
+# last load_tabs. Catches tabs whose browser open failed before it returned an id, and strays of an earlier run.
 own_page_tabs() {
-  [ -n "${SMOKE_BASE:-}" ] || return 0
-  printf '%s' "${SMOKE_ALL_TABS:-[]}" | jq -r --arg a "$SMOKE_BASE/" --arg b "${SMOKE_BASE/127.0.0.1/localhost}/" \
-    '.[] | select(((.url // "") | startswith($a)) or ((.url // "") | startswith($b))) | .tabId' 2>/dev/null
+  printf '%s' "${SMOKE_ALL_TABS:-[]}" | jq -r \
+    '.[] | select((.url // "") | test("^http://(127\\.0\\.0\\.1|localhost):[0-9]+/[a-z-]+\\.html\\?(.*&)?t=usemac-smoke-")) | .tabId' \
+    2>/dev/null
 }
 
 # Runs at exit: every tab the case opened must be gone shortly after its task finished.

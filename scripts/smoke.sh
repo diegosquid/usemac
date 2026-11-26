@@ -123,12 +123,13 @@ export SMOKE_RUN_DIR="$RUN_DIR"
 . "$SMOKE_ROOT/lib.sh"   # for ver_ge
 
 SERVER_PID=""
+TAIL_PID=""
 stop_server() {
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null && wait "$SERVER_PID" 2>/dev/null
   SERVER_PID=""
 }
 trap 'stop_server' EXIT
-trap 'stop_server; exit 130' INT TERM
+trap 'stop_server; [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null; exit 130' INT TERM
 
 needs_chrome=0
 for f in "${CASE_FILES[@]}"; do
@@ -163,13 +164,32 @@ RUN_START=$SECONDS
 
 join_lines() { [ -s "$1" ] && awk 'NR > 1 { printf "; " } { printf "%s", $0 }' "$1"; }
 
+# sweep_test_tabs <first|final>: closes smoke test pages left open in Chrome, by an earlier run that was stopped hard
+# (first) or by a case of this run that was (final).
+sweep_test_tabs() {
+  local dir="$RUN_DIR/_sweep-$1"
+  mkdir -p "$dir"
+  (
+    set +u
+    export SMOKE_CASE="sweep-$1" SMOKE_CASE_DIR="$dir"
+    # shellcheck source=smoke/lib.sh
+    . "$SMOKE_ROOT/lib.sh"
+    close_leftover_tabs
+  ) >"$dir/log" 2>&1
+  if [ -s "$dir/leaks" ]; then
+    report FAIL "(sweep, $1)" 0 "test tabs still open: $(join_lines "$dir/leaks")"
+  elif [ -s "$dir/notes" ]; then
+    echo "note: closed smoke test tabs left open $([ "$1" = first ] && echo "by an earlier run" || echo "by a case"): $(join_lines "$dir/notes")"
+  fi
+}
+
 report() { # report <result> <name> <seconds> <reason>
   printf '%-5s %-18s %4ss  %s\n' "$1" "$2" "$3" "$4"
   case "$1" in PASS) PASSED=$((PASSED + 1)) ;; FAIL) FAILED=$((FAILED + 1)) ;; SKIP) SKIPPED=$((SKIPPED + 1)) ;; esac
 }
 
 run_case() { # run_case <file> <name> <timeout>
-  local file=$1 name=$2 timeout=$3 dir="$RUN_DIR/$2" pid wd tailpid="" rc
+  local file=$1 name=$2 timeout=$3 dir="$RUN_DIR/$2" pid wd rc
   mkdir -p "$dir"
   (
     set +u
@@ -199,19 +219,24 @@ run_case() { # run_case <file> <name> <timeout>
   ) >/dev/null 2>&1 &
   wd=$!
   if [ "$VERBOSE" = 1 ]; then
-    tail -n +1 -f "$dir/log" | sed "s/^/  [$name] /" &
-    tailpid=$!
+    # tail alone, not in a pipeline: killing it must end the stream (a killed pipe reader leaves tail -f running).
+    # Disowned, so the shell prints no "Terminated" line for it.
+    echo "--- $name"
+    tail -n +1 -f "$dir/log" &
+    TAIL_PID=$!
+    disown "$TAIL_PID"
   fi
   wait "$pid"
   rc=$?
   wait "$wd" 2>/dev/null
-  if [ -n "$tailpid" ]; then
+  if [ -n "$TAIL_PID" ]; then
     sleep 0.3
-    kill "$tailpid" 2>/dev/null
-    wait "$tailpid" 2>/dev/null
+    kill "$TAIL_PID" 2>/dev/null; TAIL_PID=""
   fi
   CASE_RC=$rc
 }
+
+[ -n "$SMOKE_BASE" ] && sweep_test_tabs first
 
 for f in "${CASE_FILES[@]}"; do
   name=$(case_name "$f")
@@ -261,20 +286,7 @@ for f in "${CASE_FILES[@]}"; do
 done
 
 # A case stopped hard (after its timeout) skips its own cleanup: close any test page still open.
-if [ -n "$SMOKE_BASE" ]; then
-  mkdir -p "$RUN_DIR/_sweep"
-  (
-    set +u
-    export SMOKE_CASE=_sweep SMOKE_CASE_DIR="$RUN_DIR/_sweep"
-    . "$SMOKE_ROOT/lib.sh"
-    close_leftover_tabs
-  ) >"$RUN_DIR/_sweep/log" 2>&1
-  if [ -s "$RUN_DIR/_sweep/leaks" ]; then
-    report FAIL "(final sweep)" 0 "left behind: $(join_lines "$RUN_DIR/_sweep/leaks")"
-  elif [ -s "$RUN_DIR/_sweep/notes" ]; then
-    echo "note: the final sweep closed test tabs a case left open ($(join_lines "$RUN_DIR/_sweep/notes"))"
-  fi
-fi
+[ -n "$SMOKE_BASE" ] && sweep_test_tabs final
 
 echo
 echo "smoke: $PASSED passed, $FAILED failed, $SKIPPED skipped in $((SECONDS - RUN_START))s (app $APP_VERSION, extension ${SMOKE_EXT_VERSION:-none}). Logs: $RUN_DIR"

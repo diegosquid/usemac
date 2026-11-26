@@ -19,6 +19,9 @@ download_field() {
 
 download_state_is() { [ "$(download_field state)" = "$1" ]; }
 
+# The local server logs every request (smoke.sh keeps its log next to the case logs).
+server_saw_download() { grep -q "GET /download/$DL_NAME" "$SMOKE_RUN_DIR/server.log" 2>/dev/null; }
+
 # Stops the server's transfer (if still running) and deletes what Chrome wrote, final file or partial download.
 delete_download() {
   [ -n "$DL_NAME" ] || return 0
@@ -52,8 +55,17 @@ smoke_case() {
   open_tab "$TASK_ID" "${SMOKE_BASE/127.0.0.1/localhost}/tab.html?t=usemac-smoke-control-$SMOKE_TOKEN"
   local control=$TAB_ID
   um_ok browser act '[{"action":"click","selector":"#dl"}]' --tab "$tab"
-  wait_until 8 download_state_is in_progress \
-    || fail "the download did not start (state: $(download_field state); is Chrome set to ask where to save each file?)"
+  if ! wait_until 4 download_state_is in_progress && ! server_saw_download; then
+    # The click reported success but never reached the link (the server saw no request). Not what this case checks,
+    # so click once more and say so.
+    note "the first click on the link reported success ($(jout '.stepResults[0].mechanism // empty')) but started nothing; clicked again"
+    um_ok browser act '[{"action":"click","selector":"#dl"}]' --tab "$tab"
+  fi
+  if ! wait_until 6 download_state_is in_progress; then
+    server_saw_download \
+      && fail "Chrome requested the file but lists no running download (is it set to ask where to save each file?)"
+    fail "clicking the download link started no download (the server saw no request)"
+  fi
 
   task_done "$TASK_ID" --summary "smoke: download task done" || fail "done failed: $(um_error)"
   # The cleanup runs about 2 s after done; check after it.

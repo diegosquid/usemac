@@ -1,5 +1,7 @@
 # Shared by the scroll-event and scroll-fallback cases: native background scrolling of web content in a Chrome
-# window UseMac opened. The page shows window.scrollY in a fixed "scrollY=<n>" element, read through native observe.
+# window UseMac opened. Native observe finds the page's rows; the page's real position (window.scrollY) is read
+# through the extension, because Chrome stops rendering a window that other windows cover, so the page's own
+# "scrollY=<n>" indicator (updated on scroll events) can lag behind.
 
 # scroll_ready <window title>: the page is in the native tree, with rows out of view below the fold.
 scroll_ready() {
@@ -10,16 +12,22 @@ scroll_ready() {
   [ "${rows:-0}" -ge 5 ] && [ "${offscreen:-0}" -ge 1 ]
 }
 
-# scroll_position: the page's scrollY from the last observe ("" when the indicator is not in the tree).
-scroll_position() {
+# page_scroll_y <tabId>: window.scrollY of the tab, read through the extension.
+page_scroll_y() {
+  um browser extract eval --tab "$1" --expr "Math.round(window.scrollY)" || return 1
+  jout '.jsonResult // empty' | tr -d '"[:space:]'
+}
+
+# indicator_y <window title>: what the page's indicator says in the native tree (for the log only).
+indicator_y() {
+  observe_window "Google Chrome" "$1" --text "scrollY=" || return 1
   jout '[.elements[] | ((.title // "") + " " + (.value // "")) | capture("scrollY=(?<y>[0-9]+)") | .y] | first // empty'
 }
 
-scrolled_past_top() {
-  observe_window "Google Chrome" "$1" || return 1
+page_moved() {
   local y
-  y=$(scroll_position)
-  [ -n "$y" ] && [ "$y" -gt 0 ]
+  y=$(page_scroll_y "$1")
+  [ -n "$y" ] && [ "$y" -gt 0 ] 2>/dev/null
 }
 
 # run_scroll_case <lock>: lock=0 expects the wheel event to move the page; lock=1 serves a page that swallows wheel
@@ -37,9 +45,11 @@ run_scroll_case() {
   wait_until 15 scroll_ready "$title" \
     || fail "native observe of the window never showed the page's rows with some out of view: $(um_error)"
   local before
-  before=$(scroll_position)
-  [ "$before" = "0" ] || fail "the page did not start at the top (scrollY indicator: '${before:-missing}')"
+  before=$(page_scroll_y "$tab")
+  [ "$before" = "0" ] || fail "the page did not start at the top (window.scrollY: '${before:-unreadable}')"
 
+  # The act must follow the observe directly: its stale-window check compares against the last observe.
+  observe_window "Google Chrome" "$title" || fail "observe --window $title failed: $(um_error)"
   skip_if_chrome_in_front
   um_ok act '[{"action":"scroll","deltaY":-600}]' --app "Google Chrome" --window "$title"
   local ok mech effect delta warning
@@ -51,22 +61,29 @@ run_scroll_case() {
   smoke_log "scroll: success=$ok mechanism=$mech effect=$effect scrollDeltaY=$delta warning=$warning"
   [ "$ok" = "true" ] || fail "the scroll step failed: $(jout '.stepResults[0].message // empty')"
 
-  wait_until 4 scrolled_past_top "$title"
-  local after
-  after=$(scroll_position)
+  wait_until 4 page_moved "$tab"
+  local after shown
+  after=$(page_scroll_y "$tab")
+  shown=$(indicator_y "$title")
+  smoke_log "after the step: window.scrollY=${after:-?}, indicator scrollY=${shown:-?}"
+  local visibility
+  um browser extract eval --tab "$tab" --expr "document.visibilityState"
+  visibility=$(jout '.jsonResult // empty' | tr -d '"')
+  local seen="mechanism $mech, effect $effect, scrollDeltaY ${delta:-none}, warning: ${warning:-none}, page ${visibility:-?}"
 
+  [ -n "$after" ] && [ "$after" -gt 0 ] 2>/dev/null \
+    || fail "the page did not move: window.scrollY is still ${after:-unreadable} ($seen)"
   if [ "$lock" = 1 ]; then
     [ "$mech" = "ax-scroll-to-next" ] \
-      || fail "expected the ax-scroll-to-next fallback on a page that ignores the wheel, got mechanism $mech (effect $effect, scrollY ${after:-?})"
-    [ "$effect" = "changed" ] || fail "the fallback reported effect '$effect', expected changed"
+      || fail "expected the ax-scroll-to-next fallback on a page that ignores the wheel ($seen, window.scrollY $after)"
+    [ "$effect" = "changed" ] || fail "the fallback moved the page but reported effect '$effect' ($seen)"
   else
     [ "$mech" = "cgevent-pid-scroll" ] \
-      || fail "expected the background wheel event (cgevent-pid-scroll), got mechanism $mech (effect $effect, warning: ${warning:-none}, scrollY ${after:-?})"
+      || fail "expected the background wheel event, cgevent-pid-scroll ($seen, window.scrollY $after)"
     awk -v d="${delta:-0}" 'BEGIN { exit !(d >= 1 || d <= -1) }' \
-      || fail "the wheel event reported no movement (scrollDeltaY ${delta:-none}, warning: ${warning:-none})"
+      || fail "the page moved to window.scrollY $after but the step reported no movement ($seen)"
   fi
-  [ -n "$after" ] && [ "$after" -gt 0 ] || fail "the page did not move: scrollY is still ${after:-unknown} after a $mech step"
 
   task_done "$TASK_ID" --summary "smoke: $SMOKE_CASE done" || fail "done failed: $(um_error)"
-  note "$mech moved the page to scrollY=$after"
+  note "$mech moved the page to window.scrollY=$after"
 }

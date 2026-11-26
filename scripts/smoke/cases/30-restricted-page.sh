@@ -93,7 +93,12 @@ smoke_case() {
   others=$(printf '%s' "$SMOKE_ALL_TABS" | jq -r --argjson id "$tab" --arg t "$title" \
     '[.[] | select(.tabId != $id and .active == true and ((.title // "") | contains($t)))] | length')
   [ "${others:-0}" = 0 ] || skip "another Chrome window shows a tab titled \"$title\"; close it so --window finds only the smoke window"
-  wait_until 25 store_ready "$title" || fail "native observe of \"$title\" never showed the store's search box: $(um_error)"
+  if ! wait_until 25 store_ready "$title"; then
+    [ "$UM_RC" = 0 ] || fail "native observe of \"$title\" failed: $(um_error)"
+    [ -n "$(jout '.elements[] | select(.role == "AXWebArea") | .id')" ] \
+      || fail "native observe of the store window shows Chrome's toolbar but no page content (no AXWebArea) after 25 s; Chrome may not expose a covered background window's page"
+    fail "native observe of \"$title\" shows the page but no search box in it"
+  fi
   local count field
   count=$(jout '.elements | length')
   field=$(page_field)

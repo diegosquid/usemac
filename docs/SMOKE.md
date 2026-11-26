@@ -2,7 +2,7 @@
 
 `scripts/smoke.sh` drives the installed UseMac app through its CLI, against TextEdit and local test pages in
 Google Chrome, and prints PASS, FAIL or SKIP for each case. It covers the paths that unit tests can't check in a
-real browser. Run it before every release, on the build you are about to ship. A full run takes about two minutes.
+real browser. Run it before every release, on the build you are about to ship. A full run takes about 90 seconds.
 
 ## Before you run it
 
@@ -12,6 +12,9 @@ real browser. Run it before every release, on the build you are about to ship. A
 - Chrome is open, and the UseMac Browser Bridge extension is connected and reloaded, so that it matches the build.
   Chrome cases skip when no extension is connected. When a case needs a newer extension than the connected one, it
   also skips and says which version it needs.
+- Chrome is not the app in front (run the script from your terminal). With Chrome in front, UseMac sends real input
+  instead of taking the background paths these cases check, so `scroll-event`, `scroll-fallback` and
+  `restricted-page` skip.
 - The Mac is online. The `restricted-page` case opens the Chrome Web Store, and it skips when the store doesn't
   answer.
 - TextEdit is best left closed. The case then launches its own TextEdit in the background and quits it at the end.
@@ -30,8 +33,10 @@ USEMAC_CLI=dist/UseMac.app/Contents/Helpers/usemac scripts/smoke.sh   # another 
 ```
 
 The exit code is 0 when no case failed, 1 when one did, and 2 when the run could not start. Each case has a log
-in the folder printed at the top and the end of the run, with every `usemac` command and its JSON output.
-`--force-ext` also runs the cases gated on a newer extension, to see how they fail on the connected one.
+in the folder printed at the top and the end of the run, with every `usemac` command and its JSON output. Native
+observes of Chrome include the browser's own toolbars, so these logs can show your bookmark and tab group names; they
+stay on your Mac. `--force-ext` also runs the cases gated on a newer extension, to see how they fail on the
+connected one.
 
 | Case | What it checks |
 | --- | --- |
@@ -49,7 +54,8 @@ Every Chrome case runs in its own task (`usemac start`, `--task`, `done --task`)
 `scripts/smoke/pages/` by a server on 127.0.0.1 that the script starts and stops. Native work happens only in Chrome
 windows UseMac opened. Every case cleans up after itself, even when it fails or times out: it finishes its tasks,
 closes its tabs and windows, closes its TextEdit document without saving, and deletes the files it created or
-downloaded. A case that passes but leaves something open is reported as a FAIL.
+downloaded. A case that passes but leaves something open is reported as a FAIL. Before and after the cases, the run
+also closes any smoke test page an earlier, interrupted run left open.
 
 ## Adding a case
 

@@ -10,7 +10,8 @@
 </head>
 <body>
 <h1>UseMac smoke: a download runs while the task finishes</h1>
-<p><a id="dl" href="#">Download the slow file</a></p>
+<!-- A big target, so a click lands on it whatever the tab's size. -->
+<p><a id="dl" href="#" style="display: block; padding: 48px; font-size: 28px; background: #eef;">Download the slow file</a></p>
 <script>
   // ?name=<file>&seconds=<n>&size=<bytes> point the link at the server's slow /download endpoint.
   const name = params.get("name") || "usemac-smoke.bin";
