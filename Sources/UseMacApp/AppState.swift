@@ -138,6 +138,8 @@ public final class AppState: ObservableObject {
     @Published public var daemonError: String?
     /// Agents may capture UseMac's own windows (`debug_capture`). Only the user turns it on, in Settings → Developer.
     @Published public private(set) var isDebugCaptureEnabled: Bool
+    /// Settings → History → Record typed text, as sealed (AppState+SafetySeal).
+    @Published public internal(set) var recordsTypedText: Bool
     /// Set when the safety settings were changed outside UseMac, so it started paused (AppState+SafetySeal.swift).
     @Published public internal(set) var safetySealNotice: SafetySealNotice?
     /// Saves the execution mode, pause, Emergency stop and Debug capture, each time with a new seal.
@@ -258,6 +260,7 @@ public final class AppState: ObservableObject {
         let safetyLaunch = safetySettings.load()
         let startupSafety = safetyLaunch.state
         startupSafety.apply(to: engineService)
+        Self.applySealedSettings(safetyLaunch, store: safetySettings)
         engineService.recordSafetySealCheck(safetyLaunch)
 
         let savedCorner = defaults.string(forKey: DefaultsKeys.hudCorner)
@@ -273,6 +276,7 @@ public final class AppState: ObservableObject {
         self.engine = engineService
         self.policyBeforePause = startupSafety.policyBeforePause
         self.isDebugCaptureEnabled = startupSafety.debugCaptureEnabled
+        self.recordsTypedText = safetyLaunch.recordsTypedText
         self.safetySettings = safetySettings
         self.safetySealNotice = SafetySealNotice(safetyLaunch.check)
         self.status = engineService.currentStatus()

@@ -352,7 +352,12 @@ public struct ControlCenterView: View {
                 permissionsGroup
                 safetyGroup
                     .id(ControlCenterAnchor.safety)
-                AuditLogSettingsGroup(store: appState.engine.auditStore, onOpenHistory: { router.selection = .audit })
+                AuditLogSettingsGroup(
+                    store: appState.engine.auditStore,
+                    recordsTypedText: appState.recordsTypedText,
+                    setRecordsTypedText: appState.setRecordsTypedText,
+                    onOpenHistory: { router.selection = .audit }
+                )
                 TargetRulesGroupView()
                 SoftwareUpdatesGroupView(updater: appState.updater)
                 DebugCaptureGroupView(appState: appState)

@@ -79,16 +79,29 @@ final class SafetySealTests: XCTestCase {
 
     /// Changing the encoding changes every seal, so every Mac would start paused after the update.
     func testTheEncodingAndTheSealDontChange() throws {
-        let saved = SavedSafetySettings(policy: "readOnly", policyBeforePause: nil, killSwitchTripped: true, debugCaptureEnabled: false)
+        let saved = SavedSafetySettings(
+            policy: "readOnly", policyBeforePause: nil, killSwitchTripped: true, debugCaptureEnabled: false,
+            rulesMode: "deny", deniedApps: ["com.agilebits.onepassword7"], deniedSites: [], allowedApps: nil,
+            allowedSites: nil, recordTypedText: true
+        )
         let encoding = String(decoding: SafetySeal.canonicalEncoding(of: saved, generation: 7), as: UTF8.self)
         XCTAssertEqual(
             encoding,
+            "UseMac safety seal v2\npolicy=8:readOnly\npolicyBeforePause~\nkillSwitchTripped=1\ndebugCaptureEnabled=0\n"
+                + "rulesMode=4:deny\ndeniedApps#1\n-26:com.agilebits.onepassword7\ndeniedSites#0\nallowedApps~\nallowedSites~\n"
+                + "recordTypedText=1\ngeneration=7\n"
+        )
+        XCTAssertEqual(SafetySeal.version, 2)
+
+        // The first format still opens once, to move a Mac sealed by 0.7.0-beta.1-era builds to version 2.
+        let legacy = String(decoding: SafetySeal.legacyEncoding(of: saved, generation: 7), as: UTF8.self)
+        XCTAssertEqual(
+            legacy,
             "UseMac safety seal v1\npolicy=8:readOnly\npolicyBeforePause~\nkillSwitchTripped=1\ndebugCaptureEnabled=0\ngeneration=7\n"
         )
-
         let secret = SafetySealSecret(key: Data((0..<32).map { UInt8($0) }), generation: 7)
-        XCTAssertEqual(SafetySeal.seal(saved, with: secret), "5HaCtNiGBK4S5FUauFIfoKicjE2dm+lCRCbbkxlXKOo=")
-        XCTAssertEqual(SafetySeal.version, 1)
+        XCTAssertEqual(SafetySeal.legacySeal(saved, with: secret), "5HaCtNiGBK4S5FUauFIfoKicjE2dm+lCRCbbkxlXKOo=")
+        XCTAssertEqual(SafetySeal.legacyVersion, 1)
     }
 
     func testNoTwoSetsOfValuesEncodeTheSame() {
@@ -100,7 +113,16 @@ final class SafetySealTests: XCTestCase {
             SavedSafetySettings(policy: nil, policyBeforePause: "paused", killSwitchTripped: false, debugCaptureEnabled: false),
             SavedSafetySettings(policy: "paused\npolicyBeforePause~", policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false),
             SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: true, debugCaptureEnabled: false),
-            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: true)
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: true),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, deniedApps: []),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, deniedApps: [""]),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, deniedApps: ["a", "b"]),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, deniedApps: ["a\n-1:b"]),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, deniedSites: []),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, allowedApps: []),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, allowedSites: []),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, rulesMode: "allow"),
+            SavedSafetySettings(policy: nil, policyBeforePause: nil, killSwitchTripped: false, debugCaptureEnabled: false, recordTypedText: true)
         ]
         let encodings = variants.map { SafetySeal.canonicalEncoding(of: $0, generation: 1) }
         XCTAssertEqual(Set(encodings).count, variants.count)
@@ -260,7 +282,7 @@ final class SafetySealTests: XCTestCase {
     }
 
     func testAnUnknownMarkerIsTampered() {
-        for marker in [0, 2, 99] as [Any] + ["v1"] {
+        for marker in [0, 3, 99] as [Any] + ["v1"] {
             let (defaults, keychain) = sealedMac(loosened)
             defaults.set(marker, forKey: Key.sealVersion)
             XCTAssertEqual(relaunch(defaults, keychain).check, .tampered(.unknownVersion), "\(marker)")
@@ -483,6 +505,162 @@ final class SafetySealTests: XCTestCase {
         XCTAssertEqual(offenders, [], "save safety settings through SafetySettingsStore so they stay sealed")
     }
 
+    /// The app and site rules and Record typed text are saved only through the store too, and never with
+    /// @AppStorage, so a `defaults write` can't loosen them without failing the seal.
+    func testOnlyTheStoreWritesTheRulesAndRecordTypedText() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sources = root.appendingPathComponent("Sources")
+        let writer = "Sources/UseMacEngine/SafetySettingsStore.swift"
+        let names = try NSRegularExpression(
+            pattern: #"usemac\.rules\.|\bKeys\.(mode|deniedApps|deniedSites|allowedApps|allowedSites)\b|usemac\.audit\.recordTypedText|recordTypedTextKey"#
+        )
+        let writes = [".set(", "setValue(", "removeObject(", "PersistentDomain(", "CFPreferencesSet", "@AppStorage("]
+
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(atPath: sources.path))
+        var offenders: [String] = []
+        while let relative = enumerator.nextObject() as? String {
+            guard relative.hasSuffix(".swift"), "Sources/\(relative)" != writer else { continue }
+            let text = try String(contentsOf: sources.appendingPathComponent(relative), encoding: .utf8)
+            for (number, rawLine) in text.components(separatedBy: .newlines).enumerated() {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("//") { continue }
+                let range = NSRange(line.startIndex..., in: line)
+                if names.firstMatch(in: line, range: range) != nil && writes.contains(where: line.contains) {
+                    offenders.append("Sources/\(relative):\(number + 1)")
+                }
+            }
+        }
+        XCTAssertEqual(offenders, [], "save the rules and Record typed text through SafetySettingsStore so they stay sealed")
+    }
+
+    // MARK: - App and site rules, Record typed text
+
+    private let stricterRules = TargetRules(
+        mode: .deny,
+        deniedApps: TargetRules.defaults.deniedApps + ["com.apple.TextEdit"],
+        deniedSites: ["bank.example"]
+    )
+
+    func testTheRulesAndRecordTypedTextAreSealed() {
+        let (defaults, keychain) = sealedMac(.factoryDefault)
+        let store = SafetySettingsStore(defaults: defaults, secretStore: keychain)
+        XCTAssertEqual(store.load().check, .verified)
+        store.saveRules(stricterRules)
+        store.saveRecordTypedText(true)
+
+        let launch = relaunch(defaults, keychain)
+        XCTAssertEqual(launch.check, .verified)
+        XCTAssertEqual(launch.rules, stricterRules.normalized())
+        XCTAssertTrue(launch.recordsTypedText)
+    }
+
+    /// `defaults write app.usemac usemac.rules.deniedApps -array` would unblock password managers.
+    func testLoosenedRulesStartPausedWithTheDefaultRules() {
+        let (defaults, keychain) = sealedMac(.factoryDefault)
+        let store = SafetySettingsStore(defaults: defaults, secretStore: keychain)
+        _ = store.load()
+        store.saveRules(stricterRules)
+
+        for tamper in [
+            { defaults.set([String](), forKey: TargetRulesStore.Keys.deniedApps) },
+            { defaults.set([String](), forKey: TargetRulesStore.Keys.deniedSites) },
+            { defaults.set("allow", forKey: TargetRulesStore.Keys.mode) },
+            { defaults.set(["com.agilebits.onepassword7"], forKey: TargetRulesStore.Keys.allowedApps) },
+            { defaults.removeObject(forKey: TargetRulesStore.Keys.deniedApps) }
+        ] {
+            store.saveRules(stricterRules)
+            tamper()
+            let launch = relaunch(defaults, keychain)
+            XCTAssertEqual(launch.check, .tampered(.sealMismatch))
+            XCTAssertEqual(launch.state.policy, .paused)
+            XCTAssertEqual(launch.rules, TargetRules.defaults, "back to the defaults, which block password managers")
+            XCTAssertFalse(launch.recordsTypedText)
+            XCTAssertEqual(relaunch(defaults, keychain).check, .verified, "the fallback is sealed")
+            _ = SafetySettingsStore(defaults: defaults, secretStore: keychain).load()
+        }
+    }
+
+    func testRecordTypedTextTurnedOnOutsideUseMacIsTampered() {
+        let (defaults, keychain) = sealedMac(.factoryDefault)
+        defaults.set(true, forKey: AuditLogSettings.recordTypedTextKey)
+        let launch = relaunch(defaults, keychain)
+        XCTAssertEqual(launch.check, .tampered(.sealMismatch))
+        XCTAssertFalse(launch.recordsTypedText)
+        XCTAssertFalse(defaults.bool(forKey: AuditLogSettings.recordTypedTextKey))
+        XCTAssertEqual(launch.state.policy, .paused)
+    }
+
+    /// The first seal keeps the saved rules: resetting them could loosen a stricter list the user made.
+    func testTheFirstSealKeepsTheRulesAndTurnsRecordTypedTextOff() {
+        let defaults = makeDefaults()
+        defaults.set(stricterRules.deniedApps, forKey: TargetRulesStore.Keys.deniedApps)
+        defaults.set(true, forKey: AuditLogSettings.recordTypedTextKey)
+        let launch = relaunch(defaults, MemoryKeychain())
+        XCTAssertEqual(launch.check, .firstSeal)
+        XCTAssertEqual(launch.rules.deniedApps, stricterRules.normalized().deniedApps)
+        XCTAssertFalse(launch.recordsTypedText)
+    }
+
+    // MARK: - Moving from the first format
+
+    /// A Mac sealed in the first format, as builds before version 2 left it.
+    private func legacySealedMac(_ saved: SavedSafetySettings) -> (UserDefaults, MemoryKeychain) {
+        let defaults = makeDefaults()
+        defaults.set(saved.policy, forKey: Key.policy)
+        defaults.set(saved.policyBeforePause, forKey: Key.policyBeforePause)
+        defaults.set(saved.killSwitchTripped, forKey: Key.killSwitchTripped)
+        defaults.set(saved.debugCaptureEnabled, forKey: Key.debugCaptureEnabled)
+        if let denied = saved.deniedApps { defaults.set(denied, forKey: TargetRulesStore.Keys.deniedApps) }
+        defaults.set(saved.recordTypedText, forKey: AuditLogSettings.recordTypedTextKey)
+        let secret = SafetySealSecret(key: Data(repeating: 9, count: 32), generation: 5)
+        defaults.set(SafetySeal.legacySeal(saved, with: secret), forKey: Key.seal)
+        defaults.set(SafetySeal.legacyVersion, forKey: Key.sealVersion)
+        let keychain = MemoryKeychain()
+        keychain.data = secret.encoded
+        return (defaults, keychain)
+    }
+
+    func testAFirstFormatSealMovesToTheNewFormat() {
+        let saved = SavedSafetySettings(
+            policy: "ask", policyBeforePause: "ask", killSwitchTripped: false, debugCaptureEnabled: true,
+            deniedApps: stricterRules.deniedApps, recordTypedText: true
+        )
+        let (defaults, keychain) = legacySealedMac(saved)
+
+        let launch = relaunch(defaults, keychain)
+        XCTAssertEqual(launch.check, .upgraded)
+        XCTAssertTrue(launch.sealed)
+        XCTAssertNil(SafetySealNotice(launch.check), "updating UseMac isn't a change made outside it")
+        XCTAssertEqual(launch.state.policy, .ask)
+        XCTAssertTrue(launch.state.debugCaptureEnabled, "it was sealed, so it stays")
+        XCTAssertEqual(launch.rules.deniedApps, stricterRules.normalized().deniedApps)
+        XCTAssertFalse(launch.recordsTypedText, "it wasn't sealed before, so it starts off")
+        XCTAssertEqual(defaults.integer(forKey: Key.sealVersion), SafetySeal.version)
+        XCTAssertEqual(relaunch(defaults, keychain).check, .verified)
+    }
+
+    func testAFirstFormatSealThatDoesntMatchIsTampered() {
+        let saved = SavedSafetySettings(policy: "readOnly", policyBeforePause: "readOnly", killSwitchTripped: false, debugCaptureEnabled: false)
+        let (defaults, keychain) = legacySealedMac(saved)
+        defaults.set("autonomous", forKey: Key.policy)
+        let launch = relaunch(defaults, keychain)
+        XCTAssertEqual(launch.check, .tampered(.sealMismatch))
+        XCTAssertEqual(launch.state.policy, .paused)
+    }
+
+    /// History reads Record typed text from memory, set from the sealed value, so a `defaults write` while UseMac
+    /// runs changes nothing either.
+    func testRecordTypedTextIsntReadFromThePreferences() {
+        let before = AuditLogSettings.recordsTypedText
+        defer {
+            AuditLogSettings.recordsTypedText = before
+            UserDefaults.standard.removeObject(forKey: AuditLogSettings.recordTypedTextKey)
+        }
+        AuditLogSettings.recordsTypedText = false
+        UserDefaults.standard.set(true, forKey: AuditLogSettings.recordTypedTextKey)
+        XCTAssertFalse(AuditLogSettings.recordsTypedText)
+    }
+
     // MARK: - History and the notice
 
     func testHistoryRecordsTheFirstSealAndAChangeOutsideUseMac() {
@@ -498,7 +676,7 @@ final class SafetySealTests: XCTestCase {
         XCTAssertEqual(entries.count, 2)
         XCTAssertTrue(entries.contains { $0.success && $0.summary.hasPrefix("Sealed the safety settings") })
         XCTAssertTrue(entries.contains {
-            !$0.success && $0.summary == "Safety settings changed outside UseMac (the seal doesn't match). Started paused with Debug capture off."
+            !$0.success && $0.summary == "Safety settings changed outside UseMac (the seal doesn't match). Started paused with Debug capture and Record typed text off and the default app and site rules."
         })
         XCTAssertEqual(AuditEntryKind(method: SafetySealNotice.auditMethod), .other, "listed with the setting changes")
     }
@@ -507,13 +685,14 @@ final class SafetySealTests: XCTestCase {
         for problem in SafetySealProblem.allCases {
             let notice = try XCTUnwrap(SafetySealNotice(.tampered(problem)))
             XCTAssertTrue(notice.message.contains("automation is paused"), "\(problem)")
-            XCTAssertTrue(notice.message.contains("Settings → Safety before you resume"), "\(problem)")
+            XCTAssertTrue(notice.message.contains("Settings → Safety and General before you resume"), "\(problem)")
+            XCTAssertTrue(notice.message.contains("app and site rules are back to their defaults"), "\(problem)")
             XCTAssertTrue(notice.menuSubtitle.contains("Settings → Safety"), "\(problem)")
             XCTAssertNotNil(SafetySealNotice.auditSummary(check: .tampered(problem), sealed: true))
         }
         XCTAssertEqual(
             SafetySealNotice(.tampered(.sealMismatch))?.message,
-            "UseMac's safety settings were changed outside UseMac, so automation is paused and Debug capture is off. Check them in Settings → Safety before you resume."
+            "UseMac's safety settings were changed outside UseMac, so automation is paused, Debug capture and Record typed text are off, and the app and site rules are back to their defaults. Check them in Settings → Safety and General before you resume."
         )
         XCTAssertNil(SafetySealNotice(.verified))
         XCTAssertNil(SafetySealNotice(.firstSeal))

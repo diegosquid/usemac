@@ -183,11 +183,18 @@ final class TargetRulesTests: XCTestCase {
         XCTAssertEqual(loaded.deniedSites, [], "a saved empty list stays empty")
         XCTAssertEqual(loaded.mode, .allow)
 
+        // Saving goes through the sealed settings (SafetySettingsStore.saveRules), never straight to the preferences.
         let store = TargetRulesStore(defaults: defaults)
+        var persisted: TargetRules?
+        store.persistHandler = { persisted = $0 }
         store.update(TargetRules(deniedSites: ["https://bank.com/x"]))
-        XCTAssertEqual(defaults.stringArray(forKey: "usemac.rules.deniedSites"), ["bank.com"])
-        XCTAssertEqual(defaults.string(forKey: "usemac.rules.mode"), "deny")
-        XCTAssertEqual(TargetRulesStore(defaults: defaults).rules, store.rules)
+        XCTAssertEqual(persisted?.deniedSites, ["bank.com"])
+        XCTAssertEqual(store.rules.deniedSites, ["bank.com"])
+        XCTAssertEqual(defaults.stringArray(forKey: "usemac.rules.deniedSites"), [], "unchanged: only the handler saves")
+
+        persisted = nil
+        store.update(TargetRules.defaults, persist: false)
+        XCTAssertNil(persisted, "the app's launch replaces the rules without saving them")
     }
 
     func testNoRPCMethodEditsTheRules() {

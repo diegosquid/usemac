@@ -309,7 +309,8 @@ public struct TargetRules: Codable, Equatable, Sendable {
     }
 }
 
-/// The rules UseMac enforces, loaded from the app's defaults at launch. Only UseMac's Settings call `update`.
+/// The rules UseMac enforces. The app replaces them at launch with the sealed ones (SafetySettingsStore) and saves
+/// changes through `persistHandler`, so they are never written unsealed. Only UseMac's Settings call `update`.
 public final class TargetRulesStore: @unchecked Sendable {
     public static let shared = TargetRulesStore()
 
@@ -326,11 +327,17 @@ public final class TargetRulesStore: @unchecked Sendable {
 
     private let lock = NSLock()
     private var _rules: TargetRules
-    private let defaults: UserDefaults?
+    private var _persistHandler: ((TargetRules) -> Void)?
+
+    /// Saves rules for `update(_:persist: true)`. The app sets it to `SafetySettingsStore.saveRules`; without it
+    /// (tests, the CLI's own engine) nothing is saved.
+    public var persistHandler: ((TargetRules) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _persistHandler }
+        set { lock.lock(); _persistHandler = newValue; lock.unlock() }
+    }
 
     /// `defaults` nil keeps the rules in memory only (tests). A list that was never saved uses the defaults.
     public init(defaults: UserDefaults? = .standard) {
-        self.defaults = defaults
         self._rules = defaults.map(Self.load(from:)) ?? .defaults
     }
 
@@ -345,13 +352,10 @@ public final class TargetRulesStore: @unchecked Sendable {
         let cleaned = rules.normalized()
         lock.lock()
         _rules = cleaned
+        let handler = _persistHandler
         lock.unlock()
-        if persist, let defaults {
-            defaults.set(cleaned.mode.rawValue, forKey: Keys.mode)
-            defaults.set(cleaned.deniedApps, forKey: Keys.deniedApps)
-            defaults.set(cleaned.deniedSites, forKey: Keys.deniedSites)
-            defaults.set(cleaned.allowedApps, forKey: Keys.allowedApps)
-            defaults.set(cleaned.allowedSites, forKey: Keys.allowedSites)
+        if persist {
+            handler?(cleaned)
         }
         let post = { NotificationCenter.default.post(name: Self.didChangeNotification, object: self) }
         if Thread.isMainThread { post() } else { DispatchQueue.main.async(execute: post) }
