@@ -208,17 +208,7 @@ final class LiveAccessibilityTests: XCTestCase {
         let indexed = await waitForSpotlight(target, timeoutSeconds: 90)
         try XCTSkipUnless(indexed, "Spotlight did not index the fixture in time.")
 
-        // Open File > Open… through the menu bar (AX only, no keys).
-        let pid = try XCTUnwrap(NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first?.processIdentifier)
-        let app = AXUIElementCreateApplication(pid)
-        let openItem = try XCTUnwrap(ActionExecutor.firstDescendant(of: app, maxDepth: 6) { element in
-            ActionExecutor.axString(element, kAXRoleAttribute) == "AXMenuItem"
-                && (ActionExecutor.axString(element, kAXTitleAttribute)?.hasPrefix("Open") == true
-                    || ActionExecutor.axString(element, kAXTitleAttribute)?.hasPrefix("Abrir") == true)
-                && ActionExecutor.axString(element, kAXTitleAttribute)?.contains("Recent") != true
-                && ActionExecutor.axString(element, kAXTitleAttribute)?.contains("Recente") != true
-        })
-        XCTAssertEqual(AXUIElementPerformAction(openItem, kAXPressAction as CFString), .success)
+        let app = try openTextEditOpenPanel()
 
         let result = try await requireAct([
             ActionStep(action: .uploadFile, files: [target.path])
@@ -237,5 +227,48 @@ final class LiveAccessibilityTests: XCTestCase {
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         XCTAssertTrue(opened, "TextEdit should open the picked file")
+    }
+
+    func testOpenPanelExplainsTempFilesInTheBackground() async throws {
+        _ = try await openFixtureDocument()
+        try XCTSkipIf(NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.TextEdit", "This test needs another app in front.")
+        let target = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("usemac-pick-\(UUID().uuidString.prefix(6)).txt")
+        try "temp".write(to: target, atomically: true, encoding: .utf8)
+        createdFiles.append(target)
+
+        let app = try openTextEditOpenPanel()
+        let started = Date()
+        let result = try await requireAct([
+            ActionStep(action: .uploadFile, files: [target.path])
+        ])
+        let step = try XCTUnwrap(result.stepResults.first)
+        XCTAssertFalse(step.success)
+        XCTAssertEqual(step.mechanism, "nsopenpanel-unreachable")
+        XCTAssertEqual(step.errorCode, "TARGET_NOT_FRONTMOST")
+        XCTAssertTrue(step.message?.contains("\"foreground\": true") == true, step.message ?? "")
+        // No Spotlight round trip: only the folder walk runs before the answer.
+        XCTAssertLessThan(Date().timeIntervalSince(started), 8)
+        XCTAssertNotEqual(NSWorkspace.shared.frontmostApplication?.bundleIdentifier, "com.apple.TextEdit")
+
+        // Close the panel through its Cancel button.
+        let cancel = ActionExecutor.firstDescendant(of: app, maxDepth: 4) { element in
+            ActionExecutor.axString(element, kAXIdentifierAttribute) == "CancelButton"
+        }
+        if let cancel { _ = AXUIElementPerformAction(cancel, kAXPressAction as CFString) }
+    }
+
+    /// Opens File > Open… in TextEdit through the menu bar (AX only, no keys) and returns TextEdit's AX element.
+    private func openTextEditOpenPanel() throws -> AXUIElement {
+        let pid = try XCTUnwrap(NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.TextEdit").first?.processIdentifier)
+        let app = AXUIElementCreateApplication(pid)
+        let openItem = try XCTUnwrap(ActionExecutor.firstDescendant(of: app, maxDepth: 6) { element in
+            ActionExecutor.axString(element, kAXRoleAttribute) == "AXMenuItem"
+                && (ActionExecutor.axString(element, kAXTitleAttribute)?.hasPrefix("Open") == true
+                    || ActionExecutor.axString(element, kAXTitleAttribute)?.hasPrefix("Abrir") == true)
+                && ActionExecutor.axString(element, kAXTitleAttribute)?.contains("Recent") != true
+                && ActionExecutor.axString(element, kAXTitleAttribute)?.contains("Recente") != true
+        })
+        XCTAssertEqual(AXUIElementPerformAction(openItem, kAXPressAction as CFString), .success)
+        return app
     }
 }

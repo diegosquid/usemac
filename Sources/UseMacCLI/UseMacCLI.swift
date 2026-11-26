@@ -915,7 +915,8 @@ struct UseMacCLI {
 
     private static func sendBatchAction(_ batch: BatchActionRequest, options: GlobalOptions) async throws -> Int32 {
         let req = RPCRequest(method: .act, act: batch)
-        let (res, rttMs, mode) = try await executeRPC(req, options: options)
+        // Same budget as the MCP server: an uploadFile step alone can wait ~15 s for Spotlight.
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 60_000)
         try ensureOK(res)
 
         if options.json {
@@ -2277,7 +2278,7 @@ struct UseMacCLI {
                     "Step actions: target, openURL, navigate, click, doubleClick, rightClick, hover, setValue, type, pressKey, scroll, focus, wait, uploadFile, scrollIntoView, axAction (actionName, e.g. AXOpen), waitFor (match or elementId, timeoutMs default 5000, gone: true to wait until it disappears).",
                     "Target a step with \"elementId\": \"@e12\" or with \"match\": {\"role\", \"title\", \"value\", \"text\", \"exact\", \"index\"}, resolved when the step runs. Prefer match when the window may have changed.",
                     "Each step reports effect: changed, none or unverified. \"⚠ no visible effect\" means the step reported ok but nothing changed: observe before continuing.",
-                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder."
+                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder. Files in /tmp, $TMPDIR or hidden folders fail with TARGET_NOT_FRONTMOST in the background: upload a copy from ~/Downloads, or rerun with --foreground."
                 ],
                 examples: [
                     "usemac act '{\"app\":\"Notes\",\"steps\":[{\"action\":\"click\",\"match\":{\"role\":\"button\",\"title\":\"New Note\"}},{\"action\":\"type\",\"text\":\"Hello\"}]}'",

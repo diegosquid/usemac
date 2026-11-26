@@ -1687,7 +1687,8 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Picks a file in an open panel without Finder navigation or focus: type the file name in the panel's
     /// search field, select the result row with exactly that path and press the panel's Open button (AXOpen
-    /// as a fallback). Falls back to ⌘⇧G only when the app is already in front.
+    /// as a fallback). Falls back to ⌘⇧G only when the app is already in front. A file the search can never list
+    /// (/tmp, $TMPDIR, hidden folders) goes straight to ⌘⇧G in front, and fails fast in the background.
     private func performNativeUploadFile(
         step: ActionStep,
         resolved: ResolvedElement,
@@ -1741,8 +1742,20 @@ public final class ActionExecutor: @unchecked Sendable {
             return StepOutcome(success: true, mechanism: "nsopenpanel-navigate", message: "Selected \(fileName).\(extra)", effect: .changed)
         }
 
+        // Spotlight never lists files in /tmp, $TMPDIR or hidden folders, and Go to Folder takes no keys in the
+        // background (see OpenPanelReach). Say so now instead of searching; with the app in front, go to ⌘⇧G.
+        let searchBlocker = OpenPanelReach.searchBlocker(for: file)
+        if let searchBlocker, !WindowResolver.isFrontmost(pid: pid) {
+            return StepOutcome(
+                success: false,
+                mechanism: "nsopenpanel-unreachable",
+                message: OpenPanelReach.backgroundMessage(fileName: fileName, reason: searchBlocker, appName: targetApp?.name ?? "the app"),
+                errorCode: "TARGET_NOT_FRONTMOST"
+            )
+        }
+
         // 2. Search by name (Spotlight) when the file's folders are not reachable from the sidebar.
-        if let search = panel.searchField {
+        if searchBlocker == nil, let search = panel.searchField {
             // The picker search is Spotlight: index the file now so a file created seconds ago is found.
             await Self.indexForSpotlight(file)
             _ = AXUIElementSetAttributeValue(search, kAXValueAttribute as CFString, fileName as CFTypeRef)
@@ -1812,7 +1825,7 @@ public final class ActionExecutor: @unchecked Sendable {
                     mechanism: "nsopenpanel-search",
                     message: ambiguous
                         ? "Several files named \(fileName) showed up in the picker search. Give the file a unique name, or rerun this step in a batch with \"foreground\": true."
-                        : "The picker could not be driven in the background: browsing its folders did not enable Open, and its search (Spotlight) did not list \(fileName) yet. Rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back), or retry once Spotlight has indexed the file (not /tmp or hidden folders).",
+                        : "The picker could not be driven in the background: browsing its folders did not enable Open, and its search (Spotlight) did not list \(fileName) yet. Rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back), or retry once Spotlight has indexed the file.",
                     errorCode: "ELEMENT_NOT_FOUND"
                 )
             }
@@ -1834,8 +1847,7 @@ public final class ActionExecutor: @unchecked Sendable {
         _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
         try? await Task.sleep(nanoseconds: 300_000_000)
         _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        let closed = findOpenPanel(pid: pid) == nil
+        let closed = await waitForPanelToClose(pid: pid)
         return StepOutcome(
             success: closed,
             mechanism: "nsopenpanel-goto",
