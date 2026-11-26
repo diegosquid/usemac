@@ -48,6 +48,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 
 - **Pairing**: each Chrome profile must be paired once. The user copies the `umk_…` key from **UseMac → Settings → General → Chrome Extension** (**Copy key**) and pastes it into the extension popup. Until then browser calls return `EXTENSION_NOT_PAIRED`. The key is never exposed through the socket, MCP or CLI.
 - **Profiles**: `profile` is optional when only one Chrome profile is connected. With several, read the exact names from `browser_status` and pass `"profile": "Work"` (matched by profile name).
+- **Extension version**: each `browser_status` profile reports `extensionOutdated` (Chrome runs an older extension than the app ships, `bundledExtensionVersion`), `extensionSource` (`app`, `web_store`, `other_folder`: loaded from another folder, app updates won't reach it, or `unknown`) and a one-line `extensionNote`. When a fix "doesn't work" and the extension is outdated, tell the user: **Settings → Chrome Extension → Reload**, or `browser_reload_extension` if they ask you to. Reloading stops every agent's browser work in that profile.
 - **Tabs**: without `tabId`, a browser call of a task (see `task_start`) goes to the last tab that task opened or named, so it never lands in another agent's tab. Without a task it uses the last tab UseMac used or a tab in the `UseMac` tab group; if there is none it returns `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
 - **URLs**: `browser_open` and the `openURL`/`navigate` steps accept only `http://`, `https://` and `about:blank`. A URL without a scheme gets `https://`; anything else returns `URL_BLOCKED`.
 
@@ -63,7 +64,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 - `id` is optional. On `act` and `browser_act`, booleans default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, `includeScreenshot: false`; `steps` is required.
 - Keep one connection open across a multi-step task to reuse the Accessibility hot cache.
 
-### All 22 methods
+### All 23 methods
 
 | Method | Description |
 | :--- | :--- |
@@ -84,6 +85,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `browser_extract` | Tables and grids (optional horizontal scan), KPIs, text, session downloads, or JavaScript `eval` (`autonomous` mode only). |
 | `browser_screenshot` | JPEG of a Chrome tab or element, saved to a private temp folder (pruned after 30 minutes). |
 | `browser_act` | DOM action steps in a Chrome tab, with optional `readOnly`, on-device `verify` or post-action screenshot. |
+| `browser_reload_extension` | Reload the Chrome extension so it runs the code now in its folder, then wait until it has paired again (`profile` optional, `force` to interrupt running commands). Stops every agent's browser work: only when the user asks or nothing else uses Chrome. |
 | `vision_status` | Local vision readiness (Apple Vision OCR plus optional on-device MLX model). |
 | `vision_install` | Install the optional MLX runtime and one of the three preset models (`INVALID_MODEL` otherwise). |
 | `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. |
@@ -122,6 +124,10 @@ Target by what the element is with `match`, and wait for the result instead of s
 
 ```json
 {"method":"browser_status"}
+```
+
+```json
+{"method":"browser_reload_extension","browserReloadExtension":{"profile":"Work"}}
 ```
 
 ```json
@@ -294,6 +300,7 @@ Chrome and on-device vision (`--profile` only when several profiles are connecte
 "$USEMAC" browser open --tab 123 --activate          # make a tab active (hybrid flow)
 "$USEMAC" browser open "https://example.com" --new-window
 "$USEMAC" browser observe --screenshot
+"$USEMAC" browser reload-extension                   # only when the user asks: stops all browser work
 "$USEMAC" vision diagnose
 "$USEMAC" vision locate "X close button on notification popup"
 "$USEMAC" done --summary "Finished reading article"
@@ -392,6 +399,9 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 | `EXTENSION_NOT_CONNECTED` | No paired Chrome extension is connected, or `profile` didn't match. | Check `browser_status`, or ask the user to open Chrome with the extension enabled. |
 | `EXTENSION_NOT_PAIRED` | The extension is connected but not paired. | Ask the user to paste the key from **UseMac → Settings → General → Chrome Extension** into the extension popup. |
 | `EXTENSION_TIMEOUT` | The extension didn't answer in time; running `browser_act` batches are cancelled. | Check `browser_status` or `browser_observe` before retrying. |
+| `EXTENSION_RELOAD_UNSUPPORTED` | `browser_reload_extension`: the extension predates remote reload. Nothing was sent. | Ask the user to click the reload button on UseMac Browser Bridge in `chrome://extensions` once. |
+| `EXTENSION_RELOAD_TIMEOUT` | The extension reloaded but did not pair again within 15 s. | Ask the user to check UseMac Browser Bridge in `chrome://extensions` for errors. |
+| `BROWSER_BUSY` | `browser_reload_extension` was refused: Chrome commands are still running in that profile. | Wait for them to finish; pass `force` only if the user asked. |
 | `NO_USEMAC_TAB` | No `tabId` and no UseMac tab to fall back to, or your task's last tab was closed before an action. | Open one with `browser_open`, or pass a `tabId` from `browser_tabs`. |
 | `CANCELLED` | The Chrome batch was cancelled (Kill Switch or timeout). | Stop, check `status`, and tell the user before doing more. |
 | `APP_NOT_FOUND` | No running app matches `app`, or a step that needs a target app has none. | Check the name with `list_apps`, or launch the app with `open -g -a "<App>"`, then observe. |

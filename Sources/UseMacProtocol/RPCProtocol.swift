@@ -23,6 +23,7 @@ public enum RPCMethod: String, Codable, Sendable, CaseIterable {
     case visionQuery = "vision_query"
     case taskStart = "task_start"
     case taskComplete = "task_complete"
+    case browserReloadExtension = "browser_reload_extension"
 }
 
 public struct ObserveParams: Codable, Equatable, Sendable {
@@ -83,6 +84,7 @@ public struct RPCRequest: Codable, Sendable {
     public var auditLog: AuditLogParams?
     /// The task this request belongs to (from `task_start`). Any method takes it; see `namedTaskId`.
     public var taskId: String?
+    public var browserReloadExtension: BrowserReloadExtensionParams?
 
     public init(
         id: String = UUID().uuidString,
@@ -105,7 +107,8 @@ public struct RPCRequest: Codable, Sendable {
         taskStart: TaskStartParams? = nil,
         taskComplete: TaskCompleteParams? = nil,
         auditLog: AuditLogParams? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        browserReloadExtension: BrowserReloadExtensionParams? = nil
     ) {
         self.id = id
         self.method = method
@@ -128,6 +131,7 @@ public struct RPCRequest: Codable, Sendable {
         self.taskComplete = taskComplete
         self.auditLog = auditLog
         self.taskId = taskId
+        self.browserReloadExtension = browserReloadExtension
     }
 
     public init(from decoder: Decoder) throws {
@@ -153,6 +157,7 @@ public struct RPCRequest: Codable, Sendable {
         self.taskComplete = try c.decodeIfPresent(TaskCompleteParams.self, forKey: .taskComplete)
         self.auditLog = try c.decodeIfPresent(AuditLogParams.self, forKey: .auditLog)
         self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
+        self.browserReloadExtension = try c.decodeIfPresent(BrowserReloadExtensionParams.self, forKey: .browserReloadExtension)
     }
 }
 

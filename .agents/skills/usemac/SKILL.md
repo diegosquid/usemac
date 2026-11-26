@@ -54,6 +54,7 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
 
 - **Pairing prerequisite**: Each Chrome profile must be paired once before browser methods work. The user opens **UseMac → Settings → General → Chrome Extension**, clicks **Copy key**, and pastes the `umk_…` key into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The pairing key is never exposed via RPC, MCP, or CLI.
 - **Profile selection**: `profile` is optional when only one Chrome profile is connected. When multiple profiles are connected, get profile names from `browser_status` (lookup matches profile name, not e-mail) and pass `"profile": "<name>"`.
+- **Extension version**: each `browser_status` profile reports `extensionOutdated` (older than the app's `bundledExtensionVersion`), `extensionSource` (`app`, `web_store`, `other_folder` = loaded from another folder, app updates won't reach it, `unknown`) and `extensionNote`. If it is outdated, tell the user to click **Settings → Chrome Extension → Reload**. `browser_reload_extension` (`{"method":"browser_reload_extension"}`, CLI `browser reload-extension`) does the same, but it stops every agent's browser work, so use it only when the user asks. Errors: `EXTENSION_RELOAD_UNSUPPORTED` (the user reloads it once in `chrome://extensions`), `BROWSER_BUSY` (commands still running; `force` only if the user asked), `EXTENSION_RELOAD_TIMEOUT`.
 - **Tab targeting**: Without `tabId`, a browser method of a task goes to the last tab that task opened or named (never another agent's tab). Without a task it uses the last tab used by UseMac or a tab in the `UseMac` tab group; if none exists, it returns `NO_USEMAC_TAB` instead of touching the user's active tab. Call `browser_open` to create one, or call `browser_tabs` and pass `tabId` to work in an already open user tab.
 - **URL restriction**: `browser_open` and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs default to `https://`). Other schemes return `URL_BLOCKED`.
 
@@ -129,6 +130,7 @@ USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" browser extract downloads
 "$USEMAC" browser screenshot --tab <id> [--selector "<css>"] [--scale 2]
 "$USEMAC" browser act '[{"action":"hover","elementId":"@b1"}]' [--tab <id>] [--read-only] [--verify "Expected state"] [--screenshot]
+"$USEMAC" browser reload-extension [--profile <name>]   # only when the user asks: stops all browser work
 "$USEMAC" vision status
 "$USEMAC" vision ask "Did the expected values appear and are there any errors?" [--selector "<css>"]
 "$USEMAC" vision verify "Success banner is visible"
@@ -241,6 +243,9 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 | `EXTENSION_NOT_CONNECTED` | No paired Chrome extension is connected (or the requested `profile` name did not match). | Call `browser_status` to check connected profiles, or ask the user to open Chrome with the extension enabled. |
 | `EXTENSION_NOT_PAIRED` | Chrome extension is connected but has not been paired with the local `umk_…` key yet. | Ask the user to copy the key from **UseMac → Settings → General → Chrome Extension** and paste it in the extension popup. |
 | `EXTENSION_TIMEOUT` | The Chrome extension did not answer before the command timeout (and running `browser_act` batches are cancelled). | Call `browser_status` or `browser_observe` to check tab state before deciding whether to retry. |
+| `EXTENSION_RELOAD_UNSUPPORTED` | `browser_reload_extension`: the extension predates remote reload. Nothing was sent. | Ask the user to click the reload button on UseMac Browser Bridge in `chrome://extensions` once. |
+| `EXTENSION_RELOAD_TIMEOUT` | The extension reloaded but did not pair again within 15 s. | Ask the user to check UseMac Browser Bridge in `chrome://extensions` for errors. |
+| `BROWSER_BUSY` | `browser_reload_extension` was refused because Chrome commands are still running in that profile. | Wait for them to finish; pass `force` only if the user asked. |
 | `NO_USEMAC_TAB` | No `tabId` was passed and there is no tracked UseMac tab or tab in the `UseMac` tab group, or your task's last tab was closed before an action. | Call `browser_open` to open a new background tab, or call `browser_tabs` and pass an explicit `tabId`. |
 | `CANCELLED` | The running or queued Chrome batch was cancelled (for example by the Kill Switch or a timeout). | Stop the current batch, check `status` if needed, and inform the user before taking further actions. |
 | `DAEMON_REQUIRED` | `UseMac.app` is not running, so actions are disabled in the CLI and MCP server. | Stop and ask the user to open `UseMac.app`; do not bypass it with `--standalone`. |

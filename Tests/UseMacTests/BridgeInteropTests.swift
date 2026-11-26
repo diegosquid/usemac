@@ -75,10 +75,13 @@ final class BridgeInteropTests: XCTestCase {
             .appendingPathComponent("ExtensionTests/support/run-background-in-node.cjs")
     }
 
-    private func launchExtension(node: String, port: UInt16, key: String, profile: String) throws -> ExtensionProcess {
+    private func launchExtension(node: String, port: UInt16, key: String, profile: String, environment: [String: String] = [:]) throws -> ExtensionProcess {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = [Self.harnessURL.path, String(port), key, profile]
+        if !environment.isEmpty {
+            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        }
         let stdin = Pipe()
         let stdout = Pipe()
         process.standardInput = stdin
@@ -198,5 +201,66 @@ final class BridgeInteropTests: XCTestCase {
 
         let response = await service.handle(RPCRequest(method: .browserTabs, browserTabs: BrowserTabsParams()))
         XCTAssertEqual(response.error?.code, "EXTENSION_NOT_PAIRED")
+    }
+    /// browser_reload_extension end to end: the real extension answers, calls chrome.runtime.reload(), and the next
+    /// service worker (new code) pairs again before the RPC returns.
+    func testRealExtensionReloadsAndReconnectsWithTheNewCode() async throws {
+        guard let node = Self.locateNode() else {
+            throw XCTSkip("Node.js is not installed; the extension interop test needs it.")
+        }
+        let (service, keyDir, port) = try await makeStartedService()
+        defer {
+            service.chromeBridge.stop()
+            try? FileManager.default.removeItem(at: keyDir)
+        }
+        let keyText = try XCTUnwrap(service.bridgePairingKeyText())
+        let id = ["USEMAC_TEST_EXTENSION_ID": "abcdefghijklmnopabcdefghijklmnop"]
+
+        let first = try launchExtension(node: node, port: port, key: keyText, profile: "Reload", environment: id.merging(["USEMAC_TEST_EXTENSION_VERSION": "0.6.0"]) { _, new in new })
+        defer { first.stop() }
+        let connected = await waitForBridgeCondition(timeoutMs: 8000) {
+            service.chromeBridge.connectedProfiles().contains { $0.profileName == "Reload" && $0.extensionReloadable == true }
+        }
+        XCTAssertTrue(connected, "Extension states: \(first.output.lines)")
+
+        let restarted = Task { () -> ExtensionProcess? in
+            let reloaded = await waitForBridgeCondition(timeoutMs: 5000) { first.output.lines.contains("RELOAD") }
+            guard reloaded else { return nil }
+            return try? self.launchExtension(node: node, port: port, key: keyText, profile: "Reload", environment: id.merging(["USEMAC_TEST_EXTENSION_VERSION": "0.6.1"]) { _, new in new })
+        }
+        let response = await service.handle(RPCRequest(method: .browserReloadExtension))
+        let second = await restarted.value
+        defer { second?.stop() }
+
+        XCTAssertNotNil(second, "The extension never called chrome.runtime.reload(). Extension states: \(first.output.lines)")
+        XCTAssertTrue(response.ok, "browser_reload_extension failed: \(response.error?.code ?? "") \(response.error?.message ?? "")")
+        XCTAssertEqual(response.browserProfiles?.map(\.extensionVersion), ["0.6.1"])
+        XCTAssertEqual(service.chromeBridge.connectedProfiles().map(\.extensionVersion), ["0.6.1"])
+    }
+
+    /// The extension Chrome runs today predates hello.extensionId: it is never sent the command.
+    func testRealOldExtensionGetsReloadUnsupported() async throws {
+        guard let node = Self.locateNode() else {
+            throw XCTSkip("Node.js is not installed; the extension interop test needs it.")
+        }
+        let (service, keyDir, port) = try await makeStartedService()
+        defer {
+            service.chromeBridge.stop()
+            try? FileManager.default.removeItem(at: keyDir)
+        }
+        let keyText = try XCTUnwrap(service.bridgePairingKeyText())
+        let ext = try launchExtension(node: node, port: port, key: keyText, profile: "Old")
+        defer { ext.stop() }
+        let connected = await waitForBridgeCondition(timeoutMs: 8000) {
+            service.chromeBridge.connectedProfiles().contains { $0.profileName == "Old" }
+        }
+        XCTAssertTrue(connected, "Extension states: \(ext.output.lines)")
+
+        let response = await service.handle(RPCRequest(method: .browserReloadExtension, browserReloadExtension: BrowserReloadExtensionParams(profile: "Old")))
+        XCTAssertEqual(response.error?.code, "EXTENSION_RELOAD_UNSUPPORTED")
+        XCTAssertTrue(response.error?.message.contains("chrome://extensions") == true)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertFalse(ext.output.lines.contains("RELOAD"))
+        XCTAssertEqual(service.chromeBridge.connectedProfiles().first?.extensionId, "abcdefghijklmnopabcdefghijklmnop")
     }
 }

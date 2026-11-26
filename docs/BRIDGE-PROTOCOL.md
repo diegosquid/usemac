@@ -28,8 +28,14 @@ as 64 lowercase hex characters. Proofs are compared in constant time. `|` below 
 1. Extension → daemon, first frame after the socket opens:
 
    ```json
-   {"type":"hello","protocol":2,"extensionVersion":"0.5.0","profileName":"Work","clientNonce":"<64 hex>","hasKey":true}
+   {"type":"hello","protocol":2,"extensionVersion":"0.6.0 beta 3","extensionId":"<32 letters a-p>","profileName":"Work","clientNonce":"<64 hex>","hasKey":true}
    ```
+
+   `extensionVersion` is the manifest's `version_name`, else its `version`. `extensionId` (optional) is
+   `chrome.runtime.id`; an extension that sends it also accepts `reload_extension` (below). The daemon ignores an
+   `extensionId` that is not a string. For extensions that predate the field, the daemon takes the ID from the
+   upgrade's `Origin` header (`chrome-extension://<id>`) when every upgrade since that connection was accepted came
+   from the same ID.
 
    `hello` carries no e-mail, no window titles and no tab count. A `hello` whose `protocol` is not `2`, or whose
    `clientNonce` is not 64 hex characters, gets `{"type":"auth_failed","reason":"bad_hello"}` and the socket is closed.
@@ -57,7 +63,8 @@ as 64 lowercase hex characters. Proofs are compared in constant time. `|` below 
 
    `clientProof = HMAC-SHA256(K, utf8("usemac-bridge-v2|client|" + clientNonce + "|" + serverNonce))`
 
-   The daemon verifies it. On success it answers `{"type":"ready"}`. On failure it answers
+   The daemon verifies it. On success it answers `{"type":"ready"}`, optionally with `extensionStatus` (see
+   "Outdated or wrong-source extension" below). On failure it answers
    `{"type":"auth_failed","reason":"bad_proof"}` and closes the socket. Each `challenge` is valid for one `auth`.
 
 5. After `ready`, the extension sends `{"type":"profile_info","profileName":"Work","tabCount":12}` and repeats it
@@ -84,7 +91,8 @@ clientProof  = c98c470a7e7cf4f566d842b2a2fcdd46e9894e13bcfe448ad0c180cb17fa4f35
 ## Commands after `ready`
 
 Daemon → extension requests keep the existing shape: `{"type":"request","id":"<uuid>","command":"…", …}` with
-`command` one of `tabs`, `open`, `observe`, `extract`, `screenshot`, `act`, `focus_tab`, `stop_stream`.
+`command` one of `tabs`, `open`, `observe`, `extract`, `screenshot`, `act`, `focus_tab`, `stop_stream`,
+`close_owned_tabs`, `reload_extension`.
 Extension → daemon frames keep the existing shapes: `response`, `frame`, `cursor`, `stream_stopped`, `ping`.
 
 ### `cancel` (new, daemon → extension)
@@ -197,3 +205,53 @@ Tab listings mark tabs that belong to UseMac (in its "UseMac" tab group, or open
 The UseMac app only streams a Chrome window through the native (ScreenCaptureKit) preview when that window's
 active tab is one of these; otherwise the preview shows a placeholder, so the user's own tabs never appear in it.
 Extensions that predate the field send no `usemac`, which the app treats as "not a UseMac tab".
+
+## Outdated or wrong-source extension
+
+The daemon compares what `hello` reports with the extension copy inside the app
+(`UseMac.app/Contents/Resources/chrome-extension/manifest.json`):
+
+- **Outdated**: `extensionVersion` sorts before the bundled `version_name` (else `version`). Numbers compare
+  numerically; a release sorts after its pre-releases (`alpha` < `beta` < `rc`), so `0.5.0` < `0.6.0 beta 2` <
+  `0.6.0 beta 3` < `0.6.0`.
+- **Source**: `app` when the ID is the one Chrome gives the bundled folder loaded unpacked, `web_store` when it is
+  the Chrome Web Store ID (`UseMacChromeExtensionID` in Info.plist, or `USEMAC_CHROME_EXTENSION_ID`),
+  `other_folder` for any other ID (loaded unpacked from another folder, such as a repo checkout: app updates never
+  reach it), and `unknown` without an ID or a bundled copy.
+- **Unpacked IDs**: Chrome makes the folder path absolute with `realpath(3)` (symlinks resolved, `/tmp` →
+  `/private/tmp`, no trailing slash, on-disk case), hashes its UTF-8 bytes with SHA-256, keeps the first 16 bytes
+  and writes each hex digit `0`–`f` as `a`–`p`. A manifest with `key` hashes the decoded key instead. Example:
+  `/Applications/UseMac.app/Contents/Resources/chrome-extension` → `cjmjpbjmbbokoknjmnppdcifkeaaapca`.
+
+`ready` carries the verdict for the extension popup. Older extensions ignore the field.
+
+```json
+{"type":"ready","extensionStatus":{"source":"other_folder","bundledVersion":"0.6.0 beta 3","outdated":true,"reloadable":true,"note":"Loaded from another folder, app updates won't reach it. …"}}
+```
+
+`browser_status` reports the same per profile: `extensionId`, `extensionSource`, `bundledExtensionVersion`,
+`extensionOutdated`, `extensionReloadable` and `extensionNote`.
+
+## Reloading the extension (`reload_extension`)
+
+```json
+{"type":"request","id":"…","command":"reload_extension"}
+```
+
+The extension handles it at once, outside the tab queues. It answers `{"type":"response","id":"…","ok":true,
+"extensionVersion":"…"}`, waits until the answer has left the socket (at most 1 s), then calls
+`chrome.runtime.reload()`. Chrome restarts the service worker with the code now in the extension's folder, which
+connects and pairs again on its own (the key is in `chrome.storage.local`). Debugger sessions end, and the list of
+tabs UseMac opened (`chrome.storage.session`) is lost, so `close_owned_tabs` no longer closes tabs opened before the
+reload.
+
+The daemon (`browser_reload_extension`, CLI `usemac browser reload-extension`, Settings → Chrome Extension →
+Reload):
+
+- sends the command only to sessions whose `hello` carried `extensionId`. Others get `EXTENSION_RELOAD_UNSUPPORTED`
+  (reload once in `chrome://extensions`) without any frame, so an old extension never sees an unknown command. An
+  `UNKNOWN_COMMAND` answer maps to the same error;
+- refuses with `BROWSER_BUSY` while that session still has commands waiting for an answer, unless `force` is set;
+- treats the socket closing before the answer as a reload in progress;
+- waits up to 15 s for a new ready session with the same profile name, accepted after the command was sent, and
+  returns its status, or fails with `EXTENSION_RELOAD_TIMEOUT`.

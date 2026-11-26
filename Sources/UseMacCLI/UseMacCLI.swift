@@ -119,7 +119,8 @@ struct UseMacCLI {
         .browserOpen,
         .visionInstall,
         .setPolicy,
-        .pairApp
+        .pairApp,
+        .browserReloadExtension
     ]
 
     /// Exit code 4: a safety rule blocked the request. Stop and tell the user.
@@ -1021,7 +1022,7 @@ struct UseMacCLI {
 
     private static func handleBrowser(args: [String], options: GlobalOptions) async throws -> Int32 {
         guard let subcommand = args.first else {
-            throw CLIError.usage("Usage: usemac browser <status|tabs|open|observe|extract|screenshot|act> ...")
+            throw CLIError.usage("Usage: usemac browser <status|tabs|open|observe|extract|screenshot|act|reload-extension> ...")
         }
         let rest = Array(args.dropFirst())
         switch subcommand {
@@ -1039,10 +1040,12 @@ struct UseMacCLI {
             return try await handleBrowserScreenshot(args: rest, options: options)
         case "act":
             return try await handleBrowserAct(args: rest, options: options)
+        case "reload-extension":
+            return try await handleBrowserReloadExtension(args: rest, options: options)
         case "help":
             return try printHelp(for: ["browser"] + rest.prefix(1))
         default:
-            throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, screenshot, act.")
+            throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, screenshot, act, reload-extension.")
         }
     }
 
@@ -1101,8 +1104,51 @@ struct UseMacCLI {
                     let urlPart = profile.streamingUrl.map { " (\($0))" } ?? ""
                     return " | stream=tab:\(tabId)\(urlPart)"
                 } ?? ""
-                print("  • \(profile.profileName)\(emailPart) | v\(profile.extensionVersion) | tabs=\(profile.tabCount)\(streamPart)")
+                print("  • \(profile.profileName)\(emailPart) | v\(profile.extensionVersion) | tabs=\(profile.tabCount)\(streamPart)\(extensionStatusSuffix(profile))")
+                if let note = profile.extensionNote {
+                    print("    \(note)")
+                }
             }
+        }
+        return 0
+    }
+
+    /// " | outdated (app ships 0.6.0 beta 3) | from another folder", or "" when the app knows nothing more.
+    private static func extensionStatusSuffix(_ profile: BrowserProfileStatus) -> String {
+        var parts: [String] = []
+        if profile.extensionOutdated == true {
+            parts.append("outdated (app ships \(profile.bundledExtensionVersion ?? "a newer version"))")
+        }
+        switch profile.extensionSource {
+        case "app": parts.append("from UseMac.app")
+        case "web_store": parts.append("from Chrome Web Store")
+        case "other_folder": parts.append("from another folder")
+        default: break
+        }
+        return parts.map { " | \($0)" }.joined()
+    }
+
+    private static func handleBrowserReloadExtension(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--profile"], boolFlags: ["--force"])
+        if !parsed.positionals.isEmpty {
+            throw CLIError.usage("Usage: usemac browser reload-extension [--profile <name>] [--force]")
+        }
+        let params = BrowserReloadExtensionParams(
+            profile: parsed.values["--profile"],
+            force: parsed.flags.contains("--force") ? true : nil
+        )
+        let req = RPCRequest(method: .browserReloadExtension, browserReloadExtension: params)
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 90000)
+        try ensureOK(res)
+
+        let profiles = res.browserProfiles ?? []
+        if options.json {
+            printEncodableJSON(profiles)
+            return 0
+        }
+        print(String(format: "[%@] Reloaded the extension in %d Chrome profile(s) (%.0f ms):", mode.rawValue, profiles.count, rttMs))
+        for profile in profiles {
+            print("  • \(profile.profileName) | v\(profile.extensionVersion)\(extensionStatusSuffix(profile))")
         }
         return 0
     }
@@ -2053,7 +2099,7 @@ struct UseMacCLI {
                                                      (click, set, type and key also take --foreground, --expect-title, --allow-stale)
           screenshot [--app <name>] [--max-dim <n>] [--base64]
                                                      Capture a window or screen screenshot
-          browser status                             List Chrome profiles connected to the extension
+          browser status                             List Chrome profiles connected to the extension (version, outdated, source)
           browser tabs [--profile <n>] [--query <q>] List open Chrome tabs with tabId, title, and URL
           browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--activate] [--new-window] [--no-stream]
                                                      Open a URL in a background tab, navigate --tab, or open it in a new window
@@ -2066,6 +2112,8 @@ struct UseMacCLI {
                                                      Capture a crisp screenshot of the tab or a specific element
           browser act '<json>' [--profile <name>] [--tab <id>] [--read-only] [--verify "<condition>"] [--screenshot]
                                                      Execute BrowserActParams or [ActionStep] in Chrome with optional local verification or screenshot
+          browser reload-extension [--profile <n>] [--force]
+                                                     Reload the extension so Chrome runs the code now in its folder (stops running browser work)
           vision status                              Show Local Vision engine status (Apple OCR + MLX-VLM)
           vision install [--model <hf-repo>]         Install the MLX runtime and download the local model on demand
           vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
@@ -2130,7 +2178,8 @@ struct UseMacCLI {
         ("observe", "Inspect a tab's DOM (@b1..@bN), tables, text and overlays"),
         ("extract", "Extract tables, KPIs, text, JS results or session downloads"),
         ("screenshot", "Capture a JPEG of a tab or one element"),
-        ("act", "Run DOM action steps in a tab")
+        ("act", "Run DOM action steps in a tab"),
+        ("reload-extension", "Reload the extension so Chrome runs its current code")
     ]
 
     private static let visionSubcommands: [(String, String)] = [
@@ -2294,9 +2343,29 @@ struct UseMacCLI {
         case "browser status":
             return CommandHelp(
                 usage: ["usemac browser status"],
-                summary: "List the Chrome profiles connected to the extension (name, e-mail, extension version, tab count, streaming tab).",
+                summary: "List the Chrome profiles connected to the extension (name, e-mail, extension version, tab count, streaming tab), and whether each one runs an outdated extension or one loaded from another folder.",
+                notes: [
+                    "extensionOutdated: Chrome runs an older extension than UseMac.app ships (bundledExtensionVersion). Tell the user, or run 'usemac browser reload-extension' when nothing else is using Chrome.",
+                    "extensionSource: app (UseMac.app's folder), web_store, other_folder (unpacked from another folder: app updates won't reach it) or unknown."
+                ],
                 examples: ["usemac browser status"],
-                json: "[BrowserProfileStatus {profileName, profileEmail, extensionVersion, tabCount, streamingTabId, streamingUrl}]"
+                json: "[BrowserProfileStatus {profileName, profileEmail, extensionVersion, tabCount, streamingTabId, streamingUrl, extensionId, extensionSource, bundledExtensionVersion, extensionOutdated, extensionReloadable, extensionNote}]"
+            )
+        case "browser reload-extension":
+            return CommandHelp(
+                usage: ["usemac browser reload-extension [--profile <name>] [--force]"],
+                summary: "Reload the UseMac extension so Chrome runs the code now in its folder (after an app update, or a change in the folder it was loaded from). Waits until it has reconnected and prints its new version.",
+                flags: [
+                    ("--profile <name>", "Reload only this Chrome profile (default: every connected profile)"),
+                    ("--force", "Reload even while agents have Chrome commands running (they fail)")
+                ],
+                notes: [
+                    "Reloading stops every agent's browser work in that profile: run it only when the user asks, or when nothing else is using Chrome. Without --force it fails with BROWSER_BUSY while commands are running.",
+                    "Tabs UseMac opened before the reload stay open, but 'done' no longer closes them.",
+                    "EXTENSION_RELOAD_UNSUPPORTED: the extension predates remote reload. The user reloads it once in chrome://extensions. EXTENSION_RELOAD_TIMEOUT: it did not come back within 15 s; check chrome://extensions for errors."
+                ],
+                examples: ["usemac browser reload-extension", "usemac browser reload-extension --profile Work"],
+                json: "[BrowserProfileStatus] of the reloaded profiles, as 'browser status' prints them"
             )
         case "browser tabs":
             return CommandHelp(

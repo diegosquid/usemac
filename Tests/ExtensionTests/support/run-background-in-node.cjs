@@ -3,6 +3,9 @@
 //
 // Usage: node run-background-in-node.cjs <port> <pairing key text or "none"> <profile name>
 // Prints one line per auth state change: "STATE <wsState> <authState>".
+// Optional environment: USEMAC_TEST_EXTENSION_VERSION (manifest version, default 0.5.0) and USEMAC_TEST_EXTENSION_ID
+// (chrome.runtime.id; unset, hello carries no extensionId like an old extension). chrome.runtime.reload() prints
+// "RELOAD" and exits, as Chrome stops the old service worker; the test starts the next one.
 "use strict";
 
 const fs = require("node:fs");
@@ -46,7 +49,12 @@ function looseStub(overrides = {}) {
 
 const chromeStub = looseStub({
   runtime: looseStub({
-    getManifest: () => ({ version: "0.5.0" })
+    getManifest: () => ({ version: process.env.USEMAC_TEST_EXTENSION_VERSION || "0.5.0" }),
+    ...(process.env.USEMAC_TEST_EXTENSION_ID ? { id: process.env.USEMAC_TEST_EXTENSION_ID } : {}),
+    reload: () => {
+      process.stdout.write("RELOAD\n");
+      setTimeout(() => process.exit(0), 20);
+    }
   }),
   storage: looseStub({
     local: looseStub({

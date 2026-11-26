@@ -808,6 +808,19 @@ public struct BrowserProfileStatus: Codable, Equatable, Identifiable, Sendable {
     public var streamingTabId: Int?
     public var streamingUrl: String?
     public var streamingTitle: String?
+    /// The extension's Chrome ID (`chrome.runtime.id`; for extensions that predate it, the WebSocket Origin).
+    public var extensionId: String?
+    /// Where Chrome loads the extension from: `app` (UseMac.app's own folder), `web_store`, `other_folder`
+    /// (unpacked from another folder, so app updates never reach it) or `unknown`.
+    public var extensionSource: String?
+    /// The version of the extension copy inside UseMac.app.
+    public var bundledExtensionVersion: String?
+    /// True when Chrome runs an older extension than the app ships. Reload it (`browser_reload_extension`).
+    public var extensionOutdated: Bool?
+    /// The extension accepts `browser_reload_extension`. Older ones must be reloaded once in chrome://extensions.
+    public var extensionReloadable: Bool?
+    /// One line for people and agents when the extension needs attention (outdated, or loaded from another folder).
+    public var extensionNote: String?
 
     public init(
         id: String,
@@ -817,7 +830,13 @@ public struct BrowserProfileStatus: Codable, Equatable, Identifiable, Sendable {
         tabCount: Int,
         streamingTabId: Int? = nil,
         streamingUrl: String? = nil,
-        streamingTitle: String? = nil
+        streamingTitle: String? = nil,
+        extensionId: String? = nil,
+        extensionSource: String? = nil,
+        bundledExtensionVersion: String? = nil,
+        extensionOutdated: Bool? = nil,
+        extensionReloadable: Bool? = nil,
+        extensionNote: String? = nil
     ) {
         self.id = id
         self.profileName = profileName
@@ -827,6 +846,24 @@ public struct BrowserProfileStatus: Codable, Equatable, Identifiable, Sendable {
         self.streamingTabId = streamingTabId
         self.streamingUrl = streamingUrl
         self.streamingTitle = streamingTitle
+        self.extensionId = extensionId
+        self.extensionSource = extensionSource
+        self.bundledExtensionVersion = bundledExtensionVersion
+        self.extensionOutdated = extensionOutdated
+        self.extensionReloadable = extensionReloadable
+        self.extensionNote = extensionNote
+    }
+}
+
+public struct BrowserReloadExtensionParams: Codable, Equatable, Sendable {
+    /// The Chrome profile to reload (matched like other browser methods). Omit to reload every connected profile.
+    public var profile: String?
+    /// Reload even while agents still have Chrome commands running in that profile (they fail).
+    public var force: Bool?
+
+    public init(profile: String? = nil, force: Bool? = nil) {
+        self.profile = profile
+        self.force = force
     }
 }
 

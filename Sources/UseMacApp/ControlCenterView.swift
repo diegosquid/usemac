@@ -692,12 +692,7 @@ public struct ControlCenterView: View {
 
                 ForEach(Array(appState.connectedBrowserProfiles.enumerated()), id: \.element.id) { _, profile in
                     InsetDivider(leading: 18)
-                    codexRow(
-                        title: profile.profileName,
-                        subtitle: "\(profile.tabCount) open \(profile.tabCount == 1 ? "tab" : "tabs")"
-                    ) {
-                        StatusDot(color: UseMacTheme.statusGreen, label: "Connected")
-                    }
+                    ChromeExtensionProfileRow(appState: appState, profile: profile)
                 }
             }
         }
