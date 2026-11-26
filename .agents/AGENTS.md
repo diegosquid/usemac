@@ -93,7 +93,9 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request; `agent` names you on the preview cards. |
 | `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. |
 
-While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`. UseMac starts in **Autonomous** unless the user picked another mode. Any other mode shows in UseMac's menu bar menu ("Mode: Read-only"), and only the user can relax it or resume.
+While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`.
+
+UseMac starts in **Autonomous** unless the user picked another mode. Any other mode shows in UseMac's menu bar menu ("Mode: Read-only"), and only the user can relax it or resume.
 
 ### Ask mode
 
