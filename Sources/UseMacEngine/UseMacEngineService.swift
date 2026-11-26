@@ -16,6 +16,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     public let chromeBridge: ChromeExtensionBridge
     public let localVision = LocalVisionEngine()
     private let actionExecutor: ActionExecutor
+    /// The audit log on disk; nil keeps it in memory only (tests, in-process CLI calls).
+    public let auditStore: AuditLogStore?
 
     private let stateLock = NSLock()
     private let startedAt = Date()
@@ -78,9 +80,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     public init(
         socketPath: String = UseMacDefaults.defaultSocketPath,
         extensionPort: UInt16 = UseMacDefaults.defaultExtensionPort,
-        bridgeKeyDirectory: URL? = nil
+        bridgeKeyDirectory: URL? = nil,
+        auditStore: AuditLogStore? = nil
     ) {
         self.socketPath = socketPath
+        self.auditStore = auditStore
+        self.auditEntries = auditStore?.recentEntries() ?? []
         let pairingStore = bridgeKeyDirectory.map { BridgePairingStore(directory: $0) } ?? BridgePairingStore()
         self.chromeBridge = ChromeExtensionBridge(port: extensionPort, pairingStore: pairingStore)
         self.actionExecutor = ActionExecutor(
@@ -97,6 +102,17 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     }
 
     public func handle(_ request: RPCRequest) async -> RPCResponse {
+        await handleRequest(request)
+    }
+
+    /// Audit entries read the request from here to name its task and to scrub what it typed.
+    func handleRequest(_ request: RPCRequest) async -> RPCResponse {
+        await AuditRequestContext.$request.withValue(request) {
+            await handleRequestBody(request)
+        }
+    }
+
+    private func handleRequestBody(_ request: RPCRequest) async -> RPCResponse {
         let startNs = DispatchTime.now().uptimeNanoseconds
         incrementRequestCount()
         scheduleCapturePruneIfNeeded()
@@ -307,7 +323,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetApp?.name ?? actReq.app,
-                summary: "Executed \(actResult.stepResults.count) step(s): \(actResult.success ? "ok" : "failed")",
+                summary: "Executed \(actResult.stepResults.count) step(s): \(actResult.success ? "ok" : "failed") · \(AuditRedactor.describeSteps(actReq.steps))",
                 latencyMs: latencyMs,
                 success: actResult.success
             )
@@ -466,7 +482,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }
 
         case .auditLog:
-            let entries = recentAuditEntries(limit: 50)
+            let entries = auditLog(request.auditLog)
             let latencyMs = elapsedMs(since: startNs)
             response = .success(id: request.id, latencyMs: latencyMs, auditEntries: entries)
 
@@ -764,12 +780,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if bridgeResp.ok, let extracted = bridgeResp.extractResult {
                 let auditSummary: String
                 if isEvalMode {
-                    let rawExpression = params.expression ?? ""
-                    let singleLine = rawExpression
-                        .replacingOccurrences(of: "\r\n", with: " ")
-                        .replacingOccurrences(of: "\n", with: " ")
-                        .replacingOccurrences(of: "\r", with: " ")
-                    auditSummary = "Eval (\(rawExpression.count) chars): \(singleLine.prefix(120))"
+                    auditSummary = AuditRedactor.evalSummary(params.expression ?? "")
                 } else {
                     auditSummary = "Extracted \(extracted.mode) (\(extracted.rowCount ?? 0) rows, \(extracted.columnCount ?? 0) cols)"
                 }
@@ -1148,7 +1159,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 appendAudit(
                     method: request.method.rawValue,
                     targetApp: resolvedLabel,
-                    summary: "Executed \(stepCount) browser step(s): \(actionSuccess ? "ok" : "failed")",
+                    summary: "Executed \(stepCount) browser step(s): \(actionSuccess ? "ok" : "failed") · \(AuditRedactor.describeSteps(params.steps))",
                     latencyMs: latencyMs,
                     success: actionSuccess
                 )
@@ -1365,7 +1376,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetLabel,
-                summary: "Vision \(result.mode) [\(result.backend)]: \(result.answer.prefix(80))",
+                summary: AuditRedactor.visionSummary(mode: result.mode, backend: result.backend, answer: result.answer),
                 latencyMs: latencyMs,
                 success: true
             )
@@ -1389,12 +1400,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let summaryText = (params.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? params.summary!.trimmingCharacters(in: .whitespacesAndNewlines)
                 : "Working…"
+            let taskId = taskTabs.start(taskId: params.taskId)
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetName,
                 summary: summaryText,
                 latencyMs: latencyMs,
-                success: true
+                success: true,
+                taskId: taskId
             )
             emitLiveActivity(LiveActivityItem(
                 kind: .taskStart,
@@ -1409,7 +1422,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserProfile: resolvedProfile
             ))
             localVision.warmupIfReady()
-            let taskId = taskTabs.start(taskId: params.taskId)
             response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: taskId)
 
         case .taskComplete:
@@ -1434,7 +1446,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 targetApp: targetName,
                 summary: summaryText,
                 latencyMs: latencyMs,
-                success: true
+                success: true,
+                taskId: completion.taskId
             )
             emitLiveActivity(LiveActivityItem(
                 kind: .taskComplete,
@@ -1997,15 +2010,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         targetApp: String?,
         summary: String,
         latencyMs: Double,
-        success: Bool
+        success: Bool,
+        taskId: String? = nil
     ) {
+        let request = AuditRequestContext.request
+        let hint = request?.auditTaskHint
         let entry = AuditEntry(
             timestampMs: Int64(Date().timeIntervalSince1970 * 1000),
             method: method,
             targetApp: targetApp,
-            summary: summary,
+            summary: AuditRedactor.scrub(summary, secrets: request?.auditSecrets ?? []),
             latencyMs: latencyMs,
-            success: success
+            success: success,
+            taskId: taskId ?? taskTabs.resolve(taskId: hint?.taskId, tabId: hint?.tabId)
         )
 
         stateLock.lock()
@@ -2014,6 +2031,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             auditEntries.removeFirst(auditEntries.count - 500)
         }
         stateLock.unlock()
+        auditStore?.append(entry)
     }
 
     private func emitLiveActivity(_ item: LiveActivityItem) {

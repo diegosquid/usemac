@@ -220,7 +220,7 @@ public final class AppState: ObservableObject {
     private var policyBeforePause: GovernancePolicy?
 
     public init(socketPath: String = UseMacDefaults.defaultSocketPath) {
-        let engineService = UseMacEngineService(socketPath: socketPath)
+        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore())
         let defaults = UserDefaults.standard
 
         let savedPolicy = defaults.string(forKey: DefaultsKeys.safetyPolicy)
