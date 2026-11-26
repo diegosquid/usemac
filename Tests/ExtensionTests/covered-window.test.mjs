@@ -7,7 +7,8 @@ const { createBackgroundSandbox } = require("./support/background-sandbox.cjs");
 
 // The active tab of a window covered by other windows counts as visible (isTabVisibleToUser), but Chrome stops
 // painting it, so its screencast goes quiet. When that happens and the page reports document.visibilityState
-// "hidden", the tab goes back to screenshot polling at its real size, until the page is visible again.
+// "hidden", the tab goes back to screenshot polling at its real size, until the page is visible again. No tab is
+// ever resized: the only metrics call is the clearDeviceMetricsOverride sent when attaching.
 const SET = "Emulation.setDeviceMetricsOverride";
 const CLEAR = "Emulation.clearDeviceMetricsOverride";
 const VISIBLE = 21;
@@ -82,7 +83,7 @@ test("a visible tab whose window is covered goes back to screenshot polling at i
 
   await waitFor(() => covered(sb, VISIBLE), "the covered window to be detected");
   await assertPolls(sb, VISIBLE);
-  // No metrics override: the page keeps its layout and the user sees no reflow when the window comes back.
+  // No metrics override (only the clear sent when attaching): the page keeps its layout.
   assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
   const frames = sb.sent.filter((f) => f.type === "frame" && f.tabId === VISIBLE);
   assert.ok(frames.length >= 2, "the preview keeps getting frames");
@@ -144,7 +145,7 @@ test("a tab whose screencast keeps sending frames is not probed", async (t) => {
   assert.equal(pumpRunning(sb, VISIBLE), false);
 });
 
-test("a covered tab the user switches away from keeps the hidden-tab mode, and starts over when shown", async (t) => {
+test("a covered tab the user switches away from keeps polling as a hidden tab, and starts over when shown", async (t) => {
   const page = { visibility: "hidden", probes: 0 };
   const sb = createBackgroundSandbox({
     tabs: [
@@ -166,15 +167,14 @@ test("a covered tab the user switches away from keeps the hidden-tab mode, and s
   await waitFor(() => covered(sb, VISIBLE), "the covered window to be detected");
 
   sb.activateTab(22);
-  await waitFor(() => sb.eval(`state.tabQueues.size === 0`) && !covered(sb, VISIBLE), "the hidden-tab mode");
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET], "a hidden tab gets the override as before");
+  await waitFor(() => sb.eval(`state.tabQueues.size === 0`) && !covered(sb, VISIBLE), "the hidden-tab polling");
   await assertPolls(sb, VISIBLE);
 
   page.visibility = "visible";
   sb.activateTab(VISIBLE);
   await waitFor(() => sb.eval(`state.tabQueues.size === 0`), "the visibility sync");
   await waitFor(() => !pumpRunning(sb, VISIBLE), "the pump to stop");
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR], "never resized, hidden or shown");
   await assertNoPolling(sb, VISIBLE);
 });
 

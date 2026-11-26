@@ -14,8 +14,12 @@ const EXTENSION_VERSION = (() => {
   }
 })();
 const KEEPALIVE_ALARM = "usemac-keepalive";
-const VIEWPORT_WIDTH = 1280;
-const VIEWPORT_HEIGHT = 800;
+// UseMac never changes a tab's size. These are only reported while a page could not be measured yet (see
+// refreshLiveViewport); nothing applies them to the page.
+const FALLBACK_VIEWPORT_WIDTH = 1280;
+const FALLBACK_VIEWPORT_HEIGHT = 800;
+// Below this (CSS px, either side) a measured size is not usable: a tab Chrome has not laid out yet.
+const MIN_USABLE_VIEWPORT = 100;
 const IDLE_TIMEOUT_MS = 180000;
 const CAPTURE_INTERVAL_MS = 240;
 const CAPTURE_STALE_MS = 220;
@@ -174,17 +178,9 @@ function getOrCreateTabSession(tabId) {
       capturePumpTimer: null,
       captureInFlight: false,
       idleTimer: null,
-      // Metrics emulated while the tab is hidden (or for an explicit viewport request).
-      viewportWidth: VIEWPORT_WIDTH,
-      viewportHeight: VIEWPORT_HEIGHT,
-      deviceScaleFactor: 1,
-      // Whether the user can see the tab (see isTabVisibleToUser). A visible tab has no metrics override and
-      // keeps its real window size, measured into liveViewport ({ width, height, scale }).
+      // Whether the user can see the tab (see isTabVisibleToUser). Only decides where preview frames come from.
       visibleToUser: false,
-      metricsOverridden: false,
-      // A hidden tab the user has seen is emulated at its last on-screen size (see hiddenTabMetrics).
-      metricsKeepLiveLayout: false,
-      explicitViewport: false,
+      // The page's real size, as last measured: { width, height, scale, zoom } (see refreshLiveViewport).
       liveViewport: null,
       // A visible tab whose window is covered polls again (see checkCoveredWhileVisible).
       lastScreencastFrameAt: 0,
@@ -894,40 +890,19 @@ async function evictOldestSessionIfNeeded(keepingTabId) {
 }
 
 // --- Visible vs hidden tabs ---------------------------------------------------------------------------------------
-// Chrome does not paint a background tab at a useful size, so a hidden tab gets a metrics override and a screenshot
-// pump that keeps the preview fresh. The override is the size the tab last had on screen, so switching away does not
-// reflow it (1280x800 for a tab never seen, or an explicit viewport request's size). A tab the
-// user is looking at keeps its real window size: no override (forcing 1280 px there leaves white space beside the
-// page) and no pump (polling screenshots there forces repaints, which flicker). Its preview comes from the screencast.
+// UseMac never changes a tab's size: every tab lays out at the size Chrome gives it, and coordinates use that real
+// size (see refreshLiveViewport). Visibility only decides where preview frames come from. A hidden tab gets a
+// screenshot pump that keeps the preview fresh. A tab the user is looking at gets no pump (polling screenshots there
+// forces repaints, which flicker); its preview comes from the screencast.
 
-function hasExplicitViewport(opts) {
-  return opts?.viewportWidth != null || opts?.viewportHeight != null || opts?.deviceScaleFactor != null;
-}
-
-// CSS-pixel size and pixel ratio the page lays out into right now: the real window of a visible tab, otherwise the
-// emulated metrics.
+// CSS-pixel size and pixel ratio the page lays out into, as last measured. Until a measurement works this is
+// FALLBACK_VIEWPORT_WIDTH x FALLBACK_VIEWPORT_HEIGHT, which is only reported, never applied.
 function effectiveViewport(session) {
-  if (session?.liveViewport && !session.metricsOverridden) {
-    return session.liveViewport;
-  }
-  if (session?.liveViewport && session.metricsKeepLiveLayout) {
-    // Hidden, but emulating the size it had on screen: same layout, rendered at the override's pixel ratio.
-    const zoom = session.liveViewport.zoom || 1;
-    return {
-      width: session.liveViewport.width,
-      height: session.liveViewport.height,
-      scale: (session.deviceScaleFactor || 1) * zoom
-    };
-  }
-  return {
-    width: session?.viewportWidth || VIEWPORT_WIDTH,
-    height: session?.viewportHeight || VIEWPORT_HEIGHT,
-    scale: session?.deviceScaleFactor || 1
-  };
+  return session?.liveViewport || { width: FALLBACK_VIEWPORT_WIDTH, height: FALLBACK_VIEWPORT_HEIGHT, scale: 1 };
 }
 
 // The user can see a tab when it is the active tab of a window that is not minimized. A failed lookup counts as
-// hidden, which keeps the override and the pump.
+// hidden, which keeps the pump.
 async function isTabVisibleToUser(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -939,96 +914,68 @@ async function isTabVisibleToUser(tabId) {
   }
 }
 
+// Measures the page's real size into session.liveViewport. A tab Chrome has not laid out yet can report 0x0 (or
+// close to it): then the tab's size in Chrome is used instead, and if that is not known either the last
+// measurement stays.
 async function refreshLiveViewport(tabId, session) {
+  let measured = null;
   try {
     const res = await sendCDP(tabId, "Runtime.evaluate", {
       expression: "({ width: window.innerWidth, height: window.innerHeight, scale: window.devicePixelRatio })",
       returnByValue: true
     });
-    const v = res?.result?.value;
-    if (v && Number(v.width) > 0 && Number(v.height) > 0) {
-      // The page zoom turns window pixels into CSS pixels (at 90%, a 1512 px window lays out 1680 px wide).
-      let zoom = 1;
-      try {
-        const z = Number(await chrome.tabs.getZoom(tabId));
-        if (z > 0) zoom = z;
-      } catch (_) {}
-      session.liveViewport = {
-        width: Math.round(Number(v.width)),
-        height: Math.round(Number(v.height)),
-        scale: Number(v.scale) > 0 ? Number(v.scale) : 1,
-        zoom
-      };
-    }
+    measured = res?.result?.value || null;
   } catch (_) {}
-}
-
-// The metrics a hidden tab is emulated at. An explicit viewport request wins. A tab the user has seen keeps the
-// size it had on screen, so leaving it does not reflow the page under the agent or the user. A tab never seen
-// gets 1280x800.
-function hiddenTabMetrics(session) {
-  const live = session.liveViewport;
-  if (!session.explicitViewport && live) {
-    const zoom = live.zoom || 1;
-    const width = Math.round(live.width * zoom);
-    const height = Math.round(live.height * zoom);
-    const fits = width >= 400 && width <= 3840 && height >= 300 && height <= 2400;
-    if (fits) return { width, height, keepsLiveLayout: true };
+  // The page zoom turns window pixels into CSS pixels (at 90%, a 1512 px window lays out 1680 px wide).
+  let zoom = 1;
+  try {
+    const z = Number(await chrome.tabs.getZoom(tabId));
+    if (z > 0) zoom = z;
+  } catch (_) {}
+  let width = Number(measured?.width) || 0;
+  let height = Number(measured?.height) || 0;
+  const scale = Number(measured?.scale) > 0 ? Number(measured.scale) : session.liveViewport?.scale || 1;
+  if (width < MIN_USABLE_VIEWPORT || height < MIN_USABLE_VIEWPORT) {
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (_) {}
+    width = Number(tab?.width) / zoom || 0;
+    height = Number(tab?.height) / zoom || 0;
+    if (width < MIN_USABLE_VIEWPORT || height < MIN_USABLE_VIEWPORT) return;
   }
-  return {
-    width: session.viewportWidth || VIEWPORT_WIDTH,
-    height: session.viewportHeight || VIEWPORT_HEIGHT,
-    keepsLiveLayout: false
-  };
+  session.liveViewport = { width: Math.round(width), height: Math.round(height), scale, zoom };
 }
 
-// Puts an attached tab's metrics and capture pump in line with session.visibleToUser.
-async function applyVisibilityMetrics(tabId, session) {
+// Puts an attached tab's capture pump in line with session.visibleToUser.
+function applyCapturePump(tabId, session) {
   if (session.visibleToUser) {
     stopCapturePump(session);
-    await sendCDP(tabId, "Emulation.clearDeviceMetricsOverride");
-    session.metricsOverridden = false;
-    session.metricsKeepLiveLayout = false;
-    await sleep(METRICS_SETTLE_MS);
-    await refreshLiveViewport(tabId, session);
-    return;
-  }
-  const metrics = hiddenTabMetrics(session);
-  await sendCDP(tabId, "Emulation.setDeviceMetricsOverride", {
-    width: metrics.width,
-    height: metrics.height,
-    deviceScaleFactor: session.deviceScaleFactor || 1,
-    mobile: false
-  });
-  session.metricsOverridden = true;
-  session.metricsKeepLiveLayout = metrics.keepsLiveLayout;
-  if (session.streaming && !session.capturePumpTimer) {
+  } else if (session.streaming && !session.capturePumpTimer) {
     startCapturePump(tabId);
   }
 }
 
-// Re-checks one attached tab and switches it to the other mode when the user started or stopped seeing it.
-// `remeasure` also refreshes a visible tab's window size (resize, or a page with another zoom level).
+// Re-checks one attached tab and switches its pump when the user started or stopped seeing it. `remeasure` also
+// refreshes its size (window resize, or a page with another zoom level).
 async function syncTabVisibility(tabId, { remeasure = false } = {}) {
   const session = state.tabSessions.get(tabId);
   if (!session?.attached) return;
   const visible = await isTabVisibleToUser(tabId);
   if (state.tabSessions.get(tabId) !== session || !session.attached) return;
-  const inMode = visible ? !session.metricsOverridden : session.metricsOverridden;
-  if (visible === session.visibleToUser && inMode) {
-    if (visible && remeasure) await refreshLiveViewport(tabId, session);
-    return;
-  }
+  const changed = visible !== session.visibleToUser;
   session.visibleToUser = visible;
-  await applyVisibilityMetrics(tabId, session);
+  if (changed || remeasure) await refreshLiveViewport(tabId, session);
+  if (!changed) return;
+  applyCapturePump(tabId, session);
   if (visible && session.streaming) {
-    // One fresh frame, so the preview does not keep the hidden-tab layout until the screencast sends one.
+    // One fresh frame, so the preview does not wait for the screencast's next one.
     await captureAndEmitFrame(tabId);
   }
 }
 
-// Runs in the tab's command queue, so a running command never sees its page reflow halfway. Repeated events
-// before it runs collapse into one check.
+// Runs in the tab's command queue, so a running command never sees the measured size change halfway. Repeated
+// events before it runs collapse into one check.
 function scheduleVisibilitySync(tabId, { remeasure = false } = {}) {
   const session = state.tabSessions.get(tabId);
   if (!session?.attached) return;
@@ -1049,22 +996,13 @@ function scheduleVisibilitySyncForAttachedTabs(options) {
   }
 }
 
-// An explicit viewport request may override a visible tab for one capture; afterwards it gets its real size back.
-async function restoreVisibleViewport(tabId) {
-  const session = state.tabSessions.get(tabId);
-  if (!session?.attached || !session.visibleToUser || !session.metricsOverridden) return;
-  try {
-    await applyVisibilityMetrics(tabId, session);
-  } catch (_) {}
-}
-
 // --- Covered windows ----------------------------------------------------------------------------------------------
 // isTabVisibleToUser cannot tell a window covered by other windows (or on another Space) from one on screen, and
 // Chrome stops painting a page it knows is occluded, so its screencast goes quiet and the preview froze until the
 // next command. A quiet screencast alone proves nothing (a static page sends no frames either, and polling a tab
 // on screen flickers), so when frames stop the watch asks the page: document.visibilityState is "hidden" only when
-// Chrome is not showing it. Then the tab goes back to screenshot polling, keeping its real size (no metrics
-// override, so nothing reflows), until the page reports "visible" again.
+// Chrome is not showing it. Then the tab goes back to screenshot polling, at its real size like every tab, until
+// the page reports "visible" again.
 const SCREENCAST_STALL_MS = 1000;
 const COVER_CHECK_INTERVAL_MS = CAPTURE_INTERVAL_MS;
 const COVER_PROBE_INTERVAL_MS = 1000;
@@ -1098,7 +1036,7 @@ async function probePageHidden(tabId) {
 
 async function checkCoveredWhileVisible(tabId, session) {
   if (!session.visibleToUser) {
-    // Hidden tabs already poll (applyVisibilityMetrics); the cover state starts over when the tab is shown again.
+    // Hidden tabs already poll (applyCapturePump); the cover state starts over when the tab is shown again.
     session.coveredWhileVisible = false;
     return;
   }
@@ -1132,41 +1070,6 @@ async function checkCoveredWhileVisible(tabId, session) {
   } else if (hidden === false && session.coveredWhileVisible) {
     session.coveredWhileVisible = false;
     stopCapturePump(session);
-  }
-}
-
-async function applyViewportMetrics(tabId, width = null, height = null, scale = null) {
-  const session = getOrCreateTabSession(tabId);
-  const nextW = width != null ? clamp(Math.round(Number(width)), 400, 3840) : session.viewportWidth;
-  const nextH = height != null ? clamp(Math.round(Number(height)), 300, 2400) : session.viewportHeight;
-  const nextScale = scale != null ? clamp(Number(scale), 1, 3) : session.deviceScaleFactor;
-
-  if (
-    session.attached &&
-    session.metricsOverridden &&
-    session.explicitViewport &&
-    nextW === session.viewportWidth &&
-    nextH === session.viewportHeight &&
-    Math.abs(nextScale - session.deviceScaleFactor) < 0.01
-  ) {
-    return;
-  }
-
-  session.viewportWidth = nextW;
-  session.viewportHeight = nextH;
-  session.deviceScaleFactor = nextScale;
-  // From now on this size is also the tab's hidden size, as before (see hiddenTabMetrics).
-  session.explicitViewport = true;
-  session.metricsKeepLiveLayout = false;
-
-  if (session.attached) {
-    await sendCDP(tabId, "Emulation.setDeviceMetricsOverride", {
-      width: nextW,
-      height: nextH,
-      deviceScaleFactor: nextScale,
-      mobile: false
-    });
-    session.metricsOverridden = true;
   }
 }
 
@@ -1207,8 +1110,14 @@ async function ensureAttached(tabId) {
   } catch (_) {
     // Non-fatal on older Chrome builds without flattened OOPIF auto-attach
   }
+  // UseMac never resizes a tab, but an older extension version may have left a metrics override on this one: clear
+  // it so the page gets its real size back, then measure that size.
+  try {
+    await sendCDP(tabId, "Emulation.clearDeviceMetricsOverride");
+    await sleep(METRICS_SETTLE_MS);
+  } catch (_) {}
   session.visibleToUser = await isTabVisibleToUser(tabId);
-  await applyVisibilityMetrics(tabId, session);
+  await refreshLiveViewport(tabId, session);
   await sendCDP(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true });
   // Give already-loaded OOPIF targets a brief moment to emit Target.attachedToTarget
   await sleep(35);
@@ -2290,8 +2199,8 @@ function buildFrameIndexExpression({
   limit = 280,
   includeText = true,
   includeTables = true,
-  curVpW = VIEWPORT_WIDTH,
-  curVpH = VIEWPORT_HEIGHT,
+  curVpW = FALLBACK_VIEWPORT_WIDTH,
+  curVpH = FALLBACK_VIEWPORT_HEIGHT,
   isTopFrame = true,
   offsetX = 0,
   offsetY = 0
@@ -2879,32 +2788,16 @@ function buildFrameIndexExpression({
     })()`;
 }
 
+// Observes the page at its real size. viewportWidth/viewportHeight/deviceScaleFactor on the request are ignored:
+// UseMac never resizes a tab.
 async function observeTab(tabId, maxElements = 280, options = {}) {
-  try {
-    return await observeTabNow(tabId, maxElements, options);
-  } finally {
-    // An explicit viewport may have overridden a tab the user is looking at; give it its real size back.
-    if (hasExplicitViewport(options)) await restoreVisibleViewport(tabId);
-  }
-}
-
-async function observeTabNow(tabId, maxElements = 280, options = {}) {
   const start = performance.now();
   const limit = clamp(Number(maxElements) || 280, 1, 600);
   const includeText = options.includeText !== false;
   const includeTables = options.includeTables !== false;
 
-  if (hasExplicitViewport(options)) {
-    await applyViewportMetrics(
-      tabId,
-      options.viewportWidth ?? null,
-      options.viewportHeight ?? null,
-      options.deviceScaleFactor ?? null
-    );
-    await sleep(90);
-  }
-
   const session = getOrCreateTabSession(tabId);
+  await refreshLiveViewport(tabId, session);
   const { width: curVpW, height: curVpH } = effectiveViewport(session);
   session.elementFrameMap.clear();
 
@@ -3113,7 +3006,9 @@ function emitCursor(tabId, x, y, phase, label = null) {
 
 async function moveCursorSmoothly(tabId, targetX, targetY, label = null) {
   const session = getOrCreateTabSession(tabId);
-  const { width: maxW, height: maxH } = effectiveViewport(session);
+  // Clamp to the page's measured size only: the fallback size must not cut off clicks on a wider page.
+  const maxW = session.liveViewport?.width ?? Infinity;
+  const maxH = session.liveViewport?.height ?? Infinity;
   const tx = clamp(Number(targetX), 0, maxW);
   const ty = clamp(Number(targetY), 0, maxH);
   const startX = clamp(session.cursor.x, 0, maxW);
@@ -4599,18 +4494,98 @@ async function handleExtractCommand(req, preResolvedTab = null) {
   };
 }
 
-async function handleScreenshotCommand(req, preResolvedTab = null) {
-  const start = performance.now();
-  const tab = preResolvedTab || await resolveTargetTab(req.tabId);
+// --- Screenshot size --------------------------------------------------------------------------------------------
+// A screenshot shows the page at its real size. viewportWidth/viewportHeight on a screenshot request are a box in
+// image pixels: a bigger capture is scaled down to fit inside it, keeping its aspect ratio (never scaled up).
+// deviceScaleFactor is ignored.
+
+function screenshotBox(req) {
+  const width = Number(req?.viewportWidth) > 0 ? Math.round(Number(req.viewportWidth)) : null;
+  const height = Number(req?.viewportHeight) > 0 ? Math.round(Number(req.viewportHeight)) : null;
+  return width || height ? { width, height } : null;
+}
+
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+// Width and height from a JPEG's frame header, or null when there is none. The header sits near the start, so only
+// the first 48 KB are decoded.
+function jpegSize(base64) {
+  let bytes;
   try {
-    return await captureTabScreenshot(req, tab, start);
+    bytes = base64ToBytes(String(base64).slice(0, 65536));
+  } catch (_) {
+    return null;
+  }
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 <= bytes.length) {
+    if (bytes[i] !== 0xff) return null;
+    const marker = bytes[i + 1];
+    // SOF0..SOF15, except DHT (C4), JPG (C8) and DAC (CC), which share the range.
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      const height = (bytes[i + 5] << 8) | bytes[i + 6];
+      const width = (bytes[i + 7] << 8) | bytes[i + 8];
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    i += 2 + ((bytes[i + 2] << 8) | bytes[i + 3]);
+  }
+  return null;
+}
+
+// The size an image of width x height gets inside `box`: the same when it fits, otherwise scaled down.
+function sizeInBox(width, height, box) {
+  let w = width;
+  let h = height;
+  if (box.width && w > box.width) {
+    h = (h * box.width) / w;
+    w = box.width;
+  }
+  if (box.height && h > box.height) {
+    w = (w * box.height) / h;
+    h = box.height;
+  }
+  return {
+    width: clamp(Math.round(w), 1, box.width || Infinity),
+    height: clamp(Math.round(h), 1, box.height || Infinity)
+  };
+}
+
+// Scales a JPEG down to fit inside `box` (createImageBitmap and OffscreenCanvas, which the service worker has).
+// Throws when the image can't be decoded.
+async function fitJpegInBox(base64, box, quality) {
+  const bitmap = await createImageBitmap(new Blob([base64ToBytes(base64)], { type: "image/jpeg" }));
+  try {
+    const target = sizeInBox(bitmap.width, bitmap.height, box);
+    if (target.width === bitmap.width && target.height === bitmap.height) {
+      return { data: base64, width: bitmap.width, height: bitmap.height };
+    }
+    const canvas = new OffscreenCanvas(target.width, target.height);
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(bitmap, 0, 0, target.width, target.height);
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: quality / 100 });
+    return { data: bytesToBase64(new Uint8Array(await blob.arrayBuffer())), ...target };
   } finally {
-    // An explicit viewport may have overridden a tab the user is looking at; give it its real size back.
-    if (hasExplicitViewport(req)) await restoreVisibleViewport(tab.id);
+    bitmap.close?.();
   }
 }
 
-async function captureTabScreenshot(req, tab, start) {
+async function handleScreenshotCommand(req, preResolvedTab = null) {
+  const start = performance.now();
+  const tab = preResolvedTab || await resolveTargetTab(req.tabId);
   await assertTabScriptable(tab.id);
   if (req.tabId != null) {
     await ensureTabInUsemacGroup(tab.id);
@@ -4619,25 +4594,17 @@ async function captureTabScreenshot(req, tab, start) {
   resetIdleTimer(tab.id);
   captureAndEmitFrame(tab.id).catch(() => {});
 
-  if (hasExplicitViewport(req)) {
-    await applyViewportMetrics(
-      tab.id,
-      req.viewportWidth ?? null,
-      req.viewportHeight ?? null,
-      req.deviceScaleFactor ?? null
-    );
-    await sleep(100);
-  }
-
   const session = getOrCreateTabSession(tab.id);
-  const scale = session.deviceScaleFactor || 1;
+  await refreshLiveViewport(tab.id, session);
   const quality = clamp(Number(req.quality) || 84, 30, 100);
   const fullPage = req.fullPage === true;
 
+  // outW/outH estimate the image size (CSS px times the page's pixel ratio) for when the JPEG header can't be read.
   let clip = undefined;
   const viewport = effectiveViewport(session);
-  let outW = Math.round(viewport.width * viewport.scale);
-  let outH = Math.round(viewport.height * viewport.scale);
+  const pixelRatio = viewport.scale || 1;
+  let outW = Math.round(viewport.width * pixelRatio);
+  let outH = Math.round(viewport.height * pixelRatio);
 
   if (req.elementId || req.selector) {
     const selLit = req.elementId
@@ -4697,17 +4664,17 @@ async function captureTabScreenshot(req, tab, start) {
     if (!box) {
       throw { code: "ELEMENT_NOT_FOUND", message: `Screenshot target ${req.elementId || req.selector} not found.` };
     }
-    clip = { x: box.x, y: box.y, width: box.width, height: box.height, scale };
-    outW = Math.round(box.width * scale);
-    outH = Math.round(box.height * scale);
+    clip = { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 };
+    outW = Math.round(box.width * pixelRatio);
+    outH = Math.round(box.height * pixelRatio);
   } else if (fullPage) {
     const metrics = await sendCDP(tab.id, "Page.getLayoutMetrics").catch(() => null);
     const cs = metrics?.cssContentSize || metrics?.contentSize;
     if (cs && cs.width > 0 && cs.height > 0) {
       const cappedH = Math.min(cs.height, 6000);
-      clip = { x: 0, y: 0, width: cs.width, height: cappedH, scale };
-      outW = Math.round(cs.width * scale);
-      outH = Math.round(cappedH * scale);
+      clip = { x: 0, y: 0, width: cs.width, height: cappedH, scale: 1 };
+      outW = Math.round(cs.width * pixelRatio);
+      outH = Math.round(cappedH * pixelRatio);
     }
   }
 
@@ -4726,6 +4693,17 @@ async function captureTabScreenshot(req, tab, start) {
     throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
   }
 
+  const capturedSize = jpegSize(cap.data);
+  let shot = { data: cap.data, ...(capturedSize || { width: outW, height: outH }) };
+  const fitBox = screenshotBox(req);
+  if (fitBox) {
+    const fitted = capturedSize && sizeInBox(capturedSize.width, capturedSize.height, fitBox);
+    if (!fitted || fitted.width !== capturedSize.width || fitted.height !== capturedSize.height) {
+      // If the image can't be decoded here, the capture is returned as it is, with its own size.
+      shot = (await fitJpegInBox(cap.data, fitBox, quality).catch(() => null)) || shot;
+    }
+  }
+
   const tabInfo = await refreshTabMeta(tab.id);
   const latencyMs = Math.round((performance.now() - start) * 100) / 100;
   resetIdleTimer(tab.id);
@@ -4738,9 +4716,9 @@ async function captureTabScreenshot(req, tab, start) {
     profileName: state.profileName,
     url: tabInfo?.url || session.url,
     title: tabInfo?.title || session.title,
-    screenshotBase64: cap.data,
-    screenshotWidth: outW,
-    screenshotHeight: outH,
+    screenshotBase64: shot.data,
+    screenshotWidth: shot.width,
+    screenshotHeight: shot.height,
     screenshotLatencyMs: latencyMs,
     snapshot: null,
     actionResult: null,
@@ -5027,10 +5005,7 @@ async function handleObserveCommand(req, preResolvedTab = null) {
   const { tab: tabInfo, snapshot, screenshotBase64 } = await observeTab(tab.id, req.maxElements || 280, {
     includeText: req.includeText !== false,
     includeTables: req.includeTables !== false,
-    includeScreenshot: req.includeScreenshot === true,
-    viewportWidth: req.viewportWidth ?? null,
-    viewportHeight: req.viewportHeight ?? null,
-    deviceScaleFactor: req.deviceScaleFactor ?? null
+    includeScreenshot: req.includeScreenshot === true
   });
   resetIdleTimer(tab.id);
 

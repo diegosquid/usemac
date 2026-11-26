@@ -2,8 +2,8 @@ import Foundation
 import Darwin
 
 public enum UseMacDefaults {
-    public static let version = "0.6.0-beta.3"
-    public static let buildNumber = "62"
+    public static let version = "0.7.0-beta.1"
+    public static let buildNumber = "63"
     public static let applicationSupportFolderName = "UseMac"
 
     /// Private per-user folder (mode 0700) that holds the default socket, like tmux's `/tmp/tmux-$UID`.
@@ -923,6 +923,8 @@ public struct BrowserObserveParams: Codable, Equatable, Sendable {
     public var includeTables: Bool?
     public var includeScreenshot: Bool?
     public var returnImageContent: Bool?
+    /// Ignored, like `viewportHeight` and `deviceScaleFactor`: UseMac never resizes a tab. Kept so older clients
+    /// still decode.
     public var viewportWidth: Int?
     public var viewportHeight: Int?
     public var deviceScaleFactor: Double?
@@ -1125,8 +1127,11 @@ public struct BrowserScreenshotParams: Codable, Equatable, Sendable {
     public var selector: String?
     public var elementId: String?
     public var fullPage: Bool?
+    /// With `viewportHeight`, a box in image pixels: a bigger capture is scaled down to fit inside it, keeping its
+    /// aspect ratio. The tab itself is never resized.
     public var viewportWidth: Int?
     public var viewportHeight: Int?
+    /// Ignored: the capture uses the tab's own pixel density.
     public var deviceScaleFactor: Double?
     public var quality: Int?
     public var returnImageContent: Bool?
@@ -1621,6 +1626,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     public var taskTabIds: [Int]?
     /// The agent or client of the task the item belongs to, shown on its preview card.
     public var agentName: String?
+    /// The task the item belongs to, when UseMac could tell. The preview gives each task's cards one color.
+    public var taskId: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -1643,7 +1650,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         browserProfile: String? = nil,
         targetGuessed: Bool? = nil,
         taskTabIds: [Int]? = nil,
-        agentName: String? = nil
+        agentName: String? = nil,
+        taskId: String? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1666,6 +1674,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.targetGuessed = targetGuessed
         self.taskTabIds = taskTabIds
         self.agentName = agentName
+        self.taskId = taskId
     }
 }
 

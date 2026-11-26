@@ -88,8 +88,9 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   Modes: `"auto"`, `"tables"` (supports `scanHorizontal: true`), `"kpis"`, `"text"` (all read-only), `"downloads"` (lists only downloads started during the UseMac session), and `"eval"` (`"expression": "..."`). Note: `"eval"` runs arbitrary JavaScript in the page, is only allowed in `autonomous` mode and, once the user allows it, in `ask` mode (blocked under `confirmSensitive`, `readOnly`, and `paused`), and the audit history records each expression's length, not its source.
 - **Capture browser tab or cropped chart/element screenshot (inline image block in MCP)**:
   ```json
-  {"id":"b3s","method":"browser_screenshot","browserScreenshot":{"tabId":123,"viewportWidth":1440,"viewportHeight":900,"deviceScaleFactor":2,"returnImageContent":true}}
+  {"id":"b3s","method":"browser_screenshot","browserScreenshot":{"tabId":123,"viewportWidth":1280,"viewportHeight":800,"returnImageContent":true}}
   ```
+  UseMac never resizes a tab: pages are observed and captured at the size Chrome gives them. On `browser_screenshot`, `viewportWidth`/`viewportHeight` are the largest image size (a bigger capture is scaled down to fit, keeping its aspect ratio). `browser_observe` ignores them, and `deviceScaleFactor` is ignored everywhere.
 - **Act on `@b1..@bN` DOM refs or CSS selectors (works across OOPIF iframes & Shadow DOM; supports `navigate`/`openURL`, `"readOnly": true`, `"verify": "..."` for on-device visual verification, or `"returnImageContent": true` for an inline post-action screenshot)**:
   ```json
   {"id":"b4","method":"browser_act","browserAct":{"tabId":123,"readOnly":false,"verify":"Record values appeared with no errors","steps":[{"action":"hover","elementId":"@b8"},{"action":"wait","selector":"[role='gridcell']","durationMs":6000},{"action":"click","elementId":"@b3"}]}}
@@ -126,10 +127,10 @@ USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" browser tabs --query "analytics"
 "$USEMAC" browser open "https://example.com" [--tab <id>] [--new-window]
 "$USEMAC" browser open --tab <id> --activate
-"$USEMAC" browser observe [--tab <id>] [--screenshot] [--width 1440 --height 900 --scale 2]
+"$USEMAC" browser observe [--tab <id>] [--screenshot]
 "$USEMAC" browser extract tables --tab <id> --scan-horizontal
 "$USEMAC" browser extract downloads
-"$USEMAC" browser screenshot --tab <id> [--selector "<css>"] [--scale 2]
+"$USEMAC" browser screenshot --tab <id> [--selector "<css>"] [--width 1280 --height 800]
 "$USEMAC" browser act '[{"action":"hover","elementId":"@b1"}]' [--tab <id>] [--read-only] [--verify "Expected state"] [--screenshot]
 "$USEMAC" browser reload-extension [--profile <name>]   # only when the user asks: stops all browser work
 "$USEMAC" vision status
@@ -181,7 +182,7 @@ Each tool exposes MCP `annotations` (`readOnlyHint`, `destructiveHint`). On time
 6. **Analyze Dashboards & Data Apps Cleanly**:
    - First call `browser_tabs` to find the user's already logged-in tab (`tabId`) instead of opening a new tab.
    - Use `browser_extract(mode: "tables", scanHorizontal: true)` to pull all columns (including off-screen virtualized columns) as clean Markdown tables — or click **Export CSV** and inspect `downloadPath` / `browser_extract(mode: "downloads")` to read exported files downloaded during the current UseMac session.
-   - When the main model needs to inspect charts, funnels, or visual creatives, call `usemac_browser_screenshot(returnImageContent: true, viewportWidth: 1440, viewportHeight: 900, deviceScaleFactor: 2)` (optionally cropped to a `selector` / `elementId`) or `usemac_browser_observe(returnImageContent: true)`.
+   - When the main model needs to inspect charts, funnels, or visual creatives, call `usemac_browser_screenshot(returnImageContent: true)` (optionally cropped to a `selector` / `elementId`, and with `viewportWidth`/`viewportHeight` to cap the image size; the tab is never resized) or `usemac_browser_observe(returnImageContent: true)`.
    - Use `"readOnly": true` on `browser_act` (or **Read-only** mode in UseMac → Settings → General → Safety) whenever auditing sensitive dashboards so mutating clicks and toggles are blocked.
    - For articles and text pages, `browser_observe` (with `includeText: true`, default) returns clean visible text in `READABLE TEXT`.
 7. **Fill Forms & Upload Files Without Opening Finder (`uploadFile` + `<select>`)**:

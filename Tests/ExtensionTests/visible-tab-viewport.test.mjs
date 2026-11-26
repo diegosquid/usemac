@@ -4,9 +4,12 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { createBackgroundSandbox } = require("./support/background-sandbox.cjs");
+const { fakeJpeg, base64Size } = require("./support/fake-jpeg.cjs");
 
-// A tab the user is looking at keeps its real window size and gets no screenshot polling; a hidden tab keeps the
-// 1280x800 metrics override and the capture pump (CAPTURE_INTERVAL_MS = 240 ms).
+// UseMac never changes a tab's size. Every tab lays out at the size Chrome gives it and reports that size. A tab the
+// user is looking at gets its preview from the screencast; a hidden tab gets the capture pump (CAPTURE_INTERVAL_MS =
+// 240 ms). The only metrics call is one clearDeviceMetricsOverride when attaching, for a tab an older version left
+// overridden.
 const PUMP_WINDOW_MS = 650; // at least two pump ticks
 const SET = "Emulation.setDeviceMetricsOverride";
 const CLEAR = "Emulation.clearDeviceMetricsOverride";
@@ -36,6 +39,13 @@ const cdpMethods = (sb, tabId) =>
 const metricsCalls = (sb, tabId) => cdpMethods(sb, tabId).filter((m) => m === SET || m === CLEAR);
 const screenshotCount = (sb, tabId) => cdpMethods(sb, tabId).filter((m) => m === "Page.captureScreenshot").length;
 const pumpRunning = (sb, tabId) => sb.eval(`Boolean(state.tabSessions.get(${tabId})?.capturePumpTimer)`);
+const viewportOf = (sb, tabId) =>
+  JSON.parse(sb.eval(`JSON.stringify(effectiveViewport(state.tabSessions.get(${tabId})))`));
+
+function assertNeverResized(sb) {
+  const sets = sb.callsTo("debugger.sendCommand").filter((c) => c.args[1] === SET);
+  assert.deepEqual(sets, [], "no tab ever gets Emulation.setDeviceMetricsOverride");
+}
 
 async function waitFor(predicate, message, timeoutMs = 2000) {
   const startedAt = Date.now();
@@ -54,6 +64,12 @@ async function observe(sb, tabId, extra = {}) {
   return response;
 }
 
+async function screenshot(sb, tabId, extra = {}) {
+  const { response } = await sb.request({ type: "request", id: nextId(), command: "screenshot", tabId, ...extra });
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  return response;
+}
+
 async function assertPumpPolls(sb, tabId) {
   assert.equal(pumpRunning(sb, tabId), true, `tab ${tabId} has a capture pump`);
   const before = screenshotCount(sb, tabId);
@@ -68,39 +84,50 @@ async function assertNoPolling(sb, tabId) {
   assert.equal(screenshotCount(sb, tabId), before, `tab ${tabId} gets no polling screenshots`);
 }
 
-test("a hidden tab gets the 1280x800 metrics override and the screenshot pump", async (t) => {
-  const overrides = [];
-  const sb = withSandbox(t, {
-    cdp: (tabId, method, params) => {
-      if (method === SET) overrides.push([tabId, params.width, params.height]);
-    }
-  });
+// A Retina window: 1728x1004 CSS px at a pixel ratio of 2, so a capture of the whole tab is 3456x2008.
+const RETINA = { width: 1728, height: 1004, scale: 2 };
+const retinaCdp = (extra = () => undefined) => (tabId, method, params) => {
+  if (method === "Runtime.evaluate" && String(params?.expression || "").includes("window.innerWidth, height: window.innerHeight")) {
+    return { result: { value: RETINA } };
+  }
+  if (method === "Page.captureScreenshot") return { data: fakeJpeg(3456, 2008) };
+  return extra(tabId, method, params);
+};
+
+test("a hidden tab is never resized and still gets the screenshot pump", async (t) => {
+  const sb = withSandbox(t, { cdp: retinaCdp() });
   await observe(sb, HIDDEN);
 
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [SET]);
-  assert.deepEqual(overrides, [[HIDDEN, 1280, 800]]);
+  assert.deepEqual(metricsCalls(sb, HIDDEN), [CLEAR], "only the clear sent when attaching");
+  assert.deepEqual(viewportOf(sb, HIDDEN), { ...RETINA, zoom: 1 }, "it reports the size Chrome gave it");
   await assertPumpPolls(sb, HIDDEN);
+  const frame = sb.sent.filter((f) => f.type === "frame" && f.tabId === HIDDEN).at(-1);
+  assert.deepEqual([frame.viewportWidth, frame.viewportHeight], [1728, 1004]);
+  assertNeverResized(sb);
 });
 
-test("the active tab of a normal window keeps its real size and is not polled for screenshots", async (t) => {
+test("the active tab of a normal window is never resized and is not polled for screenshots", async (t) => {
   const sb = withSandbox(t);
   await observe(sb, VISIBLE);
 
   assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
   assert.ok(cdpMethods(sb, VISIBLE).includes("Page.startScreencast"), "frames come from the screencast");
+  assert.ok(cdpMethods(sb, VISIBLE).includes("Emulation.setFocusEmulationEnabled"), "focus emulation stays");
   assert.ok(screenshotCount(sb, VISIBLE) <= 1, "at most the one frame sent when streaming starts");
   await assertNoPolling(sb, VISIBLE);
+  assertNeverResized(sb);
 });
 
 test("the active tab of a minimized window counts as hidden", async (t) => {
   const sb = withSandbox(t, { windows: [{ id: 1, focused: false, state: "minimized" }] });
   await observe(sb, VISIBLE);
 
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [SET]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
   await assertPumpPolls(sb, VISIBLE);
+  assertNeverResized(sb);
 });
 
-test("switching tabs moves the override and the pump to the tab the user left", async (t) => {
+test("switching tabs moves the pump to the tab the user left and resizes neither", async (t) => {
   const sb = withSandbox(t);
   await observe(sb, VISIBLE);
   await observe(sb, HIDDEN);
@@ -109,35 +136,34 @@ test("switching tabs moves the override and the pump to the tab the user left", 
 
   sb.activateTab(HIDDEN);
   await queuesIdle(sb);
-
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [SET, CLEAR], "the tab the user switched to loses the override");
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET], "the tab the user left gets it");
   await Promise.all([assertNoPolling(sb, HIDDEN), assertPumpPolls(sb, VISIBLE)]);
 
   // And back again.
   sb.activateTab(VISIBLE);
   await queuesIdle(sb);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [SET, CLEAR, SET]);
   await Promise.all([assertNoPolling(sb, VISIBLE), assertPumpPolls(sb, HIDDEN)]);
+
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR], "one clear when attaching, nothing after");
+  assert.deepEqual(metricsCalls(sb, HIDDEN), [CLEAR]);
+  assertNeverResized(sb);
 });
 
-test("minimizing and restoring the window switches its active tab between the two modes", async (t) => {
+test("minimizing and restoring the window switches its active tab's pump", async (t) => {
   const sb = withSandbox(t);
   await observe(sb, VISIBLE);
 
   sb.setWindowState(1, "minimized");
   await queuesIdle(sb);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET]);
   assert.equal(pumpRunning(sb, VISIBLE), true);
 
   sb.setWindowState(1, "normal");
   await queuesIdle(sb);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
   await assertNoPolling(sb, VISIBLE);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assertNeverResized(sb);
 });
 
-test("events that change nothing do not touch the metrics", async (t) => {
+test("events that change nothing leave the pumps alone", async (t) => {
   const sb = withSandbox(t);
   await observe(sb, VISIBLE);
   await observe(sb, HIDDEN);
@@ -147,65 +173,90 @@ test("events that change nothing do not touch the metrics", async (t) => {
   sb.events.tabsUpdated.emit(VISIBLE, { status: "complete" }, sb.tabs.get(VISIBLE));
   await queuesIdle(sb);
 
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [SET]);
   assert.equal(pumpRunning(sb, VISIBLE), false);
   assert.equal(pumpRunning(sb, HIDDEN), true);
+  assertNeverResized(sb);
 });
 
-test("an explicit viewport screenshot overrides a visible tab for the capture, then clears it again", async (t) => {
-  const overrides = [];
+test("a window resize re-measures every attached tab, hidden ones too", async (t) => {
+  let live = { width: 1280, height: 720, scale: 2 };
   const sb = withSandbox(t, {
     cdp: (tabId, method, params) => {
-      if (method === SET) overrides.push([tabId, params.width, params.height]);
-      if (method === "Page.captureScreenshot") return { data: JPEG };
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("window.innerWidth, height: window.innerHeight")) {
+        return { result: { value: live } };
+      }
       return undefined;
     }
   });
   await observe(sb, VISIBLE);
+  await observe(sb, HIDDEN);
+  assert.equal(viewportOf(sb, HIDDEN).width, 1280);
 
-  const { response } = await sb.request({
-    type: "request",
-    id: nextId(),
-    command: "screenshot",
-    tabId: VISIBLE,
-    viewportWidth: 1024,
-    viewportHeight: 768
-  });
-  assert.equal(response.ok, true, JSON.stringify(response.error));
-  assert.equal(response.screenshotWidth, 1024);
-  assert.equal(response.screenshotHeight, 768);
-
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
-  assert.deepEqual(overrides, [[VISIBLE, 1024, 768]]);
-  const methods = cdpMethods(sb, VISIBLE);
-  const set = methods.lastIndexOf(SET);
-  const shot = methods.lastIndexOf("Page.captureScreenshot");
-  const clear = methods.lastIndexOf(CLEAR);
-  assert.ok(set < shot && shot < clear, `override, capture, then clear (got ${set}, ${shot}, ${clear})`);
-  assert.equal(sb.eval(`state.tabSessions.get(${VISIBLE}).metricsOverridden`), false);
-  await assertNoPolling(sb, VISIBLE);
+  live = { width: 1600, height: 900, scale: 2 };
+  sb.events.windowsBoundsChanged.emit({ id: 1 });
+  await queuesIdle(sb);
+  assert.deepEqual([viewportOf(sb, VISIBLE).width, viewportOf(sb, VISIBLE).height], [1600, 900]);
+  assert.deepEqual([viewportOf(sb, HIDDEN).width, viewportOf(sb, HIDDEN).height], [1600, 900]);
+  assertNeverResized(sb);
 });
 
-test("an explicit viewport observe restores a visible tab, and still sticks on a hidden one", async (t) => {
-  const overrides = [];
-  const sb = withSandbox(t, {
-    cdp: (tabId, method, params) => {
-      if (method === SET) overrides.push([tabId, params.width, params.height]);
-    }
-  });
-  await observe(sb, VISIBLE);
-  const visible = await observe(sb, VISIBLE, { viewportWidth: 1100, viewportHeight: 700 });
-  assert.equal(visible.snapshot.app.windowBounds.width, 1100, "observed at the requested size");
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
+for (const [name, tabId] of [["visible", VISIBLE], ["hidden", HIDDEN]]) {
+  test(`observe with viewportWidth/viewportHeight/deviceScaleFactor does not resize a ${name} tab`, async (t) => {
+    const sb = withSandbox(t, { cdp: retinaCdp() });
+    const observed = await observe(sb, tabId, { viewportWidth: 1100, viewportHeight: 700, deviceScaleFactor: 2 });
 
-  await observe(sb, HIDDEN, { viewportWidth: 1100, viewportHeight: 700 });
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [SET, SET], "a hidden tab keeps the requested override");
-  assert.deepEqual(overrides, [
-    [VISIBLE, 1100, 700],
-    [HIDDEN, 1280, 800],
-    [HIDDEN, 1100, 700]
-  ]);
+    assert.equal(observed.snapshot.app.windowBounds.width, 1728, "observed at the tab's real size");
+    assert.equal(observed.snapshot.app.windowBounds.height, 1004);
+    assert.deepEqual(metricsCalls(sb, tabId), [CLEAR]);
+    assertNeverResized(sb);
+  });
+
+  test(`a screenshot with viewportWidth/viewportHeight of a ${name} tab fits that box without resizing the tab`, async (t) => {
+    const sb = withSandbox(t, { cdp: retinaCdp() });
+    await observe(sb, tabId);
+
+    const shot = await screenshot(sb, tabId, { viewportWidth: 1024, viewportHeight: 768 });
+    // 3456x2008 scaled down to fit 1024x768, keeping its aspect ratio.
+    assert.deepEqual([shot.screenshotWidth, shot.screenshotHeight], [1024, 595]);
+    assert.deepEqual(base64Size(shot.screenshotBase64), { width: 1024, height: 595 }, "the image itself is that size");
+    assert.ok(shot.screenshotWidth <= 1024 && shot.screenshotHeight <= 768);
+    assert.deepEqual(sb.canvasDraws, [[1024, 595]]);
+    assert.deepEqual(metricsCalls(sb, tabId), [CLEAR]);
+    assertNeverResized(sb);
+  });
+}
+
+test("a screenshot box can be a width or a height alone", async (t) => {
+  const sb = withSandbox(t, { cdp: retinaCdp() });
+  await observe(sb, VISIBLE);
+
+  const byWidth = await screenshot(sb, VISIBLE, { viewportWidth: 1728 });
+  assert.deepEqual([byWidth.screenshotWidth, byWidth.screenshotHeight], [1728, 1004]);
+  const byHeight = await screenshot(sb, VISIBLE, { viewportHeight: 500 });
+  assert.deepEqual([byHeight.screenshotWidth, byHeight.screenshotHeight], [861, 500]);
+  assert.deepEqual(base64Size(byHeight.screenshotBase64), { width: 861, height: 500 });
+  assertNeverResized(sb);
+});
+
+test("a screenshot that already fits the box is returned as captured, never scaled up", async (t) => {
+  const sb = withSandbox(t, { cdp: retinaCdp() });
+  await observe(sb, VISIBLE);
+
+  const shot = await screenshot(sb, VISIBLE, { viewportWidth: 4000, viewportHeight: 3000, deviceScaleFactor: 3 });
+  assert.equal(shot.screenshotBase64, fakeJpeg(3456, 2008));
+  assert.deepEqual([shot.screenshotWidth, shot.screenshotHeight], [3456, 2008]);
+  assert.deepEqual(sb.canvasDraws, [], "nothing was re-encoded");
+  assertNeverResized(sb);
+});
+
+test("a screenshot without a box reports the size of the image it returns", async (t) => {
+  const sb = withSandbox(t, { cdp: retinaCdp() });
+  await observe(sb, HIDDEN);
+
+  const shot = await screenshot(sb, HIDDEN);
+  assert.deepEqual([shot.screenshotWidth, shot.screenshotHeight], [3456, 2008]);
+  assert.deepEqual(sb.canvasDraws, []);
+  assertNeverResized(sb);
 });
 
 test("a visible tab reports its real window size to the preview and does not clamp clicks to 1280 px", async (t) => {
@@ -243,51 +294,79 @@ test("a visible tab reports its real window size to the preview and does not cla
 // A page zoomed to 90% in a 1512x680 window lays out at 1680x756 CSS pixels.
 const LIVE = { width: 1680, height: 756, scale: 1.8 };
 const ZOOM = 0.9;
-const liveViewportCdp = (overrides, extra = () => undefined) => (tabId, method, params) => {
-  if (method === SET) overrides.push([tabId, params.width, params.height]);
+const liveViewportCdp = (tabId, method, params) => {
   if (method === "Runtime.evaluate" && String(params?.expression || "").includes("window.innerWidth, height: window.innerHeight")) {
     return { result: { value: LIVE } };
   }
-  return extra(tabId, method, params);
+  return undefined;
 };
 
-test("a tab the user has seen keeps its on-screen layout when it goes to the background", async (t) => {
-  const overrides = [];
-  const sb = withSandbox(t, { cdp: liveViewportCdp(overrides), zoom: () => ZOOM });
+test("a zoomed tab keeps its CSS size when it goes to the background and back", async (t) => {
+  const sb = withSandbox(t, { cdp: liveViewportCdp, zoom: () => ZOOM });
   await observe(sb, VISIBLE);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assert.deepEqual(viewportOf(sb, VISIBLE), { ...LIVE, zoom: ZOOM });
 
   sb.activateTab(HIDDEN);
   await queuesIdle(sb);
-
-  // Emulated at the window size it had (1680x756 CSS at 90% = 1512x680), not 1280x800, so nothing reflows.
-  assert.deepEqual(overrides.filter(([id]) => id === VISIBLE), [[VISIBLE, 1512, 680]]);
-  const viewport = JSON.parse(sb.eval(`JSON.stringify(effectiveViewport(state.tabSessions.get(${VISIBLE})))`));
-  assert.equal(viewport.width, 1680, "coordinates still use the on-screen layout");
-  assert.equal(viewport.height, 756);
+  assert.deepEqual(viewportOf(sb, VISIBLE), { ...LIVE, zoom: ZOOM }, "coordinates still use the page's layout");
   await assertPumpPolls(sb, VISIBLE);
 
   sb.activateTab(VISIBLE);
   await queuesIdle(sb);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR, SET, CLEAR]);
   await assertNoPolling(sb, VISIBLE);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assertNeverResized(sb);
 });
 
-test("a tab opened in the background, never seen, still gets 1280x800", async (t) => {
-  const overrides = [];
-  const sb = withSandbox(t, { cdp: liveViewportCdp(overrides), zoom: () => ZOOM });
+test("a tab opened in the background, never seen, reports the size Chrome gave it", async (t) => {
+  const sb = withSandbox(t, { cdp: liveViewportCdp, zoom: () => ZOOM });
+  const observed = await observe(sb, HIDDEN);
+  assert.equal(observed.snapshot.app.windowBounds.width, 1680);
+  assert.equal(observed.snapshot.app.windowBounds.height, 756);
+  assertNeverResized(sb);
+});
+
+test("a tab that reports 0x0 uses its size in Chrome, divided by the zoom", async (t) => {
+  const sb = createBackgroundSandbox({
+    tabs: [{ id: HIDDEN, windowId: 1, url: "https://example.com/hidden", active: false, width: 1512, height: 680 }],
+    windows: [{ id: 1, focused: true }],
+    zoom: () => ZOOM,
+    cdp: (tabId, method, params) => {
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("window.innerWidth, height: window.innerHeight")) {
+        return { result: { value: { width: 0, height: 0, scale: 1.8 } } };
+      }
+      return undefined;
+    }
+  });
+  t.after(() => sb.dispose());
   await observe(sb, HIDDEN);
-  assert.deepEqual(overrides, [[HIDDEN, 1280, 800]]);
+  assert.deepEqual(viewportOf(sb, HIDDEN), { width: 1680, height: 756, scale: 1.8, zoom: ZOOM });
+  assertNeverResized(sb);
 });
 
-test("an explicit viewport request still sets a seen tab's hidden size", async (t) => {
-  const overrides = [];
-  const sb = withSandbox(t, { cdp: liveViewportCdp(overrides), zoom: () => ZOOM });
-  await observe(sb, VISIBLE);
-  await observe(sb, VISIBLE, { viewportWidth: 1100, viewportHeight: 700 });
+test("a tab with no usable size reports the fallback size and does not clamp clicks to it", async (t) => {
+  const mouse = [];
+  const sb = withSandbox(t, {
+    cdp: (tabId, method, params) => {
+      if (method === "Runtime.evaluate" && String(params?.expression || "").includes("window.innerWidth, height: window.innerHeight")) {
+        return { result: { value: { width: 3, height: 2, scale: 2 } } };
+      }
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") mouse.push([params.x, params.y]);
+      return undefined;
+    }
+  });
+  await observe(sb, HIDDEN);
+  assert.deepEqual(viewportOf(sb, HIDDEN), { width: 1280, height: 800, scale: 1 }, "only reported, never applied");
 
-  sb.activateTab(HIDDEN);
-  await queuesIdle(sb);
-
-  assert.deepEqual(overrides.filter(([id]) => id === VISIBLE), [[VISIBLE, 1100, 700], [VISIBLE, 1100, 700]]);
+  const { response } = await sb.request({
+    type: "request",
+    id: nextId(),
+    command: "act",
+    tabId: HIDDEN,
+    returnObservation: false,
+    steps: [{ action: "click", x: 1500, y: 900 }]
+  });
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  assert.deepEqual(mouse, [[1500, 900]]);
+  assertNeverResized(sb);
 });

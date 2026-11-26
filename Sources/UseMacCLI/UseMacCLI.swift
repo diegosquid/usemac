@@ -2222,12 +2222,12 @@ struct UseMacCLI {
           browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--activate] [--new-window] [--no-stream]
                                                      Open a URL in a background tab, navigate --tab, or open it in a new window
           browser open --tab <id> --activate         Make an existing tab the active tab of its window (for native observe/act)
-          browser observe [--profile <n>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables] [--width <px>] [--height <px>] [--scale <n>]
+          browser observe [--profile <n>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables]
                                                      Inspect DOM (including cross-origin iframes and Shadow DOM), tables, text, and overlays (@b1..@bN)
           browser extract [auto|tables|text|kpis|eval|downloads] [--profile <n>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]
                                                      Extract tables/ARIA grids (with horizontal scan), KPIs, text, JS, or downloads
-          browser screenshot [--profile <n>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--scale <n>] [--quality <n>]
-                                                     Capture a crisp screenshot of the tab or a specific element
+          browser screenshot [--profile <n>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--quality <n>]
+                                                     Capture the tab or one element at its real size (--width/--height: fit the image in that box)
           browser act '<json>' [--profile <name>] [--tab <id>] [--read-only] [--verify "<condition>"] [--screenshot]
                                                      Execute BrowserActParams or [ActionStep] in Chrome with optional local verification or screenshot
           browser reload-extension [--profile <n>] [--force]
@@ -2537,7 +2537,7 @@ struct UseMacCLI {
             )
         case "browser observe":
             return CommandHelp(
-                usage: ["usemac browser observe [--profile <name>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables] [--width <px>] [--height <px>] [--scale <n>]"],
+                usage: ["usemac browser observe [--profile <name>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables]"],
                 summary: "Inspect a tab's interactive DOM as @b1..@bN refs (including cross-origin iframes and Shadow DOM), tables, readable text, scroll state and blocking overlays.",
                 flags: [
                     ("--profile <name>", "Chrome profile (only needed with several profiles)"),
@@ -2545,9 +2545,12 @@ struct UseMacCLI {
                     ("--max-elements <n>", "Maximum DOM elements (default 280, max 600)"),
                     ("--screenshot", "Also save a JPEG of the tab"),
                     ("--no-text | --no-tables", "Leave out readable text or tables"),
-                    ("--width/--height <px>, --scale <n>", "Emulated viewport size and pixel density")
+                    ("--width/--height <px>, --scale <n>", "Ignored: UseMac never resizes a tab (still accepted, for old scripts)")
                 ],
-                notes: [restrictedPageNote],
+                notes: [
+                    "The tab is observed at the size Chrome gives it; UseMac never resizes it.",
+                    restrictedPageNote
+                ],
                 examples: ["usemac browser observe --tab 123"],
                 json: snapshotJSON + " plus pageState {readableText, tablesMarkdown, scroll…, blockingOverlay}"
             )
@@ -2567,15 +2570,16 @@ struct UseMacCLI {
             )
         case "browser screenshot":
             return CommandHelp(
-                usage: ["usemac browser screenshot [--profile <name>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--scale <n>] [--quality <n>]"],
-                summary: "Capture a JPEG of a tab, or crop it around a selector or @bID. Prefer observe/extract or on-device vision first.",
+                usage: ["usemac browser screenshot [--profile <name>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--quality <n>]"],
+                summary: "Capture a JPEG of a tab at its real size, or crop it around a selector or @bID. UseMac never resizes the tab. Prefer observe/extract or on-device vision first.",
                 flags: [
                     ("--selector <css> | --element <@bID>", "Crop around this element"),
                     ("--full-page", "Capture the full scrollable height (capped at 6000 px)"),
-                    ("--width/--height <px>, --scale <n>", "Emulated viewport size and pixel density"),
+                    ("--width/--height <px>", "Scale the image down to fit this box, keeping its aspect ratio (one is enough); the page is not resized"),
+                    ("--scale <n>", "Ignored (still accepted, for old scripts)"),
                     ("--quality <n>", "JPEG quality 30–100 (default 84)")
                 ],
-                examples: ["usemac browser screenshot --tab 123 --selector \"#chart\" --scale 2"],
+                examples: ["usemac browser screenshot --tab 123 --selector \"#chart\"", "usemac browser screenshot --tab 123 --width 1280 --height 800"],
                 json: "ScreenshotResult {path, mimeType, width, height, byteCount, latencyMs}"
             )
         case "browser act":

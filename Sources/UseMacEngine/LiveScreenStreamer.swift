@@ -799,26 +799,22 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
 // MARK: - Preview geometry (pure, used by the HUD preview overlay)
 
 /// Maps global screen coordinates (top-left origin, the space AX frames and `sourceBounds` use) into the
-/// live preview, which draws the source aspect-fit like `CALayer.contentsGravity = .resizeAspect`.
+/// live preview. The preview has a fixed size and never asks the page or window to change: the source fills it from
+/// its top-left corner, and whatever does not fit (on the right or at the bottom) is cut off.
 public enum LivePreviewGeometry {
-    /// Rect the source occupies inside a preview of `previewSize`.
-    public static func fittedRect(sourceSize: CGSize, in previewSize: CGSize) -> CGRect {
+    /// Rect the whole source occupies in a preview of `previewSize`, in preview points with y down. It starts at the
+    /// preview's top-left corner and is at least as large as the preview on both axes; the part past the preview's
+    /// edges is cropped.
+    public static func displayedRect(sourceSize: CGSize, in previewSize: CGSize) -> CGRect {
         guard sourceSize.width > 0, sourceSize.height > 0, previewSize.width > 0, previewSize.height > 0 else {
             return .zero
         }
-        let scale = min(previewSize.width / sourceSize.width, previewSize.height / sourceSize.height)
-        let width = sourceSize.width * scale
-        let height = sourceSize.height * scale
-        return CGRect(
-            x: (previewSize.width - width) / 2,
-            y: (previewSize.height - height) / 2,
-            width: width,
-            height: height
-        )
+        let scale = max(previewSize.width / sourceSize.width, previewSize.height / sourceSize.height)
+        return CGRect(x: 0, y: 0, width: sourceSize.width * scale, height: sourceSize.height * scale)
     }
 
-    /// Preview position of a global point, or nil when it falls outside the source by more than `tolerance`
-    /// (a fraction of the source size).
+    /// Preview position of a global point, or nil when it falls outside the source by more than `tolerance` (a
+    /// fraction of the source size) or lands in the cropped part (with the same slack, as a fraction of the preview).
     public static func previewPoint(
         _ point: CGPoint,
         sourceBounds: CGRect,
@@ -831,28 +827,38 @@ public enum LivePreviewGeometry {
         guard relX >= -tolerance, relX <= 1 + tolerance, relY >= -tolerance, relY <= 1 + tolerance else {
             return nil
         }
-        let fitted = fittedRect(sourceSize: sourceBounds.size, in: previewSize)
-        guard fitted.width > 0, fitted.height > 0 else { return nil }
-        return CGPoint(x: fitted.minX + relX * fitted.width, y: fitted.minY + relY * fitted.height)
+        let shown = displayedRect(sourceSize: sourceBounds.size, in: previewSize)
+        guard shown.width > 0, shown.height > 0 else { return nil }
+        let mapped = CGPoint(x: shown.minX + relX * shown.width, y: shown.minY + relY * shown.height)
+        let slackX = tolerance * previewSize.width
+        let slackY = tolerance * previewSize.height
+        guard mapped.x >= -slackX, mapped.x <= previewSize.width + slackX,
+              mapped.y >= -slackY, mapped.y <= previewSize.height + slackY else {
+            return nil
+        }
+        return mapped
     }
 
-    /// Preview rect of a global rect, clipped to the source, or nil when it does not overlap the source.
+    /// Preview rect of a global rect, clipped to the source and to the preview, or nil when nothing of it shows.
     public static func previewRect(_ rect: CGRect, sourceBounds: CGRect, previewSize: CGSize) -> CGRect? {
         guard sourceBounds.width > 0, sourceBounds.height > 0 else { return nil }
         // Zero-size rects (Chrome reports them for clipped elements) still mark a position.
         let target = CGRect(x: rect.minX, y: rect.minY, width: max(rect.width, 1), height: max(rect.height, 1))
         let clipped = target.intersection(sourceBounds)
         guard !clipped.isNull, !clipped.isEmpty else { return nil }
-        let fitted = fittedRect(sourceSize: sourceBounds.size, in: previewSize)
-        guard fitted.width > 0, fitted.height > 0 else { return nil }
-        let scaleX = fitted.width / sourceBounds.width
-        let scaleY = fitted.height / sourceBounds.height
-        return CGRect(
-            x: fitted.minX + (clipped.minX - sourceBounds.minX) * scaleX,
-            y: fitted.minY + (clipped.minY - sourceBounds.minY) * scaleY,
+        let shown = displayedRect(sourceSize: sourceBounds.size, in: previewSize)
+        guard shown.width > 0, shown.height > 0 else { return nil }
+        let scaleX = shown.width / sourceBounds.width
+        let scaleY = shown.height / sourceBounds.height
+        let mapped = CGRect(
+            x: shown.minX + (clipped.minX - sourceBounds.minX) * scaleX,
+            y: shown.minY + (clipped.minY - sourceBounds.minY) * scaleY,
             width: clipped.width * scaleX,
             height: clipped.height * scaleY
         )
+        let visible = mapped.intersection(CGRect(origin: .zero, size: previewSize))
+        guard !visible.isNull, !visible.isEmpty else { return nil }
+        return visible
     }
 
     /// Whether an overlay that belongs to window `overlayWindowId` of `overlayPid` may be drawn on the frame
