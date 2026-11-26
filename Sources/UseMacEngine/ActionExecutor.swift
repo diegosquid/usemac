@@ -625,6 +625,81 @@ public final class ActionExecutor: @unchecked Sendable {
         )
     }
 
+    /// The window a step must reach when the batch names one (`window`, which pins it): UseMac works in that
+    /// window even when another window of the app is in front. Without a pin the target is whichever window
+    /// of the app is in front, which can change during the batch (⌘N opens one), so no id is enforced.
+    private func pinnedWindowId(_ targetApp: AppDescriptor?) -> CGWindowID? {
+        guard let pid = targetApp?.pid, pid > 0, WindowResolver.pinnedTitle(pid: pid) != nil else { return nil }
+        return targetApp?.windowId.map { CGWindowID($0) }
+    }
+
+    /// Real mouse input lands in the window on top at the point. With the target app in front, that can still be
+    /// another window: the user's own Chrome window over the one UseMac works in, or another app's window.
+    /// Decides how a step that would post real input sends it. `backgroundAllowed`: the event has a background
+    /// route without side effects (wheel and mouse-moved events, not clicks).
+    private func pointerRoute(_ targetApp: AppDescriptor?, at point: CGPoint?, backgroundAllowed: Bool) -> InputRouting.PointerRoute {
+        guard let pid = targetApp?.pid, pid > 0 else { return .foreground }
+        var documentIds: Set<CGWindowID>?
+        return InputRouting.pointerRoute(
+            point: point,
+            targetPid: pid,
+            targetWindowId: pinnedWindowId(targetApp),
+            windows: InputRouting.pointerWindows(),
+            isDocumentWindow: { id in
+                if documentIds == nil { documentIds = InputRouting.documentWindowIds(pid: pid) }
+                return documentIds?.contains(id) == true
+            },
+            backgroundAllowed: backgroundAllowed
+        )
+    }
+
+    /// Refuses real mouse input (clicks) that would land in another window than the target.
+    private func pointerRefusal(_ targetApp: AppDescriptor?, at point: CGPoint?, input: String) -> StepOutcome? {
+        switch pointerRoute(targetApp, at: point, backgroundAllowed: false) {
+        case .foreground:
+            return nil
+        case .background(let covering), .refuse(let covering):
+            return coveredWindowOutcome(targetApp: targetApp, covering: covering, input: input)
+        }
+    }
+
+    private func coveredWindowOutcome(targetApp: AppDescriptor?, covering: WindowResolver.WindowInfo?, input: String) -> StepOutcome {
+        let app = targetApp?.name ?? "the target app"
+        let place: String
+        if let covering {
+            place = covering.pid == targetApp?.pid
+                ? "another \(app) window is on top of it there"
+                : "a \(NSRunningApplication(processIdentifier: covering.pid)?.localizedName ?? "another app") window is on top of it there"
+        } else {
+            place = "it is not on screen there"
+        }
+        return StepOutcome(
+            success: false,
+            mechanism: "hid-guard",
+            message: "The \(app) window UseMac works in would not get real \(input): \(place). Nothing was sent. Use a background step (setValue, axAction, scrollIntoView, or click an element with AXPress), or wait until that window is in front.",
+            errorCode: "TARGET_NOT_FRONTMOST"
+        )
+    }
+
+    /// Real keys go to the focused (key) window of the app in front. Refuses when that is not the window UseMac
+    /// works in, e.g. a window it opened that sits behind the user's own window of the same app.
+    private func keyWindowGuard(_ targetApp: AppDescriptor?, input: String) -> StepOutcome? {
+        guard let pid = targetApp?.pid, pid > 0, let target = pinnedWindowId(targetApp) else { return nil }
+        let keysReach = InputRouting.keysReachTarget(
+            appIsFrontmost: WindowResolver.isFrontmost(pid: pid),
+            targetWindowId: target,
+            focusedWindowId: InputRouting.focusedWindowId(pid: pid)
+        )
+        if keysReach { return nil }
+        let app = targetApp?.name ?? "the target app"
+        return StepOutcome(
+            success: false,
+            mechanism: "hid-guard",
+            message: "The \(app) window UseMac works in is not \(app)'s focused window, so real \(input) would go to the window in front (probably the user's). Nothing was sent. Use setValue or axAction, which work without focus.",
+            errorCode: "TARGET_NOT_FRONTMOST"
+        )
+    }
+
     // MARK: - Step dispatch
 
     private func executeStep(
@@ -830,14 +905,31 @@ public final class ActionExecutor: @unchecked Sendable {
         return parts.isEmpty ? "(empty match)" : parts.joined(separator: ", ")
     }
 
-    private func resolvePoint(step: ActionStep, node: ElementNode?) -> CGPoint? {
+    /// Where a pointer event for the step goes: the given coordinates, or the middle of the part of the element
+    /// inside its window. The middle of a tall text area or list can lie below the window, over another app.
+    private func resolvePoint(step: ActionStep, node: ElementNode?, targetApp: AppDescriptor?) -> CGPoint? {
         if let x = step.x, let y = step.y {
             return CGPoint(x: x, y: y)
         }
-        if let node, node.offscreen != true, node.frame.width > 0, node.frame.height > 0 {
-            return CGPoint(x: node.frame.centerX, y: node.frame.centerY)
+        guard let node, node.offscreen != true, node.frame.width > 0, node.frame.height > 0 else {
+            return nil
         }
-        return nil
+        let rect = CGRect(x: node.frame.x, y: node.frame.y, width: node.frame.width, height: node.frame.height)
+        if let window = targetWindowFrame(targetApp) {
+            let visible = rect.intersection(window)
+            if !visible.isNull, visible.width > 1, visible.height > 1 {
+                return CGPoint(x: visible.midX, y: visible.midY)
+            }
+        }
+        return CGPoint(x: rect.midX, y: rect.midY)
+    }
+
+    /// The target window's frame now (falls back to the bounds seen when the batch started).
+    private func targetWindowFrame(_ targetApp: AppDescriptor?) -> CGRect? {
+        if let windowId = targetApp?.windowId, let info = WindowResolver.info(windowId: CGWindowID(windowId)) {
+            return info.frame
+        }
+        return targetApp?.windowBounds.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
     }
 
     private func highlight(_ node: ElementNode?, targetApp: AppDescriptor?, onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?) {
@@ -1007,7 +1099,7 @@ public final class ActionExecutor: @unchecked Sendable {
             }
         }
 
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-click" : "cgevent-hid",
@@ -1019,7 +1111,8 @@ public final class ActionExecutor: @unchecked Sendable {
             )
         }
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point)
+            ?? pointerRefusal(targetApp, at: point, input: "clicks") {
             var refusedWithNode = refused
             refusedWithNode.node = resolved.node
             return refusedWithNode
@@ -1049,8 +1142,8 @@ public final class ActionExecutor: @unchecked Sendable {
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) -> StepOutcome {
-        let bgPid = backgroundPid(for: step, targetApp: targetApp)
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        var bgPid = backgroundPid(for: step, targetApp: targetApp)
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-hover" : "cgevent-hover",
@@ -1059,8 +1152,18 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "mouse movement", at: point) {
-            return refused
+        if bgPid == nil {
+            if let refused = frontmostGuard(targetApp, input: "mouse movement", at: point) {
+                return refused
+            }
+            switch pointerRoute(targetApp, at: point, backgroundAllowed: step.preferBackground != false) {
+            case .foreground:
+                break
+            case .background:
+                bgPid = targetApp?.pid
+            case .refuse(let covering):
+                return coveredWindowOutcome(targetApp: targetApp, covering: covering, input: "mouse movement")
+            }
         }
 
         if resolved.node != nil {
@@ -1106,7 +1209,7 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-click" : "cgevent-hid",
@@ -1115,7 +1218,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point)
+            ?? pointerRefusal(targetApp, at: point, input: "clicks") {
             return refused
         }
 
@@ -1154,7 +1258,7 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-click" : "cgevent-hid",
@@ -1163,7 +1267,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point)
+            ?? pointerRefusal(targetApp, at: point, input: "clicks") {
             return refused
         }
 
@@ -1222,10 +1327,13 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         if bgPid == nil {
-            if let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node)) {
+            let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp)
+            if let refused = frontmostGuard(targetApp, input: "typing", at: point)
+                ?? keyWindowGuard(targetApp, input: "typing")
+                ?? point.flatMap({ pointerRefusal(targetApp, at: $0, input: "clicks") }) {
                 return refused
             }
-            if let point = resolvePoint(step: step, node: resolved.node) {
+            if let point {
                 pulse(point, label: resolved.node?.id ?? "setValue", targetApp: targetApp, onOverlayEvent: onOverlayEvent)
                 _ = postMouseClick(at: point, button: .left, clickCount: 1, restoreCursor: step.restoreCursor != false, targetPid: nil)
             }
@@ -1257,7 +1365,13 @@ public final class ActionExecutor: @unchecked Sendable {
         let text = step.text ?? ""
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node)) {
+        // Where a real click places the caret first (an element or explicit coordinates).
+        let clickPoint: CGPoint? = bgPid == nil && (resolved.node != nil || (step.x != nil && step.y != nil))
+            ? resolvePoint(step: step, node: resolved.node, targetApp: targetApp)
+            : nil
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node, targetApp: targetApp))
+            ?? keyWindowGuard(targetApp, input: "typing")
+            ?? clickPoint.flatMap({ pointerRefusal(targetApp, at: $0, input: "clicks") }) {
             return refused
         }
 
@@ -1268,9 +1382,7 @@ public final class ActionExecutor: @unchecked Sendable {
                 _ = AXUIElementSetAttributeValue(axEl, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             }
         }
-        if bgPid == nil,
-           let point = resolvePoint(step: step, node: resolved.node),
-           resolved.node != nil || (step.x != nil && step.y != nil) {
+        if let point = clickPoint {
             pulse(point, label: resolved.node?.id ?? "type", targetApp: targetApp, onOverlayEvent: onOverlayEvent)
             _ = postMouseClick(at: point, button: .left, clickCount: 1, restoreCursor: step.restoreCursor != false, targetPid: nil)
         }
@@ -1308,7 +1420,7 @@ public final class ActionExecutor: @unchecked Sendable {
             warning = "AXConfirm failed on \(resolved.node?.id ?? "the element"); sent a key event instead."
         }
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "key presses") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "key presses") ?? keyWindowGuard(targetApp, input: "key presses") {
             return refused
         }
 
@@ -1338,7 +1450,7 @@ public final class ActionExecutor: @unchecked Sendable {
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) async -> StepOutcome {
-        let bgPid = backgroundPid(for: step, targetApp: targetApp)
+        var bgPid = backgroundPid(for: step, targetApp: targetApp)
         let dy = Int32(step.deltaY ?? 0)
         let dx = Int32(step.deltaX ?? 0)
 
@@ -1375,6 +1487,25 @@ public final class ActionExecutor: @unchecked Sendable {
 
         let probes = scrollProbes(pid: pid, near: point)
 
+        // The app is in front, but a real wheel event goes to the window on top at the point, which may not be
+        // the target window (the user's own window of the same app, or another app's): scroll it in the
+        // background then.
+        if bgPid == nil {
+            if let refused = frontmostGuard(targetApp, input: "scrolling", at: point) {
+                return refused
+            }
+            switch pointerRoute(targetApp, at: point, backgroundAllowed: step.preferBackground != false) {
+            case .foreground:
+                break
+            case .background:
+                bgPid = targetApp?.pid
+            case .refuse(let covering):
+                var refused = coveredWindowOutcome(targetApp: targetApp, covering: covering, input: "scrolling")
+                refused.node = resolved.node
+                return refused
+            }
+        }
+
         if let bgPid {
             if let point {
                 scrollEvent.location = point
@@ -1394,10 +1525,6 @@ public final class ActionExecutor: @unchecked Sendable {
                 return fallback
             }
             return StepOutcome(success: true, mechanism: "cgevent-pid-scroll", node: resolved.node, scrollDeltaY: moved)
-        }
-
-        if let refused = frontmostGuard(targetApp, input: "scrolling", at: point) {
-            return refused
         }
 
         let savedCursor = CGEvent(source: nil)?.location
@@ -1421,12 +1548,7 @@ public final class ActionExecutor: @unchecked Sendable {
         if let x = step.x, let y = step.y {
             return CGPoint(x: x, y: y)
         }
-        let window: CGRect? = {
-            if let windowId = targetApp?.windowId, let info = WindowResolver.info(windowId: CGWindowID(windowId)) {
-                return info.frame
-            }
-            return targetApp?.windowBounds.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
-        }()
+        let window = targetWindowFrame(targetApp)
         if let node, node.offscreen != true, node.frame.width > 0, node.frame.height > 0 {
             let rect = CGRect(x: node.frame.x, y: node.frame.y, width: node.frame.width, height: node.frame.height)
             if let window {

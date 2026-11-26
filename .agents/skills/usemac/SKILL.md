@@ -185,6 +185,7 @@ Each tool exposes MCP `annotations` (`readOnlyHint`, `destructiveHint`). On time
    - `browser_observe` automatically indexes elements inside cross-origin iframes (OOPIFs), same-origin iframes, and open Shadow DOM as unified `@b1..@bN` refs — click, type, select, wait, extract, and upload directly with `@bID` without falling back to screenshots. Fall back to `(x, y)` from `vision_query` only for canvas/WebGL/image-only controls.
 9. **Foreground bursts — only when needed, never while the user is typing**:
    - Steps that need real keyboard or mouse input only run when the app is in front; otherwise they fail with `TARGET_NOT_FRONTMOST` and nothing is sent.
+   - The window counts too: real mouse input only when a window of the app is on top at that point (with `window`, that window), real keys only when the `window` is the app's focused window. On a `window` pin behind the user's own window, `scroll`/`hover` go in the background, `setValue` works without focusing it, and coordinate clicks, `type` and `pressKey` fail with `TARGET_NOT_FRONTMOST`.
    - Try background steps first (`click`/`setValue`/`axAction` on an `elementId` or `match`). Only after `TARGET_NOT_FRONTMOST` or repeated `effect: none`, rerun just those steps with `"foreground": true`: UseMac brings the app forward, runs them, then gives focus back and restores the cursor.
    - `USER_ACTIVE` means the user used the keyboard or mouse in the last 1.5 s: wait and retry later, never loop or force it.
 10. **Restricted Chrome pages — hybrid flow (`RESTRICTED_PAGE`)**:
@@ -242,7 +243,7 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 | `STALE_SNAPSHOT` | The window changed since your last observe (or `expectWindowTitle` didn't match). Nothing ran. | Observe again and use the new ids, or use `match`. |
 | `ELEMENT_NOT_FOUND` | No element matched `match` (or the id is gone). | Observe again (raise `maxDepth`/`maxElements`, scroll the list), loosen the match, or check `index`. |
 | `WAIT_TIMEOUT` | `waitFor` ran out of time. | Observe to see the current state before retrying. |
-| `TARGET_NOT_FRONTMOST` | A step needed real input but the app was not in front. Nothing was sent. | Use a background step, or rerun those steps with `"foreground": true`. |
+| `TARGET_NOT_FRONTMOST` | A step needed real input but the app was not in front, or another window was on top of the target window (for keys: the app's focused window was another one). Nothing was sent. | Use a background step (`setValue`, `axAction`, `scrollIntoView`), or rerun those steps with `"foreground": true` when the app was not in front. |
 | `USER_ACTIVE` | A foreground burst was refused because the user is typing or using the mouse. | Wait and retry later; never force it. |
 | `RESTRICTED_PAGE` | The Chrome extension can't script this page (Chrome Web Store, `chrome://`). | Use the hybrid flow (section 2, item 10). |
 | `CAPTURE_TOO_SMALL` | The captured window is too small to trust (a helper strip or hidden window). | Don't answer from that image. Observe the app, or bring up the right window and retry. |

@@ -117,10 +117,15 @@ public enum WindowResolver {
 
     /// Normal (layer 0) windows on the current Space, front to back.
     public static func onScreenWindows() -> [WindowInfo] {
+        onScreenWindows(upToLayer: 0)
+    }
+
+    /// Windows on the current Space at layers 0 through `maxLayer`, front to back.
+    public static func onScreenWindows(upToLayer maxLayer: Int) -> [WindowInfo] {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return []
         }
-        return list.compactMap(parse).filter { $0.layer == 0 && $0.alpha > 0.01 }
+        return list.compactMap(parse).filter { $0.layer >= 0 && $0.layer <= maxLayer && $0.alpha > 0.01 }
     }
 
     /// True when `point` (global, top-left origin) is on screen and the topmost normal window there is the
