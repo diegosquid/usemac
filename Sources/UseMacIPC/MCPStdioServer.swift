@@ -859,6 +859,10 @@ public final class MCPStdioServer: @unchecked Sendable {
                 latencyMs: shot.latencyMs
             )
             header += String(format: "\nPath: %@ (%dx%d, %d bytes, %@)", shot.path, shot.width, shot.height, shot.byteCount, shot.mimeType)
+            if shot.truncated == true {
+                let params = request.browserScreenshot
+                header += "\n" + ScreenshotResult.truncatedNote(element: params?.elementId != nil || params?.selector != nil)
+            }
             var blocks: [MCPContentBlock] = [.text(header)]
             if returnImageContent {
                 if let base64 = shot.base64Data, !base64.isEmpty {
@@ -1750,15 +1754,15 @@ public final class MCPStdioServer: @unchecked Sendable {
                     ],
                     "elementId": [
                         "type": "string",
-                        "description": "Optional @bID element to crop the screenshot around."
+                        "description": "Optional @bID element to capture. It is scrolled into view only if needed, and the scroll is put back. An element bigger than the tab's viewport comes back as the part on screen, from its top-left corner, marked truncated."
                     ],
                     "selector": [
                         "type": "string",
-                        "description": "Optional CSS selector to crop the screenshot around (e.g. a chart or creative card)."
+                        "description": "Optional CSS selector of the element to capture (e.g. a chart or creative card). Same as elementId."
                     ],
                     "fullPage": [
                         "type": "boolean",
-                        "description": "Capture full scrollable page height (capped at 6000px, default false)."
+                        "description": "Capture the whole page height (default false): UseMac scrolls through the page, stitches viewport captures at the tab's width and puts the scroll back. Stops at 16384 CSS px, marked truncated. Fixed or sticky headers repeat in each viewport."
                     ],
                     "viewportWidth": [
                         "type": "integer",

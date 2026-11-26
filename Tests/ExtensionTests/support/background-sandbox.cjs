@@ -323,8 +323,10 @@ function createBackgroundSandbox(options = {}) {
   // Every timer the extension starts is tracked so dispose() can stop idle timers and capture pumps.
   const timeouts = new Set();
   const intervals = new Set();
-  // Canvas sizes the extension encoded (a screenshot scaled down to fit a box), as [width, height].
+  // Canvas sizes the extension encoded (a screenshot scaled down to fit a box, or a stitched full page), as
+  // [width, height], and every drawImage call on a canvas (see fakeImageApis).
   const canvasDraws = [];
+  const drawImageCalls = [];
   const context = {
     chrome,
     WebSocket: FakeWebSocket,
@@ -334,7 +336,7 @@ function createBackgroundSandbox(options = {}) {
     atob,
     btoa,
     Blob,
-    ...fakeImageApis(canvasDraws),
+    ...fakeImageApis(canvasDraws, drawImageCalls),
     crypto: globalThis.crypto,
     performance,
     navigator: { userAgent: options.userAgent || CHROME_UA },
@@ -377,6 +379,7 @@ function createBackgroundSandbox(options = {}) {
     groups,
     attached,
     canvasDraws,
+    drawImageCalls,
 
     /** Calls a top-level function of background.js; plain values come back as outer-realm JSON clones. */
     call(name, ...args) {
