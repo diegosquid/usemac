@@ -588,6 +588,9 @@ public final class ActionExecutor: @unchecked Sendable {
     /// Real (HID) input goes to whatever app is in front. Refuse unless that is the target.
     /// `point` is where a mouse event would land, for the check that it is not a UseMac window.
     private func frontmostGuard(_ targetApp: AppDescriptor?, input: String, at point: CGPoint? = nil) -> StepOutcome? {
+        if let point, let refusal = killSwitch.approvalPromptRefusal(at: point) {
+            return StepOutcome(success: false, mechanism: "self-target", message: refusal, errorCode: "SELF_TARGET_BLOCKED")
+        }
         if let pid = targetApp?.pid, pid > 0, !WindowResolver.isFrontmost(pid: pid) {
             return notFrontmostOutcome(targetApp: targetApp, input: input)
         }
