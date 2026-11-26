@@ -340,7 +340,7 @@ public struct SetupGuideView: View {
                 SetupRow(
                     leading: { SetupSymbolTile(symbol: "rectangle.dashed.badge.record") },
                     title: "Screen Recording",
-                    detail: "Lets agents take screenshots, and shows you a live preview while they work."
+                    detail: "Lets agents take screenshots, run instant on-device Apple Vision OCR, and shows you a live preview while they work."
                 ) {
                     permissionControl(granted: perms.screenRecordingGranted) {
                         appState.triggerPermissionFlow(for: .screenRecording, prompt: true)
@@ -467,7 +467,7 @@ public struct SetupGuideView: View {
         }
     }
 
-    // 5. Agent
+    // 4. Agent
 
     private var agentStep: some View {
         let prompt = agentChoice.usesMCP ? appState.mcpAgentPrompt : appState.socketAgentPrompt
@@ -537,7 +537,7 @@ public struct SetupGuideView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // 6. Ready
+    // 5. Ready
 
     private var readyStep: some View {
         VStack(spacing: 26) {

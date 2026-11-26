@@ -5,19 +5,69 @@ import UseMacProtocol
 /// its task's last tab instead of the last tab any agent touched, an acting request waits (`TARGET_BUSY`) while
 /// another running task holds its window or tab, what the request did counts toward the task's `task_complete`
 /// summary, and its preview cards show the task's agent. Requests of no task run exactly as before.
+///
+/// Supports zero-ceremony piggybacked lifecycle: any non-`task_start` request may carry `taskStart` to start a task
+/// inline (stamping `taskId` onto the response), and any non-`task_complete` request may carry `taskComplete` to
+/// finish the task right after the request executes (attaching `taskSummary` onto the response).
 extension UseMacEngineService {
     public func handle(_ request: RPCRequest) async -> RPCResponse {
-        let scope = taskTabs.scope(request)
-        let agent = request.method == .taskStart
-            ? TaskTabRegistry.cleanAgent(request.taskStart?.agent)
-            : taskTabs.agent(of: scope.taskId)
-        let response = await TaskActivityContext.$agentName.withValue(agent) {
-            await TaskActivityContext.$taskId.withValue(scope.taskId) {
-                await handleScoped(request, scope: scope)
+        var workingRequest = request
+        var startedTaskId: String?
+
+        // Zero-ceremony piggybacked task_start on any non-taskStart request.
+        if workingRequest.method != .taskStart, let inlineStart = workingRequest.taskStart {
+            let taskId = startTaskInline(inlineStart, explicitTaskId: workingRequest.taskId)
+            startedTaskId = taskId
+            workingRequest.taskId = taskId
+            if workingRequest.method == .browserOpen, workingRequest.browserOpen?.taskId == nil {
+                workingRequest.browserOpen?.taskId = taskId
             }
         }
+
+        let scope = taskTabs.scope(workingRequest)
+        let effectiveTaskId = scope.taskId ?? startedTaskId
+        let agent: String? = {
+            if workingRequest.method == .taskStart {
+                return TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent)
+            }
+            if let inlineAgent = TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent) {
+                return inlineAgent
+            }
+            return taskTabs.agent(of: effectiveTaskId)
+        }()
+
+        var response = await TaskActivityContext.$agentName.withValue(agent) {
+            await TaskActivityContext.$taskId.withValue(effectiveTaskId) {
+                await handleScoped(workingRequest, scope: scope)
+            }
+        }
+
+        if let startedTaskId, response.taskId == nil {
+            response.taskId = startedTaskId
+        }
+
+        // Zero-ceremony piggybacked task_complete on any non-taskComplete request.
+        if workingRequest.method != .taskComplete, let inlineComplete = workingRequest.taskComplete {
+            let completionTaskId = inlineComplete.taskId ?? effectiveTaskId ?? workingRequest.namedTaskId
+            let completion = TaskActivityContext.$agentName.withValue(agent) {
+                TaskActivityContext.$taskId.withValue(completionTaskId) {
+                    completeTaskInline(
+                        inlineComplete,
+                        taskId: completionTaskId,
+                        fallbackTabId: response.browserTabId ?? workingRequest.namedTabId,
+                        fallbackProfile: workingRequest.namedProfile,
+                        success: response.ok
+                    )
+                }
+            }
+            if response.taskId == nil {
+                response.taskId = completion.taskId ?? completionTaskId
+            }
+            response.taskSummary = completion.summary
+        }
+
         // Audit entries don't carry error codes; a problem report lists them from here.
-        problemReports.record(response, of: request, taskId: scope.taskId)
+        problemReports.record(response, of: workingRequest, taskId: effectiveTaskId)
         return response
     }
 

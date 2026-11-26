@@ -38,6 +38,21 @@ extension ChromeExtensionBridge {
         }
         guard checksTab, rules.hasSiteRules else { return nil }
 
+        // Fast path: when targeting an explicit tabId and the extension pushes live `tab_url` events,
+        // consult the in-memory `profile -> tabId -> url` cache without an all-tabs WS round-trip.
+        if let requestedTabId = tabId,
+           let cached = liveCachedTabURL(profileQuery: profile, tabId: requestedTabId) {
+            let trimmed = cached.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                guard rules.blocksURL(trimmed) else { return nil }
+                return Self.targetBlockedResponse(
+                    TargetRules.blockedSiteMessage(host: nil),
+                    tabId: requestedTabId,
+                    profileName: cached.profileName
+                )
+            }
+        }
+
         let timeout = min(Self.targetRulesLookupTimeoutSeconds, max(1, baseCommandTimeoutSeconds))
         let listing = await unfilteredTabs(profile: profile, timeoutSeconds: timeout)
         guard listing.ok else {

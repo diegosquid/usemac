@@ -348,6 +348,7 @@ public struct ControlCenterView: View {
                 livePreviewGroup
                 shortcutsGroup
                 chromeExtensionGroup
+                visionGroup
                 permissionsGroup
                 safetyGroup
                     .id(ControlCenterAnchor.safety)
@@ -733,6 +734,19 @@ public struct ControlCenterView: View {
         }
     }
 
+    private var visionGroup: some View {
+        SettingsGroup(title: "On-Device Vision") {
+            EmptyView()
+        } content: {
+            codexRow(
+                title: "Apple Vision OCR",
+                subtitle: "Built into macOS on Apple Neural Engine. Instant text recognition and local verification with zero setup or downloads."
+            ) {
+                StatusDot(color: UseMacTheme.statusGreen, label: "Ready")
+            }
+        }
+    }
+
     private var permissionsGroup: some View {
         let perms = appState.status.permissions
         let needsRepair = !perms.accessibilityGranted || !perms.screenRecordingGranted
@@ -762,7 +776,7 @@ public struct ControlCenterView: View {
 
             permissionRow(
                 title: "Screen Recording",
-                subtitle: "Stream live previews and take screenshots that your connected agent can see.",
+                subtitle: "Stream live previews, take screenshots, and run instant on-device Apple Vision OCR.",
                 granted: perms.screenRecordingGranted,
                 showRestartHint: !perms.screenRecordingGranted && appState.attemptedScreenRecordingGrant,
                 onGrant: { appState.triggerPermissionFlow(for: .screenRecording, prompt: true) },
