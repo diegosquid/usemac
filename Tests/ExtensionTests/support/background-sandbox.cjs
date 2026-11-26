@@ -52,7 +52,7 @@ class FakeWebSocket {
 /**
  * @param {object} options
  * @param {Array<object>} options.tabs  Initial tabs: { id, windowId, url, title?, active?, pinned?, status? }.
- * @param {Array<object>} [options.windows]  Initial windows: { id, focused? }. Derived from tabs when omitted.
+ * @param {Array<object>} [options.windows]  Initial windows: { id, focused?, state? }. Derived from tabs when omitted.
  * @param {boolean} [options.fileAccess]  Result of chrome.extension.isAllowedFileSchemeAccess().
  * @param {(tabId:number, tab:object) => string|null} [options.attachError]  Message chrome.debugger.attach rejects with.
  * @param {(tabId:number, method:string, params:object) => any} [options.cdp]  CDP command results (default {}).
@@ -87,7 +87,7 @@ function createBackgroundSandbox(options = {}) {
     });
   }
   for (const w of options.windows || []) {
-    windows.set(w.id, { id: w.id, focused: Boolean(w.focused), type: "normal", state: "normal" });
+    windows.set(w.id, { id: w.id, focused: Boolean(w.focused), type: "normal", state: w.state || "normal" });
   }
   for (const t of tabs.values()) {
     if (!windows.has(t.windowId)) {
@@ -97,6 +97,9 @@ function createBackgroundSandbox(options = {}) {
 
   const tabsUpdated = makeEvent();
   const tabsRemoved = makeEvent();
+  const tabsActivated = makeEvent();
+  const windowsFocusChanged = makeEvent();
+  const windowsBoundsChanged = makeEvent();
   const debuggerDetached = makeEvent();
   const sessionStore = {};
 
@@ -107,10 +110,13 @@ function createBackgroundSandbox(options = {}) {
   }
 
   function activateInWindow(tab) {
+    const wasActive = tab.active;
     for (const other of tabs.values()) {
       if (other.windowId === tab.windowId) other.active = false;
     }
     tab.active = true;
+    // Like Chrome, a tab that becomes the active one of its window fires tabs.onActivated.
+    if (!wasActive) tabsActivated.emit({ tabId: tab.id, windowId: tab.windowId });
   }
 
   function navigate(tab, url) {
@@ -170,6 +176,7 @@ function createBackgroundSandbox(options = {}) {
     tabs: {
       onUpdated: tabsUpdated,
       onRemoved: tabsRemoved,
+      onActivated: tabsActivated,
       get: async (id) => clone(getTabOrThrow(id)),
       remove: async (id) => {
         record("tabs.remove", id);
@@ -220,6 +227,9 @@ function createBackgroundSandbox(options = {}) {
       }
     },
     windows: {
+      WINDOW_ID_NONE: -1,
+      onFocusChanged: windowsFocusChanged,
+      onBoundsChanged: windowsBoundsChanged,
       getAll: async () => Array.from(windows.values()).map(clone),
       getLastFocused: async () => clone(Array.from(windows.values()).find((w) => w.focused) || Array.from(windows.values())[0]),
       get: async (id) => clone(windows.get(id)),
@@ -323,6 +333,27 @@ function createBackgroundSandbox(options = {}) {
 
     callsTo(api) {
       return calls.filter((c) => c.api === api);
+    },
+
+    /** chrome.* events the tests fire by hand, as Chrome would after a user action. */
+    events: {
+      tabsActivated,
+      tabsUpdated,
+      windowsFocusChanged,
+      windowsBoundsChanged
+    },
+
+    /** The user clicks a tab: it becomes the active tab of its window (fires tabs.onActivated). */
+    activateTab(tabId) {
+      activateInWindow(getTabOrThrow(tabId));
+    },
+
+    /** The user minimizes or restores a window ("minimized" | "normal" | ...); focus leaves or returns to it. */
+    setWindowState(windowId, windowState) {
+      const win = windows.get(windowId);
+      win.state = windowState;
+      win.focused = windowState !== "minimized";
+      windowsFocusChanged.emit(win.focused ? windowId : -1);
     },
 
     /** Marks the bridge authenticated so the extension sends responses (captured in `sent`). */
