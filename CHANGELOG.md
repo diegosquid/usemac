@@ -6,6 +6,15 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **UseMac notices safety settings changed outside it.** The execution mode, the Emergency stop and Debug capture
+  are now saved with a seal whose key is in your login Keychain. If another process changes them (for example with
+  `defaults write app.usemac …`) and UseMac relaunches, it starts Paused with Debug capture off, records it in
+  History, and says so in the menu bar menu and **Settings → Safety**. Only you resume. The first launch of this
+  version seals your current settings and turns Debug capture off; turn it on again in **Settings → Developer** if
+  you use it.
+
 ## [0.7.0-beta.1] - 2026-11-26
 
 ### Added
