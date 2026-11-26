@@ -203,6 +203,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let viewportWidth: Int?
         let viewportHeight: Int?
         let jpegBase64: String?
+        /// True while the tab indicator (#27) is on screen in this frame; older extensions never send it.
+        let indicator: Bool?
     }
 
     private struct CursorPayload: Decodable {
@@ -231,6 +233,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         public let url: String?
         public let title: String
         public let capturedAt: Date
+        /// The frame shows UseMac's tab indicator (border and pill), so agents must not get it as a screenshot.
+        public var showsIndicator: Bool = false
     }
 
     private struct ResponsePayload: Decodable {
@@ -810,6 +814,75 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
     }
 
+    // MARK: - Tab Control (the tab indicator)
+
+    // The extension draws a blue border and a pill on a Chrome tab an agent controls while the user can see it (#27).
+    // The daemon tells it when that control stops or ends (`tab_control`); the pill's Stop button comes back as
+    // `stop_requested`. See docs/BRIDGE-PROTOCOL.md.
+
+    private struct TabControlWireMessage: Encodable {
+        let type = "tab_control"
+        let state: String
+        let keepTabIds: [Int]?
+
+        private enum CodingKeys: String, CodingKey {
+            case type
+            case state
+            case keepTabIds
+        }
+    }
+
+    private struct StopRequestedPayload: Decodable {
+        let tabId: Int?
+    }
+
+    private var _onUserStopRequested: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)?
+
+    /// The user pressed Stop in the pill on a controlled tab. The app handles it like Stop in the HUD.
+    public var onUserStopRequested: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _onUserStopRequested
+        }
+        set {
+            lock.lock()
+            _onUserStopRequested = newValue
+            lock.unlock()
+        }
+    }
+
+    /// The kill switch or Pause stopped the agent: every controlled tab's pill says "Stopped" for a few seconds.
+    public func sendTabControlStopped() {
+        broadcastTabControl(TabControlWireMessage(state: "stopped", keepTabIds: nil))
+    }
+
+    /// A task completed: the indicator goes away on every tab except those other running tasks still own.
+    public func sendTabControlEnded(keepTabIds: [Int]) {
+        broadcastTabControl(TabControlWireMessage(state: "ended", keepTabIds: Array(Set(keepTabIds)).sorted()))
+    }
+
+    private func broadcastTabControl(_ message: TabControlWireMessage) {
+        lock.lock()
+        let targets = readySessionsLocked().map(\.connection)
+        lock.unlock()
+        for connection in targets {
+            sendEncodable(message, on: connection)
+        }
+    }
+
+    private func handleStopRequested(_ payload: StopRequestedPayload?, sessionId: String) {
+        lock.lock()
+        guard let session = sessions[sessionId], session.isReady else {
+            lock.unlock()
+            return
+        }
+        let profileName = session.profileName
+        let handler = _onUserStopRequested
+        lock.unlock()
+        handler?(profileName, payload?.tabId)
+    }
+
     public func stopActiveStreams() {
         lock.lock()
         var targets: [NWConnection] = []
@@ -1375,6 +1448,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             let payload = try? decoder.decode(StreamStoppedPayload.self, from: data)
             handleStreamStopped(payload, sessionId: sessionId)
 
+        case "stop_requested":
+            let payload = try? decoder.decode(StopRequestedPayload.self, from: data)
+            handleStopRequested(payload, sessionId: sessionId)
+
         case "response":
             guard let payload = try? decoder.decode(ResponsePayload.self, from: data) else { return }
             handleResponse(payload, sessionId: sessionId)
@@ -1609,7 +1686,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             tabId: payload.tabId,
             url: payload.url ?? session.streamingUrl,
             title: title,
-            capturedAt: Date()
+            capturedAt: Date(),
+            showsIndicator: payload.indicator == true
         )
         let frameKey = "\(profileName.lowercased()):\(payload.tabId ?? -1)"
         cachedFramesByTab[frameKey] = cached

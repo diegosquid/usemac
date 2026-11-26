@@ -604,9 +604,13 @@ final class BridgeAuthTests: XCTestCase {
 
         service.tripKillSwitch(true)
 
+        // The tab indicator learns first (its pill says "Stopped" before the debugger detaches), then cancel.
         let firstMsg = try await receiveBridgeJSON(from: wsTask)
-        XCTAssertEqual(firstMsg["type"] as? String, "cancel")
-        XCTAssertTrue(firstMsg["tabId"] is NSNull, "Expected explicit null tabId in cancel frame, got \(firstMsg)")
+        XCTAssertEqual(firstMsg["type"] as? String, "tab_control")
+        XCTAssertEqual(firstMsg["state"] as? String, "stopped")
+        let cancelMsg = try await receiveBridgeJSON(from: wsTask)
+        XCTAssertEqual(cancelMsg["type"] as? String, "cancel")
+        XCTAssertTrue(cancelMsg["tabId"] is NSNull, "Expected explicit null tabId in cancel frame, got \(cancelMsg)")
     }
 
     func testActTimeoutScalesWithWaitStepsAndSendsCancel() async throws {

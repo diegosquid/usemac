@@ -93,6 +93,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             workspaceMonitor: workspaceMonitor,
             killSwitch: killSwitch
         )
+        // Stop in the pill on a controlled Chrome tab. The app replaces this with the HUD's Stop (AppState).
+        self.chromeBridge.onUserStopRequested = { [weak self] _, _ in
+            self?.tripKillSwitch(true)
+        }
         self.chromeBridge.onProfilesChanged = { [weak self] _ in
             self?.notifyStateChanged()
         }
@@ -1505,6 +1509,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 success: true,
                 taskId: completion.taskId
             )
+            // The tab indicator goes away on this task's tabs (and on tabs kept with keepTabIds).
+            chromeBridge.sendTabControlEnded(keepTabIds: Array(completion.protectedTabIds))
             emitLiveActivity(LiveActivityItem(
                 kind: .taskComplete,
                 appName: targetName,
@@ -1596,7 +1602,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
             // Use cached live stream frame when fresh (< 1.5s old) for zero capture latency
             if let cached = chromeBridge.latestFrame(profileQuery: params.profile, tabId: params.tabId),
-               Date().timeIntervalSince(cached.capturedAt) < 1.5 {
+               Date().timeIntervalSince(cached.capturedAt) < 1.5,
+               !cached.showsIndicator {
                 let dir = UseMacDefaults.captureDirectory
                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                 let path = (dir as NSString).appendingPathComponent("vision-browser-\(cached.tabId ?? 0)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
@@ -1700,6 +1707,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
     public func setGovernancePolicy(_ policy: GovernancePolicy) {
         killSwitch.setPolicy(policy)
+        if policy == .paused { chromeBridge.sendTabControlStopped() }
         emitLiveActivity(LiveActivityItem(
             kind: .policyOrSafety,
             title: "Policy set to \(policy.rawValue)",
@@ -1717,6 +1725,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         killSwitch.trip(tripped)
         if tripped {
             onOverlayEvent?(.clear)
+            chromeBridge.sendTabControlStopped()
             chromeBridge.cancelActiveCommands()
             chromeBridge.stopActiveStreams()
         }

@@ -255,3 +255,55 @@ Reload):
 - treats the socket closing before the answer as a reload in progress;
 - waits up to 15 s for a new ready session with the same profile name, accepted after the command was sent, and
   returns its status, or fails with `EXTENSION_RELOAD_TIMEOUT`.
+
+## Tab indicator (`tab_control`, `stop_requested`)
+
+While an agent controls a tab and the user can see it (the active tab of a window that is not minimized), the
+extension draws a blue border around the viewport and a pill at the top center: "UseMac is controlling this tab",
+the current step when there is one ("Clicking Save"), and a **Stop** button. It draws through the debugger it is
+already attached with, in the `usemac` isolated world of the top document, so it needs no extra permission:
+
+- one `<usemac-tab-indicator>` host under `<html>` (not `<body>`), `aria-hidden`, with a **closed** shadow root,
+  `position: fixed`, the highest z-index (and the top layer through a manual popover where Chrome supports it).
+  Only the pill takes pointer events. The host is put back if the page removes it, and drawn again after every
+  top-level navigation.
+- A tab counts as controlled from the first agent command on it (`open`, `observe`, `extract`, `screenshot`, `act`)
+  until its control ends (below), its debugger detaches (idle timeout, eviction, `stop_stream`, release from the
+  popup) or the tab closes. Nothing is drawn into a controlled tab until the user looks at it.
+- The page holds a lease of 12 s that the extension renews every 4 s while the indicator is on screen. Without a
+  renewal (the debugger went away) the page hides and removes it by itself.
+- Agents never see it: the DOM walk of `observe` cannot enter the closed shadow root, `Page.captureScreenshot` for
+  `observe`, `act` and `screenshot` runs with the indicator hidden, and the pill stops taking pointer events while the
+  agent's own mouse events land on it, so they reach the page below.
+
+### `tab_control` (daemon → extension)
+
+```json
+{"type":"tab_control","state":"stopped"}
+{"type":"tab_control","state":"ended","keepTabIds":[123]}
+```
+
+No `id`, no response. Ignored before `ready`, like `cancel`.
+
+| `state` | Sent when | Effect |
+| --- | --- | --- |
+| `stopped` | The kill switch trips (sent right before `cancel`), or the policy becomes `paused`. | Every controlled tab's pill says "Stopped" (no Stop button, gray border) for 4 s, then the indicator goes away. A tab `cancel` detaches keeps its "Stopped" pill for those 4 s. |
+| `ended` | `task_complete`, with or without `keepTabs`. | The indicator goes away on every controlled tab except `keepTabIds`: the tabs other running tasks still own (`TaskTabRegistry`). A tab kept open with `keepTabIds` loses it too. The next agent command on a tab brings it back. |
+
+### `stop_requested` (extension → daemon)
+
+```json
+{"type":"stop_requested","tabId":123}
+```
+
+Sent when the user clicks Stop in the pill. The click must be trusted (`event.isTrusted`), come from a pointer
+(`detail >= 1`, so not a keyboard or accessibility press) and reach the extension through a CDP binding
+(`Runtime.addBinding` with `executionContextName: "usemac"`) that the page's own scripts cannot call; the binding
+carries a per-tab token. The daemon drops it from a session that is not `ready`. The app handles it like Stop in the
+HUD: it trips the kill switch, unless the agent is already stopped or paused.
+
+### `frame.indicator`
+
+`frame` messages carry `"indicator": true` while the indicator is on screen in that frame (screencast frames of a
+visible tab show what Chrome paints). The daemon does not reuse such frames as an agent's screenshot (`vision_query`
+takes a fresh capture instead). Frames without the field (older extensions) count as plain.

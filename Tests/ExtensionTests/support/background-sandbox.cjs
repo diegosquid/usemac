@@ -414,13 +414,31 @@ function createBackgroundSandbox(options = {}) {
     /** Marks the bridge authenticated so the extension sends responses (captured in `sent`). */
     markReady() {
       vm.runInContext(
-        `state.ws = state.ws || new WebSocket("ws://test"); state.ws.readyState = WebSocket.OPEN; state.authState = "ready";`,
+        // The real connectWS installs the socket handlers (deliver() uses them); the fake socket never opens.
+        `if (!state.ws) connectWS(true); state.ws.readyState = WebSocket.OPEN; state.authState = "ready";`,
         context
       );
     },
 
     get sent() {
       return vm.runInContext("state.ws ? state.ws.sentFrames : []", context);
+    },
+
+    /** Delivers a daemon -> extension frame (e.g. `cancel`, `tab_control`) through the real socket handler. */
+    async deliver(message, timeoutMs = 2000) {
+      const startedAt = Date.now();
+      while (!vm.runInContext("typeof state.ws?.onmessage === 'function'", context)) {
+        if (Date.now() - startedAt > timeoutMs) throw new Error("The extension never set up its socket handler");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      this.markReady();
+      context.__deliverText = JSON.stringify(message);
+      vm.runInContext("state.ws.onmessage({ data: __deliverText })", context);
+    },
+
+    /** A CDP event from the debugger, as Chrome sends it for the tab's top-level target. */
+    debuggerEvent(tabId, method, params = {}) {
+      chrome.debugger.onEvent.emit({ tabId }, method, params);
     },
 
     /** Sends a daemon request through the real dispatcher and resolves with the extension's response frame. */
