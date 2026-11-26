@@ -2,8 +2,8 @@ import Foundation
 import Darwin
 
 public enum UseMacDefaults {
-    public static let version = "0.6.0-beta.3"
-    public static let buildNumber = "62"
+    public static let version = "0.7.0-beta.1"
+    public static let buildNumber = "63"
     public static let applicationSupportFolderName = "UseMac"
 
     /// Private per-user folder (mode 0700) that holds the default socket, like tmux's `/tmp/tmux-$UID`.

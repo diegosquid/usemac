@@ -6,6 +6,23 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0-beta.1] - 2026-11-26
+
+### Changed
+
+- **The live preview is a stack that shuffles itself.** With several agents at once, up to two cards sit behind the
+  front one, each with a 7 pt edge showing, blurred and with no title, icon or click target. Every 5 s the front
+  card goes to the back and the next card with new work comes forward. It doesn't shuffle while the pointer is over
+  the preview or automation is stopped, and with Reduce Motion the switch is a short fade. When an agent behind
+  clicks, types or scrolls, its card's edge flashes. The panel grows by 7 pt per card behind (14 pt at most) instead
+  of 46 pt. The thumbnail strip, the title chip and the blue ring of a switch are gone.
+- **Each task has its own color in the preview.** The click ripple and the edge flash use it. Two sessions of the
+  same agent are two tasks, so they get two colors, and a task's tabs share one. Green, amber and red stay reserved
+  for done, paused and stopped. Live activity items carry the `taskId` they belong to.
+- **The preview has no Stop or Resume.** It only shows what is happening. Stop and resume from the UseMac menu or
+  with ⌘⇧⎋. A stopped preview keeps its red border, and the collapsed pill says "Stopped".
+- **A softer shadow.** The preview draws its own light shadow instead of the macOS window shadow.
+
 ## [0.6.0-beta.3] - 2026-11-26
 
 ### Added
@@ -234,7 +251,8 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
-[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.3...HEAD
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.7.0-beta.1...HEAD
+[0.7.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.3...v0.7.0-beta.1
 [0.6.0-beta.3]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.2...v0.6.0-beta.3
 [0.6.0-beta.2]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.1...v0.6.0-beta.2
 [0.6.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.5.0...v0.6.0-beta.1
