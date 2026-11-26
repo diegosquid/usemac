@@ -149,8 +149,10 @@ public final class ActivityHUDController {
     private let edgeMargin: CGFloat = 14
     private let peekStep: CGFloat = hudDeckPeek
     private let collapsedSize: NSSize = hudCollapsedPillSize
-    private let regularPiPSize = NSSize(width: 268, height: 172)
-    private let largePiPSize = NSSize(width: 380, height: 242)
+    /// The preview's fixed sizes (16:10). The picture fills them and is cropped; the HUD never follows the page's
+    /// or window's shape, and nothing ever resizes the page to fit the HUD.
+    private let regularPiPSize = NSSize(width: 280, height: 175)
+    private let largePiPSize = NSSize(width: 400, height: 250)
 
     public var isVisible: Bool {
         panel.isVisible
@@ -168,10 +170,9 @@ public final class ActivityHUDController {
         let initialSize = Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
             isLarge: appState.isHUDLarge,
-            hasFrame: appState.videoSink.hasReceivedFrame,
-            aspectRatio: appState.videoSink.frameAspectRatio,
             stackBehindCount: initialBehind,
             peekStep: peekStep,
+            tagHeight: appState.isHUDCollapsed || appState.hudDeck.isEmpty ? 0 : hudTagHeight,
             collapsedSize: collapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
@@ -388,10 +389,9 @@ public final class ActivityHUDController {
         return Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
             isLarge: appState.isHUDLarge,
-            hasFrame: appState.videoSink.hasReceivedFrame,
-            aspectRatio: appState.videoSink.frameAspectRatio,
             stackBehindCount: behind,
             peekStep: peekStep,
+            tagHeight: appState.isHUDCollapsed || appState.hudDeck.isEmpty ? 0 : hudTagHeight,
             collapsedSize: collapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
@@ -415,10 +415,9 @@ public final class ActivityHUDController {
     private static func sizeFor(
         collapsed: Bool,
         isLarge: Bool,
-        hasFrame: Bool,
-        aspectRatio: CGFloat,
         stackBehindCount: Int,
         peekStep: CGFloat,
+        tagHeight: CGFloat,
         collapsedSize: NSSize,
         regularPiPSize: NSSize,
         largePiPSize: NSSize
@@ -426,17 +425,9 @@ public final class ActivityHUDController {
         if collapsed {
             return collapsedSize
         }
-        let baseSize: NSSize
-        if hasFrame && aspectRatio > 0.2 {
-            let targetWidth: CGFloat = isLarge ? 400 : 280
-            let minHeight: CGFloat = isLarge ? 200 : 140
-            let maxHeight: CGFloat = isLarge ? 320 : 228
-            let fittedHeight = round(min(max(targetWidth / aspectRatio, minHeight), maxHeight))
-            baseSize = NSSize(width: targetWidth, height: fittedHeight)
-        } else {
-            baseSize = isLarge ? largePiPSize : regularPiPSize
-        }
-        let extraHeight = CGFloat(max(stackBehindCount, 0)) * peekStep
+        let baseSize = isLarge ? largePiPSize : regularPiPSize
+        // The cards behind show an edge each, and the front card's task tag sits above its picture.
+        let extraHeight = CGFloat(max(stackBehindCount, 0)) * peekStep + tagHeight
         return NSSize(width: baseSize.width, height: baseSize.height + extraHeight)
     }
 

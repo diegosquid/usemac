@@ -35,6 +35,11 @@ enum HUDTaskPalette {
         guard let slot else { return MinimalHUDPalette.activeSky }
         return colors[((slot % colors.count) + colors.count) % colors.count]
     }
+
+    /// How strongly a card's tag shows its task color over white: a pastel that stays at the edge of the eye.
+    static let tagOpacity: Double = 0.22
+    /// A tag behind the front card brightens to this for a moment when its agent does something.
+    static let tagFlashOpacity: Double = 0.40
 }
 
 /// Transparent margin around the HUD that its own soft shadow draws into. The panel has no system shadow, and
@@ -77,15 +82,24 @@ public struct ActivityHUDView: View {
 private final class LiveVideoContainerView: NSView {
     let videoLayer = CALayer()
 
+    /// The size of what the frames show (the page or the window). The picture fills the card from its top-left
+    /// corner at this aspect, and what does not fit is cut off (LivePreviewGeometry.displayedRect).
+    var sourceSize: CGSize = .zero {
+        didSet {
+            if sourceSize != oldValue { needsLayout = true }
+        }
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
 
         let containerLayer = CALayer()
         containerLayer.backgroundColor = NSColor.white.cgColor
+        containerLayer.masksToBounds = true
         self.layer = containerLayer
 
-        videoLayer.contentsGravity = .resizeAspect
+        videoLayer.contentsGravity = .resizeAspectFill
         videoLayer.magnificationFilter = .trilinear
         videoLayer.minificationFilter = .trilinear
         videoLayer.masksToBounds = true
@@ -105,22 +119,41 @@ private final class LiveVideoContainerView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        videoLayer.frame = bounds
+        let shown = LivePreviewGeometry.displayedRect(sourceSize: sourceSize, in: bounds.size)
+        if shown.isEmpty {
+            videoLayer.frame = bounds
+        } else {
+            // This view is not flipped, so its layer's origin is the bottom-left corner: keep the picture's top
+            // edge on the card's top edge and let the bottom run past it.
+            videoLayer.frame = CGRect(
+                x: shown.minX,
+                y: bounds.height - shown.maxY,
+                width: shown.width,
+                height: shown.height
+            )
+        }
         CATransaction.commit()
     }
 }
 
 private struct LiveVideoSurfaceView: NSViewRepresentable {
-    let videoSink: LiveVideoSink
+    @ObservedObject var videoSink: LiveVideoSink
 
     func makeNSView(context: Context) -> LiveVideoContainerView {
         let view = LiveVideoContainerView()
         videoSink.attach(layer: view.videoLayer)
+        view.sourceSize = Self.sourceSize(of: videoSink)
         return view
     }
 
     func updateNSView(_ nsView: LiveVideoContainerView, context: Context) {
         videoSink.attach(layer: nsView.videoLayer)
+        nsView.sourceSize = Self.sourceSize(of: videoSink)
+    }
+
+    private static func sourceSize(of sink: LiveVideoSink) -> CGSize {
+        guard let bounds = sink.sourceBounds else { return .zero }
+        return CGSize(width: bounds.width, height: bounds.height)
     }
 }
 
@@ -275,11 +308,15 @@ private struct CollapsedMicroPill: View {
 let hudDeckPeek: CGFloat = 7
 /// Most cards drawn behind the front one.
 let hudDeckMaxBehind = 2
+/// The soft task-color tag along the top of the front card. ActivityHUDController adds it to the panel's height so
+/// the live picture keeps its size.
+let hudTagHeight: CGFloat = 7
 
-/// The front card is the live preview; up to two more cards sit behind it, each with a 7 pt edge showing. They are
-/// only there to show that more work is going on: no titles, no click targets. Their edge flashes in their task's
-/// color when their agent does something, and the deck shuffles them forward in turn (AppState+DeckShuffle). The
-/// stack grows up from a bottom corner and down from a top corner.
+/// The front card is the live preview under a thin tag in its task's color; up to two more cards sit behind it, each
+/// with a 7 pt edge showing. They are only there to show that more work is going on: no titles, no pictures, no click
+/// targets. Their edge is a soft tag in their task's color that brightens for a moment when their agent does
+/// something, and the deck shuffles them forward in turn (AppState+DeckShuffle). The stack grows up from a bottom
+/// corner and down from a top corner.
 private struct StackedPiPDeckView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var videoSink: LiveVideoSink
@@ -297,7 +334,7 @@ private struct StackedPiPDeckView: View {
             ZStack(alignment: .topLeading) {
                 if deck.isEmpty {
                     // Nothing in the deck yet (a pinned preview, the full display): the live card on its own.
-                    FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: HUDTaskPalette.color(slot: nil))
+                    FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: HUDTaskPalette.color(slot: nil), tag: nil)
                         .hudSoftShadow(cardShape, ambient: true)
                         .frame(width: geo.size.width, height: cardHeight)
                 }
@@ -309,7 +346,6 @@ private struct StackedPiPDeckView: View {
                         videoSink: videoSink,
                         card: card,
                         position: index,
-                        growsUp: growsUp,
                         accent: HUDTaskPalette.color(slot: appState.taskColorSlot(for: card))
                     )
                     .frame(width: geo.size.width, height: cardHeight)
@@ -328,13 +364,12 @@ private struct StackedPiPDeckView: View {
     }
 }
 
-/// One card of the deck: the live preview in front, a still of its tab or window behind.
+/// One card of the deck: the live preview in front, a soft tag in its task's color behind.
 private struct DeckCardView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var videoSink: LiveVideoSink
     let card: HUDSessionCard
     let position: Int
-    let growsUp: Bool
     let accent: Color
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -347,25 +382,19 @@ private struct DeckCardView: View {
 
         ZStack {
             if isFront {
-                FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: accent)
+                FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: accent, tag: accent)
                     .opacity(frontFade)
             } else {
                 backFace(shape: shape, depth: min(position, hudDeckMaxBehind))
             }
         }
         .hudSoftShadow(shape, ambient: isFront)
-        .overlay(
-            shape
-                .strokeBorder(accent, lineWidth: 1)
-                .opacity(flash ? 0.9 : 0)
-                .allowsHitTesting(false)
-        )
         .onChange(of: card.backgroundStepCount) { _, _ in
             guard !isFront else { return }
             var start = Transaction()
             start.disablesAnimations = true
             withTransaction(start) { flash = true }
-            withAnimation(.easeOut(duration: 0.45).delay(0.09)) { flash = false }
+            withAnimation(.easeOut(duration: 0.6).delay(0.09)) { flash = false }
         }
         .onChange(of: isFront) { _, nowFront in
             // With Reduce Motion the cards change places without moving; the new front fades in instead.
@@ -377,26 +406,16 @@ private struct DeckCardView: View {
         }
     }
 
-    /// A card behind the front one: its last picture, veiled and blurred so nothing in it can be read.
+    /// A card behind the front one: only its edge shows, as a soft tag in its task's color. The card further back is a
+    /// little paler.
     private func backFace(shape: RoundedRectangle, depth: Int) -> some View {
-        GeometryReader { geo in
-            ZStack {
-                Color(red: 0.975, green: 0.975, blue: 0.98)
-                if let cgImage = card.previewImage {
-                    Image(decorative: cgImage, scale: 2.0)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: geo.size.width, height: geo.size.height, alignment: growsUp ? .top : .bottom)
-                        .clipped()
-                        .blur(radius: 1.2)
-                        .saturation(0.9)
-                }
-                Color.white.opacity(depth <= 1 ? 0.22 : 0.40)
-            }
-            .frame(width: geo.size.width, height: geo.size.height)
+        let base = HUDTaskPalette.tagOpacity * (depth <= 1 ? 1 : 0.75)
+        return ZStack {
+            Color.white
+            accent.opacity(flash ? HUDTaskPalette.tagFlashOpacity : base)
         }
         .clipShape(shape)
-        .overlay(shape.strokeBorder(Color.black.opacity(0.085), lineWidth: 0.75))
+        .overlay(shape.strokeBorder(Color.black.opacity(0.07), lineWidth: 0.75))
     }
 }
 
@@ -429,6 +448,8 @@ private struct FramelessLivePiPCard: View {
     @ObservedObject var videoSink: LiveVideoSink
     /// The card's task color: the click ripple uses it.
     let accent: Color
+    /// The color of the soft tag along the card's top, or nil for no tag (a preview with no task).
+    let tag: Color?
 
     @State private var isHovering = false
     @State private var isEnableHovered = false
@@ -447,43 +468,48 @@ private struct FramelessLivePiPCard: View {
         let isBusy = appState.isAgentBusy && !isStopped
         let isCompleted = appState.hasCompletedHUDAction && !isStopped && !isBusy
 
-        ZStack {
-            Color.white
+        VStack(spacing: 0) {
+            if let tag {
+                taskTag(tag)
+            }
+            ZStack {
+                Color.white
 
-            if appState.chromePreviewHidden && !appState.isBrowserStreamActive {
-                PrivatePreviewPlaceholder()
-                    .transition(.opacity)
-            } else if videoSink.hasReceivedFrame {
-                LiveVideoSurfaceView(videoSink: videoSink)
-                    .transition(.opacity)
+                if appState.chromePreviewHidden && !appState.isBrowserStreamActive {
+                    PrivatePreviewPlaceholder()
+                        .transition(.opacity)
+                } else if videoSink.hasReceivedFrame {
+                    LiveVideoSurfaceView(videoSink: videoSink)
+                        .transition(.opacity)
 
-                if !isCompleted {
-                    videoSpatialOverlay
-                        .allowsHitTesting(false)
+                    if !isCompleted {
+                        videoSpatialOverlay
+                            .allowsHitTesting(false)
+                            .transition(.opacity)
+                    }
+                } else {
+                    softOnboardingState
                         .transition(.opacity)
                 }
-            } else {
-                softOnboardingState
-                    .transition(.opacity)
-            }
 
-            // Keep active preview frameless and calm; only show a soft red aura when Emergency Stop is tripped
-            if isStopped {
-                cardShape
-                    .stroke(MinimalHUDPalette.stopRed.opacity(0.20), lineWidth: 4.0)
-                    .blur(radius: 3.5)
-                    .clipShape(cardShape)
-                    .allowsHitTesting(false)
-            }
+                // Keep active preview frameless and calm; only show a soft red aura when Emergency Stop is tripped
+                if isStopped {
+                    cardShape
+                        .stroke(MinimalHUDPalette.stopRed.opacity(0.20), lineWidth: 4.0)
+                        .blur(radius: 3.5)
+                        .clipShape(cardShape)
+                        .allowsHitTesting(false)
+                }
 
-            // OpenAI-style airy translucent white frosted completion overlay + soft light-green check
-            if isCompleted {
-                completionVeilOverlay
-                    .transition(.opacity)
-                    .allowsHitTesting(false)
-            }
+                // OpenAI-style airy translucent white frosted completion overlay + soft light-green check
+                if isCompleted {
+                    completionVeilOverlay
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
+                }
 
-            whisperFloatingChrome(isCompleted: isCompleted)
+                whisperFloatingChrome(isCompleted: isCompleted)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(cardShape)
@@ -625,6 +651,18 @@ private struct FramelessLivePiPCard: View {
                     .opacity(completionReveal ? 1.0 : 0.0)
             }
         }
+    }
+
+    /// The card's task color as a thin pastel band along its top, so cards of different tasks tell apart at a glance
+    /// without coloring the picture.
+    private func taskTag(_ color: Color) -> some View {
+        ZStack(alignment: .bottom) {
+            Color.white
+            color.opacity(HUDTaskPalette.tagOpacity)
+            color.opacity(0.16)
+                .frame(height: 0.5)
+        }
+        .frame(height: hudTagHeight)
     }
 
     // MARK: - Whisper-Quiet Floating Chrome (No Screen Pill, Nearly Invisible CTAs)
