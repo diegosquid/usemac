@@ -6,6 +6,12 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- With several agents working at once, the preview no longer jumps between their cards every second. The card in
+  front stays until you pick another one, it goes away or its task finishes. The others keep updating in the
+  filmstrip, and their captions, cursor and clicks no longer show up on the card you are watching.
+
 ## [0.6.0-beta.2] - 2026-11-25
 
 Fixes from the first days of the beta, mostly in Chrome and the live preview.
