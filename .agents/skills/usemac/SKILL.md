@@ -52,7 +52,7 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
 
 - **Pairing prerequisite**: Each Chrome profile must be paired once before browser methods work. The user opens **UseMac → Settings → General → Chrome Extension**, clicks **Copy key**, and pastes the `umk_…` key into the extension popup. Until paired, browser calls return `EXTENSION_NOT_PAIRED`. The pairing key is never exposed via RPC, MCP, or CLI.
 - **Profile selection**: `profile` is optional when only one Chrome profile is connected. When multiple profiles are connected, get profile names from `browser_status` (lookup matches profile name, not e-mail) and pass `"profile": "<name>"`.
-- **Tab targeting**: Without `tabId`, browser methods use the last tab used by UseMac or a tab in the `UseMac` tab group; if none exists, they return `NO_USEMAC_TAB` instead of touching the user's active tab. Call `browser_open` to create one, or call `browser_tabs` and pass `tabId` to work in an already open user tab.
+- **Tab targeting**: Without `tabId`, a browser method of a task goes to the last tab that task opened or named (never another agent's tab). Without a task it uses the last tab used by UseMac or a tab in the `UseMac` tab group; if none exists, it returns `NO_USEMAC_TAB` instead of touching the user's active tab. Call `browser_open` to create one, or call `browser_tabs` and pass `tabId` to work in an already open user tab.
 - **URL restriction**: `browser_open` and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs default to `https://`). Other schemes return `URL_BLOCKED`.
 
 - **Browser status**:
@@ -100,10 +100,11 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   Call `task_start` ONCE at the beginning of a multi-step task so the floating preview stays continuously open across all iterations, and call `task_complete` ONLY ONCE at the very end so the completion overlay plays once and smoothly closes the preview:
   ```json
   {"id":"s1","method":"task_start","taskStart":{"summary":"Analyzing analytics dashboard"}}
-  {"id":"o1","method":"browser_open","browserOpen":{"url":"https://example.com","taskId":"<taskId from task_start>"}}
+  {"id":"o1","method":"browser_open","taskId":"<taskId from task_start>","browserOpen":{"url":"https://example.com"}}
+  {"id":"b1","method":"browser_observe","taskId":"<taskId from task_start>","browserObserve":{}}
   {"id":"d1","method":"task_complete","taskComplete":{"taskId":"<taskId from task_start>","summary":"Analysis complete"}}
   ```
-  `task_start` returns a `taskId`. Pass it to every `browser_open` and to `task_complete`: other agents may be working at the same time, and the `taskId` is how UseMac closes only your tabs and marks only your preview cards done.
+  `task_start` returns a `taskId`. Put it at the top level of every later request (any method takes it): other agents may be working at the same time, and the `taskId` is how UseMac sends your requests without `tabId` to your own last tab, closes only your tabs, and marks only your preview cards done. `task_complete` returns a `taskSummary` (`requests`, `actions`, `failedActions`, `blocked`, `tabsOpened`, `tabsClosed`, `tabsClosing`, `durationMs`).
 
 Quick one-liner via `nc` or persistent Python `AF_UNIX` socket:
 ```bash
@@ -194,7 +195,7 @@ Each tool exposes MCP `annotations` (`readOnlyHint`, `destructiveHint`). On time
 11. **Wrap Multi-Step Tasks with `task_start` → `task_complete` (Never Flap Preview)**:
    - Call `task_start` (`usemac_task_start` / `usemac start --summary "..."`) **once** when beginning a task so the floating live preview opens once and stays continuously open across turns.
    - Call `task_complete` (`usemac_task_complete` / `usemac done --summary "..."`) **only once** at the very end when the entire user request is finished — this plays the completion overlay once and smoothly closes the preview.
-   - Pass the `taskId` that `task_start` returned to `browser_open` and `task_complete` (CLI: `usemac start` prints it; use `--task <id>`). Other agents may be running: with the `taskId`, finishing closes only the tabs your task opened, never theirs.
+   - Pass the `taskId` that `task_start` returned on every later request (socket: top-level `"taskId"`; CLI: `usemac start` prints it, then `--task <id>` on every command or `export USEMAC_TASK=<id>`; MCP: automatic while the connection started one task). Other agents may be running: with the `taskId`, a browser call without `tabId` goes to your own last tab, and finishing closes only the tabs your task opened, never theirs.
    - About 2 s later UseMac closes the Chrome tabs your task opened (never the user's own tabs, the tab the user is looking at, or tabs with a running download). If the user should see a result page or work is pending there, keep it: `"keepTabIds": [123]` (CLI `--keep-tab 123`), or `"keepTabs": true` (CLI `--keep-tabs`).
 
 ---
@@ -236,7 +237,7 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 | `EXTENSION_NOT_CONNECTED` | No paired Chrome extension is connected (or the requested `profile` name did not match). | Call `browser_status` to check connected profiles, or ask the user to open Chrome with the extension enabled. |
 | `EXTENSION_NOT_PAIRED` | Chrome extension is connected but has not been paired with the local `umk_…` key yet. | Ask the user to copy the key from **UseMac → Settings → General → Chrome Extension** and paste it in the extension popup. |
 | `EXTENSION_TIMEOUT` | The Chrome extension did not answer before the command timeout (and running `browser_act` batches are cancelled). | Call `browser_status` or `browser_observe` to check tab state before deciding whether to retry. |
-| `NO_USEMAC_TAB` | No `tabId` was passed and there is no tracked UseMac tab or tab in the `UseMac` tab group. | Call `browser_open` to open a new background tab, or call `browser_tabs` and pass an explicit `tabId`. |
+| `NO_USEMAC_TAB` | No `tabId` was passed and there is no tracked UseMac tab or tab in the `UseMac` tab group, or your task's last tab was closed before an action. | Call `browser_open` to open a new background tab, or call `browser_tabs` and pass an explicit `tabId`. |
 | `CANCELLED` | The running or queued Chrome batch was cancelled (for example by the Kill Switch or a timeout). | Stop the current batch, check `status` if needed, and inform the user before taking further actions. |
 | `DAEMON_REQUIRED` | `UseMac.app` is not running, so actions are disabled in the CLI and MCP server. | Stop and ask the user to open `UseMac.app`; do not bypass it with `--standalone`. |
 | `STALE_SNAPSHOT` | The window changed since your last observe (or `expectWindowTitle` didn't match). Nothing ran. | Observe again and use the new ids, or use `match`. |

@@ -48,7 +48,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 
 - **Pairing**: each Chrome profile must be paired once. The user copies the `umk_…` key from **UseMac → Settings → General → Chrome Extension** (**Copy key**) and pastes it into the extension popup. Until then browser calls return `EXTENSION_NOT_PAIRED`. The key is never exposed through the socket, MCP or CLI.
 - **Profiles**: `profile` is optional when only one Chrome profile is connected. With several, read the exact names from `browser_status` and pass `"profile": "Work"` (matched by profile name).
-- **Tabs**: without `tabId`, browser calls use the last tab UseMac used or a tab in the `UseMac` tab group; if there is none they return `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
+- **Tabs**: without `tabId`, a browser call of a task (see `task_start`) goes to the last tab that task opened or named, so it never lands in another agent's tab. Without a task it uses the last tab UseMac used or a tab in the `UseMac` tab group; if there is none it returns `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
 - **URLs**: `browser_open` and the `openURL`/`navigate` steps accept only `http://`, `https://` and `about:blank`. A URL without a scheme gets `https://`; anything else returns `URL_BLOCKED`.
 
 ---
@@ -87,8 +87,8 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `vision_status` | Local vision readiness (Apple Vision OCR plus optional on-device MLX model). |
 | `vision_install` | Install the optional MLX runtime and one of the three preset models (`INVALID_MODEL` otherwise). |
 | `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. |
-| `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass to `browser_open` and `task_complete`. |
-| `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). |
+| `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request. |
+| `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. |
 
 While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`.
 
@@ -158,17 +158,27 @@ Call `task_start` once at the beginning of a multi-step task and `task_complete`
 {"method":"task_start","taskStart":{"summary":"Reviewing dashboard"}}
 ```
 
-The response carries a `taskId` (for example `"taskId":"task-1a2b3c4d"`). Pass it to `browser_open` and `task_complete`:
+The response carries a `taskId` (for example `"taskId":"task-1a2b3c4d"`). Put it at the top level of every later request (any method takes it), or inside `browserOpen`/`taskComplete`:
 
 ```json
-{"method":"browser_open","browserOpen":{"url":"https://example.com","taskId":"task-1a2b3c4d"}}
+{"method":"browser_open","taskId":"task-1a2b3c4d","browserOpen":{"url":"https://example.com"}}
+{"method":"browser_observe","taskId":"task-1a2b3c4d","browserObserve":{}}
 ```
 
 ```json
 {"method":"task_complete","taskComplete":{"taskId":"task-1a2b3c4d","summary":"Article summarized"}}
 ```
 
-Several agents can work at the same time. The `taskId` is how UseMac knows which tabs are yours: `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed. Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task; when it can't tell, it closes nothing that a running task owns. In the CLI, `usemac start` prints the id; pass it as `--task` to `browser open` and `done`.
+Several agents can work at the same time. The `taskId` is how UseMac knows which tabs are yours:
+
+- A browser request without `tabId` goes to the last tab your task opened or named, not to the last tab any agent touched. Without a task it goes where it always did.
+- `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed.
+- Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task. When it can't tell, it closes nothing that a running task owns. A `taskId` that names no running task (finished, or idle for 30 minutes) belongs to no task.
+- If your task's last tab was closed, a read (`browser_observe`, `browser_extract`, `browser_screenshot`, `vision_query`) runs on your task's previous tab; an action fails with `NO_USEMAC_TAB` instead of moving to another tab.
+
+In the CLI, `usemac start` prints the id: pass it as `--task <id>` to every command, or `export USEMAC_TASK=<id>`. The MCP server does this for you: while the connection has started one task, its tool calls belong to it.
+
+`task_complete` returns what the task did in `taskSummary`: `requests`, `actions` (act and browser_act steps), `failedActions`, `blocked` (refused for a safety reason), `tabsOpened`, `tabsClosed` (closed during the task), `tabsClosing` (closed in the cleanup below) and `durationMs`.
 
 About 2 s after `task_complete`, UseMac closes the Chrome tabs your task opened so the user's tab strip does not fill up. It never closes tabs the user already had open (even if you used them through `tabId`), the tab the user is looking at, or tabs with a running download. Keep a tab when the user should see it or work is pending: `"keepTabIds":[42]` (CLI `usemac done --keep-tab 42`), or `"keepTabs":true` to keep them all (CLI `--keep-tabs`).
 
@@ -236,8 +246,8 @@ Every tool carries MCP `annotations` (`readOnlyHint`, `destructiveHint`). On a t
 | `usemac_browser_act` | DOM action steps with optional `readOnly`, `verify` or inline screenshot. |
 | `usemac_vision_status` | Local vision readiness. |
 | `usemac_vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`). |
-| `usemac_task_start` | Hold the floating live preview open across a task. |
-| `usemac_task_complete` | Finish the task and close the preview. |
+| `usemac_task_start` | Hold the floating live preview open across a task; later calls on this connection belong to it. |
+| `usemac_task_complete` | Finish the task, close the preview and report what the task did. |
 
 Install the skill too (section 1): MCP gives the tools, the skill teaches how to use them well.
 
@@ -373,7 +383,7 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 | `EXTENSION_NOT_CONNECTED` | No paired Chrome extension is connected, or `profile` didn't match. | Check `browser_status`, or ask the user to open Chrome with the extension enabled. |
 | `EXTENSION_NOT_PAIRED` | The extension is connected but not paired. | Ask the user to paste the key from **UseMac → Settings → General → Chrome Extension** into the extension popup. |
 | `EXTENSION_TIMEOUT` | The extension didn't answer in time; running `browser_act` batches are cancelled. | Check `browser_status` or `browser_observe` before retrying. |
-| `NO_USEMAC_TAB` | No `tabId` and no UseMac tab to fall back to. | Open one with `browser_open`, or pass a `tabId` from `browser_tabs`. |
+| `NO_USEMAC_TAB` | No `tabId` and no UseMac tab to fall back to, or your task's last tab was closed before an action. | Open one with `browser_open`, or pass a `tabId` from `browser_tabs`. |
 | `CANCELLED` | The Chrome batch was cancelled (Kill Switch or timeout). | Stop, check `status`, and tell the user before doing more. |
 
 ---

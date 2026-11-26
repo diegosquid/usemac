@@ -26,6 +26,8 @@ public final class MCPStdioServer: @unchecked Sendable {
     private let fallbackService: UseMacServiceProtocol?
     private let requestTimeoutOverrideMs: Int?
     private let client: UnixSocketClient
+    /// The tasks this connection started, so its requests carry their taskId (see MCPTaskScope).
+    private let taskScope = MCPTaskScope()
 
     public init(
         socketPath: String = UseMacDefaults.defaultSocketPath,
@@ -188,7 +190,7 @@ public final class MCPStdioServer: @unchecked Sendable {
     }
 
     private func handleToolsList(_ request: MCPRequest) -> MCPResponse {
-        let tools = Self.toolDefinitions.map(\.jsonValue)
+        let tools = Self.toolDefinitions.map { MCPTaskScope.withTaskIdArgument($0).jsonValue }
         return MCPResponse.success(id: request.id, result: ["tools": .array(tools)])
     }
 
@@ -356,7 +358,7 @@ public final class MCPStdioServer: @unchecked Sendable {
             arguments = [:]
         }
 
-        let rpcRequest: RPCRequest
+        var rpcRequest: RPCRequest
         var returnImageContent = false
 
         do {
@@ -550,6 +552,7 @@ public final class MCPStdioServer: @unchecked Sendable {
                     message: "Unknown tool: \(toolName)"
                 )
             }
+            taskScope.stamp(&rpcRequest, explicitTaskId: try optionalString(arguments, key: "taskId"))
         } catch let error as ArgumentValidationError {
             return MCPResponse.failure(
                 id: request.id,
@@ -590,6 +593,7 @@ public final class MCPStdioServer: @unchecked Sendable {
             )
         }
 
+        taskScope.record(rpcRequest, response: rpcResponse)
         if !rpcResponse.ok {
             let code = rpcResponse.error?.code ?? "rpc_error"
             let message = rpcResponse.error?.message ?? "Unknown RPC failure"
@@ -954,14 +958,21 @@ public final class MCPStdioServer: @unchecked Sendable {
             let summary = request.taskStart?.summary ?? "Task started"
             var text = "Started continuous preview session: \(summary)"
             if let taskId = response.taskId {
-                text += "\ntaskId: \(taskId) (pass it to usemac_browser_open and usemac_task_complete, so finishing this task only closes the tabs it opened)"
+                text += "\ntaskId: \(taskId) (this connection's later calls belong to it on their own; pass it explicitly only if this connection runs several tasks at once. Finishing this task only closes the tabs it opened.)"
             }
             return [.text(text)]
 
         case "usemac_task_complete":
             let summary = request.taskComplete?.summary ?? "Task completed"
             let taskTag = response.taskId.map { " (task \($0))" } ?? ""
-            return [.text("Marked task complete\(taskTag): \(summary)")]
+            var text = "Marked task complete\(taskTag): \(summary)"
+            if let done = response.taskSummary {
+                let tabs = { (ids: [Int]) in ids.isEmpty ? "none" : ids.map(String.init).joined(separator: ", ") }
+                text += "\nSummary: \(done.requests) requests, \(done.actions) actions (\(done.failedActions) failed), \(done.blocked) blocked, "
+                    + String(format: "%.1f s", Double(done.durationMs) / 1000)
+                text += "\nTabs opened: \(tabs(done.tabsOpened)); closed during the task: \(tabs(done.tabsClosed)); closing now: \(tabs(done.tabsClosing))"
+            }
+            return [.text(text)]
 
         default:
             return [.text("OK")]
@@ -1555,7 +1566,7 @@ public final class MCPStdioServer: @unchecked Sendable {
                     ],
                     "taskId": [
                         "type": "string",
-                        "description": "The taskId from usemac_task_start. The new tab belongs to that task, so another agent's usemac_task_complete never closes it."
+                        "description": "The taskId from usemac_task_start (optional when this connection started one task). The new tab belongs to that task, so another agent's usemac_task_complete never closes it."
                     ],
                     "profile": [
                         "type": "string",
@@ -1860,7 +1871,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_task_start",
-            description: "Signal the start of a multi-step agent task so the floating live preview opens once and stays continuously open across all iterations until usemac_task_complete is called. Returns a taskId: pass it to usemac_browser_open and usemac_task_complete so that, when several agents work at once, finishing this task only closes the tabs it opened.",
+            description: "Signal the start of a multi-step agent task so the floating live preview opens once and stays continuously open across all iterations until usemac_task_complete is called. Returns a taskId. Later calls on this MCP connection belong to that task on their own (pass taskId only if this connection runs several tasks at once): browser tools without tabId go to this task's own last tab, never another agent's, and finishing the task only closes the tabs it opened.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -1896,7 +1907,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_task_complete",
-            description: "Signal that the agent has finished the user's entire request (call ONLY once at the very end, never between intermediate steps). Shows the frosted white completion check once and smoothly closes the floating preview. About 2 s later UseMac closes the Chrome tabs it opened during the task (never the user's own tabs, the tab the user is looking at, or tabs with a running download); pass keepTabIds for a page the user should see, or keepTabs to keep them all. Pass the taskId from usemac_task_start: only that task's tabs are closed, and tabs other running tasks opened are never closed.",
+            description: "Signal that the agent has finished the user's entire request (call ONLY once at the very end, never between intermediate steps). Shows the frosted white completion check once and smoothly closes the floating preview. About 2 s later UseMac closes the Chrome tabs it opened during the task (never the user's own tabs, the tab the user is looking at, or tabs with a running download); pass keepTabIds for a page the user should see, or keepTabs to keep them all. Only this task's tabs are closed (tabs other running tasks opened never are), and the result summarizes what the task did: requests, actions, blocked steps, tabs opened and closed, and duration.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -1927,7 +1938,7 @@ public final class MCPStdioServer: @unchecked Sendable {
                     ],
                     "taskId": [
                         "type": "string",
-                        "description": "The taskId from usemac_task_start. Only this task's tabs close and only its preview cards are marked done."
+                        "description": "The taskId from usemac_task_start (optional when this connection started one task). Only this task's tabs close and only its preview cards are marked done."
                     ]
                 ]
             ],
