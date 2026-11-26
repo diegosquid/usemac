@@ -381,38 +381,17 @@ public final class AppState: ObservableObject {
         UseMacDefaults.chromeWebStoreExtensionId
     }
 
-    private static func isValidChromeExtensionId(_ extId: String) -> Bool {
-        let scalars = extId.unicodeScalars
-        guard scalars.count == 32 else { return false }
-        return scalars.allSatisfy { scalar in
-            scalar.value >= 97 && scalar.value <= 112 // 'a'...'p'
-        }
-    }
-
-    /// Registers Chrome's official External Extension JSON so Chrome installs the published
-    /// Chrome Web Store extension automatically on next launch, and opens its store page.
+    /// Opens the extension's Chrome Web Store page in Chrome, where the user clicks Add to Chrome.
+    /// Returns false while no valid store ID is set (beta builds load the extension unpacked).
     @discardableResult
     public func installPublishedChromeExtension() -> Bool {
-        guard let extId = chromeWebStoreExtensionId,
-              Self.isValidChromeExtensionId(extId) else {
+        guard let storeURL = UseMacDefaults.chromeWebStoreListingURL else {
             return false
         }
-        let externalDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Google/Chrome/External Extensions", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: externalDir, withIntermediateDirectories: true)
-            let jsonURL = externalDir.appendingPathComponent("\(extId).json")
-            let payload = #"{"external_update_url":"https://clients2.google.com/service/update2/crx"}"# + "\n"
-            try payload.write(to: jsonURL, atomically: true, encoding: .utf8)
-        } catch {
-            return false
-        }
-        if let storeURL = URL(string: "https://chromewebstore.google.com/detail/\(extId)") {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-a", "Google Chrome", storeURL.absoluteString]
-            try? process.run()
-        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", "Google Chrome", storeURL.absoluteString]
+        try? process.run()
         return true
     }
 
