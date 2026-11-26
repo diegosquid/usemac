@@ -17,7 +17,7 @@ import UseMacProtocol
 @MainActor
 final class ProblemReportReviewController: NSObject, NSWindowDelegate {
     static let shared = ProblemReportReviewController()
-    static let windowTitle = "Review problem report"
+    static let windowTitle = ProblemReport.reviewWindowTitle
 
     private static let log = Logger(subsystem: "app.usemac", category: "problem-report")
 

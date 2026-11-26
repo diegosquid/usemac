@@ -8,6 +8,8 @@ import UseMacProtocol
 public enum ProblemReport {
     /// UseMac's GitHub repository, where reports become issues. `scripts/release-dmg.sh` publishes releases there too.
     public static let githubRepository = "diegosquid/usemac"
+    /// The app's review window, as agents are told to point the user to it.
+    public static let reviewWindowTitle = "Review problem report"
     /// A draft lists at most this many audit entries: the most recent ones.
     public static let maxEntries = 40
     /// Without a task, a draft covers this much recent activity.

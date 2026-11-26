@@ -155,7 +155,7 @@ extension UseMacEngineService {
             taskId: draft.taskId,
             entryCount: draft.entryCount,
             errorCodes: draft.errorCodes,
-            message: "The report is open in UseMac's \"Review problem report\" window. Tell the user to read it there and remove anything they don't want to share. Only they can open it as a GitHub issue; don't paste the report anywhere else."
+            message: "The report is open in UseMac's \"\(ProblemReport.reviewWindowTitle)\" window. Tell the user to read it there and remove anything they don't want to share. Only they can open it as a GitHub issue; don't paste the report anywhere else."
         )
         return .success(id: request.id, latencyMs: latencyMs, problemReport: receipt)
     }
