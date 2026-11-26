@@ -146,6 +146,19 @@ public final class WorkspaceMonitor: @unchecked Sendable {
         return Self.matchQuery(query, in: regularApps(withWindowMetadata: false), selfPid: selfPid) == .useMac
     }
 
+    /// Whether a request's target app was guessed. That is the case when neither the request nor any of its steps
+    /// named an app and no app is paired, so UseMac fell back to the app in front, which is usually the user's own.
+    /// The live preview never shows work on a guessed target.
+    public static func isGuessedTarget(requestApp: String?, stepApps: [String?] = [], hasPairedApp: Bool) -> Bool {
+        let names: (String?) -> Bool = { !($0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }
+        if names(requestApp) || stepApps.contains(where: names) { return false }
+        return !hasPairedApp
+    }
+
+    public func isGuessedTarget(requestApp: String?, stepApps: [String?] = []) -> Bool {
+        Self.isGuessedTarget(requestApp: requestApp, stepApps: stepApps, hasPairedApp: getPairedApp() != nil)
+    }
+
     /// True when `pid` is UseMac (this process, or the app seen from a `--standalone` CLI).
     public func isUseMacProcess(pid: Int32) -> Bool {
         Self.isUseMac(

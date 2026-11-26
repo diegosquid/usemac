@@ -1755,11 +1755,14 @@ public final class AppState: ObservableObject {
     // MARK: - Live Activity Stream Handling
 
     private func handleLiveActivity(_ item: LiveActivityItem) {
-        updatePreviewResizeHold(for: item)
         liveActivities.append(item)
         if liveActivities.count > 80 {
             liveActivities.removeFirst(liveActivities.count - 80)
         }
+        // Golden rule: the preview only shows UseMac's tabs and apps an agent named. Work on a guessed target (no app
+        // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
+        guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
+        updatePreviewResizeHold(for: item)
 
         // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
         // cursor or stream target on the large preview of the card the user is watching.
@@ -1976,6 +1979,12 @@ public final class AppState: ObservableObject {
                 }
                 return sub
             }()
+            // A failed browser step on a tab with no card (closed, or never UseMac's) adds nothing: the card would be
+            // an empty globe for a tab that is not there.
+            let cardExists = hudDeck.contains(where: { $0.id == cardId })
+            guard cardExists || PreviewDeckFocus.activityAddsCard(isBrowser: isChromeBridgeActivity, success: item.success) else {
+                return
+            }
             upsertHUDCard(
                 id: cardId,
                 isBrowser: isChromeBridgeActivity,

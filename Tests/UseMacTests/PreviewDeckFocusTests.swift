@@ -74,4 +74,25 @@ final class PreviewDeckFocusTests: XCTestCase {
         let finished = PreviewDeckFocus.Front(isBrowser: true, browserTabId: 11, hasPreview: true, isBusy: false, isCompleted: true)
         XCTAssertFalse(PreviewDeckFocus.isBackgroundActivity(front: finished, tabId: 22, appPid: nil, isChromiumApp: false))
     }
+
+    // MARK: Golden rule: only UseMac tabs and apps an agent named
+
+    func testGuessedTargetNeverReachesThePreview() {
+        XCTAssertFalse(PreviewDeckFocus.previewShows(targetGuessed: true))
+        XCTAssertTrue(PreviewDeckFocus.previewShows(targetGuessed: false))
+    }
+
+    func testFailedBrowserStepAddsNoCard() {
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, success: false))
+        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: true, success: true))
+        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: false, success: false))
+    }
+
+    func testTargetIsGuessedOnlyWhenNothingNamesAnApp() {
+        XCTAssertTrue(WorkspaceMonitor.isGuessedTarget(requestApp: nil, hasPairedApp: false))
+        XCTAssertTrue(WorkspaceMonitor.isGuessedTarget(requestApp: "  ", stepApps: [nil, ""], hasPairedApp: false))
+        XCTAssertFalse(WorkspaceMonitor.isGuessedTarget(requestApp: "TextEdit", hasPairedApp: false))
+        XCTAssertFalse(WorkspaceMonitor.isGuessedTarget(requestApp: nil, stepApps: [nil, "Notes"], hasPairedApp: false))
+        XCTAssertFalse(WorkspaceMonitor.isGuessedTarget(requestApp: nil, hasPairedApp: true), "pair_app names the target")
+    }
 }
