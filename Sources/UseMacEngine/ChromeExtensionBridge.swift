@@ -273,6 +273,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let id: String
         let command = "close_owned_tabs"
         let keepTabIds: [Int]
+        /// Close only these (the finished task's own tabs). Omitted: every owned tab not kept, as before.
+        let closeTabIds: [Int]?
     }
 
     private struct TabsWireCommand: Encodable {
@@ -394,6 +396,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var _onBrowserStreamPaused: (@Sendable (_ profileName: String, _ tabId: Int) -> Void)?
     private var _onProfilesChanged: (@Sendable ([BrowserProfileStatus]) -> Void)?
     private var _onPairingStateChanged: (@Sendable () -> Void)?
+    private var _onTabStreamEnded: (@Sendable (_ profileName: String, _ tabId: Int, _ reason: String?) -> Void)?
 
     internal var baseCommandTimeoutSeconds: UInt64 {
         get {
@@ -463,6 +466,21 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         set {
             lock.lock()
             _onBrowserStreamStopped = newValue
+            lock.unlock()
+        }
+    }
+
+    /// Every `stream_stopped` that names a tab, with the extension's reason ("closed" when the tab is gone; older
+    /// extensions send none). The engine forgets closed tabs with it; the preview uses onBrowserStreamStopped/Paused.
+    public var onTabStreamEnded: (@Sendable (_ profileName: String, _ tabId: Int, _ reason: String?) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _onTabStreamEnded
+        }
+        set {
+            lock.lock()
+            _onTabStreamEnded = newValue
             lock.unlock()
         }
     }
@@ -846,10 +864,11 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     /// Closes the tabs UseMac opened itself (never the user's own tabs), keeping `keepTabIds`, the tab the
-    /// user is looking at and tabs with a running download.
-    public func closeOwnedTabs(profile: String?, keepTabIds: [Int]) async -> BridgeResponse {
+    /// user is looking at and tabs with a running download. With `closeTabIds`, extensions 0.6+ close only those;
+    /// older ones ignore it and go by `keepTabIds`.
+    public func closeOwnedTabs(profile: String?, keepTabIds: [Int], closeTabIds: [Int]? = nil) async -> BridgeResponse {
         await sendCommand(profileQuery: profile) { requestId in
-            CloseOwnedTabsWireCommand(id: requestId, keepTabIds: keepTabIds)
+            CloseOwnedTabsWireCommand(id: requestId, keepTabIds: keepTabIds, closeTabIds: closeTabIds)
         }
     }
 
@@ -1416,9 +1435,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let profilesHandler = _onProfilesChanged
         let stoppedHandler = _onBrowserStreamStopped
         let pausedHandler = _onBrowserStreamPaused
+        let endedHandler = _onTabStreamEnded
         lock.unlock()
 
         profilesHandler?(snapshot)
+        if let tabId = payload?.tabId {
+            endedHandler?(profileName, tabId, payload?.reason)
+        }
         let stillOpen = payload?.reason == "idle" || payload?.reason == "evicted"
         if stillOpen, let stoppedTabId, let pausedHandler {
             pausedHandler(profileName, stoppedTabId)

@@ -9,7 +9,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let killSwitch = KillSwitch()
     private let workspaceMonitor = WorkspaceMonitor()
     /// Which running task owns which Chrome tabs UseMac opened (see TaskTabRegistry).
-    private let taskTabs = TaskTabRegistry()
+    let taskTabs = TaskTabRegistry()
     private let axIndexer = AXIndexer()
     private let screenCapturer = FastScreenCapturer()
     public let liveStreamer = LiveScreenStreamer()
@@ -99,13 +99,13 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         self.chromeBridge.onPairingStateChanged = { [weak self] in
             self?.notifyStateChanged()
         }
+        self.chromeBridge.onTabStreamEnded = { [weak self] profile, tabId, reason in
+            self?.tabStreamEnded(profile: profile, tabId: tabId, reason: reason)
+        }
     }
 
-    public func handle(_ request: RPCRequest) async -> RPCResponse {
-        await handleRequest(request)
-    }
-
-    /// Audit entries read the request from here to name its task and to scrub what it typed.
+    /// Runs one request. `handle` (UseMacEngineService+Tasks.swift) ties it to its task first; this sets the
+    /// request audit entries read to name its task and to scrub what it typed.
     func handleRequest(_ request: RPCRequest) async -> RPCResponse {
         await AuditRequestContext.$request.withValue(request) {
             await handleRequestBody(request)
@@ -631,7 +631,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if bridgeResp.ok {
                 // A tab UseMac created belongs to the request's task, so another task finishing never closes it.
                 if params.tabId == nil, let openedTabId = bridgeResp.tabId {
-                    taskTabs.recordOpenedTab(openedTabId, taskId: params.taskId)
+                    taskTabs.recordOpenedTab(openedTabId, taskId: request.namedTaskId, profile: params.profile)
                 }
                 appendAudit(
                     method: request.method.rawValue,
@@ -1428,7 +1428,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let params = request.taskComplete ?? TaskCompleteParams()
             let latencyMs = elapsedMs(since: startNs)
             // Only this task's tabs close and only its cards are marked done; other running tasks keep theirs.
-            let completion = taskTabs.complete(taskId: params.taskId, tabId: params.tabId)
+            let completion = taskTabs.complete(
+                taskId: request.namedTaskId, tabId: params.tabId, keepTabIds: Set(params.keepTabIds ?? []), keepTabs: params.keepTabs == true
+            )
             let resolvedProfile: String? = {
                 if let p = params.profile, !p.isEmpty { return p }
                 if params.tabId != nil {
@@ -1463,10 +1465,13 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 taskTabIds: completion.ownTabIds.map { Array($0).sorted() }
             ))
             if params.keepTabs != true {
-                let keep = Set(params.keepTabIds ?? []).union(completion.protectedTabIds)
-                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: Array(keep).sorted())
+                // A finished task closes only its own tabs (closeTabIds); with no task, every owned tab as before.
+                let ownTabs = completion.taskId != nil ? completion.ownTabIds.map { Array($0).sorted() } : nil
+                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: params.keepTabIds ?? [], closeTabIds: ownTabs)
             }
-            response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId)
+            response = .success(
+                id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId, taskSummary: completion.summary
+            )
         }
 
         notifyStateChanged()
@@ -1476,17 +1481,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     /// Closes the Chrome tabs UseMac opened during the task once the completion animation has played, so the
     /// user's tab strip does not fill up with agent tabs. The extension never closes tabs the user had open,
     /// the tab the user is looking at, or tabs with a running download.
-    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int]) {
+    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int], closeTabIds: [Int]? = nil) {
         let profiles: [String?] = {
             if let profile, !profile.isEmpty { return [profile] }
             let connected = chromeBridge.connectedProfiles().map(\.profileName)
             return connected.isEmpty ? [] : connected.map { Optional($0) }
         }()
         guard !profiles.isEmpty else { return }
-        Task { [chromeBridge] in
+        Task { [chromeBridge, taskTabs] in
             try? await Task.sleep(nanoseconds: 1_800_000_000)
+            // Built now, not at task_complete: a tab another task opened in the meantime stays open, also with
+            // extensions that predate closeTabIds and go by keepTabIds alone.
+            let keep = Set(keepTabIds).union(taskTabs.protectedTabIds()).sorted()
             for name in profiles {
-                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keepTabIds)
+                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keep, closeTabIds: closeTabIds)
             }
         }
     }

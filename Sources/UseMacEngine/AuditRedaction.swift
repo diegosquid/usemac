@@ -10,13 +10,8 @@ enum AuditRequestContext {
 extension RPCRequest {
     /// The task id and tab a request names, to tie its audit entry to a running task (`TaskTabRegistry.resolve`).
     var auditTaskHint: (taskId: String?, tabId: Int?) {
-        // TODO(integration): put the envelope `taskId` from the tasks branch first: `request.taskId ?? params.taskId`.
-        let taskIds: [String?] = [browserOpen?.taskId, taskStart?.taskId, taskComplete?.taskId]
-        let tabIds: [Int?] = [
-            browserOpen?.tabId, browserObserve?.tabId, browserExtract?.tabId, browserScreenshot?.tabId,
-            browserAct?.tabId, visionQuery?.tabId, taskStart?.tabId, taskComplete?.tabId
-        ]
-        return (taskIds.compactMap { $0 }.first, tabIds.compactMap { $0 }.first)
+        // The envelope or params taskId (`namedTaskId`), or the id a task_start is about to give its task.
+        (namedTaskId ?? taskStart?.taskId, namedTabId)
     }
 
     /// Text this request carries that the audit log must not copy: typed and set values, and page scripts.

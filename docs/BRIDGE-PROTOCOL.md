@@ -180,11 +180,14 @@ The extension remembers the tabs it created itself (`open` with a new tab or `ne
 2 s after `task_complete` unless the agent passed `keepTabs: true`.
 
 ```json
-{"type":"request","id":"…","command":"close_owned_tabs","keepTabIds":[123]}
+{"type":"request","id":"…","command":"close_owned_tabs","keepTabIds":[123],"closeTabIds":[123,124]}
 ```
 
 The extension closes every owned tab except tabs in `keepTabIds`, the active tab of the focused window (the user
-is looking at it) and tabs whose origin has a download still in progress. Tabs the user opened are never in the
+is looking at it) and tabs whose origin has a download still in progress. With `closeTabIds` (the tabs of the task
+that finished; extensions 0.6+), it only considers those owned tabs and leaves every other one alone, so a tab
+another agent's task opened stays open. Older extensions ignore `closeTabIds`; for them the daemon builds
+`keepTabIds` from the tabs running tasks own right before it sends the command. Tabs the user opened are never in the
 list, even if a command used them through `tabId`. The response carries `closedTabs` and `keptTabs`
 (`[{tabId, title, reason}]`).
 

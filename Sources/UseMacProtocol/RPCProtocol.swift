@@ -81,6 +81,8 @@ public struct RPCRequest: Codable, Sendable {
     public var taskStart: TaskStartParams?
     public var taskComplete: TaskCompleteParams?
     public var auditLog: AuditLogParams?
+    /// The task this request belongs to (from `task_start`). Any method takes it; see `namedTaskId`.
+    public var taskId: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -102,7 +104,8 @@ public struct RPCRequest: Codable, Sendable {
         visionQuery: VisionQueryParams? = nil,
         taskStart: TaskStartParams? = nil,
         taskComplete: TaskCompleteParams? = nil,
-        auditLog: AuditLogParams? = nil
+        auditLog: AuditLogParams? = nil,
+        taskId: String? = nil
     ) {
         self.id = id
         self.method = method
@@ -124,6 +127,7 @@ public struct RPCRequest: Codable, Sendable {
         self.taskStart = taskStart
         self.taskComplete = taskComplete
         self.auditLog = auditLog
+        self.taskId = taskId
     }
 
     public init(from decoder: Decoder) throws {
@@ -148,6 +152,7 @@ public struct RPCRequest: Codable, Sendable {
         self.taskStart = try c.decodeIfPresent(TaskStartParams.self, forKey: .taskStart)
         self.taskComplete = try c.decodeIfPresent(TaskCompleteParams.self, forKey: .taskComplete)
         self.auditLog = try c.decodeIfPresent(AuditLogParams.self, forKey: .auditLog)
+        self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
     }
 }
 
@@ -183,6 +188,8 @@ public struct RPCResponse: Codable, Sendable {
     /// The task a `task_start` opened. Pass it to `browser_open` and `task_complete` so finishing this task only
     /// closes this task's tabs.
     public var taskId: String?
+    /// What the task did, on `task_complete`.
+    public var taskSummary: TaskSummary?
     public var error: RPCErrorPayload?
 
     public init(
@@ -205,6 +212,7 @@ public struct RPCResponse: Codable, Sendable {
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
         taskId: String? = nil,
+        taskSummary: TaskSummary? = nil,
         error: RPCErrorPayload? = nil
     ) {
         self.id = id
@@ -226,6 +234,7 @@ public struct RPCResponse: Codable, Sendable {
         self.visionStatus = visionStatus
         self.visionResult = visionResult
         self.taskId = taskId
+        self.taskSummary = taskSummary
         self.error = error
     }
 
@@ -247,7 +256,8 @@ public struct RPCResponse: Codable, Sendable {
         browserTitle: String? = nil,
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        taskSummary: TaskSummary? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
@@ -269,6 +279,7 @@ public struct RPCResponse: Codable, Sendable {
             visionStatus: visionStatus,
             visionResult: visionResult,
             taskId: taskId,
+            taskSummary: taskSummary,
             error: nil
         )
     }

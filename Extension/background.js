@@ -4671,6 +4671,8 @@ function hasRunningDownloadFrom(tabUrl, busyDownloadUrls) {
 // the focused window) and tabs with a download still in progress. Returns what was closed and what was kept.
 async function handleCloseOwnedTabsCommand(req) {
   const keep = new Set(Array.isArray(req.keepTabIds) ? req.keepTabIds.map(Number) : []);
+  // closeTabIds: the finished task's own tabs. Only those close, so a tab another agent's task opened stays open.
+  const only = Array.isArray(req.closeTabIds) ? new Set(req.closeTabIds.map(Number)) : null;
   const owned = await loadOwnedTabIds();
   const closed = [];
   const kept = [];
@@ -4692,6 +4694,7 @@ async function handleCloseOwnedTabsCommand(req) {
       owned.delete(tabId);
       continue;
     }
+    if (only && !only.has(tabId)) continue;
     let reason = null;
     if (keep.has(tabId)) reason = "asked to keep";
     else if (tab.active && tab.windowId === focusedWindowId) reason = "the user is looking at it";
