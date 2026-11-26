@@ -5,9 +5,9 @@
 #                    [--count-tokens]
 #
 # 1. Local IPC: `usemac bench` against the running UseMac daemon (ping, list_apps, and observe of --app).
-# 2. What an agent reads per look, for each --url (a background Chrome tab at 1280x800) and for --app (a native
-#    window): the text UseMac returns (`usemac browser observe` / `usemac observe`, the same text the MCP tools
-#    return) next to a screenshot of the same view (`usemac browser screenshot` / `usemac screenshot`).
+# 2. What an agent reads per look, for each --url (a background Chrome tab, its screenshot fit to 1280x800) and for
+#    --app (a native window): the text UseMac returns (`usemac browser observe` / `usemac observe`, the same text the
+#    MCP tools return) next to a screenshot of the same view (`usemac browser screenshot` / `usemac screenshot`).
 # 3. With --vision: `usemac vision verify "<assertion>"` on the first --url tab, three times, answered by the
 #    on-device model (needs `usemac vision install` first). The first run can include loading the model.
 #
@@ -27,10 +27,10 @@ URLS=()
 VISION=""
 OUT=""
 TOKEN_FLAGS=()
-# Every web view is captured at the same CSS viewport, so the numbers compare across runs and machines.
+# Every web screenshot is scaled down to fit the same box, so the image numbers compare across runs and machines.
+# UseMac never resizes the tab, so the text depends on the size of the Chrome window it opens in.
 VIEW_W=1280
 VIEW_H=800
-VIEW_SCALE=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -94,10 +94,9 @@ if (( ${#URLS[@]} > 0 )); then
     fi
     FIRST_TAB="${FIRST_TAB:-$tab}"
     sleep 2
-    "$USEMAC" --require-daemon browser observe --tab "$tab" \
-      --width "$VIEW_W" --height "$VIEW_H" --scale "$VIEW_SCALE" > "$VIEWS/${name}.observe.txt"
+    "$USEMAC" --require-daemon browser observe --tab "$tab" > "$VIEWS/${name}.observe.txt"
     "$USEMAC" --require-daemon --json browser screenshot --tab "$tab" \
-      --width "$VIEW_W" --height "$VIEW_H" --scale "$VIEW_SCALE" > "$VIEWS/${name}.shot.json"
+      --width "$VIEW_W" --height "$VIEW_H" > "$VIEWS/${name}.shot.json"
     cp "$(jq -r '.path' "$VIEWS/${name}.shot.json")" "$VIEWS/${name}.jpg"
     printf '%s\n' "$url" > "$VIEWS/${name}.source.txt"
   done

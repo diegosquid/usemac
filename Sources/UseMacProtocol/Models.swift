@@ -923,6 +923,8 @@ public struct BrowserObserveParams: Codable, Equatable, Sendable {
     public var includeTables: Bool?
     public var includeScreenshot: Bool?
     public var returnImageContent: Bool?
+    /// Ignored, like `viewportHeight` and `deviceScaleFactor`: UseMac never resizes a tab. Kept so older clients
+    /// still decode.
     public var viewportWidth: Int?
     public var viewportHeight: Int?
     public var deviceScaleFactor: Double?
@@ -1125,8 +1127,11 @@ public struct BrowserScreenshotParams: Codable, Equatable, Sendable {
     public var selector: String?
     public var elementId: String?
     public var fullPage: Bool?
+    /// With `viewportHeight`, a box in image pixels: a bigger capture is scaled down to fit inside it, keeping its
+    /// aspect ratio. The tab itself is never resized.
     public var viewportWidth: Int?
     public var viewportHeight: Int?
+    /// Ignored: the capture uses the tab's own pixel density.
     public var deviceScaleFactor: Double?
     public var quality: Int?
     public var returnImageContent: Bool?
