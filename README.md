@@ -88,6 +88,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 - **Blocked by default**:
   - **URLs**: `browser_open` and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs get `https://`; everything else returns `URL_BLOCKED`).
   - **File uploads**: `uploadFile` blocks `~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, `.env` files, browser and password-manager directories in `~/Library`, shell histories, and secret/key extensions (`.pem`, `.pfx`, `.p8`, `.kdbx`, `.ovpn`, `.jks`, `.keystore`, `.tfstate`), returning `UPLOAD_BLOCKED`.
+  - **UseMac's own windows**: agents can't observe or act on UseMac itself (Settings, the setup guide). Requests that name it return `SELF_TARGET_BLOCKED`, and `list_apps` leaves it out.
   - **Local vision paths & models**: `vision_query.imagePath` only accepts files inside your user temporary directory or `/tmp`; `vision_install` only accepts the three built-in model presets (`INVALID_MODEL`).
   - **Temporary captures**: Screenshots are written to a private folder inside your user temporary directory and deleted after 30 minutes.
 - **Chrome extension pairing & tab isolation**: Each Chrome profile must be paired once with the local `umk_…` key (unpaired requests return `EXTENSION_NOT_PAIRED`, and the key is never exposed via RPC, MCP, or CLI). Without an explicit `tabId`, browser methods only target the last UseMac tab or a tab in the `UseMac` tab group (`NO_USEMAC_TAB` otherwise).

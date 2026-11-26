@@ -6,6 +6,11 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Agents can no longer observe or act on UseMac's own windows, such as Settings. Requests that name UseMac
+  return `SELF_TARGET_BLOCKED`, and `list_apps` no longer lists it.
+
 ## [0.6.0-beta.2] - 2026-11-25
 
 Fixes from the first days of the beta, mostly in Chrome and the live preview.
