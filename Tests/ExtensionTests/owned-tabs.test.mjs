@@ -45,6 +45,29 @@ test("close_owned_tabs closes only tabs UseMac opened, and keeps the ones asked 
   assert.ok(!sb.callsTo("tabs.remove").some((c) => c.args[0] === 501));
 });
 
+test("close_owned_tabs with closeTabIds closes only the finished task's tabs", async (t) => {
+  const sb = withSandbox(t, {
+    tabs: [{ id: 551, windowId: 1, url: "https://mail.example.com/", active: true }],
+    windows: [{ id: 1, focused: true }]
+  });
+  const mine = await openTab(sb);
+  const kept = await openTab(sb);
+  // Another agent's task opened this one after the daemon built its keep list.
+  const theirs = await openTab(sb);
+
+  const { response } = await sb.request({
+    type: "request", id: nextId(), command: "close_owned_tabs", keepTabIds: [kept], closeTabIds: [mine, kept]
+  });
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.closedTabs.map((c) => c.tabId), [mine]);
+  assert.deepEqual(response.keptTabs.map((k) => [k.tabId, k.reason]), [[kept, "asked to keep"]]);
+  assert.deepEqual(sb.callsTo("tabs.remove").map((c) => c.args[0]), [mine], "the other task's tab stays open");
+
+  // It is still owned: a later cleanup without closeTabIds (no task) closes it as before.
+  const again = await sb.request({ type: "request", id: nextId(), command: "close_owned_tabs", keepTabIds: [] });
+  assert.deepEqual(again.response.closedTabs.map((c) => c.tabId).sort(), [kept, theirs].sort());
+});
+
 test("close_owned_tabs keeps the UseMac tab the user is looking at", async (t) => {
   const sb = withSandbox(t, {
     tabs: [{ id: 601, windowId: 1, url: "https://example.com/", active: true }],

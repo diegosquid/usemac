@@ -273,6 +273,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let id: String
         let command = "close_owned_tabs"
         let keepTabIds: [Int]
+        /// Close only these (the finished task's own tabs). Omitted: every owned tab not kept, as before.
+        let closeTabIds: [Int]?
     }
 
     private struct TabsWireCommand: Encodable {
@@ -862,10 +864,11 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     /// Closes the tabs UseMac opened itself (never the user's own tabs), keeping `keepTabIds`, the tab the
-    /// user is looking at and tabs with a running download.
-    public func closeOwnedTabs(profile: String?, keepTabIds: [Int]) async -> BridgeResponse {
+    /// user is looking at and tabs with a running download. With `closeTabIds`, extensions 0.6+ close only those;
+    /// older ones ignore it and go by `keepTabIds`.
+    public func closeOwnedTabs(profile: String?, keepTabIds: [Int], closeTabIds: [Int]? = nil) async -> BridgeResponse {
         await sendCommand(profileQuery: profile) { requestId in
-            CloseOwnedTabsWireCommand(id: requestId, keepTabIds: keepTabIds)
+            CloseOwnedTabsWireCommand(id: requestId, keepTabIds: keepTabIds, closeTabIds: closeTabIds)
         }
     }
 

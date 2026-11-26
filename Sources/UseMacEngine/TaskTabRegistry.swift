@@ -184,6 +184,13 @@ public final class TaskTabRegistry: @unchecked Sendable {
         }
     }
 
+    /// Tabs running tasks own: the cleanup after another task's `task_complete` must leave them open.
+    public func protectedTabIds(now: Date = Date()) -> Set<Int> {
+        lock.lock(); defer { lock.unlock() }
+        expire(now: now)
+        return allTabsLocked()
+    }
+
     /// True when a running task opened or worked in this tab.
     public func knowsTab(_ tabId: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }

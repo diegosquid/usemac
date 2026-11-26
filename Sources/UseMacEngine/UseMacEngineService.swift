@@ -1456,8 +1456,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 taskTabIds: completion.ownTabIds.map { Array($0).sorted() }
             ))
             if params.keepTabs != true {
-                let keep = Set(params.keepTabIds ?? []).union(completion.protectedTabIds)
-                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: Array(keep).sorted())
+                // A finished task closes only its own tabs (closeTabIds); with no task, every owned tab as before.
+                let ownTabs = completion.taskId != nil ? completion.ownTabIds.map { Array($0).sorted() } : nil
+                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: params.keepTabIds ?? [], closeTabIds: ownTabs)
             }
             response = .success(
                 id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId, taskSummary: completion.summary
@@ -1471,17 +1472,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     /// Closes the Chrome tabs UseMac opened during the task once the completion animation has played, so the
     /// user's tab strip does not fill up with agent tabs. The extension never closes tabs the user had open,
     /// the tab the user is looking at, or tabs with a running download.
-    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int]) {
+    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int], closeTabIds: [Int]? = nil) {
         let profiles: [String?] = {
             if let profile, !profile.isEmpty { return [profile] }
             let connected = chromeBridge.connectedProfiles().map(\.profileName)
             return connected.isEmpty ? [] : connected.map { Optional($0) }
         }()
         guard !profiles.isEmpty else { return }
-        Task { [chromeBridge] in
+        Task { [chromeBridge, taskTabs] in
             try? await Task.sleep(nanoseconds: 1_800_000_000)
+            // Built now, not at task_complete: a tab another task opened in the meantime stays open, also with
+            // extensions that predate closeTabIds and go by keepTabIds alone.
+            let keep = Set(keepTabIds).union(taskTabs.protectedTabIds()).sorted()
             for name in profiles {
-                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keepTabIds)
+                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keep, closeTabIds: closeTabIds)
             }
         }
     }

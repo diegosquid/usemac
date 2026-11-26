@@ -383,6 +383,68 @@ final class TaskScopeTests: XCTestCase {
         }
     }
 
+    func testAnActionIsNeverSentTwiceWhenItsTabClosed() async throws {
+        try await withEngine { engine, wire, _ in
+            let a = try await startTask(engine)
+            let first = try await openTab(engine, task: a)
+            let last = try await openTab(engine, task: a)
+            wire.close(last)
+            let click = RPCRequest(
+                method: .browserAct,
+                browserAct: BrowserActParams(steps: [ActionStep(action: .click, text: "x")]),
+                taskId: a
+            )
+            let refused = await engine.handle(click)
+            XCTAssertEqual(refused.error?.code, "NO_USEMAC_TAB")
+            XCTAssertEqual(wire.requests("act").map { $0["tabId"] as? Int }, [last], "sent once, never again to another tab")
+
+            // Only the agent's next request goes to the task's previous tab.
+            let next = await engine.handle(click)
+            XCTAssertTrue(next.ok, "\(String(describing: next.error))")
+            XCTAssertEqual(wire.requests("act").map { $0["tabId"] as? Int }, [last, first])
+
+            // eval can change the page, so it is never retried either.
+            wire.close(first)
+            let eval = await engine.handle(RPCRequest(
+                method: .browserExtract,
+                browserExtract: BrowserExtractParams(mode: "eval", expression: "1"),
+                taskId: a
+            ))
+            XCTAssertEqual(eval.error?.code, "NO_USEMAC_TAB")
+            XCTAssertEqual(wire.requests("extract").count, 1)
+        }
+    }
+
+    func testATabAnotherTaskOpensBeforeTheCleanupStaysOpen() async throws {
+        try await withEngine { engine, wire, _ in
+            let a = try await startTask(engine)
+            let b = try await startTask(engine)
+            let tabA = try await openTab(engine, task: a)
+            let done = await engine.handle(RPCRequest(method: .taskComplete, taskComplete: TaskCompleteParams(), taskId: a))
+            XCTAssertEqual(done.taskId, a)
+            // B opens a tab after A's done but before the cleanup runs (about 1.8 s later).
+            let tabB = try await openTab(engine, task: b)
+
+            let sent = await waitForBridgeCondition(timeoutMs: 5000) { !wire.requests("close_owned_tabs").isEmpty }
+            XCTAssertTrue(sent)
+            let cleanup = try XCTUnwrap(wire.requests("close_owned_tabs").first)
+            XCTAssertEqual(cleanup["closeTabIds"] as? [Int], [tabA], "the new extension closes only A's tabs")
+            XCTAssertEqual(cleanup["keepTabIds"] as? [Int], [tabB], "built when the cleanup runs, for older extensions")
+        }
+    }
+
+    func testWithoutTasksTheCleanupClosesEveryOwnedTabAsBefore() async throws {
+        try await withEngine { engine, wire, _ in
+            _ = await engine.handle(open(task: nil))
+            _ = await engine.handle(RPCRequest(method: .taskComplete, taskComplete: TaskCompleteParams(keepTabIds: [7])))
+            let sent = await waitForBridgeCondition(timeoutMs: 5000) { !wire.requests("close_owned_tabs").isEmpty }
+            XCTAssertTrue(sent)
+            let cleanup = try XCTUnwrap(wire.requests("close_owned_tabs").first)
+            XCTAssertNil(cleanup["closeTabIds"], "no task: every owned tab not kept")
+            XCTAssertEqual(cleanup["keepTabIds"] as? [Int], [7])
+        }
+    }
+
     func testAClosedSignalFromTheExtensionForgetsTheTab() async throws {
         try await withEngine { engine, wire, ws in
             let a = try await startTask(engine)
