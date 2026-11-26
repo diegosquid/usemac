@@ -658,6 +658,36 @@ public final class AppState: ObservableObject {
     /// Cards kept in the preview deck; the filmstrip shows up to 8 and summarizes the rest as "+N".
     static let maxDeckCards = 12
 
+    /// The browser card of the UseMac tab a Chrome window is showing (matched by title, as Chrome titles the
+    /// window after its active tab), or the front browser card when the title does not settle it.
+    private func browserCard(shownIn app: AppDescriptor) -> HUDSessionCard? {
+        let browserCards = hudDeck.filter { $0.isBrowser && $0.browserTabId != nil }
+        let windowTitle = (app.windowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !windowTitle.isEmpty, let match = browserCards.first(where: { !$0.title.isEmpty && windowTitle.hasPrefix($0.title) }) {
+            return match
+        }
+        return browserCards.first
+    }
+
+    /// One card per Chrome tab: tab ids are unique within the browser, so an existing card for the tab is
+    /// reused even when an activity names the profile differently (agents that omit `profile` get the
+    /// placeholder "Browser"), instead of showing the same tab twice in the filmstrip.
+    private func browserCardIdForTab(_ tabId: Int?) -> String? {
+        guard let tabId else { return nil }
+        return hudDeck.first(where: { $0.isBrowser && $0.browserTabId == tabId })?.id
+    }
+
+    /// Maps the placeholder profile names used before the extension answers ("Browser", "Chrome") to the
+    /// connected profile when there is exactly one.
+    private func resolvedBrowserProfile(_ name: String) -> String {
+        let placeholder = name.isEmpty || name.caseInsensitiveCompare("Browser") == .orderedSame
+            || name.caseInsensitiveCompare("Chrome") == .orderedSame
+        if placeholder, connectedBrowserProfiles.count == 1 {
+            return connectedBrowserProfiles[0].profileName
+        }
+        return name
+    }
+
     private static func browserCardId(profile: String, tabId: Int?) -> String {
         if let tabId {
             return "browser:\(profile):\(tabId)"
@@ -673,7 +703,7 @@ public final class AppState: ObservableObject {
         profileName: String,
         title: String
     ) {
-        let cardId = Self.browserCardId(profile: profileName, tabId: tabId)
+        let cardId = browserCardIdForTab(tabId) ?? Self.browserCardId(profile: profileName, tabId: tabId)
         let displayTitle = title.isEmpty ? "Chrome (\(profileName))" : title
         let bounds = ScreenRect(x: 0, y: 0, width: Double(width), height: Double(height))
         let aspect = width > 0 && height > 0 ? min(max(CGFloat(width) / CGFloat(height), 0.62), 2.15) : (268.0 / 172.0)
@@ -1787,44 +1817,44 @@ public final class AppState: ObservableObject {
         var cardAppDescriptor: AppDescriptor?
 
         if isChromeBridgeActivity {
-            let prof = cardProfile ?? item.appName?
+            let rawProfile = cardProfile ?? item.appName?
                 .replacingOccurrences(of: "Chrome (", with: "")
                 .replacingOccurrences(of: ")", with: "") ?? connectedBrowserProfiles.first?.profileName ?? "Chrome"
+            let prof = resolvedBrowserProfile(rawProfile)
             cardProfile = prof
-            cardId = Self.browserCardId(profile: prof, tabId: item.browserTabId)
-        } else {
+            cardId = browserCardIdForTab(item.browserTabId) ?? Self.browserCardId(profile: prof, tabId: item.browserTabId)
+        } else if let resolvedTarget = resolveTargetApp(from: item), resolvedTarget.pid > 0 {
             showingFrozenBrowserFrame = false
             // Drop any empty browser placeholder created by a generic task_start before targeting a native app
             hudDeck.removeAll { $0.isBrowser && $0.browserTabId == nil && $0.previewImage == nil }
-            if let resolvedTarget = resolveTargetApp(from: item) {
-                cardAppDescriptor = resolvedTarget
-                if activeTargetApp != resolvedTarget {
-                    activeTargetApp = resolvedTarget
-                    if isHUDVisible {
-                        syncLiveStream()
-                    }
+            cardAppDescriptor = resolvedTarget
+            if activeTargetApp != resolvedTarget {
+                activeTargetApp = resolvedTarget
+                if isHUDVisible {
+                    syncLiveStream()
                 }
-            } else if activeTargetApp == nil {
-                activeTargetApp = engine.captureFrontmostExternalApp()
-                cardAppDescriptor = activeTargetApp
-            } else {
-                cardAppDescriptor = activeTargetApp
             }
-            if let pid = cardAppDescriptor?.pid, pid > 0 {
-                cardId = "app:\(pid)"
-            }
+            cardId = "app:\(resolvedTarget.pid)"
         }
+        // Otherwise the activity names no app (a task_start without one, a vision query, a resume): it must not
+        // pick whatever app is in front as the target, or the preview would show the user's own screen.
 
         // Native work in Chrome on one of the user's own tabs (not a UseMac tab): no card and no preview.
         // The answer is cached per window; until the first check returns, treat the window as the user's.
         var suppressNativeChromePreview = false
         if !isChromeBridgeActivity, let app = cardAppDescriptor, Self.isChromium(app),
            !connectedBrowserProfiles.isEmpty, hudStreamMode == .autoWindow,
-           item.kind != .taskComplete,
-           chromeWindowShowsUsemacTab(app) != true {
-            cardId = nil
-            suppressNativeChromePreview = true
-            hudDeck.removeAll { !$0.isBrowser && $0.appDescriptor?.pid == app.pid }
+           item.kind != .taskComplete {
+            if chromeWindowShowsUsemacTab(app) != true {
+                cardId = nil
+                suppressNativeChromePreview = true
+                hudDeck.removeAll { !$0.isBrowser && $0.appDescriptor?.pid == app.pid }
+            } else if let tabCard = browserCard(shownIn: app) {
+                // Native work in a window that shows a UseMac tab is that tab's work: reuse its card instead of
+                // adding a second, imageless "Google Chrome" card for the same page.
+                cardId = tabCard.id
+                hudDeck.removeAll { !$0.isBrowser && $0.appDescriptor?.pid == app.pid }
+            }
         }
 
         if item.kind == .taskComplete {

@@ -4,6 +4,16 @@ All notable changes to UseMac are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). Versions below 1.0 may still change how agents talk to UseMac.
 
+## [Unreleased]
+
+### Fixed
+
+- A Chrome tab UseMac controls now keeps its real width and no longer flickers while you are looking at it.
+- The Resume button in the HUD's "Stopped" pill no longer wraps onto two lines.
+- The preview filmstrip no longer shows the same Chrome tab twice when an agent does not name the Chrome profile.
+- Activity that names no app (for example after pressing Resume) no longer makes the preview show whatever app is in front, such as your own screen; native work in a window showing a UseMac tab uses that tab's card.
+- The Chrome extension reports its real version to the app instead of a fixed "0.5.0".
+
 ## [0.6.0-beta.1] - 2026-11-25
 
 A reliability pass on everything agents do in the background, and a new live preview.
@@ -81,5 +91,6 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.1...HEAD
 [0.6.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.5.0...v0.6.0-beta.1
 [0.5.0]: https://github.com/diegosquid/usemac/releases/tag/v0.5.0

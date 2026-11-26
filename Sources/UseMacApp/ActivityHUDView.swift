@@ -122,7 +122,12 @@ private struct WhisperIconButton: View {
     }
 }
 
-// MARK: - Collapsed Micro-Pill (164 x 34)
+// MARK: - Collapsed Micro-Pill (164 x 34, 200 x 34 while stopped)
+
+/// Size of the collapsed pill. ActivityHUDController sizes the panel with the same values. While automation is
+/// stopped the pill is wider, so "Stopped", Resume and the close button fit on one line.
+let hudCollapsedPillSize = CGSize(width: 164, height: 34)
+let hudStoppedPillSize = CGSize(width: 200, height: 34)
 
 private struct CollapsedMicroPill: View {
     @ObservedObject var appState: AppState
@@ -135,6 +140,7 @@ private struct CollapsedMicroPill: View {
 
     var body: some View {
         let isStopped = appState.status.killSwitchTripped
+        let pillSize = isStopped ? hudStoppedPillSize : hudCollapsedPillSize
 
         HStack(spacing: isStopped ? 5 : 6) {
             Circle()
@@ -158,6 +164,8 @@ private struct CollapsedMicroPill: View {
                     } label: {
                         Text("Resume")
                             .font(.system(size: 11, weight: .medium))
+                            .lineLimit(1)
+                            .fixedSize()
                             .foregroundStyle(isResumeHovered ? .white : resumeGreen)
                             .padding(.horizontal, 7)
                             .frame(minHeight: 24)
@@ -202,7 +210,7 @@ private struct CollapsedMicroPill: View {
         }
         .padding(.leading, isStopped ? 9 : 10)
         .padding(.trailing, 5)
-        .frame(width: 164, height: 34)
+        .frame(width: pillSize.width, height: pillSize.height)
         .background(Color.white.opacity(0.97), in: Capsule(style: .continuous))
         .overlay(
             Capsule(style: .continuous)
