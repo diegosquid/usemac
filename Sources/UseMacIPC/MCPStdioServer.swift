@@ -1217,10 +1217,14 @@ public final class MCPStdioServer: @unchecked Sendable {
         "x": ["type": "number"],
         "y": ["type": "number"],
         "text": ["type": "string"],
-        "key": ["type": "string"],
+        "key": [
+            "type": "string",
+            "description": "pressKey key, case-insensitive, the same in native apps and Chrome: return (enter), tab, space, delete (backspace), forwarddelete, escape (esc), up, down, left, right (or arrowup…), home, end, pageup, pagedown, f1–f12, a–z, 0–9, - = [ ] ; ' , . / \\ `. Native character keys are US key positions: use type for text, and shift with the base key for a shifted symbol. delete is backspace in native apps but forward delete in Chrome. An unknown key fails with INVALID_REQUEST."
+        ],
         "modifiers": [
             "type": "array",
-            "items": ["type": "string"]
+            "items": ["type": "string"],
+            "description": "pressKey modifiers: cmd (command, meta), ctrl (control), alt (opt, option), shift. Any ⌘ or ⌃ shortcut is sensitive."
         ],
         "deltaX": ["type": "number"],
         "deltaY": ["type": "number"],

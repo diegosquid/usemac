@@ -2196,9 +2196,13 @@ struct UseMacCLI {
         case "key":
             return CommandHelp(
                 usage: ["usemac key <chord> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
-                summary: "Press a key or shortcut. Modifiers: cmd, shift, opt (alt), ctrl, fn. Keys: return, tab, space, escape, delete, arrows, a–z, 0–9.",
+                summary: "Press a key or shortcut. Modifiers: cmd (command, meta), shift, opt (alt, option), ctrl (control). Keys: return (enter), tab, space, delete (backspace), forwarddelete, escape (esc), up, down, left, right, home, end, pageup, pagedown, f1–f12, a–z, 0–9, - = [ ] ; ' , . / \\ `.",
                 flags: batchFlagHelp,
-                examples: ["usemac key cmd+shift+n --app \"Finder\""],
+                notes: [
+                    "Character keys are key positions on a US keyboard: use `usemac type` to enter text, and shift plus the base key for a shifted symbol (shift+= for +).",
+                    "An unknown key fails with INVALID_REQUEST and lists these names."
+                ],
+                examples: ["usemac key cmd+shift+n --app \"Finder\"", "usemac key pagedown --app \"TextEdit\""],
                 json: batchResultJSON
             )
         case "screenshot":

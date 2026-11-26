@@ -79,7 +79,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 | Mode (`set_policy`) | App UI label | Behavior |
 | :--- | :--- | :--- |
 | `autonomous` | **Autonomous** | Allows all actions (still subject to URL, upload, and path guards). |
-| `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃`, and `browser_extract` in `eval` mode. |
+| `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃` (whatever the spelling: `cmd`, `command`, `meta`, `ctrl`, `control`), and `browser_extract` in `eval` mode. |
 | `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `target`, observe, read-only extract (`auto`, `tables`, `text`, `kpis`, `downloads`), and screenshots remain allowed. |
 | `paused` | **Paused** | Blocks all automation, including reads. |
 

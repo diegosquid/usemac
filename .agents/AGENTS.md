@@ -146,6 +146,8 @@ Target by what the element is with `match`, and wait for the result instead of s
 {"method":"browser_act","browserAct":{"tabId":42,"steps":[{"action":"setValue","elementId":"@b2","text":"UseMac"},{"action":"click","elementId":"@b3"}]}}
 ```
 
+A browser `setValue` must name its field with `elementId`, `selector` or `x`/`y`. Without one the batch fails with `INVALID_REQUEST` before anything runs. To type into the field that has focus, use `type`.
+
 ### On-device vision and the live preview
 
 ```json
@@ -317,6 +319,14 @@ A failed batch exits with the code of its first failed step. With `--json`, succ
 | `waitFor` | `match` or `elementId`, `timeoutMs` (default 5000, max 30000), `gone` | Waits until the element appears, or disappears with `gone: true`. Fails with `WAIT_TIMEOUT`. |
 
 `doubleClick` uses `AXOpen` first when the element supports it, so it stays in the background.
+
+### `pressKey` keys
+
+`act` and `browser_act` take the same key names, case-insensitive: `return` (`enter`), `tab`, `space`, `delete` (`backspace`), `forwarddelete`, `escape` (`esc`), `up`, `down`, `left`, `right` (or `arrowup`, `arrowdown`, `arrowleft`, `arrowright`), `home`, `end`, `pageup`, `pagedown`, `f1`–`f12`, `a`–`z`, `0`–`9`, and `-` `=` `[` `]` `;` `'` `,` `.` `/` `\` `` ` ``. Modifiers: `cmd` (`command`, `meta`), `ctrl` (`control`), `alt` (`opt`, `option`) and `shift`; every spelling of ⌘ and ⌃ counts as a sensitive shortcut.
+
+- In native apps a character key is the key at that spot on a US keyboard, so enter text with `type`. A shifted symbol is its base key plus `shift` (`+` is `=` with `"modifiers":["shift"]`).
+- `delete` is the Mac delete key (backspace) in native apps but forward delete in Chrome. Say `backspace` or `forwarddelete` when it matters.
+- An unknown key fails with `INVALID_REQUEST`, and the message lists the names above.
 
 ### Read every step result
 
