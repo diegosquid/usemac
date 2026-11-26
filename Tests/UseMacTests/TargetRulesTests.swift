@@ -425,6 +425,116 @@ final class TargetRulesTests: XCTestCase {
         use(TargetRules(deniedSites: ["fine.example"]))
         XCTAssertNil(bridge.latestFrame(tabId: 6))
     }
+
+    /// A connected bridge whose mock extension answers each request with `respond` (nil: no answer at all).
+    private func withMockExtension(
+        profile: String,
+        respond: @escaping @Sendable (_ command: String, _ request: [String: Any]) -> [String: Any]?,
+        _ body: (ChromeExtensionBridge, CommandLog) async throws -> Void
+    ) async throws {
+        let keyDir = makeTemporaryBridgeKeyDirectory()
+        defer { try? FileManager.default.removeItem(at: keyDir) }
+        let bridge = ChromeExtensionBridge(port: 0, pairingStore: BridgePairingStore(directory: keyDir))
+        bridge.baseCommandTimeoutSeconds = 1
+        bridge.start()
+        defer { bridge.stop() }
+        let port = await waitForListeningPort(of: bridge)
+        let key = try XCTUnwrap(bridge.pairingKeyText().flatMap(BridgeKey.init(text:)))
+        let wsTask = try await connectAuthenticatedMockExtension(port: port, key: key, profileName: profile, tabCount: 1)
+        defer { wsTask.cancel(with: .goingAway, reason: nil) }
+        let ready = await waitForBridgeCondition { bridge.connectedProfiles().first?.profileName == profile }
+        XCTAssertTrue(ready)
+
+        let commands = CommandLog()
+        let responder = Task {
+            while !Task.isCancelled {
+                guard let obj = try? await receiveBridgeJSON(from: wsTask) else { break }
+                guard (obj["type"] as? String) == "request", let id = obj["id"] as? String,
+                      let command = obj["command"] as? String else { continue }
+                commands.append(command)
+                guard var resp = respond(command, obj) else { continue }
+                resp["type"] = "response"
+                resp["id"] = id
+                resp["profileName"] = profile
+                try? await sendBridgeJSON(resp, on: wsTask)
+            }
+        }
+        defer { responder.cancel() }
+        try await body(bridge, commands)
+    }
+
+    func testATabCommandIsRefusedWhenTheTabLookupTimesOut() async throws {
+        use(TargetRules(deniedSites: ["blocked.example"]))
+        // The extension never answers the lookup, but would answer anything else.
+        try await withMockExtension(profile: "Mute", respond: { command, _ in
+            command == "tabs" ? nil : ["ok": true, "tabId": 7, "url": "https://fine.example/"]
+        }) { bridge, commands in
+            let calls: [(String, () async -> ChromeExtensionBridge.BridgeResponse)] = [
+                ("act", { await bridge.act(BrowserActParams(profile: "Mute", tabId: 7, steps: [ActionStep(action: .click, elementId: "@b1")])) }),
+                ("observe", { await bridge.observe(BrowserObserveParams(profile: "Mute", tabId: 7)) }),
+                ("extract", { await bridge.extract(BrowserExtractParams(profile: "Mute", tabId: 7)) }),
+                ("screenshot", { await bridge.screenshot(BrowserScreenshotParams(profile: "Mute", tabId: 7)) }),
+                ("open on a tab", { await bridge.open(BrowserOpenParams(url: "https://fine.example/", profile: "Mute", tabId: 7)) })
+            ]
+            for (name, call) in calls {
+                commands.reset()
+                let resp = await call()
+                XCTAssertEqual(resp.error?.code, "TARGET_BLOCKED", name)
+                XCTAssertTrue(resp.error?.message.contains("couldn't confirm this tab's site") == true, name)
+                XCTAssertTrue(resp.error?.message.contains("Retry once") == true, name)
+                XCTAssertEqual(commands.all, ["tabs"], "\(name): nothing but the lookup was sent")
+            }
+
+            // browser_tabs is only a listing, filtered afterwards: it reports the extension's own timeout.
+            let tabs = await bridge.tabs(BrowserTabsParams(profile: "Mute"))
+            XCTAssertEqual(tabs.error?.code, "EXTENSION_TIMEOUT")
+        }
+    }
+
+    func testATabWhoseAddressIsUnknownIsRefused() async throws {
+        use(TargetRules(deniedSites: ["blocked.example"]))
+        try await withMockExtension(profile: "Loading", respond: { command, _ in
+            command == "tabs"
+                ? ["ok": true, "tabId": 3, "tabs": [["tabId": 3, "title": "", "url": "", "active": true, "usemac": true]]]
+                : ["ok": true, "tabId": 3, "url": "https://fine.example/"]
+        }) { bridge, commands in
+            let resp = await bridge.act(BrowserActParams(profile: "Loading", steps: [ActionStep(action: .click, elementId: "@b1")]))
+            XCTAssertEqual(resp.error?.code, "TARGET_BLOCKED")
+            XCTAssertTrue(resp.error?.message.contains("not known yet") == true)
+            XCTAssertEqual(commands.all, ["tabs"])
+
+            // A tab id Chrome does not list goes on to the extension, which answers for a missing tab itself.
+            commands.reset()
+            _ = await bridge.observe(BrowserObserveParams(profile: "Loading", tabId: 999))
+            XCTAssertEqual(commands.all, ["tabs", "observe"])
+        }
+    }
+
+    func testNoTabLookupWithoutSiteRules() async throws {
+        use(TargetRules(deniedApps: ["com.apple.Passwords"]))
+        try await withMockExtension(profile: "Plain", respond: { _, _ in
+            ["ok": true, "tabId": 7, "url": "https://anything.example/"]
+        }) { bridge, commands in
+            let resp = await bridge.observe(BrowserObserveParams(profile: "Plain", tabId: 7))
+            XCTAssertTrue(resp.ok, String(describing: resp.error))
+            XCTAssertEqual(commands.all, ["observe"], "no extra round trip without a site rule")
+        }
+    }
+
+    func testVisionOnABlockedTabIsRefused() async throws {
+        use(TargetRules(deniedSites: ["blocked.example"]))
+        try await withMockExtension(profile: "Vision", respond: { command, _ in
+            command == "tabs"
+                ? ["ok": true, "tabId": 4, "tabs": [["tabId": 4, "title": "Secret", "url": "https://blocked.example/", "active": true, "usemac": true]]]
+                : ["ok": true, "tabId": 4, "url": "https://blocked.example/"]
+        }) { bridge, _ in
+            let refusal = await bridge.targetRulesVisionPreflight(VisionQueryParams(mode: "ask", query: "what is shown?", profile: "Vision", tabId: 4))
+            XCTAssertEqual(refusal?.error?.code, "TARGET_BLOCKED")
+            // A query on a native app does not read a tab.
+            let native = await bridge.targetRulesVisionPreflight(VisionQueryParams(mode: "ask", query: "what is shown?", app: "TextEdit"))
+            XCTAssertNil(native)
+        }
+    }
 }
 
 private final class CommandLog: @unchecked Sendable {

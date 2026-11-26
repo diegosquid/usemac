@@ -94,9 +94,16 @@ public struct TargetRules: Codable, Equatable, Sendable {
         return "\(subject) is blocked by the user's UseMac rules, so nothing ran. \(stopHint)"
     }
 
-    public static func blockedSiteMessage(host: String?) -> String {
+    /// `afterResult`: the command ran and its page ended up on a blocked site, so its result was withheld.
+    public static func blockedSiteMessage(host: String?, afterResult: Bool = false) -> String {
         let subject = host.map { "This site (\($0))" } ?? "This tab's site"
-        return "\(subject) is blocked by the user's UseMac rules, so nothing was returned. \(stopHint)"
+        let outcome = afterResult ? "so UseMac withheld the result" : "so nothing ran"
+        return "\(subject) is blocked by the user's UseMac rules, \(outcome). \(stopHint)"
+    }
+
+    /// The site rules could not be checked for the tab a command would run on, so it was refused.
+    public static func unconfirmedSiteMessage(reason: String) -> String {
+        "UseMac couldn't confirm this tab's site against the user's rules (\(reason)), so nothing ran. Retry once; if it fails again, stop and tell the user."
     }
 
     public static let blockedBrowserMessage = "Google Chrome is blocked by the user's UseMac rules, so nothing ran. \(stopHint)"

@@ -1282,6 +1282,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = targetBlockedResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Vision query blocked", message: blocked)
                 break
             }
+            if let blocked = await chromeBridge.targetRulesVisionPreflight(params) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: visionTargetLabel, activityTitle: "Vision query blocked", message: blocked.error?.message ?? "")
+                break
+            }
             if let rawImagePath = params.imagePath?.trimmingCharacters(in: .whitespacesAndNewlines), !rawImagePath.isEmpty {
                 guard isAllowedVisionImagePath(rawImagePath) else {
                     let latencyMs = elapsedMs(since: startNs)

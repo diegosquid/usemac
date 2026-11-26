@@ -641,6 +641,8 @@ final class BridgeAuthTests: XCTestCase {
         let reader = Task {
             while !Task.isCancelled {
                 guard let obj = try? await receiveBridgeJSON(from: wsTask) else { break }
+                // The site-rules lookup before the act is answered; only the act itself is left hanging.
+                if await answerTabsLookup(obj, on: wsTask, profileName: "SlowExt") { continue }
                 received.append(obj)
             }
         }

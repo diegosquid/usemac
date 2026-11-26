@@ -86,7 +86,7 @@ public enum UseMacErrorGuide {
         case "SELF_TARGET_BLOCKED":
             return "UseMac never observes or acts on its own windows. Stop and tell the user; never try to change UseMac's settings through its UI."
         case "TARGET_BLOCKED":
-            return "The user's app and site rules block this app or site. Stop and tell the user; only they can change the rules, in UseMac Settings. Do not reach it another way."
+            return "The user's app and site rules block this app or site. Stop and tell the user; only they can change the rules, in UseMac Settings. Do not reach it another way. Only when the message says UseMac couldn't confirm the tab's site, retry once first."
         case "DAEMON_REQUIRED":
             return "Ask the user to open UseMac.app; do not bypass it with --standalone."
         default:
