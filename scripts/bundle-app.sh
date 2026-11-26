@@ -120,12 +120,14 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$HELPERS_DIR" "$FRAMEWORKS_DIR" "$RESOURCES_DIR"
 
-# On case-insensitive APFS volumes, 'UseMac' and 'usemac' collide in the same directory.
-# Build and copy each product separately to preserve both binaries.
-echo "Building UseMac.app ($CONFIG)..."
+# The CLI product is named usemac-cli so it can't overwrite UseMac on a case-insensitive volume.
+# It is installed as Contents/Helpers/usemac.
+echo "Building UseMac.app and the usemac CLI ($CONFIG)..."
+# A build from before the rename can leave the CLI's binary at $BIN_PATH/UseMac. Removing it forces a relink.
 rm -f "$BIN_PATH/UseMac" "$BIN_PATH/usemac"
-CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG" --product UseMac
+CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG"
 cp "$BIN_PATH/UseMac" "$MACOS_DIR/UseMac"
+cp "$BIN_PATH/usemac-cli" "$HELPERS_DIR/usemac"
 
 # Embed Sparkle.framework with symlinks intact (ditto) and ensure @executable_path/../Frameworks rpath
 SPARKLE_SRC=""
@@ -139,11 +141,6 @@ if [[ -n "$SPARKLE_SRC" && -d "$SPARKLE_SRC" ]]; then
   /usr/bin/ditto "$SPARKLE_SRC" "$FRAMEWORKS_DIR/Sparkle.framework"
   /usr/bin/install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/UseMac" 2>/dev/null || true
 fi
-
-echo "Building usemac CLI ($CONFIG)..."
-rm -f "$BIN_PATH/UseMac" "$BIN_PATH/usemac"
-CLANG_MODULE_CACHE_PATH="$CLANG_CACHE_DIR" swift build "${SPM_FLAGS[@]}" -c "$CONFIG" --product usemac
-cp "$BIN_PATH/usemac" "$HELPERS_DIR/usemac"
 
 chmod +x "$MACOS_DIR/UseMac" "$HELPERS_DIR/usemac"
 

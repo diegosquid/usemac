@@ -97,7 +97,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 ## Build from source
 
 ```bash
-# Build all Swift targets
+# Build all Swift targets: .build/debug/UseMac (the app) and .build/debug/usemac-cli (the CLI)
 swift build
 
 # Run Swift tests
@@ -106,7 +106,7 @@ swift test
 # Run Chrome extension tests
 node --test Tests/ExtensionTests/*.test.mjs
 
-# Build and sign the local .app bundle under dist/
+# Build and sign the local .app bundle under dist/ (the CLI is installed as Contents/Helpers/usemac)
 ./scripts/bundle-app.sh
 
 # Run release preflight checks (requires Developer ID, notarization, and Sparkle key to publish)
