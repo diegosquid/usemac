@@ -459,6 +459,8 @@ public final class AppState: ObservableObject {
     }
 
     private func hookEngineCallbacks() {
+        // `report_prepare` opens its review window (ProblemReportWindow.swift).
+        ProblemReportReviewController.shared.attach(to: engine)
         engine.onOverlayEvent = { [weak self] event in
             Task { @MainActor [weak self] in
                 self?.handleOverlayEvent(event)

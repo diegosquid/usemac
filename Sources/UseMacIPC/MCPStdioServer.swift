@@ -535,6 +535,14 @@ public final class MCPStdioServer: @unchecked Sendable {
                 )
                 rpcRequest = RPCRequest(method: .taskComplete, taskComplete: params)
 
+            case "usemac_report_prepare":
+                let params = ReportPrepareParams(
+                    summary: try requiredNonEmptyString(arguments, key: "summary", toolName: "usemac_report_prepare"),
+                    title: try optionalString(arguments, key: "title"),
+                    taskId: try optionalString(arguments, key: "taskId")
+                )
+                rpcRequest = RPCRequest(method: .reportPrepare, reportPrepare: params)
+
             case "usemac_browser_act":
                 let steps = try decodeSteps(arguments, toolName: "usemac_browser_act")
                 returnImageContent = try optionalBool(arguments, key: "returnImageContent") ?? false
@@ -981,6 +989,14 @@ public final class MCPStdioServer: @unchecked Sendable {
                 text += "\nTabs opened: \(tabs(done.tabsOpened)); closed during the task: \(tabs(done.tabsClosed)); closing now: \(tabs(done.tabsClosing))"
             }
             return [.text(text)]
+
+        case "usemac_report_prepare":
+            guard let receipt = response.problemReport else {
+                return [.text("Report status unavailable")]
+            }
+            let scope = receipt.taskId.map { "task \($0)" } ?? "recent activity"
+            let codes = receipt.errorCodes.isEmpty ? "no error codes" : receipt.errorCodes.joined(separator: ", ")
+            return [.text("Report \(receipt.status) (\(scope), \(receipt.entryCount) audit entries, \(codes)).\n\(receipt.message)")]
 
         default:
             return [.text("OK")]
@@ -1970,6 +1986,35 @@ public final class MCPStdioServer: @unchecked Sendable {
                 readOnlyHint: false,
                 destructiveHint: false,
                 idempotentHint: true,
+                openWorldHint: false
+            )
+        ),
+        MCPToolDefinition(
+            name: "usemac_report_prepare",
+            description: "Prepare a problem report for UseMac's maintainers after a failure that looks like a UseMac bug (not a safety block such as POLICY_BLOCKED or TARGET_BLOCKED, and not something the user chose). Ask the user first. UseMac builds the report from your summary, the environment (app, extension and macOS versions, execution mode) and the task's audit entries and error codes, removes sensitive data (typed text, emails, tokens and keys, the home folder, URL query strings, long numbers; never screenshots), and opens it in its \"Review problem report\" window. The result comes back at once with status awaiting_user_review: you never get the report's text or the user's decision. Only the user can open it as a GitHub issue, from that window. Tell the user to review it there, and never paste the report anywhere else. Works in every execution mode; the Kill Switch blocks it. One report shows at a time (REPORT_IN_REVIEW otherwise).",
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "summary": [
+                        "type": "string",
+                        "description": "What you tried, what you expected and what happened (at most 4000 characters). Leave out the user's personal data."
+                    ],
+                    "title": [
+                        "type": "string",
+                        "description": "Optional issue title (default: the first line of summary)."
+                    ],
+                    "taskId": [
+                        "type": "string",
+                        "description": "The task the report is about (default: this connection's task, else the only running task, else the last 30 minutes of activity)."
+                    ]
+                ],
+                "required": ["summary"]
+            ],
+            annotations: MCPToolAnnotations(
+                title: "Prepare problem report",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: false,
                 openWorldHint: false
             )
         )
