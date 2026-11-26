@@ -78,7 +78,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 
 ### Error codes
 
-Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error-codes) explains each one and what the agent should do next.
+Failed requests carry an error `code` and `message`, and an optional `hint` when UseMac knows what the agent should do next (for `POLICY_BLOCKED`, which execution mode, pause or Kill Switch refused it). The [Agent Guide](.agents/AGENTS.md#error-codes) explains each code and what the agent should do next.
 
 - **Stop and tell the user** (a safety rule blocked it, or UseMac isn't running): `POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DAEMON_REQUIRED`.
 - **The screen changed** (observe again): `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`.
@@ -92,6 +92,8 @@ Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error
 ## Safety model
 
 ### Execution modes
+
+UseMac starts in **Autonomous** until you pick another mode in **Settings → General → Safety**. Any other mode shows in the menu bar: Read-only badges the icon with an eye, Paused and the Kill Switch with pause bars, and the menu says "Mode: …" with a link back to Safety. Agents that a mode refuses get a `POLICY_BLOCKED` hint that names it and tells them to ask you.
 
 | Mode (`set_policy`) | App UI label | Behavior |
 | :--- | :--- | :--- |

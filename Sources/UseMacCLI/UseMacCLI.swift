@@ -41,7 +41,8 @@ struct UseMacCLI {
         case usage(String)
         case daemonRequired(String)
         case invalidJSON(String)
-        case rpcFailure(code: String, message: String)
+        /// `hint`: the daemon's own advice for this refusal (`error.hint`), preferred over `UseMacErrorGuide`.
+        case rpcFailure(code: String, message: String, hint: String? = nil)
     }
 
     private struct CLIErrorEnvelope: Encodable {
@@ -290,6 +291,7 @@ struct UseMacCLI {
         let code: String
         let message: String
         let includeCodeInText: Bool
+        var serverHint: String?
 
         switch error {
         case .usage(let msg):
@@ -307,14 +309,15 @@ struct UseMacCLI {
             code = "DAEMON_REQUIRED"
             message = msg
             includeCodeInText = true
-        case .rpcFailure(let rpcCode, let rpcMessage):
+        case .rpcFailure(let rpcCode, let rpcMessage, let rpcHint):
             exitCode = Self.exitCode(forErrorCode: rpcCode)
             code = rpcCode
             message = rpcMessage
             includeCodeInText = true
+            serverHint = rpcHint
         }
 
-        let hint = UseMacErrorGuide.hint(for: code)
+        let hint = serverHint ?? UseMacErrorGuide.hint(for: code)
         if json {
             printEncodableJSON(CLIErrorEnvelope(error: .init(code: code, message: message, hint: hint)))
         } else if includeCodeInText {
@@ -2049,7 +2052,7 @@ struct UseMacCLI {
         if !response.ok {
             let code = response.error?.code ?? "rpc_error"
             let message = response.error?.message ?? "Unknown RPC error."
-            throw CLIError.rpcFailure(code: code, message: message)
+            throw CLIError.rpcFailure(code: code, message: message, hint: response.error?.hint)
         }
     }
 
@@ -2153,6 +2156,8 @@ struct UseMacCLI {
           Success prints the result object itself: observe → WindowSnapshot, find → {"app","count","matches"},
           act/click/set/type/key → BatchActionResult, apps → [AppDescriptor], status → DaemonStatus.
           Errors print {"ok":false,"error":{"code":"…","message":"…","hint":"…"}} to stdout; the exit code is set as above.
+          "hint" ("Next:" without --json) says what to do next; for POLICY_BLOCKED it names the execution mode, pause
+          or Kill Switch that refused the request, which only the user can change (UseMac → Settings → Safety).
           Run 'usemac help <command>' for that command's fields.
         """)
     }

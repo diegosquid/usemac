@@ -164,10 +164,14 @@ public struct RPCRequest: Codable, Sendable {
 public struct RPCErrorPayload: Codable, Equatable, Sendable {
     public var code: String
     public var message: String
+    /// What the agent should do next, when UseMac knows more than the code says (the mode, pause or Emergency stop
+    /// that refused a request). Optional: clients fall back to their own advice for the code.
+    public var hint: String?
 
-    public init(code: String, message: String) {
+    public init(code: String, message: String, hint: String? = nil) {
         self.code = code
         self.message = message
+        self.hint = hint
     }
 }
 
@@ -293,13 +297,14 @@ public struct RPCResponse: Codable, Sendable {
         id: String,
         code: String,
         message: String,
-        latencyMs: Double = 0
+        latencyMs: Double = 0,
+        hint: String? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
             ok: false,
             serverLatencyMs: latencyMs,
-            error: RPCErrorPayload(code: code, message: message)
+            error: RPCErrorPayload(code: code, message: message, hint: hint)
         )
     }
 }

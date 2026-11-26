@@ -20,7 +20,7 @@ Use **UseMac** to inspect and control macOS desktop applications and Google Chro
 ## 1. Transport Priority (Unix Socket Default)
 
 ### Option A — Direct Unix Socket NDJSON (Default)
-Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u)/usemac.sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
+Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u)/usemac.sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). A failure answers `"ok": false` with `error.code`, `error.message` and, when UseMac knows what you should do next, `error.hint`. `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
 
 Methods: `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`.
 
@@ -238,8 +238,8 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 
 | Code | Meaning | What the agent should do |
 | :--- | :--- | :--- |
-| `POLICY_BLOCKED` | Action or read was blocked by the execution mode (`confirmSensitive`, `readOnly`, `paused`) or Kill Switch (`⇧⌘⎋`). | Stop immediately and tell the user; do not retry or look for another route. |
-| `POLICY_LOCKED` | Attempted to relax the execution mode via `set_policy` over the socket. | Stop and tell the user; only the user can relax the execution mode in UseMac Settings. |
+| `POLICY_BLOCKED` | Action or read was blocked by the execution mode (`confirmSensitive`, `readOnly`, `paused`) or Kill Switch (`⇧⌘⎋`). The message and `error.hint` (`Next:` in the CLI and MCP) say which; with `browser_act` `readOnly: true`, your own flag blocked it. | Stop immediately and tell the user which mode blocked you: only they can change it, in **UseMac → Settings → Safety** (or **Resume Agents** in UseMac's menu bar menu). Do not retry or look for another route. |
+| `POLICY_LOCKED` | Attempted to relax the execution mode via `set_policy` over the socket. The hint names the current mode. | Stop and tell the user; only the user can relax the execution mode, in **UseMac → Settings → Safety**. |
 | `APPROVAL_DENIED` | **Ask** mode: the user denied the sensitive step (upload, `cmd`/`ctrl` shortcut, page script) in UseMac's prompt. Nothing ran. | Stop and tell the user; retry only if they ask you to. |
 | `APPROVAL_TIMEOUT` | **Ask** mode: nobody answered UseMac's prompt in time (45 s by default). Nothing ran. | Tell the user what needs their OK; retry once they say they are at the Mac. |
 | `URL_BLOCKED` | Target URL scheme is not `http://`, `https://`, or `about:blank`. | Stop and tell the user; do not try an alternate route or workaround. |

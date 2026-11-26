@@ -21,8 +21,15 @@ public enum ControlCenterSection: String, CaseIterable, Identifiable {
 @MainActor
 public final class ControlCenterRouter: ObservableObject {
     @Published public var selection: ControlCenterSection = .overview
+    /// A group in General to scroll to once it shows, then cleared (the menu bar's "Mode: …" line asks for Safety).
+    @Published public var scrollTarget: ControlCenterAnchor?
 
     public init() {}
+}
+
+/// Groups in General that other parts of the app can open Settings at.
+public enum ControlCenterAnchor: Hashable {
+    case safety
 }
 
 // MARK: - Window Drag Strip for Transparent Titlebar
@@ -61,9 +68,12 @@ public final class ControlCenterWindowController {
         }
     }
 
-    public func show(section: ControlCenterSection? = nil) {
+    public func show(section: ControlCenterSection? = nil, scrollTo anchor: ControlCenterAnchor? = nil) {
         if let section {
             router.selection = section
+        }
+        if let anchor {
+            router.scrollTarget = anchor
         }
 
         if window == nil {
@@ -284,7 +294,11 @@ public struct ControlCenterView: View {
         Group {
             switch router.selection {
             case .overview:
-                generalSection
+                ScrollViewReader { proxy in
+                    generalSection
+                        .onAppear { scrollToTarget(proxy) }
+                        .onChange(of: router.scrollTarget) { scrollToTarget(proxy) }
+                }
             case .connect:
                 connectSection
             case .audit:
@@ -293,6 +307,17 @@ public struct ControlCenterView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .codexSheetElevation(colorScheme, cornerRadius: 18)
+    }
+
+    /// Scrolls General to `router.scrollTarget`, once laid out, and clears it.
+    private func scrollToTarget(_ proxy: ScrollViewProxy) {
+        guard let target = router.scrollTarget else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(target, anchor: .top)
+            }
+            router.scrollTarget = nil
+        }
     }
 
     // MARK: - General Preferences Section (Pure Codex Style, Zero Dashboard)
@@ -324,6 +349,7 @@ public struct ControlCenterView: View {
                 localVisionGroup
                 permissionsGroup
                 safetyGroup
+                    .id(ControlCenterAnchor.safety)
                 AuditLogSettingsGroup(store: appState.engine.auditStore, onOpenHistory: { router.selection = .audit })
                 TargetRulesGroupView()
                 SoftwareUpdatesGroupView(updater: appState.updater)

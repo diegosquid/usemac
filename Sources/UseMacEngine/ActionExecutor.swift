@@ -150,13 +150,18 @@ public final class ActionExecutor: @unchecked Sendable {
                 isMutatingAction: isMutatingStep(step)
             ) {
                 allSucceeded = false
+                // Usually the mode, a pause or the Emergency stop changed while the batch ran (the engine refuses a
+                // blocked batch up front). A step result has no hint field, so its message says what to do next.
+                let policy = killSwitch.policy
+                let tripped = killSwitch.isTripped
+                let hint = ExecutionModeNotice.agentHint(policy: policy, killSwitchTripped: tripped)
                 stepResults.append(ActionStepResult(
                     index: index,
                     action: step.action,
                     success: false,
                     mechanism: "blocked",
                     latencyMs: 0,
-                    message: blockReason,
+                    message: hint.map { "\(blockReason) \($0)" } ?? blockReason,
                     errorCode: "POLICY_BLOCKED"
                 ))
                 onLiveActivity?(LiveActivityItem(
@@ -167,7 +172,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     windowTitle: currentApp?.windowTitle,
                     windowBounds: currentApp?.windowBounds,
                     title: ActivityCaption.failedStepTitle(step: step, position: (index + 1, request.steps.count)),
-                    subtitle: ActivityCaption.reason(errorCode: "POLICY_BLOCKED"),
+                    subtitle: ExecutionModeNotice.activityReason(policy: policy, killSwitchTripped: tripped)
+                        ?? ActivityCaption.reason(errorCode: "POLICY_BLOCKED"),
                     elementId: step.elementId,
                     mechanism: "blocked",
                     latencyMs: 0,
