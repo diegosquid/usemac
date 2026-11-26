@@ -41,8 +41,8 @@ connected one.
 | Case | What it checks |
 | --- | --- |
 | `textedit` | Native basics: observe an untitled document, type into it in the background, read the text back, close it without saving. |
-| `scroll-event` | Native background scroll of a page in a UseMac Chrome window: the wheel event moves the page (`cgevent-pid-scroll`). |
-| `scroll-fallback` | The same on a page that swallows wheel events: UseMac scrolls the next offscreen element into view (`ax-scroll-to-next`). |
+| `scroll-event` | Native background scroll of a page in a UseMac Chrome window. The page moves, through the wheel event (`cgevent-pid-scroll`) or the offscreen-element fallback (`ax-scroll-to-next`), and a second UseMac window gets neither scrolled nor any wheel event. |
+| `scroll-fallback` | The same on a page that swallows wheel events, so only the fallback (`ax-scroll-to-next`) can move it. |
 | `restricted-page` | The `RESTRICTED_PAGE` hybrid flow: `browser open --new-window` on the Chrome Web Store, `browser observe` refusing it, then native observe and act with `--window`. |
 | `upload` | `uploadFile` in Chrome with files created a second before in `$TMPDIR`: into a file input on the page, then through an intercepted file chooser. |
 | `two-tasks` | Two tasks at once: `done --task A` closes A's tab and leaves B's open. |
