@@ -90,10 +90,13 @@ public final class KillSwitch: @unchecked Sendable {
         return "This input would land on UseMac's approval prompt, so nothing was sent. Only the user answers it. \(WorkspaceMonitor.selfTargetMessage)"
     }
 
+    /// Why a request is refused while the Emergency stop is on (agents see it as the `POLICY_BLOCKED` message).
+    static let emergencyStopMessage = "UseMac's emergency stop is on, so agents can't read the screen or act until the user resumes."
+
     public func trip(_ tripped: Bool, reason: String? = nil) {
         lock.lock()
         _isTripped = tripped
-        _tripReason = tripped ? (reason ?? "Emergency kill switch tripped") : nil
+        _tripReason = tripped ? (reason ?? Self.emergencyStopMessage) : nil
         lock.unlock()
     }
 
@@ -105,7 +108,7 @@ public final class KillSwitch: @unchecked Sendable {
         lock.unlock()
 
         if tripped {
-            return tripReason ?? "Emergency kill switch is tripped"
+            return tripReason ?? Self.emergencyStopMessage
         }
 
         switch currentPolicy {
@@ -116,16 +119,16 @@ public final class KillSwitch: @unchecked Sendable {
             return nil
         case .readOnly:
             if isMutatingAction {
-                return "Mutating action blocked under readOnly policy (scroll, hover, observe, extract, and screenshot are allowed)"
+                return "UseMac is in Read-only mode, so agents can't click, type, press keys, upload or change anything (observe, scroll, hover, extract and screenshot still work)."
             }
             return nil
         case .confirmSensitive:
             if forSensitiveAction {
-                return "Sensitive action blocked under confirmSensitive policy"
+                return "UseMac is in Block sensitive mode, so uploads, page scripts and ⌘/⌃ shortcuts don't run (other steps still work)."
             }
             return nil
         case .paused:
-            return "Agent actions are paused by governance policy"
+            return "UseMac is paused, so agents can't read the screen or act until the user resumes."
         }
     }
 }

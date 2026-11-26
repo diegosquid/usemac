@@ -604,7 +604,7 @@ public final class MCPStdioServer: @unchecked Sendable {
             let code = rpcResponse.error?.code ?? "rpc_error"
             let message = rpcResponse.error?.message ?? "Unknown RPC failure"
             var text = "Error [\(code)]: \(message)"
-            if let hint = UseMacErrorGuide.hint(for: code) {
+            if let hint = rpcResponse.error?.hint ?? UseMacErrorGuide.hint(for: code) {
                 text += "\nNext: \(hint)"
             }
             return toolResultResponse(

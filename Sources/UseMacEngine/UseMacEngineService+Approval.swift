@@ -37,6 +37,7 @@ extension UseMacEngineService {
         let code: String
         let message: String
         let activityTitle: String
+        var hint: String?
         switch outcome {
         case .allowedOnce, .allowedForTask, .allowedByTaskGrant:
             if request.method == .act, request.act?.foreground == true {
@@ -57,9 +58,11 @@ extension UseMacEngineService {
             code = "POLICY_BLOCKED"
             message = "This step was waiting for approval when \(reason), so nothing was run."
             activityTitle = "Approval cancelled"
+            hint = ExecutionModeNotice.agentHint(policy: killSwitch.getPolicy(), killSwitchTripped: killSwitch.isTripped)
+                ?? ExecutionModeNotice.modeChangedWhileWaitingHint
         }
         onLiveActivity?(held.activity(title: activityTitle, subtitle: message, success: false, inProgress: false, latencyMs: latencyMs))
-        return .failure(id: request.id, code: code, message: message, latencyMs: latencyMs)
+        return .failure(id: request.id, code: code, message: message, latencyMs: latencyMs, hint: hint)
     }
 
     /// Where the app shows the approval prompt (global coordinates, top-left origin), or nil once it is gone. UseMac

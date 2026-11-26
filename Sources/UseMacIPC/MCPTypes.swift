@@ -81,7 +81,11 @@ public enum UseMacErrorGuide {
             return "The Chrome extension cannot script this page (Chrome Web Store or chrome:// pages). Make the tab active with browser_open tabId + activate: true (CLI: browser open --tab <id> --activate), or open the URL with newWindow: true (CLI: --new-window), then use native observe/act with app \"Google Chrome\"."
         case "CAPTURE_TOO_SMALL":
             return "The captured window is too small to trust (a helper strip or hidden window). Do not draw conclusions from it: observe the app instead, or make the right window visible and retry."
-        case "POLICY_BLOCKED", "POLICY_LOCKED", "URL_BLOCKED", "UPLOAD_BLOCKED":
+        case "POLICY_BLOCKED":
+            return "UseMac's execution mode, a pause or the emergency stop refused this (the message says which). Stop and tell the user: only they can change it, in UseMac → Settings → Safety (or UseMac menu bar icon → Resume Agents); agents can't relax it. Don't look for another route."
+        case "POLICY_LOCKED":
+            return "Only the user can relax the execution mode, in UseMac → Settings → Safety. Ask them if the task needs it; don't retry set_policy."
+        case "URL_BLOCKED", "UPLOAD_BLOCKED":
             return "Blocked by a UseMac safety rule. Stop and tell the user; do not look for another route."
         case "APPROVAL_DENIED":
             return "The user denied this step in UseMac's approval prompt, so it did not run. Stop and tell the user; retry only if they ask you to."
