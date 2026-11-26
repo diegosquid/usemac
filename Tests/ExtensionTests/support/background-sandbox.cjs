@@ -7,6 +7,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { fakeImageApis } = require("./fake-jpeg.cjs");
 
 const extensionDir = path.resolve(__dirname, "..", "..", "..", "Extension");
 const CHROME_UA =
@@ -51,7 +52,8 @@ class FakeWebSocket {
 
 /**
  * @param {object} options
- * @param {Array<object>} options.tabs  Initial tabs: { id, windowId, url, title?, active?, pinned?, status? }.
+ * @param {Array<object>} options.tabs  Initial tabs: { id, windowId, url, title?, active?, pinned?, status?,
+ *   width?, height? } (width and height: the tab's size as chrome.tabs reports it).
  * @param {Array<object>} [options.windows]  Initial windows: { id, focused?, state? }. Derived from tabs when omitted.
  * @param {boolean} [options.fileAccess]  Result of chrome.extension.isAllowedFileSchemeAccess().
  * @param {(tabId:number, tab:object) => string|null} [options.attachError]  Message chrome.debugger.attach rejects with.
@@ -87,7 +89,8 @@ function createBackgroundSandbox(options = {}) {
       pinned: Boolean(t.pinned),
       status: t.status || "complete",
       groupId: t.groupId ?? -1,
-      ...(t.pendingUrl ? { pendingUrl: t.pendingUrl } : {})
+      ...(t.pendingUrl ? { pendingUrl: t.pendingUrl } : {}),
+      ...(t.width != null ? { width: t.width, height: t.height } : {})
     });
   }
   for (const g of options.groups || []) {
@@ -320,12 +323,18 @@ function createBackgroundSandbox(options = {}) {
   // Every timer the extension starts is tracked so dispose() can stop idle timers and capture pumps.
   const timeouts = new Set();
   const intervals = new Set();
+  // Canvas sizes the extension encoded (a screenshot scaled down to fit a box), as [width, height].
+  const canvasDraws = [];
   const context = {
     chrome,
     WebSocket: FakeWebSocket,
     console,
     URL,
     TextEncoder,
+    atob,
+    btoa,
+    Blob,
+    ...fakeImageApis(canvasDraws),
     crypto: globalThis.crypto,
     performance,
     navigator: { userAgent: options.userAgent || CHROME_UA },
@@ -367,6 +376,7 @@ function createBackgroundSandbox(options = {}) {
     windows,
     groups,
     attached,
+    canvasDraws,
 
     /** Calls a top-level function of background.js; plain values come back as outer-realm JSON clones. */
     call(name, ...args) {
