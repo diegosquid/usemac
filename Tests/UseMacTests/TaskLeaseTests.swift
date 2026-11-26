@@ -191,6 +191,8 @@ final class TaskLeaseTests: XCTestCase {
         let responder = Task {
             while !Task.isCancelled {
                 guard let obj = try? await receiveBridgeJSON(from: ws) else { break }
+                // The site rules (#12) look the tab up before a tab command; answer it so it isn't refused.
+                if await answerTabsLookup(obj, on: ws, profileName: "Lease") { continue }
                 guard (obj["type"] as? String) == "request", let id = obj["id"] as? String,
                       let command = obj["command"] as? String else { continue }
                 recorder.append(command: command)
