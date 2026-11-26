@@ -75,7 +75,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `screenshot` | Downscaled JPEG of an app window or display, saved to a private temp folder (pruned after 30 minutes). |
 | `set_policy` | Keep or tighten the execution mode (`autonomous` → `confirmSensitive` → `readOnly` → `paused`); relaxing returns `POLICY_LOCKED`. |
 | `pair_app` | Set or clear the default target app (`appTarget`). |
-| `audit_log` | Recent in-memory audit entries (up to 50). |
+| `audit_log` | Audit entries, newest first (the 50 most recent by default). Optional `auditLog`: `limit` (up to 1000), `sinceMs`, `taskId`. Kept on disk for 30 days; typed text and `eval` sources appear only as their length. |
 | `highlight` | Highlight a cached `@eID` element on screen. |
 | `browser_status` | Paired, connected Chrome profiles and daemon status. |
 | `browser_tabs` | Open Chrome tabs (`tabId`, `title`, `url`, `active`), optional substring filter. |
@@ -136,7 +136,7 @@ Target by what the element is with `match`, and wait for the result instead of s
 {"method":"browser_observe","browserObserve":{"tabId":42,"maxElements":180}}
 ```
 
-`browser_extract` modes `auto`, `tables`, `text` and `kpis` only read. `downloads` lists downloads started during the UseMac session. `eval` runs arbitrary JavaScript in the page, works only in `autonomous` mode, and every expression is logged in the history.
+`browser_extract` modes `auto`, `tables`, `text` and `kpis` only read. `downloads` lists downloads started during the UseMac session. `eval` runs arbitrary JavaScript in the page, works only in `autonomous` mode, and the history records each expression's length, not its source.
 
 ```json
 {"method":"browser_extract","browserExtract":{"tabId":42,"mode":"tables","scanHorizontal":true}}
@@ -169,6 +169,14 @@ The response carries a `taskId` (for example `"taskId":"task-1a2b3c4d"`). Pass i
 ```
 
 Several agents can work at the same time. The `taskId` is how UseMac knows which tabs are yours: `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed. Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task; when it can't tell, it closes nothing that a running task owns. In the CLI, `usemac start` prints the id; pass it as `--task` to `browser open` and `done`.
+
+Every audit entry carries the `taskId` it belonged to, so you can check what your task did, even after UseMac restarts:
+
+```json
+{"method":"audit_log","auditLog":{"taskId":"task-1a2b3c4d","limit":200}}
+```
+
+Entries come newest first (`timestampMs`, `method`, `targetApp`, `summary`, `success`, `taskId`). `sinceMs` keeps only newer entries. Summaries never copy what was typed: `type`/`setValue` text and `eval` sources appear as their length (`type (14 chars)`), and URLs lose their credentials and secret-looking query values.
 
 About 2 s after `task_complete`, UseMac closes the Chrome tabs your task opened so the user's tab strip does not fill up. It never closes tabs the user already had open (even if you used them through `tabId`), the tab the user is looking at, or tabs with a running download. Keep a tab when the user should see it or work is pending: `"keepTabIds":[42]` (CLI `usemac done --keep-tab 42`), or `"keepTabs":true` to keep them all (CLI `--keep-tabs`).
 
@@ -279,6 +287,7 @@ Chrome and on-device vision (`--profile` only when several profiles are connecte
 "$USEMAC" vision diagnose
 "$USEMAC" vision locate "X close button on notification popup"
 "$USEMAC" done --summary "Finished reading article"
+"$USEMAC" audit --task task-1a2b3c4d               # what this task did (--since 2h, --limit 200)
 ```
 
 When `UseMac.app` is closed, action commands (`act`, `click`, `set`, `type`, `key`, `browser open`, `browser act`, `vision install`) fail with `DAEMON_REQUIRED`. `--standalone` runs in-process without the app and **without** the Kill Switch or execution mode; use it only when the user asks.

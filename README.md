@@ -67,6 +67,7 @@ USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 "$USEMAC" observe --app "Notes"
 "$USEMAC" act '{"app":"Notes","steps":[{"action":"type","text":"Meeting notes","preferBackground":true}]}'
 "$USEMAC" browser status
+"$USEMAC" audit --since 2h
 "$USEMAC" install-skill
 ```
 
@@ -91,6 +92,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
   - **UseMac's own windows**: agents can't observe or act on UseMac itself (Settings, the setup guide). Requests that name it return `SELF_TARGET_BLOCKED`, and `list_apps` leaves it out.
   - **Local vision paths & models**: `vision_query.imagePath` only accepts files inside your user temporary directory or `/tmp`; `vision_install` only accepts the three built-in model presets (`INVALID_MODEL`).
   - **Temporary captures**: Screenshots are written to a private folder inside your user temporary directory and deleted after 30 minutes.
+- **Audit log**: Every observation and action is appended to one JSONL file per day in `~/Library/Application Support/UseMac/audit/` (readable only by you), kept for 30 days by default (**Settings → General → History**). Typed text, `setValue` values and `eval` sources are stored only as their length unless you turn on **Record typed text**, and URLs always lose their credentials and secret-looking query values. **Settings → History** filters it by task, app and result and exports it as JSON Lines or CSV; agents read it with `audit_log` (`limit`, `sinceMs`, `taskId`) or `usemac audit`.
 - **Chrome extension pairing & tab isolation**: Each Chrome profile must be paired once with the local `umk_…` key (unpaired requests return `EXTENSION_NOT_PAIRED`, and the key is never exposed via RPC, MCP, or CLI). Without an explicit `tabId`, browser methods only target the last UseMac tab or a tab in the `UseMac` tab group (`NO_USEMAC_TAB` otherwise).
 - **AI client data flow**: Everything an agent observes, extracts, or captures through UseMac is returned to the AI client you connected, which typically sends that data to its AI provider under that provider's terms.
 
