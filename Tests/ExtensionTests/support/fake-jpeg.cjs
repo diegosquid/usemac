@@ -35,8 +35,11 @@ function base64Size(base64) {
   return jpegSizeOf(Buffer.from(base64, "base64"));
 }
 
-/** createImageBitmap and OffscreenCanvas for the vm context. `log` collects each canvas size drawn. */
-function fakeImageApis(log = []) {
+/**
+ * createImageBitmap and OffscreenCanvas for the vm context. `log` collects each canvas size encoded, `draws` each
+ * drawImage call: { canvas: [w, h], image: [w, h], args: [the numbers after the image] }.
+ */
+function fakeImageApis(log = [], draws = []) {
   async function createImageBitmap(blob) {
     const size = jpegSizeOf(new Uint8Array(await blob.arrayBuffer()));
     if (!size) throw new Error("The source image could not be decoded.");
@@ -50,7 +53,15 @@ function fakeImageApis(log = []) {
     }
 
     getContext() {
-      return { imageSmoothingQuality: "low", drawImage() {} };
+      const canvas = this;
+      return {
+        imageSmoothingQuality: "low",
+        fillStyle: "#000000",
+        fillRect() {},
+        drawImage(image, ...args) {
+          draws.push({ canvas: [canvas.width, canvas.height], image: [image.width, image.height], args });
+        }
+      };
     }
 
     async convertToBlob() {
