@@ -82,10 +82,15 @@ final class PreviewDeckFocusTests: XCTestCase {
         XCTAssertTrue(PreviewDeckFocus.previewShows(targetGuessed: false))
     }
 
-    func testFailedBrowserStepAddsNoCard() {
-        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, success: false))
-        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: true, success: true))
-        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: false, success: false))
+    func testATabsCardComesFromItsFrameNotFromASteps() {
+        // Steps on a tab (even successful ones, like "starting") never add its card: a closed tab would leave an empty one.
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: true, success: true))
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: true, success: false))
+        // A browser task that has not opened a tab yet may show the placeholder.
+        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: false, success: true))
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: false, success: false))
+        // Native apps an agent named keep their cards.
+        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: false, namesTab: false, success: false))
     }
 
     func testTargetIsGuessedOnlyWhenNothingNamesAnApp() {

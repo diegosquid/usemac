@@ -572,7 +572,10 @@ public final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let profile = event.profileName ?? self.hudDeck.first(where: { $0.isBrowser })?.browserProfile ?? self.connectedBrowserProfiles.first?.profileName ?? "Chrome"
-                let cardId = Self.browserCardId(profile: profile, tabId: event.tabId)
+                // A cursor only moves on a tab that already has a card; the card itself comes with the tab's first frame.
+                let profileCardId = Self.browserCardId(profile: profile, tabId: event.tabId)
+                guard let cardId = self.browserCardIdForTab(event.tabId)
+                    ?? (self.hudDeck.contains(where: { $0.id == profileCardId }) ? profileCardId : nil) else { return }
                 let label: String?
                 switch event.phase {
                 case "click":
@@ -1979,10 +1982,14 @@ public final class AppState: ObservableObject {
                 }
                 return sub
             }()
-            // A failed browser step on a tab with no card (closed, or never UseMac's) adds nothing: the card would be
-            // an empty globe for a tab that is not there.
+            // A step on a tab with no card yet adds nothing: the tab's card comes with its first real frame. Otherwise
+            // a step on a closed tab (or one that is not UseMac's) left an empty globe card and reopened the preview.
             let cardExists = hudDeck.contains(where: { $0.id == cardId })
-            guard cardExists || PreviewDeckFocus.activityAddsCard(isBrowser: isChromeBridgeActivity, success: item.success) else {
+            guard cardExists || PreviewDeckFocus.activityAddsCard(
+                isBrowser: isChromeBridgeActivity,
+                namesTab: item.browserTabId != nil,
+                success: item.success
+            ) else {
                 return
             }
             upsertHUDCard(

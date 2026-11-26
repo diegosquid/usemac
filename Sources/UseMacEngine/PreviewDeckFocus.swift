@@ -50,10 +50,12 @@ public enum PreviewDeckFocus {
         !targetGuessed
     }
 
-    /// Whether an activity may add a card the deck does not have yet. A failed browser step adds none: its tab may
-    /// be closed or not UseMac's, and the card would stay empty.
-    public static func activityAddsCard(isBrowser: Bool, success: Bool) -> Bool {
-        !isBrowser || success
+    /// Whether an activity may add a card the deck does not have yet. A Chrome tab's card only comes from a real
+    /// frame of that tab, never from a step: a step can name a tab that is closed or not UseMac's, and its card would
+    /// stay empty. A browser activity that names no tab (a task that has not opened one yet) may add the placeholder.
+    public static func activityAddsCard(isBrowser: Bool, namesTab: Bool, success: Bool) -> Bool {
+        guard isBrowser else { return true }
+        return !namesTab && success
     }
 
     /// True when an activity is another card's work, so it must not drive the large preview (its caption, cursor,
