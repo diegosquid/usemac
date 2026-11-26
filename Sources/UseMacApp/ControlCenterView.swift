@@ -856,44 +856,32 @@ public struct ControlCenterView: View {
         }
     }
 
-    private var executionModeSubtitle: String {
-        switch appState.status.policy {
-        case .autonomous:
-            return "Agents can read and act without asking."
-        case .ask:
-            return "Agents can act, but uploads, page scripts and ⌘/⌃ shortcuts wait for your OK in the live preview."
-        case .confirmSensitive:
-            return "Agents can act, but uploads, page scripts and ⌘/⌃ shortcuts are blocked."
-        case .readOnly:
-            return "Agents can look and scroll. Clicks, typing and uploads are blocked."
-        case .paused:
-            return "Agents can't read the screen or act until you resume."
-        }
-    }
-
     private var safetyGroup: some View {
         SettingsGroup(title: "Safety") {
             EmptyView()
         } content: {
-            codexRow(
-                title: "Execution mode",
-                subtitle: executionModeSubtitle,
-                subtitleLineLimit: nil
-            ) {
-                CodexSegmentedControl(
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2.5) {
+                    Text("Execution mode")
+                        .font(.system(size: 13.5, weight: .medium))
+                    Text("Choose what agents may do on this Mac. Agents can only make it stricter.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 18)
+
+                ExecutionModePicker(
                     selection: Binding(
                         get: { appState.status.policy },
                         set: { appState.setPolicy($0) }
                     ),
-                    options: [
-                        CodexSegmentOption(value: GovernancePolicy.autonomous, label: "Autonomous"),
-                        CodexSegmentOption(value: GovernancePolicy.ask, label: "Ask"),
-                        CodexSegmentOption(value: GovernancePolicy.confirmSensitive, label: "Block sensitive"),
-                        CodexSegmentOption(value: GovernancePolicy.readOnly, label: "Read-only"),
-                        CodexSegmentOption(value: GovernancePolicy.paused, label: "Paused")
-                    ]
+                    placement: .settings
                 )
+                .padding(.horizontal, 8)
             }
+            .padding(.top, 14)
+            .padding(.bottom, 8)
 
             InsetDivider(leading: 18)
 
