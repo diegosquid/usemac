@@ -62,9 +62,9 @@
   const fieldDropzone = document.getElementById("fieldDropzone");
   const catChip = document.getElementById("catChip");
   const btnSubmit = document.getElementById("btnSubmit");
-  const claudeReply = document.getElementById("claudeReply");
-  const ccInputHint = document.getElementById("ccInputHint");
-  const ccSteps = Array.from(document.querySelectorAll("#ccStream .cc-step"));
+  const agentReply = document.getElementById("agentReply");
+  const agentInputHint = document.getElementById("agentInputHint");
+  const agentSteps = Array.from(document.querySelectorAll("#agentStream .term-step"));
   const stageStepBtns = Array.from(document.querySelectorAll(".stage-step[data-step]"));
 
   let isPaused = false;
@@ -120,7 +120,7 @@
   }
 
   function setActiveStep(stepIdx, allDone = false) {
-    ccSteps.forEach((el, idx) => {
+    agentSteps.forEach((el, idx) => {
       el.classList.remove("running", "done");
       if (allDone || idx < stepIdx) el.classList.add("done");
       else if (idx === stepIdx) el.classList.add("running");
@@ -132,8 +132,8 @@
       if (isActive) btn.setAttribute("aria-current", "step");
       else btn.removeAttribute("aria-current");
     });
-    if (ccInputHint) {
-      ccInputHint.textContent = allDone ? "Ready for next command" : "Running in background…";
+    if (agentInputHint) {
+      agentInputHint.textContent = allDone ? "Ready for next command" : "Running in background…";
     }
   }
 
@@ -143,8 +143,8 @@
     formView?.classList.remove("hidden");
     submittedView?.classList.remove("visible");
     completeOverlay?.classList.remove("visible");
-    claudeReply?.classList.remove("visible");
-    if (ccInputHint) ccInputHint.textContent = "Running in background…";
+    agentReply?.classList.remove("visible");
+    if (agentInputHint) agentInputHint.textContent = "Running in background…";
     menubarBadge?.classList.add("working");
     menubarPulse?.classList.remove("idle");
 
@@ -271,7 +271,7 @@
         if (statusText) statusText.textContent = "All done";
         if (completeLabel) completeLabel.textContent = "All done";
         completeOverlay?.classList.add("visible");
-        claudeReply?.classList.add("visible");
+        agentReply?.classList.add("visible");
         menubarBadge?.classList.remove("working");
         menubarPulse?.classList.add("idle");
       });
@@ -312,7 +312,7 @@
     isPaused = true;
     resetDemo();
     applyPrefixState(3);
-    ccSteps.forEach((el, idx) => {
+    agentSteps.forEach((el, idx) => {
       el.classList.remove("running", "done");
       if (idx < 3) el.classList.add("done");
     });
@@ -327,7 +327,7 @@
     menubarPulse?.classList.add("idle");
     if (spinner) spinner.style.display = "none";
     if (statusText) statusText.textContent = "Uploaded receipt-q4.pdf";
-    if (ccInputHint) ccInputHint.textContent = "Demo paused";
+    if (agentInputHint) agentInputHint.textContent = "Demo paused";
     hideCursor();
     syncPlayState(true);
   }
