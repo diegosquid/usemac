@@ -38,13 +38,23 @@ public struct AuditLogQuery: Equatable, Sendable {
     public var app: String?
     /// `true` for entries that succeeded, `false` for failures.
     public var success: Bool?
+    /// Only entries of these kinds (History's "Observations" switch); nil keeps every kind.
+    public var kinds: Set<AuditEntryKind>?
 
-    public init(limit: Int? = AuditLogParams.defaultLimit, sinceMs: Int64? = nil, taskId: String? = nil, app: String? = nil, success: Bool? = nil) {
+    public init(
+        limit: Int? = AuditLogParams.defaultLimit,
+        sinceMs: Int64? = nil,
+        taskId: String? = nil,
+        app: String? = nil,
+        success: Bool? = nil,
+        kinds: Set<AuditEntryKind>? = nil
+    ) {
         self.limit = limit
         self.sinceMs = sinceMs
         self.taskId = taskId
         self.app = app
         self.success = success
+        self.kinds = kinds
     }
 
     /// The query an `audit_log` request asks for.
@@ -57,6 +67,7 @@ public struct AuditLogQuery: Equatable, Sendable {
         if let taskId, entry.taskId != taskId { return false }
         if let app, entry.targetApp != app { return false }
         if let success, entry.success != success { return false }
+        if let kinds, !kinds.contains(AuditEntryKind(entry)) { return false }
         return true
     }
 
