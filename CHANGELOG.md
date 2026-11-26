@@ -6,8 +6,24 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0-beta.3] - 2026-11-26
+
 ### Added
 
+- **Report a problem from your agent**: after a failure that looks like a UseMac bug, an agent can ask UseMac for a
+  problem report (`report_prepare`, MCP `usemac_report_prepare`, CLI `usemac report`). UseMac builds it from the
+  agent's description, the app, extension and macOS versions, the execution mode, and the task's activity and error
+  codes. It removes typed text, emails, tokens and keys, your home folder, URL query strings, long numbers and your
+  name, and shows the result in a **Review problem report** window, where you can edit it. Once you check that it
+  has no personal or sensitive data, **Open issue on GitHub** opens a prefilled issue that you submit yourself.
+  Agents never see the report or your decision, and only your own click sends it. One report shows at a time
+  (`REPORT_IN_REVIEW`).
+- A **How to contribute** section in the README: reporting a problem, what a report contains and what is removed,
+  building and testing, and opening a pull request.
+- The menu bar shows the execution mode while it isn't Autonomous: an eye badge for Read-only, the tooltip names the
+  mode, and a "Mode: …" line in the menu opens Settings at Safety.
+- Refusals caused by the execution mode, a pause or the emergency stop carry an `error.hint` that names it and tells
+  the agent to ask you to change it in Settings → Safety. The CLI and MCP show it as the `Next:` line.
 - **Ask mode**: a new execution mode between Autonomous and Block sensitive. An upload, a ⌘/⌃ shortcut or a page
   script waits until you click **Allow once** or **Deny** in a prompt next to the live preview; nobody answering
   within 45 s denies it. For shortcuts and page scripts you can also allow the rest of the task. Agents get
@@ -47,6 +63,13 @@ All notable changes to UseMac are documented here. The format follows
 
 ### Changed
 
+- **Settings → History** folds repeated entries into one row with a count and a time range, so an agent listing
+  tabs twice a second no longer floods it. Click the row to see each entry. Actions are marked apart from
+  observations, and failures in red. A new **Observations** switch hides observations, so you see what agents
+  changed. What is stored and exported is unchanged.
+- `POLICY_BLOCKED` messages name the mode the way Settings does ("UseMac is in Read-only mode, …"), and the live
+  preview caption says which mode blocked the action.
+- The app icon's drop shadow is lighter and tighter, like the system's own icons, instead of a dark halo.
 - The live preview's caption says which step failed and why, in plain words (for example "Couldn't click “Open”",
   "needs the app in front"), instead of "Batch failed", with a failure mark instead of a spinner.
 - The CLI and the MCP server wait 75 s longer for `act`, `browser_act` and `browser_extract`, which can now wait
@@ -65,6 +88,13 @@ All notable changes to UseMac are documented here. The format follows
 
 ### Fixed
 
+- Settings → Safety: the execution mode picker is a list with each mode's full name and a one-line description,
+  instead of five cut-off segments ("Au… Ask Bl… Re… P…").
+- The Setup guide offers the same execution modes as Settings, Ask included, with the same names and descriptions.
+  Paused stays in Settings.
+- Agents no longer fail with no visible reason when the mode isn't Autonomous. A test pins Autonomous as the mode a
+  new install starts in.
+- `usemac audit --task <id>` filters by task again.
 - With several agents working at once, the preview no longer jumps between their cards every second. The card in
   front stays until you pick another one, it goes away or its task finishes. The others keep updating in the
   filmstrip, and their captions, cursor and clicks no longer show up on the card you are watching.
@@ -204,7 +234,8 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
-[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.2...HEAD
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.3...HEAD
+[0.6.0-beta.3]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.2...v0.6.0-beta.3
 [0.6.0-beta.2]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.1...v0.6.0-beta.2
 [0.6.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.5.0...v0.6.0-beta.1
 [0.5.0]: https://github.com/diegosquid/usemac/releases/tag/v0.5.0

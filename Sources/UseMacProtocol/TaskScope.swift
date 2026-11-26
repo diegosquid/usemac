@@ -49,7 +49,7 @@ public struct TaskSummary: Codable, Equatable, Sendable {
 }
 
 extension RPCRequest {
-    /// The task a request names: the `taskId` inside its params (`browser_open`, `task_complete`), else the
+    /// The task a request names: the `taskId` inside its params (`browser_open`, `task_complete`, `report_prepare`), else the
     /// envelope's `taskId`. `task_start` names no task: its `taskId` is the id to give the new one.
     public var namedTaskId: String? {
         switch method {
@@ -59,6 +59,8 @@ extension RPCRequest {
             return browserOpen?.taskId ?? taskId
         case .taskComplete:
             return taskComplete?.taskId ?? taskId
+        case .reportPrepare:
+            return reportPrepare?.taskId ?? taskId
         default:
             return taskId
         }

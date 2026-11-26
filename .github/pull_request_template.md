@@ -10,7 +10,7 @@
 
 - [ ] `swift test` and `node --test Tests/ExtensionTests/*.test.mjs` pass.
 - [ ] Tests cover the change, or I explain below why they can't.
-- [ ] If agents see the change, `README.md`, `.agents/AGENTS.md` and `.agents/skills/usemac/SKILL.md` are updated.
+- [ ] If agents see the change, `.agents/AGENTS.md`, the skill, the MCP tool descriptions, the CLI help and `README.md` are updated.
 - [ ] If users or agents would notice the change, `CHANGELOG.md` has a line under `[Unreleased]`.
 - [ ] Every commit is signed off (`git commit -s`).
 

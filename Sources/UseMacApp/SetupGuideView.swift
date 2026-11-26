@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UseMacEngine
 import UseMacProtocol
 
 // MARK: - Steps
@@ -629,24 +630,19 @@ public struct SetupGuideView: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("What agents may do")
                                 .font(.system(size: 13.5, weight: .medium))
-                            Text(executionModeDetail)
+                            Text(ExecutionModeChoices.summary(appState.status.policy))
                                 .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 0)
                     }
-                    CodexSegmentedControl(
+                    ExecutionModePicker(
                         selection: Binding(
                             get: { appState.status.policy },
                             set: { appState.setPolicy($0) }
                         ),
-                        options: [
-                            CodexSegmentOption(value: GovernancePolicy.autonomous, label: "Autonomous"),
-                            CodexSegmentOption(value: GovernancePolicy.confirmSensitive, label: "Block sensitive"),
-                            CodexSegmentOption(value: GovernancePolicy.readOnly, label: "Read-only")
-                        ]
+                        placement: .setupGuide
                     )
-                    .fixedSize()
                     .padding(.leading, 46)
                 }
                 .padding(.horizontal, 16)
@@ -672,16 +668,6 @@ public struct SetupGuideView: View {
             .frame(width: 540)
         }
         .frame(maxWidth: .infinity)
-    }
-
-    private var executionModeDetail: String {
-        switch appState.status.policy {
-        case .autonomous: return "Agents can read and act without asking."
-        case .ask: return "Uploads, page scripts and ⌘/⌃ shortcuts wait for your OK."
-        case .confirmSensitive: return "Uploads, page scripts and ⌘/⌃ shortcuts are blocked."
-        case .readOnly: return "Agents can look and scroll. Clicks and typing are blocked."
-        case .paused: return "Agents are paused until you resume."
-        }
     }
 
     // MARK: Vision install banner

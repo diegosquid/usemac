@@ -41,7 +41,8 @@ The safety-critical paths are critical for these reasons:
   handlers and changes to pairing widen what any page or agent can reach, and they also go through Chrome Web Store
   review.
 - **The safety engine.** Execution modes, the Kill Switch, Ask approvals, app and site rules, bridge pairing and
-  origin checks, audit redaction and the Unix socket are what the product promises the user. A change that loosens
+  origin checks, audit and problem report redaction, the human-only confirmation windows and the Unix socket are
+  what the product promises the user. A change that loosens
   any of them loosens that promise.
 - **Build, CI and entitlements.** `.github/`, `Package.swift`, `Package.resolved` and `Assets/usemac.entitlements`
   decide what code runs in CI and what the signed app is allowed to do.

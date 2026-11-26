@@ -24,6 +24,7 @@ public enum RPCMethod: String, Codable, Sendable, CaseIterable {
     case taskStart = "task_start"
     case taskComplete = "task_complete"
     case browserReloadExtension = "browser_reload_extension"
+    case reportPrepare = "report_prepare"
 }
 
 public struct ObserveParams: Codable, Equatable, Sendable {
@@ -85,6 +86,7 @@ public struct RPCRequest: Codable, Sendable {
     /// The task this request belongs to (from `task_start`). Any method takes it; see `namedTaskId`.
     public var taskId: String?
     public var browserReloadExtension: BrowserReloadExtensionParams?
+    public var reportPrepare: ReportPrepareParams?
 
     public init(
         id: String = UUID().uuidString,
@@ -108,7 +110,8 @@ public struct RPCRequest: Codable, Sendable {
         taskComplete: TaskCompleteParams? = nil,
         auditLog: AuditLogParams? = nil,
         taskId: String? = nil,
-        browserReloadExtension: BrowserReloadExtensionParams? = nil
+        browserReloadExtension: BrowserReloadExtensionParams? = nil,
+        reportPrepare: ReportPrepareParams? = nil
     ) {
         self.id = id
         self.method = method
@@ -132,6 +135,7 @@ public struct RPCRequest: Codable, Sendable {
         self.auditLog = auditLog
         self.taskId = taskId
         self.browserReloadExtension = browserReloadExtension
+        self.reportPrepare = reportPrepare
     }
 
     public init(from decoder: Decoder) throws {
@@ -158,16 +162,21 @@ public struct RPCRequest: Codable, Sendable {
         self.auditLog = try c.decodeIfPresent(AuditLogParams.self, forKey: .auditLog)
         self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
         self.browserReloadExtension = try c.decodeIfPresent(BrowserReloadExtensionParams.self, forKey: .browserReloadExtension)
+        self.reportPrepare = try c.decodeIfPresent(ReportPrepareParams.self, forKey: .reportPrepare)
     }
 }
 
 public struct RPCErrorPayload: Codable, Equatable, Sendable {
     public var code: String
     public var message: String
+    /// What the agent should do next, when UseMac knows more than the code says (the mode, pause or Emergency stop
+    /// that refused a request). Optional: clients fall back to their own advice for the code.
+    public var hint: String?
 
-    public init(code: String, message: String) {
+    public init(code: String, message: String, hint: String? = nil) {
         self.code = code
         self.message = message
+        self.hint = hint
     }
 }
 
@@ -195,6 +204,8 @@ public struct RPCResponse: Codable, Sendable {
     public var taskId: String?
     /// What the task did, on `task_complete`.
     public var taskSummary: TaskSummary?
+    /// The draft `report_prepare` put in UseMac's review window.
+    public var problemReport: ProblemReportReceipt?
     public var error: RPCErrorPayload?
 
     public init(
@@ -218,7 +229,8 @@ public struct RPCResponse: Codable, Sendable {
         visionResult: VisionQueryResult? = nil,
         taskId: String? = nil,
         taskSummary: TaskSummary? = nil,
-        error: RPCErrorPayload? = nil
+        error: RPCErrorPayload? = nil,
+        problemReport: ProblemReportReceipt? = nil
     ) {
         self.id = id
         self.ok = ok
@@ -241,6 +253,7 @@ public struct RPCResponse: Codable, Sendable {
         self.taskId = taskId
         self.taskSummary = taskSummary
         self.error = error
+        self.problemReport = problemReport
     }
 
     public static func success(
@@ -262,7 +275,8 @@ public struct RPCResponse: Codable, Sendable {
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
         taskId: String? = nil,
-        taskSummary: TaskSummary? = nil
+        taskSummary: TaskSummary? = nil,
+        problemReport: ProblemReportReceipt? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
@@ -285,7 +299,8 @@ public struct RPCResponse: Codable, Sendable {
             visionResult: visionResult,
             taskId: taskId,
             taskSummary: taskSummary,
-            error: nil
+            error: nil,
+            problemReport: problemReport
         )
     }
 
@@ -293,13 +308,14 @@ public struct RPCResponse: Codable, Sendable {
         id: String,
         code: String,
         message: String,
-        latencyMs: Double = 0
+        latencyMs: Double = 0,
+        hint: String? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
             ok: false,
             serverLatencyMs: latencyMs,
-            error: RPCErrorPayload(code: code, message: message)
+            error: RPCErrorPayload(code: code, message: message, hint: hint)
         )
     }
 }

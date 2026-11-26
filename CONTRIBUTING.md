@@ -38,8 +38,9 @@ unpacked in `chrome://extensions`, preferably in a Chrome profile you use only f
 
 - Branch from `main` and keep each pull request to one change.
 - Add or update tests. Swift tests live in `Tests/UseMacTests`, extension tests in `Tests/ExtensionTests`.
-- If agents see the change (a method, a parameter, an error code, a CLI command), update `README.md`,
-  `.agents/AGENTS.md` and `.agents/skills/usemac/SKILL.md` to match.
+- If agents see the change (a method, a parameter, an MCP tool, an error code, a default), update
+  `.agents/AGENTS.md`, `.agents/skills/usemac/SKILL.md`, the MCP tool descriptions, the CLI help and `README.md`
+  to match. A docs sync test in `swift test` fails when one of them is missing.
 - If users or agents would notice the change, add a line under `[Unreleased]` in `CHANGELOG.md`, in the same style
   as the entries already there.
 - Fill in the pull request template. CI must pass.

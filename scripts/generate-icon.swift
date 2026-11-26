@@ -83,10 +83,11 @@ func renderIconPNGData(pixelSize: Int, macOSDockPadding: Bool = true) throws -> 
     let bodyRect = CGRect(x: inset, y: inset, width: side, height: side)
     let squircle = CGPath(roundedRect: bodyRect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
 
-    // Soft physical macOS drop shadow (for Dock / Finder icons)
+    // Light, tight drop shadow for Dock and Finder icons, close to the system's own icons.
+    // A heavier one reads as a dark halo on light backgrounds (#62).
     if macOSDockPadding {
         cg.saveGState()
-        cg.setShadow(offset: CGSize(width: 0, height: -20), blur: 36, color: color(0, 0, 0, 0.38))
+        cg.setShadow(offset: CGSize(width: 0, height: -6), blur: 12, color: color(0, 0, 0, 0.16))
         cg.addPath(squircle)
         cg.setFillColor(color(0.05, 0.05, 0.06, 1.0))
         cg.fillPath()
