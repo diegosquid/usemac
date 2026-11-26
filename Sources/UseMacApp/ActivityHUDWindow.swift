@@ -29,7 +29,8 @@ public final class ActivityHUDPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = true
+        // ActivityHUDView draws its own soft shadow into a transparent margin (hudShadowInset).
+        hasShadow = false
         isMovableByWindowBackground = true
         hidesOnDeactivate = false
 
@@ -146,9 +147,8 @@ public final class ActivityHUDController {
     private var transitionGeneration: UInt64 = 0
 
     private let edgeMargin: CGFloat = 14
-    private let peekStep: CGFloat = hudFilmstripHeight
+    private let peekStep: CGFloat = hudDeckPeek
     private let collapsedSize: NSSize = hudCollapsedPillSize
-    private let stoppedCollapsedSize: NSSize = hudStoppedPillSize
     private let regularPiPSize = NSSize(width: 268, height: 172)
     private let largePiPSize = NSSize(width: 380, height: 242)
 
@@ -156,25 +156,23 @@ public final class ActivityHUDController {
         panel.isVisible
     }
 
-    /// Where the HUD panel is on screen (the Ask-mode prompt docks next to it).
+    /// Where the HUD is on screen, without the transparent shadow margin (the Ask-mode prompt docks next to it).
     public var panelFrame: NSRect {
-        panel.frame
+        panel.frame.insetBy(dx: hudShadowInset, dy: hudShadowInset)
     }
 
     public init(appState: AppState) {
         self.appState = appState
 
-        let initialBehind = appState.isHUDCollapsed ? 0 : (appState.hudDeck.count > 1 ? 1 : 0)
+        let initialBehind = appState.isHUDCollapsed ? 0 : Self.cardsBehind(appState.hudDeck.count)
         let initialSize = Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
-            killSwitchTripped: appState.status.killSwitchTripped,
             isLarge: appState.isHUDLarge,
             hasFrame: appState.videoSink.hasReceivedFrame,
             aspectRatio: appState.videoSink.frameAspectRatio,
             stackBehindCount: initialBehind,
             peekStep: peekStep,
             collapsedSize: collapsedSize,
-            stoppedCollapsedSize: stoppedCollapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
         )
@@ -218,13 +216,9 @@ public final class ActivityHUDController {
             self?.snap(to: corner, animated: true)
         }
 
-        // The filmstrip appears (and the panel grows by its height) as soon as a second card joins the deck.
+        // Each card behind the front one (two at most) grows the panel by its visible edge.
         let deckBehindPublisher = appState.$hudDeck
-            .map { $0.count > 1 ? 1 : 0 }
-            .removeDuplicates()
-        // The collapsed pill is wider while automation is stopped (it shows Resume), so Stop and Resume re-snap it.
-        let killSwitchPublisher = appState.$status
-            .map { $0.killSwitchTripped }
+            .map { Self.cardsBehind($0.count) }
             .removeDuplicates()
 
         Publishers.CombineLatest4(
@@ -234,13 +228,11 @@ public final class ActivityHUDController {
             appState.videoSink.$frameAspectRatio.removeDuplicates()
         )
         .combineLatest(deckBehindPublisher)
-        .combineLatest(killSwitchPublisher)
         .dropFirst()
         .receive(on: RunLoop.main)
         .sink { [weak self] _ in
             guard let self else { return }
             self.snap(to: self.appState.hudCorner, animated: self.panel.isVisible)
-            self.panel.invalidateShadow()
         }
         .store(in: &cancellables)
 
@@ -278,7 +270,6 @@ public final class ActivityHUDController {
             panel.alphaValue = 0.0
         }
         panel.orderFrontRegardless()
-        panel.invalidateShadow()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = wasVisible ? 0.12 : 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -383,33 +374,33 @@ public final class ActivityHUDController {
                 panel.animator().setFrame(targetFrame, display: true)
             }, completionHandler: { [weak self] in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.panel.isProgrammaticSnap = false
-                    self.panel.invalidateShadow()
+                    self?.panel.isProgrammaticSnap = false
                 }
             })
         } else {
             panel.setFrame(targetFrame, display: true)
             panel.isProgrammaticSnap = false
-            panel.invalidateShadow()
         }
     }
 
     private func currentTargetSize() -> NSSize {
-        let behind = appState.isHUDCollapsed ? 0 : (appState.hudDeck.count > 1 ? 1 : 0)
+        let behind = appState.isHUDCollapsed ? 0 : Self.cardsBehind(appState.hudDeck.count)
         return Self.sizeFor(
             collapsed: appState.isHUDCollapsed,
-            killSwitchTripped: appState.status.killSwitchTripped,
             isLarge: appState.isHUDLarge,
             hasFrame: appState.videoSink.hasReceivedFrame,
             aspectRatio: appState.videoSink.frameAspectRatio,
             stackBehindCount: behind,
             peekStep: peekStep,
             collapsedSize: collapsedSize,
-            stoppedCollapsedSize: stoppedCollapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
         )
+    }
+
+    /// Cards drawn behind the front one for a deck of `count` cards.
+    private static func cardsBehind(_ count: Int) -> Int {
+        min(max(count - 1, 0), hudDeckMaxBehind)
     }
 
     private func currentScreen() -> NSScreen? {
@@ -420,21 +411,20 @@ public final class ActivityHUDController {
         return panel.screen ?? NSScreen.main ?? NSScreen.screens.first
     }
 
+    /// The size of what the HUD shows (the pill, or the deck), without the shadow margin.
     private static func sizeFor(
         collapsed: Bool,
-        killSwitchTripped: Bool,
         isLarge: Bool,
         hasFrame: Bool,
         aspectRatio: CGFloat,
         stackBehindCount: Int,
         peekStep: CGFloat,
         collapsedSize: NSSize,
-        stoppedCollapsedSize: NSSize,
         regularPiPSize: NSSize,
         largePiPSize: NSSize
     ) -> NSSize {
         if collapsed {
-            return killSwitchTripped ? stoppedCollapsedSize : collapsedSize
+            return collapsedSize
         }
         let baseSize: NSSize
         if hasFrame && aspectRatio > 0.2 {
@@ -446,10 +436,12 @@ public final class ActivityHUDController {
         } else {
             baseSize = isLarge ? largePiPSize : regularPiPSize
         }
-        let extraHeight = stackBehindCount > 0 ? peekStep : 0
+        let extraHeight = CGFloat(max(stackBehindCount, 0)) * peekStep
         return NSSize(width: baseSize.width, height: baseSize.height + extraHeight)
     }
 
+    /// The panel's frame for a HUD of `size` in `corner`: the HUD sits `margin` from the screen's edges, and the panel
+    /// reaches `hudShadowInset` past it on every side for the shadow.
     private static func frame(
         for corner: HUDCorner,
         size: NSSize,
@@ -476,5 +468,6 @@ public final class ActivityHUDController {
         }
 
         return NSRect(x: round(x), y: round(y), width: size.width, height: size.height)
+            .insetBy(dx: -hudShadowInset, dy: -hudShadowInset)
     }
 }
