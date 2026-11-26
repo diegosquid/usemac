@@ -22,7 +22,9 @@ final class AgentDocsSyncTests: XCTestCase {
 
     /// Upper-case string literals in Sources/ and Extension/ that look like error codes but are not.
     /// `USEMAC_…` literals are environment variables and are skipped too.
-    private static let notErrorCodes: Set<String> = []
+    /// Upper-case literals the scan finds that are not error codes: the function key names in the extension's
+    /// key table (`F1`…`F12`, added with the native key map).
+    private static let notErrorCodes: Set<String> = Set((1...12).map { "F\($0)" })
 
     // MARK: - Every name is documented
 

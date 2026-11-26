@@ -195,12 +195,7 @@ public enum ActivityCaption {
     }
 
     static func keyChord(key: String?, modifiers: [String]?) -> String {
-        var prefix = ""
-        let lower = Set((modifiers ?? []).map { $0.lowercased() })
-        if lower.contains("ctrl") || lower.contains("control") { prefix += "⌃" }
-        if lower.contains("alt") || lower.contains("opt") || lower.contains("option") { prefix += "⌥" }
-        if lower.contains("shift") { prefix += "⇧" }
-        if lower.contains("cmd") || lower.contains("command") { prefix += "⌘" }
+        let prefix = ModifierAliases.symbols(modifiers)
         let raw = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let formatted = raw.count == 1 ? raw.uppercased() : raw.capitalized
         return prefix + (formatted.isEmpty ? "the key" : formatted)

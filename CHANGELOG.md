@@ -60,6 +60,8 @@ All notable changes to UseMac are documented here. The format follows
   generic agent.
 - Bridge protocol (still v2): `hello` carries an optional `extensionId`, `ready` may carry `extensionStatus`, and
   new `tab_control` / `stop_requested` messages drive the tab indicator.
+- Native `pressKey` takes the same key names as Chrome: `home`, `end`, `pageup`, `pagedown`, `forwarddelete`,
+  `f1`–`f12` and punctuation, and an unknown key's error lists the names it takes.
 
 ### Fixed
 
@@ -92,6 +94,8 @@ All notable changes to UseMac are documented here. The format follows
 - Builds with a Chrome Web Store ID still accept the extension loaded unpacked from UseMac.app, and
   `usemac.bridge.allowedExtensionIds` lets them accept a copy loaded from another folder.
 - Checking whether the local vision runtime is installed no longer scans every file of it.
+- A Chrome `setValue` step with no field (`elementId`, `selector` or a point) is refused with `INVALID_REQUEST`
+  instead of typing into whatever field had focus.
 
 ### Security
 
@@ -105,6 +109,8 @@ All notable changes to UseMac are documented here. The format follows
   secret-looking query values.
 - Only a physical click answers an Ask prompt: clicks posted by any process and Accessibility actions are ignored,
   UseMac refuses to send real input onto the prompt, and no socket method or MCP tool can answer it.
+- Every spelling of ⌘ and ⌃ (`meta`, `command`, `control`, …) counts as a shortcut for Block sensitive and Ask
+  mode. Before, a Chrome `pressKey` with `meta` was pressed as ⌘ without being blocked or held.
 
 ## [0.6.0-beta.2] - 2026-11-25
 
