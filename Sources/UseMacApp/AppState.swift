@@ -206,6 +206,9 @@ public final class AppState: ObservableObject {
     private var previewResizeHoldTask: Task<Void, Never>?
     private var activityIndicatorHoldTask: Task<Void, Never>?
     private var hudAutoHideTask: Task<Void, Never>?
+    /// Removes finished cards after the completion check. Separate from hudAutoHideTask so another agent's activity,
+    /// which cancels auto-hide, never keeps a finished card in the filmstrip.
+    private var completionCleanupTask: Task<Void, Never>?
     private var taskIdleSettleTask: Task<Void, Never>?
     private var isHUDManuallyPinned: Bool = false
     private var isHUDShowingStoppedPill: Bool = false
@@ -1595,26 +1598,27 @@ public final class AppState: ObservableObject {
     }
 
     private func scheduleCompletionAutoClose(delaySeconds: Double = 1.85) {
-        hudAutoHideTask?.cancel()
-        hudAutoHideTask = Task { @MainActor [weak self] in
+        completionCleanupTask?.cancel()
+        completionCleanupTask = Task { @MainActor [weak self] in
             let nanos = UInt64(max(0.2, delaySeconds) * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanos)
             guard !Task.isCancelled, let self else { return }
             guard !self.isHUDManuallyPinned else { return }
 
-            // Remove completed cards while preserving any other parallel card still actively working
-            let remainingActive = self.hudDeck.filter { $0.isBusy }
-            if remainingActive.isEmpty {
+            // A finished card leaves once its check has shown, even while other agents keep working; the preview
+            // closes only when no card is left working.
+            let isFinished: (HUDSessionCard) -> Bool = { $0.isCompleted && !$0.isBusy }
+            let remaining = self.hudDeck.filter { !isFinished($0) }
+            if !remaining.contains(where: { $0.isBusy }) {
                 if !self.isAgentBusy && self.isHUDVisible && !self.status.killSwitchTripped {
                     self.hideHUD(userInitiated: false)
                 }
             } else {
-                let finishedBrowserCards = self.hudDeck.filter { !$0.isBusy && $0.isBrowser }
-                for card in finishedBrowserCards {
+                for card in self.hudDeck where isFinished(card) && card.isBrowser {
                     self.engine.chromeBridge.stopStream(profileQuery: card.browserProfile, tabId: card.browserTabId)
                 }
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-                    self.hudDeck = remainingActive
+                    self.hudDeck = remaining
                 }
                 self.syncFrontCardToUI()
             }
@@ -1908,7 +1912,22 @@ public final class AppState: ObservableObject {
             }
         }
 
-        if item.kind == .taskComplete {
+        if item.kind == .taskComplete, let finishedTabs = item.taskTabIds.map(Set.init) {
+            // UseMac knows which task finished: only its tabs' cards (and a native app it named) are done. The cards of
+            // other agents' running tasks stay as they are.
+            for idx in hudDeck.indices {
+                let card = hudDeck[idx]
+                let isFinishedTasks: Bool = card.isBrowser
+                    ? card.browserTabId.map { finishedTabs.contains($0) || $0 == item.browserTabId } ?? false
+                    : item.appPid != nil && card.appDescriptor?.pid == item.appPid
+                if isFinishedTasks {
+                    hudDeck[idx].isBusy = false
+                    hudDeck[idx].isCompleted = item.success && !engine.isKillSwitchTripped()
+                    hudDeck[idx].caption = item
+                }
+            }
+            syncFrontCardToUI()
+        } else if item.kind == .taskComplete {
             var matchedAny = false
             for idx in hudDeck.indices {
                 let matchBrowser: Bool = {

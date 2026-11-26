@@ -176,6 +176,9 @@ public struct RPCResponse: Codable, Sendable {
     public var browserTitle: String?
     public var visionStatus: VisionStatus?
     public var visionResult: VisionQueryResult?
+    /// The task a `task_start` opened. Pass it to `browser_open` and `task_complete` so finishing this task only
+    /// closes this task's tabs.
+    public var taskId: String?
     public var error: RPCErrorPayload?
 
     public init(
@@ -197,6 +200,7 @@ public struct RPCResponse: Codable, Sendable {
         browserTitle: String? = nil,
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
+        taskId: String? = nil,
         error: RPCErrorPayload? = nil
     ) {
         self.id = id
@@ -217,6 +221,7 @@ public struct RPCResponse: Codable, Sendable {
         self.browserTitle = browserTitle
         self.visionStatus = visionStatus
         self.visionResult = visionResult
+        self.taskId = taskId
         self.error = error
     }
 
@@ -237,7 +242,8 @@ public struct RPCResponse: Codable, Sendable {
         browserUrl: String? = nil,
         browserTitle: String? = nil,
         visionStatus: VisionStatus? = nil,
-        visionResult: VisionQueryResult? = nil
+        visionResult: VisionQueryResult? = nil,
+        taskId: String? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
@@ -258,6 +264,7 @@ public struct RPCResponse: Codable, Sendable {
             browserTitle: browserTitle,
             visionStatus: visionStatus,
             visionResult: visionResult,
+            taskId: taskId,
             error: nil
         )
     }

@@ -100,8 +100,10 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   Call `task_start` ONCE at the beginning of a multi-step task so the floating preview stays continuously open across all iterations, and call `task_complete` ONLY ONCE at the very end so the completion overlay plays once and smoothly closes the preview:
   ```json
   {"id":"s1","method":"task_start","taskStart":{"summary":"Analyzing analytics dashboard"}}
-  {"id":"d1","method":"task_complete","taskComplete":{"tabId":123,"summary":"Analysis complete"}}
+  {"id":"o1","method":"browser_open","browserOpen":{"url":"https://example.com","taskId":"<taskId from task_start>"}}
+  {"id":"d1","method":"task_complete","taskComplete":{"taskId":"<taskId from task_start>","summary":"Analysis complete"}}
   ```
+  `task_start` returns a `taskId`. Pass it to every `browser_open` and to `task_complete`: other agents may be working at the same time, and the `taskId` is how UseMac closes only your tabs and marks only your preview cards done.
 
 Quick one-liner via `nc` or persistent Python `AF_UNIX` socket:
 ```bash
@@ -192,7 +194,8 @@ Each tool exposes MCP `annotations` (`readOnlyHint`, `destructiveHint`). On time
 11. **Wrap Multi-Step Tasks with `task_start` → `task_complete` (Never Flap Preview)**:
    - Call `task_start` (`usemac_task_start` / `usemac start --summary "..."`) **once** when beginning a task so the floating live preview opens once and stays continuously open across turns.
    - Call `task_complete` (`usemac_task_complete` / `usemac done --summary "..."`) **only once** at the very end when the entire user request is finished — this plays the completion overlay once and smoothly closes the preview.
-   - About 2 s later UseMac closes the Chrome tabs it opened during the task (never the user's own tabs, the tab the user is looking at, or tabs with a running download). If the user should see a result page or work is pending there, keep it: `"keepTabIds": [123]` (CLI `--keep-tab 123`), or `"keepTabs": true` (CLI `--keep-tabs`).
+   - Pass the `taskId` that `task_start` returned to `browser_open` and `task_complete` (CLI: `usemac start` prints it; use `--task <id>`). Other agents may be running: with the `taskId`, finishing closes only the tabs your task opened, never theirs.
+   - About 2 s later UseMac closes the Chrome tabs your task opened (never the user's own tabs, the tab the user is looking at, or tabs with a running download). If the user should see a result page or work is pending there, keep it: `"keepTabIds": [123]` (CLI `--keep-tab 123`), or `"keepTabs": true` (CLI `--keep-tabs`).
 
 ---
 

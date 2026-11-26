@@ -8,6 +8,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let permissionManager = PermissionManager()
     private let killSwitch = KillSwitch()
     private let workspaceMonitor = WorkspaceMonitor()
+    /// Which running task owns which Chrome tabs UseMac opened (see TaskTabRegistry).
+    private let taskTabs = TaskTabRegistry()
     private let axIndexer = AXIndexer()
     private let screenCapturer = FastScreenCapturer()
     public let liveStreamer = LiveScreenStreamer()
@@ -611,6 +613,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let resolvedProfile = bridgeResp.profileName ?? params.profile ?? "Browser"
             let resolvedLabel = "Chrome (\(resolvedProfile))"
             if bridgeResp.ok {
+                // A tab UseMac created belongs to the request's task, so another task finishing never closes it.
+                if params.tabId == nil, let openedTabId = bridgeResp.tabId {
+                    taskTabs.recordOpenedTab(openedTabId, taskId: params.taskId)
+                }
                 appendAudit(
                     method: request.method.rawValue,
                     targetApp: resolvedLabel,
@@ -1403,11 +1409,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserProfile: resolvedProfile
             ))
             localVision.warmupIfReady()
-            response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus())
+            let taskId = taskTabs.start(taskId: params.taskId)
+            response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: taskId)
 
         case .taskComplete:
             let params = request.taskComplete ?? TaskCompleteParams()
             let latencyMs = elapsedMs(since: startNs)
+            // Only this task's tabs close and only its cards are marked done; other running tasks keep theirs.
+            let completion = taskTabs.complete(taskId: params.taskId, tabId: params.tabId)
             let resolvedProfile: String? = {
                 if let p = params.profile, !p.isEmpty { return p }
                 if params.tabId != nil {
@@ -1437,12 +1446,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 success: true,
                 isInProgress: false,
                 browserTabId: params.tabId,
-                browserProfile: resolvedProfile
+                browserProfile: resolvedProfile,
+                taskTabIds: completion.ownTabIds.map { Array($0).sorted() }
             ))
             if params.keepTabs != true {
-                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: params.keepTabIds ?? [])
+                let keep = Set(params.keepTabIds ?? []).union(completion.protectedTabIds)
+                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: Array(keep).sorted())
             }
-            response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus())
+            response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId)
         }
 
         notifyStateChanged()

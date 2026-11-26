@@ -1089,10 +1089,10 @@ struct UseMacCLI {
     private static func handleBrowserOpen(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab"],
+            valueFlags: ["--profile", "--tab", "--task"],
             boolFlags: ["--same-tab", "--new-tab", "--no-stream", "--activate", "--new-window"]
         )
-        let usage = "Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream], or: usemac browser open --tab <id> --activate"
+        let usage = "Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream] [--task <taskId>], or: usemac browser open --tab <id> --activate"
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let activate = parsed.flags.contains("--activate")
         let newWindow = parsed.flags.contains("--new-window")
@@ -1123,7 +1123,8 @@ struct UseMacCLI {
             newTab: openNewTab,
             stream: !parsed.flags.contains("--no-stream"),
             activate: activate ? true : nil,
-            newWindow: newWindow ? true : nil
+            newWindow: newWindow ? true : nil,
+            taskId: parsed.values["--task"]
         )
         let req = RPCRequest(method: .browserOpen, browserOpen: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 20000)
@@ -1498,7 +1499,7 @@ struct UseMacCLI {
     private static func handleTaskStart(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--app", "--summary"]
+            valueFlags: ["--profile", "--tab", "--app", "--summary", "--task"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let summary = parsed.values["--summary"] ?? (parsed.positionals.isEmpty ? nil : parsed.positionals.joined(separator: " "))
@@ -1506,7 +1507,8 @@ struct UseMacCLI {
             profile: parsed.values["--profile"],
             tabId: tabId,
             app: parsed.values["--app"],
-            summary: summary
+            summary: summary,
+            taskId: parsed.values["--task"]
         )
         let req = RPCRequest(method: .taskStart, taskStart: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -1516,13 +1518,16 @@ struct UseMacCLI {
             return 0
         }
         print(String(format: "[%@] Session started (%@) | rtt: %.2f ms", mode.rawValue, summary ?? "Working…", rttMs))
+        if let taskId = res.taskId {
+            print("taskId: \(taskId)  (pass --task \(taskId) to 'browser open' and 'done', so finishing this task only closes its own tabs)")
+        }
         return 0
     }
 
     private static func handleTaskComplete(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--app", "--summary", "--keep-tab"],
+            valueFlags: ["--profile", "--tab", "--app", "--summary", "--keep-tab", "--task"],
             boolFlags: ["--keep-tabs"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
@@ -1541,7 +1546,8 @@ struct UseMacCLI {
             app: parsed.values["--app"],
             summary: summary,
             keepTabs: parsed.flags.contains("--keep-tabs") ? true : nil,
-            keepTabIds: keepTabIds
+            keepTabIds: keepTabIds,
+            taskId: parsed.values["--task"]
         )
         let req = RPCRequest(method: .taskComplete, taskComplete: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -2237,7 +2243,7 @@ struct UseMacCLI {
         case "browser open":
             return CommandHelp(
                 usage: [
-                    "usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream]",
+                    "usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream] [--task <taskId>]",
                     "usemac browser open --tab <id> --activate"
                 ],
                 summary: "Open a URL in a new background tab, navigate an existing tab, make a tab active, or open the URL in a new unfocused window.",
@@ -2247,7 +2253,8 @@ struct UseMacCLI {
                     ("--same-tab | --new-tab", "Force navigating in place or opening a new tab"),
                     ("--activate", "Make the tab the active tab of its window (Chrome stays in the background). With --tab and no URL, only activates that tab."),
                     ("--new-window", "Open the URL in a new, unfocused Chrome window owned by UseMac (cannot be combined with --tab)"),
-                    ("--no-stream", "Do not stream live preview frames to the UseMac HUD")
+                    ("--no-stream", "Do not stream live preview frames to the UseMac HUD"),
+                    ("--task <taskId>", "The taskId 'start' printed: the new tab belongs to that task, so another agent's 'done' never closes it")
                 ],
                 notes: [
                     "Only http://, https:// and about:blank are allowed (a URL without a scheme gets https://); anything else fails with URL_BLOCKED.",
@@ -2367,14 +2374,14 @@ struct UseMacCLI {
             )
         case "start":
             return CommandHelp(
-                usage: ["usemac start [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>]"],
-                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps.",
+                usage: ["usemac start [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>] [--task <taskId>]"],
+                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps. Prints a taskId: pass it as --task to 'browser open' and 'done', so that when several agents work at once, finishing this task only closes the tabs it opened.",
                 examples: ["usemac start --summary \"Reviewing dashboard\""]
             )
         case "stop", "done", "complete":
             return CommandHelp(
-                usage: ["usemac done [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>] [--keep-tab <id,id>] [--keep-tabs]   (aliases: stop, complete)"],
-                summary: "Call once when the whole task is finished: shows the completion state and closes the live preview. About 2 s later UseMac closes the Chrome tabs it opened (never your own tabs, the tab you are looking at, or tabs with a running download). --keep-tab keeps the page with the result; --keep-tabs keeps them all.",
+                usage: ["usemac done [--summary \"<text>\"] [--task <taskId>] [--app <name>] [--profile <name>] [--tab <id>] [--keep-tab <id,id>] [--keep-tabs]   (aliases: stop, complete)"],
+                summary: "Call once when the whole task is finished: shows the completion state and closes the live preview. About 2 s later UseMac closes the Chrome tabs it opened (never your own tabs, the tab you are looking at, or tabs with a running download). --keep-tab keeps the page with the result; --keep-tabs keeps them all. With --task, only that task's tabs close: tabs other running tasks opened are never closed.",
                 examples: ["usemac done --summary \"Report exported\"", "usemac done --summary \"Invoice ready\" --keep-tab 123"]
             )
         case "serve":

@@ -438,7 +438,8 @@ public final class MCPStdioServer: @unchecked Sendable {
                     newTab: try optionalBool(arguments, key: "newTab") ?? (tabId == nil ? true : false),
                     stream: try optionalBool(arguments, key: "stream"),
                     activate: activate,
-                    newWindow: newWindow
+                    newWindow: newWindow,
+                    taskId: try optionalString(arguments, key: "taskId")
                 )
                 rpcRequest = RPCRequest(method: .browserOpen, browserOpen: params)
 
@@ -509,7 +510,8 @@ public final class MCPStdioServer: @unchecked Sendable {
                     profile: try optionalString(arguments, key: "profile"),
                     tabId: try optionalInt(arguments, key: "tabId"),
                     app: try optionalString(arguments, key: "app"),
-                    summary: try optionalString(arguments, key: "summary")
+                    summary: try optionalString(arguments, key: "summary"),
+                    taskId: try optionalString(arguments, key: "taskId")
                 )
                 rpcRequest = RPCRequest(method: .taskStart, taskStart: params)
 
@@ -520,7 +522,8 @@ public final class MCPStdioServer: @unchecked Sendable {
                     app: try optionalString(arguments, key: "app"),
                     summary: try optionalString(arguments, key: "summary"),
                     keepTabs: try optionalBool(arguments, key: "keepTabs"),
-                    keepTabIds: try optionalIntArray(arguments, key: "keepTabIds")
+                    keepTabIds: try optionalIntArray(arguments, key: "keepTabIds"),
+                    taskId: try optionalString(arguments, key: "taskId")
                 )
                 rpcRequest = RPCRequest(method: .taskComplete, taskComplete: params)
 
@@ -949,11 +952,16 @@ public final class MCPStdioServer: @unchecked Sendable {
 
         case "usemac_task_start":
             let summary = request.taskStart?.summary ?? "Task started"
-            return [.text("Started continuous preview session: \(summary)")]
+            var text = "Started continuous preview session: \(summary)"
+            if let taskId = response.taskId {
+                text += "\ntaskId: \(taskId) (pass it to usemac_browser_open and usemac_task_complete, so finishing this task only closes the tabs it opened)"
+            }
+            return [.text(text)]
 
         case "usemac_task_complete":
             let summary = request.taskComplete?.summary ?? "Task completed"
-            return [.text("Marked task complete: \(summary)")]
+            let taskTag = response.taskId.map { " (task \($0))" } ?? ""
+            return [.text("Marked task complete\(taskTag): \(summary)")]
 
         default:
             return [.text("OK")]
@@ -1545,6 +1553,10 @@ public final class MCPStdioServer: @unchecked Sendable {
                         "type": "boolean",
                         "description": "Open the URL in a new, unfocused Chrome window owned by UseMac, so native observe/act can work there without switching the user's tabs. Cannot be combined with tabId."
                     ],
+                    "taskId": [
+                        "type": "string",
+                        "description": "The taskId from usemac_task_start. The new tab belongs to that task, so another agent's usemac_task_complete never closes it."
+                    ],
                     "profile": [
                         "type": "string",
                         "description": "Optional Chrome profile name from usemac_status (e.g. 'Work'). Not needed when one profile is connected."
@@ -1848,7 +1860,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_task_start",
-            description: "Signal the start of a multi-step agent task so the floating live preview opens once and stays continuously open across all iterations until usemac_task_complete is called.",
+            description: "Signal the start of a multi-step agent task so the floating live preview opens once and stays continuously open across all iterations until usemac_task_complete is called. Returns a taskId: pass it to usemac_browser_open and usemac_task_complete so that, when several agents work at once, finishing this task only closes the tabs it opened.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -1867,6 +1879,10 @@ public final class MCPStdioServer: @unchecked Sendable {
                     "summary": [
                         "type": "string",
                         "description": "Optional concise task label shown on the HUD (e.g. 'Reviewing analytics dashboard')."
+                    ],
+                    "taskId": [
+                        "type": "string",
+                        "description": "Optional id to use for the task; UseMac makes one when omitted. Use the taskId the result returns."
                     ]
                 ]
             ],
@@ -1880,7 +1896,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_task_complete",
-            description: "Signal that the agent has finished the user's entire request (call ONLY once at the very end, never between intermediate steps). Shows the frosted white completion check once and smoothly closes the floating preview. About 2 s later UseMac closes the Chrome tabs it opened during the task (never the user's own tabs, the tab the user is looking at, or tabs with a running download); pass keepTabIds for a page the user should see, or keepTabs to keep them all.",
+            description: "Signal that the agent has finished the user's entire request (call ONLY once at the very end, never between intermediate steps). Shows the frosted white completion check once and smoothly closes the floating preview. About 2 s later UseMac closes the Chrome tabs it opened during the task (never the user's own tabs, the tab the user is looking at, or tabs with a running download); pass keepTabIds for a page the user should see, or keepTabs to keep them all. Pass the taskId from usemac_task_start: only that task's tabs are closed, and tabs other running tasks opened are never closed.",
             inputSchema: [
                 "type": "object",
                 "properties": [
@@ -1908,6 +1924,10 @@ public final class MCPStdioServer: @unchecked Sendable {
                         "type": "array",
                         "items": ["type": "integer"],
                         "description": "Keep only these UseMac tabs open, e.g. the page with the result the user should look at, or one with pending work."
+                    ],
+                    "taskId": [
+                        "type": "string",
+                        "description": "The taskId from usemac_task_start. Only this task's tabs close and only its preview cards are marked done."
                     ]
                 ]
             ],

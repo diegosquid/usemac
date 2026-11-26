@@ -87,8 +87,8 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `vision_status` | Local vision readiness (Apple Vision OCR plus optional on-device MLX model). |
 | `vision_install` | Install the optional MLX runtime and one of the three preset models (`INVALID_MODEL` otherwise). |
 | `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. |
-| `task_start` | Open and hold the floating live preview across a multi-step task. |
-| `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs UseMac opened (`keepTabIds`/`keepTabs` to keep them). |
+| `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass to `browser_open` and `task_complete`. |
+| `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). |
 
 While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`.
 
@@ -158,11 +158,19 @@ Call `task_start` once at the beginning of a multi-step task and `task_complete`
 {"method":"task_start","taskStart":{"summary":"Reviewing dashboard"}}
 ```
 
+The response carries a `taskId` (for example `"taskId":"task-1a2b3c4d"`). Pass it to `browser_open` and `task_complete`:
+
 ```json
-{"method":"task_complete","taskComplete":{"tabId":42,"summary":"Article summarized"}}
+{"method":"browser_open","browserOpen":{"url":"https://example.com","taskId":"task-1a2b3c4d"}}
 ```
 
-About 2 s after `task_complete`, UseMac closes the Chrome tabs it opened during the task so the user's tab strip does not fill up. It never closes tabs the user already had open (even if you used them through `tabId`), the tab the user is looking at, or tabs with a running download. Keep a tab when the user should see it or work is pending: `"keepTabIds":[42]` (CLI `usemac done --keep-tab 42`), or `"keepTabs":true` to keep them all (CLI `--keep-tabs`).
+```json
+{"method":"task_complete","taskComplete":{"taskId":"task-1a2b3c4d","summary":"Article summarized"}}
+```
+
+Several agents can work at the same time. The `taskId` is how UseMac knows which tabs are yours: `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed. Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task; when it can't tell, it closes nothing that a running task owns. In the CLI, `usemac start` prints the id; pass it as `--task` to `browser open` and `done`.
+
+About 2 s after `task_complete`, UseMac closes the Chrome tabs your task opened so the user's tab strip does not fill up. It never closes tabs the user already had open (even if you used them through `tabId`), the tab the user is looking at, or tabs with a running download. Keep a tab when the user should see it or work is pending: `"keepTabIds":[42]` (CLI `usemac done --keep-tab 42`), or `"keepTabs":true` to keep them all (CLI `--keep-tabs`).
 
 ### Minimal persistent client (Python)
 
