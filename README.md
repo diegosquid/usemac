@@ -33,13 +33,14 @@
 
 **GPT Codex** set the state of the art for computer use. UseMac was born from the need to bring that same SOTA computer-use capability natively to macOS — faster, local, open source, and unlocked for **every** AI agent.
 
-Our mission is simple: **use every native resource available on the Mac to make computer use as smooth as possible.** Instead of spinning up cloud VMs, hijacking your cursor and window focus, or burning thousands of vision tokens on sluggish screenshot-and-click loops, UseMac taps straight into macOS and Apple Silicon — Accessibility APIs, background input routing, native screen capture, Apple Vision OCR, on-device MLX models, and Keychain-backed safety controls — giving **Claude Code, Codex, Cursor, Antigravity, or any custom agent** fast, quiet, zero-focus control over the desktop apps and Chrome tabs you already use.
+Our mission is simple: **use every native resource available on the Mac to make computer use as smooth as possible.** Instead of spinning up cloud VMs, hijacking your cursor and window focus, or burning thousands of tokens on sluggish screenshot-and-click loops, UseMac taps straight into macOS and Apple Silicon — batched Accessibility APIs, event-driven `AXObserver` / `MutationObserver` waits, direct background menu bar invocation, native screen capture with dirty-rect diff cropping, instant Apple Vision OCR, passive CDP network capture, and Keychain-backed safety controls — giving **Claude Code, Codex, Cursor, Antigravity, or any custom agent** fast, quiet, zero-focus control over the desktop apps and Chrome tabs you already use.
 
 | Capability | What it gives your agents |
 | :--- | :--- |
-| **Sub-millisecond local IPC** | `0.04 ms` p50 Unix socket round trips and `~1.2 ms` hot-cache Accessibility re-reads ([benchmarks](#benchmarks)). |
-| **Zero-focus background control** | Drive native macOS apps via Accessibility (`@e1..@eN`) and your real signed-in Chrome tabs via a Manifest V3 CDP bridge (`@b1..@bN`) — including cross-origin iframes (OOPIFs), Shadow DOM, and silent file uploads with zero Finder dialogs. |
-| **Structured trees + on-device vision** | Act on stable element refs instead of guessing coordinates, and run optional Apple Silicon MLX visual checks locally (**−91% tokens** vs. uploading a 1280×800 screenshot). |
+| **Fewer LLM turns, lower token tax** | Piggybacked task lifecycle, `browser_open` with inline `steps` + `autoDismissOverlays`, compound resilient steps (`fillForm`, `scrollUntil`, `assert`, `optional`, `menuAction`), auto-delta observations, reusable `SkillStore` macros, a compact 9-tool MCP schema, and a ≤ 5.5 KB core skill. |
+| **Sub-millisecond local IPC & batched AX** | `0.04 ms` p50 Unix socket round trips with concurrent pipelining, `AXUIElementCopyMultipleAttributeValues` batching, background `AXObserver` wakes, and `app_menu` direct menu invocation ([benchmarks](#benchmarks)). |
+| **Zero-focus background control** | Drive native macOS apps via Accessibility (`@e1..@eN`) and your real signed-in Chrome tabs via a Manifest V3 CDP bridge (`@b1..@bN`) — including OOPIF cross-origin iframes, Shadow DOM, passive XHR/Fetch JSON extraction (`mode: "network"`), parallel `browser_batch`, and silent file uploads with zero Finder dialogs. |
+| **Instant Apple Vision OCR + dirty-rect diff/crop** | Zero-setup on-device Apple Vision OCR (`~20 ms` negation-safe `verify`, automatic `@v1..@vN` OCR fusion on AX-blind windows) and `16×10` tile `diffCrop` screenshots — zero Python/MLX downloads or GBs of RAM. |
 | **Multi-agent ready with live HUD** | Run several agents in parallel with per-task tab isolation, automatic window/tab leases, and a quiet corner mini-preview so you stay in your flow. |
 | **Local-first safety controls** | Five execution modes, physical-click-only **Ask** approvals, instant `⇧⌘⎋` Kill Switch, Keychain-sealed safety settings, default credential/password-manager guards, and a redacted local audit log. |
 | **One engine, three transports** | Connect over raw Unix domain socket (NDJSON), a native `stdio` MCP server, or the `usemac` CLI — all governed by the exact same daemon and safety policies. |
@@ -49,13 +50,13 @@ Our mission is simple: **use every native resource available on the Mac to make 
 ```mermaid
 flowchart LR
     Agents["AI Agents<br/>Claude Code · Codex · Cursor · Antigravity"]
-    Socket["Unix Socket (NDJSON)<br/>0.04 ms p50 · 25 methods"]
-    MCP["MCP Server (stdio)<br/>17 tools"]
+    Socket["Unix Socket (NDJSON)<br/>0.04 ms p50 · 29 methods"]
+    MCP["MCP Server (stdio)<br/>9 tools"]
     CLI["CLI (usemac)"]
-    Daemon["UseMac.app Daemon (Swift)<br/>Safety Policies · Task Leases · Live HUD · Audit Log"]
-    Native["Native macOS Apps<br/>Accessibility Tree + Background Input"]
-    Chrome["Google Chrome<br/>MV3 Extension + CDP Bridge"]
-    Vision["On-Device Vision<br/>Apple Vision OCR + MLX"]
+    Daemon["UseMac.app Daemon (Swift)<br/>Safety Policies · Task Leases · SkillStore · Live HUD"]
+    Native["Native macOS Apps<br/>Batched AX Tree · Menu Bar · Background Input"]
+    Chrome["Google Chrome<br/>MV3 Extension · CDP Bridge · Network Ring Buffer"]
+    Vision["On-Device Vision<br/>Apple Vision OCR · Dirty-Rect Diff/Crop"]
 
     Agents --> Socket
     Agents --> MCP
@@ -91,19 +92,19 @@ Download the latest signed DMG from **[usemac.app](https://usemac.app)** (or [bu
 
 ### Unix socket (NDJSON)
 
-The fastest transport — zero MCP schema overhead. `UseMac.app` listens on `/tmp/usemac-$UID/usemac.sock` (override with `USEMAC_SOCKET`), inside a directory only your user can open. If the socket file is removed while the app runs, UseMac recreates it within 30 seconds. Connections are restricted to the same macOS user, and requests over 16 MiB are rejected (`message_too_large`). `id` is optional on requests, and boolean fields on `act` default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false`.
+The fastest transport — zero MCP schema overhead and concurrent pipelining over a single persistent connection. `UseMac.app` listens on `/tmp/usemac-$UID/usemac.sock` (override with `USEMAC_SOCKET`), inside a directory only your user can open. If the socket file is removed while the app runs, UseMac recreates it within 30 seconds. Connections are restricted to the same macOS user, and requests over 16 MiB are rejected (`message_too_large`). `id` is optional on requests; any request accepts piggybacked `taskStart`/`taskComplete`; boolean fields on `act` default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false`.
 
 ```bash
 printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
-**Methods (25):**
+**Methods (29):**
 
 | Category | Methods |
 | :--- | :--- |
-| **Core & apps** | `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `highlight`, `pair_app` |
-| **Chrome bridge** | `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension` |
-| **On-device vision** | `vision_status`, `vision_install`, `vision_query` |
+| **Core & native apps** | `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `highlight`, `pair_app`, `app_menu` |
+| **Chrome bridge** | `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_batch`, `browser_reload_extension` |
+| **On-device vision & skills** | `vision_status`, `vision_query`, `skill_save`, `skill_run`, `skill_list` |
 | **Tasks, safety & diagnostics** | `task_start`, `task_complete`, `set_policy`, `audit_log`, `report_prepare`, `debug_capture` |
 
 See the [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) for schemas and examples of each method. `debug_capture` is only for developing UseMac itself and works only after you turn on **Debug capture** in Settings ([Agent Guide, section 9](.agents/AGENTS.md#9-debug-capture-developing-usemac)).
@@ -123,24 +124,29 @@ Register the bundled helper binary under the `"usemac"` key in your MCP client c
 }
 ```
 
-Every MCP tool carries `annotations` (`readOnlyHint`, `destructiveHint`), and the server never automatically retries a mutating action on timeout.
+Every MCP tool carries `annotations` (`readOnlyHint`, `destructiveHint`), returns inline `.image` blocks on both native and browser visual calls when requested, and never automatically retries a mutating action on timeout.
 
-**Exposed tools (17):**
+**Exposed tools (9):**
 
 | Category | Tools |
 | :--- | :--- |
-| **Native macOS** | `usemac_status`, `usemac_list_apps`, `usemac_observe`, `usemac_act`, `usemac_screenshot`, `usemac_highlight` |
-| **Chrome bridge** | `usemac_browser_tabs`, `usemac_browser_open`, `usemac_browser_observe`, `usemac_browser_extract`, `usemac_browser_screenshot`, `usemac_browser_act` |
-| **Vision, tasks & reports** | `usemac_vision_status`, `usemac_vision_query`, `usemac_task_start`, `usemac_task_complete`, `usemac_report_prepare` |
+| **Observe & act (native + Chrome)** | `usemac_observe`, `usemac_act`, `usemac_screenshot` |
+| **Chrome navigation & extraction** | `usemac_browser_open`, `usemac_browser_extract` |
+| **Discovery, vision, skills & session** | `usemac_discover`, `usemac_vision`, `usemac_skill`, `usemac_session` |
+
+*Backwards-compatible legacy aliases* (still accepted on `tools/call`): `usemac_status`, `usemac_list_apps`, `usemac_browser_tabs`, `usemac_browser_observe`, `usemac_browser_act`, `usemac_browser_screenshot`, `usemac_vision_status`, `usemac_vision_query`, `usemac_task_start`, `usemac_task_complete`, `usemac_highlight`, `usemac_report_prepare`.
 
 ### CLI (`usemac`)
 
 ```bash
 USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 "$USEMAC" status
-"$USEMAC" observe --app "Notes"
-"$USEMAC" act '{"app":"Notes","steps":[{"action":"type","text":"Meeting notes","preferBackground":true}]}'
-"$USEMAC" browser status
+"$USEMAC" observe --app "Notes" --filter-role button
+"$USEMAC" menu --app "Notes" --query "New"
+"$USEMAC" act '{"app":"Notes","observationMode":"auto","steps":[{"action":"type","text":"Meeting notes","preferBackground":true}]}'
+"$USEMAC" browser open "https://example.com" --auto-dismiss
+"$USEMAC" browser extract network --url-filter "/api/"
+"$USEMAC" skill list
 "$USEMAC" audit --since 2h
 "$USEMAC" install-skill
 "$USEMAC" debug capture --window preview --context   # developing UseMac only, once Debug capture is on
@@ -155,14 +161,14 @@ Failed requests return an error `code`, a `message`, and an optional `hint` when
 | Category | Codes |
 | :--- | :--- |
 | **Stop and tell the user** *(safety rule, approval, or daemon closed)* | `POLICY_BLOCKED`, `POLICY_LOCKED`, `APPROVAL_DENIED`, `APPROVAL_TIMEOUT`, `TARGET_BLOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DEBUG_CAPTURE_OFF`, `DAEMON_REQUIRED` |
-| **Screen changed** *(observe again)* | `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT` |
+| **Screen changed or check failed** *(observe again)* | `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`, `ASSERTION_FAILED`, `FORM_FILL_FAILED`, `MENU_NOT_FOUND`, `SKILL_NOT_FOUND` |
 | **App in background, user active, or target leased** | `TARGET_NOT_FRONTMOST`, `USER_ACTIVE`, `TARGET_BUSY` |
 | **Wrong route** *(switch to native observe / hybrid Chrome flow)* | `RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL` |
 | **Chrome extension** | `EXTENSION_NOT_CONNECTED`, `EXTENSION_NOT_PAIRED`, `EXTENSION_TIMEOUT`, `EXTENSION_RELOAD_UNSUPPORTED`, `EXTENSION_RELOAD_TIMEOUT`, `BROWSER_BUSY`, `NO_USEMAC_TAB`, `CANCELLED`, `WINDOW_ERROR`, `EVAL_ERROR` |
 | **Apps, permissions & captures** | `APP_NOT_FOUND`, `PERMISSION_DENIED`, `CAPTURE_FAILED`, `UPLOAD_FAILED`, `NO_IMAGE_SOURCE` |
 | **Problem reports** | `REPORT_IN_REVIEW` *(another report is still open for review; see [How to contribute](#how-to-contribute))* |
-| **Malformed requests** | `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND`, `INVALID_MODEL` |
-| **Unexpected failures** | `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED` |
+| **Malformed or unsupported requests** | `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND`, `NOT_IMPLEMENTED` |
+| **Unexpected failures** | `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED`, `BROWSER_BATCH_FAILED`, `APP_MENU_FAILED`, `SKILL_SAVE_FAILED`, `SKILL_RUN_FAILED` |
 
 ## Safety model
 
@@ -175,7 +181,7 @@ UseMac starts in **Autonomous** until you choose another mode in **Settings → 
 | `autonomous` | **Autonomous** | Allows all actions (still subject to URL, upload, and path guards). |
 | `ask` | **Ask** | Holds `uploadFile`, keyboard shortcuts using `⌘` or `⌃` (any spelling), and `browser_extract` in `eval` mode until you click **Allow once** or **Deny** in a prompt next to the HUD. Deny returns `APPROVAL_DENIED`; no answer within 45 s returns `APPROVAL_TIMEOUT`. |
 | `confirmSensitive` | **Block sensitive** | Blocks `uploadFile`, keyboard shortcuts using `⌘` or `⌃` (whatever the spelling: `cmd`, `command`, `meta`, `ctrl`, `control`), and `browser_extract` in `eval` mode. |
-| `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `target`, observe, read-only extract (`auto`, `tables`, `text`, `kpis`, `downloads`), and screenshots remain allowed. |
+| `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `assert`, `target`, observe, `app_menu` search, `skill_list`, read-only extract (`auto`, `tables`, `text`, `kpis`, `network`, `downloads`), and screenshots remain allowed. |
 | `paused` | **Paused** | Blocks all automation, including reads. |
 
 ### Guardrails & isolation
@@ -184,36 +190,45 @@ UseMac starts in **Autonomous** until you choose another mode in **Settings → 
 - **One-way socket policy & tamper-evident seal**: `set_policy` over the socket can only keep or tighten the execution mode; relaxing it returns `POLICY_LOCKED` (only the app UI can relax it). Execution mode, Kill Switch state, Debug capture, app and site rules, and Record typed text are sealed with a key in your login Keychain — if modified outside UseMac, UseMac relaunches **Paused** with default rules, Debug capture off, and Record typed text off until you resume.
 - **Ask prompts answer only to physical input**: Only a real click from your Mac's mouse or trackpad answers an Ask prompt. Clicks posted by any process (another agent, Screen Sharing, Universal Control, Voice Control) and Accessibility actions are ignored, there is no RPC/MCP tool for it, and every answer or ignored click is logged. One prompt shows at a time; others queue.
 - **Blocked by default**:
-  - **URLs**: `browser_open` and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs default to `https://`; everything else returns `URL_BLOCKED`).
+  - **URLs**: `browser_open`, `browser_batch`, and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs default to `https://`; everything else returns `URL_BLOCKED`).
   - **Sensitive file uploads**: `uploadFile` blocks `~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, `.env` files, browser and password-manager folders in `~/Library`, shell histories, and secret/key extensions (`.pem`, `.pfx`, `.p8`, `.kdbx`, `.ovpn`, `.jks`, `.keystore`, `.tfstate`), returning `UPLOAD_BLOCKED`.
   - **UseMac's own windows**: Agents cannot observe or act on UseMac itself (Settings, setup guide). Targeting it returns `SELF_TARGET_BLOCKED`, and `list_apps` omits it.
   - **Debug capture** (**Settings → General → Developer**, off by default): Strictly for developing UseMac. While on, agents can take read-only PNG screenshots of UseMac's own windows and surrounding screen (`debug_capture`, CLI `usemac debug capture`), but still cannot click or type in them. Only your physical click on **Turn On** enables it; while off, `debug_capture` returns `DEBUG_CAPTURE_OFF`.
-  - **Local vision paths & models**: `vision_query.imagePath` only accepts files inside your user temporary directory or `/tmp`; `vision_install` only accepts the three built-in presets (`INVALID_MODEL`). The on-device model stays off until you install it and turn it on; then only the UseMac app loads it, one copy for every agent, on the first visual check, and unloads it after 5 idle minutes.
+  - **Local Apple Vision OCR paths**: `vision_query.imagePath` only accepts files inside your user temporary directory or `/tmp` (`IMAGE_PATH_BLOCKED` otherwise). OCR runs 100% locally via macOS Vision (`VNRecognizeTextRequest`) on the Apple Neural Engine with zero external downloads or background Python workers.
   - **Temporary captures**: Screenshots are saved to a private folder inside your user temporary directory and automatically pruned after 30 minutes.
-- **App and site rules** (**Settings → General → App and site rules**): Block apps (by bundle ID) and sites (by host) so agents never observe, act on, or capture them, or switch to **Allow only listed**. Keychain Access, Passwords, 1Password, Bitwarden, KeePassXC, Dashlane, and their web vaults are blocked by default. Blocked apps and tabs are omitted from `list_apps`, `browser_tabs`, display screenshots, and the live preview, and direct requests return `TARGET_BLOCKED`. Site rules are enforced daemon-side across every `browser_*` call, and rules can only be edited in the app.
+- **App and site rules** (**Settings → General → App and site rules**): Block apps (by bundle ID) and sites (by host) so agents never observe, act on, or capture them, or switch to **Allow only listed**. Keychain Access, Passwords, 1Password, Bitwarden, KeePassXC, Dashlane, and their web vaults are blocked by default. Blocked apps and tabs are omitted from `list_apps`, `browser_tabs`, display screenshots, and the live preview, and direct requests return `TARGET_BLOCKED`. Site rules are enforced daemon-side across every `browser_*` call (including each URL in `browser_batch`), and rules can only be edited in the app.
 - **Chrome pairing & tab isolation**: Each Chrome profile must be paired once with the local `umk_…` key (unpaired requests return `EXTENSION_NOT_PAIRED`, and the key is never exposed via RPC, MCP, or CLI). Without an explicit `tabId`, browser calls target only the task's own last tab (when carrying a `taskId`), the last UseMac tab, or a tab in the `UseMac` tab group (`NO_USEMAC_TAB` otherwise).
-- **Multi-agent leases**: `task_start` returns a `taskId` carried on later requests (top-level `taskId`, CLI `--task`/`USEMAC_TASK`, automatic over MCP). A task's requests without `tabId` stay in its own tabs, and `task_complete` closes only tabs opened by that task and returns a `taskSummary`. Windows and tabs a task acts in are leased until completion: another task's action there returns `TARGET_BUSY` (CLI exit code 6), while reads never block and un-scoped requests are never refused. Live preview cards display each task's `agent` name.
+- **Multi-agent leases**: `task_start` (or piggybacked `taskStart`) returns a `taskId` carried on later requests (top-level `taskId`, CLI `--task`/`USEMAC_TASK`, automatic over MCP). A task's requests without `tabId` stay in its own tabs, and `task_complete` closes only tabs opened by that task and returns a `taskSummary`. Windows and tabs a task acts in are leased until completion: another task's action there returns `TARGET_BUSY` (CLI exit code 6), while reads never block and un-scoped requests are never refused. Live preview cards display each task's `agent` name.
 - **Local redacted audit log**: Every observation and action is appended to daily JSONL files in `~/Library/Application Support/UseMac/audit/` (user-readable only, kept 30 days by default in **Settings → General → History**). Typed text, `setValue` values, and `eval` sources are stored only as their character length unless you enable **Record typed text**, and URL credentials and secret-looking query params are stripped. Filter and export (JSONL/CSV) in **Settings → History**, or query via `audit_log` / `usemac audit`.
 - **AI client data flow**: Anything an agent observes, extracts, or captures through UseMac is returned to the AI client you connected, which typically sends it to that client's AI provider under their terms.
 
 ## Benchmarks
 
-The numbers published on [usemac.app](https://usemac.app) come from `scripts/bench.sh`. To reproduce them, open `UseMac.app` and run:
+UseMac includes two reproducible benchmark scripts:
 
-```bash
-python3 -m http.server --bind 127.0.0.1 8742 --directory scripts/bench &   # serves the fixture form page
-open -g -a Calculator
-scripts/bench.sh --app Calculator --url http://127.0.0.1:8742/expense-form.html \
-  --vision "The Submit expense button is visible"
-```
+1. **SOTA end-to-end & context-tax benchmark (`scripts/bench-sota.py` + `scripts/bench/spa-fixture.html`):**
+   Measures static MCP schema + skill context tax, local IPC/AX/menu/skill/Apple Vision OCR latency, realistic SPA fixture benchmarks (cookie modal auto-dismiss, multi-field `fillForm`, `mode: "network"` JSON capture vs 120-row `scanVertical` table, `includeOffscreen: false` token compression, and `diffCrop` screenshots), plus a calibrated Amdahl wall-clock & token model for 5-step Native and Browser tasks:
+   ```bash
+   python3 scripts/bench-sota.py --save before.json
+   # ... after changes ...
+   python3 scripts/bench-sota.py --save after.json
+   python3 scripts/bench-sota.py --compare before.json after.json
+   ```
+2. **Classic IPC & per-look token benchmark (`scripts/bench.sh`):**
+   ```bash
+   python3 -m http.server --bind 127.0.0.1 8742 --directory scripts/bench &
+   open -g -a Calculator
+   scripts/bench.sh --app Calculator --url http://127.0.0.1:8742/expense-form.html \
+     --vision "The Submit expense button is visible"
+   ```
 
 It measures three things:
 
 - **Local IPC**: `usemac bench --iterations 1000 --app Calculator`. Each sample is a full round trip from the CLI to the running daemon over the Unix socket: encode, send, handle, reply, decode. `ping` does no work (the latency floor); hot-cache `observe` returns the window's cached Accessibility snapshot and diff.
-- **What the agent reads per look**: For a Chrome tab or native window, the structured text printed by `usemac browser observe` or `usemac observe` (identical to what MCP returns), compared against a screenshot of the same view. UseMac never resizes tabs; screenshots are scaled down to fit 1280×800 (`--width 1280 --height 800`). The runs below used `0.6.0-beta.2`, which still laid web pages out at 1280×800. Screenshot tokens use Anthropic's published estimate (`width × height / 750` after the 1568 px long-edge downscale, ~1,600 tokens max). Text tokens are estimated conservatively at 2.5 chars/token. Pass `--count-tokens` with `ANTHROPIC_API_KEY` for exact counts from Anthropic's `count_tokens` endpoint (sends captures to the API).
-- **On-device visual check**: `usemac vision verify` answered by the local Apple Silicon MLX model (`usemac vision install`), so the agent reads a one-line text answer instead of an image.
+- **What the agent reads per look**: For a Chrome tab or native window, the structured text printed by `usemac browser observe` or `usemac observe` (identical to what MCP returns), compared against a screenshot of the same view. UseMac never resizes tabs; screenshots are scaled down to fit 1280×800 (`--width 1280 --height 800`). Screenshot tokens use Anthropic's published estimate (`width × height / 750` after the 1568 px long-edge downscale, ~1,600 tokens max). Text tokens are estimated conservatively at 2.5 chars/token. Pass `--count-tokens` with `ANTHROPIC_API_KEY` for exact counts from Anthropic's `count_tokens` endpoint (sends captures to the API).
+- **On-device visual check**: `usemac vision verify` answered instantly by Apple Vision OCR (`VNRecognizeTextRequest` on the Apple Neural Engine), returning a one-line text verification instead of uploading a full screenshot.
 
-Measured on **2026-11-26** on an **Apple M4 Pro** (12 cores, 24 GB), **macOS 15.7 (24G222)**, running `UseMac 0.6.0-beta.2` alongside other builds on the same machine:
+Baseline numbers measured on **2026-11-26** on an **Apple M4 Pro** (12 cores, 24 GB), **macOS 15.7 (24G222)**, running `UseMac 0.6.0-beta.2` alongside other builds on the same machine:
 
 | Local IPC (p50 across 9 runs) | Result |
 | :--- | ---: |
@@ -222,18 +237,17 @@ Measured on **2026-11-26** on an **Apple M4 Pro** (12 cores, 24 GB), **macOS 15.
 | `observe` Calculator, hot cache | **0.99–1.24 ms** |
 | `observe` Calculator, cold | **19–69 ms** |
 
-| What the agent reads per look (estimated) | Text | Screenshot | Text vs. screenshot |
+| What the agent reads per look (estimated, `0.6.0-beta.2` baseline) | Text | Screenshot | Text vs. screenshot |
 | :--- | ---: | ---: | ---: |
 | Fixture form page (`scripts/bench/expense-form.html`) | ≈904 tokens | 1,366 tokens (1280×800) | **−34%** |
 | Landing page (`website/public`) | ≈1,674 tokens | 1,366 tokens (1280×800) | +23% |
 | Calculator window | ≈744 tokens | 93 tokens (198×350) | +700% |
-| On-device visual check of fixture form (`Qwen2.5-VL-3B-Instruct-4bit`, 2.3–2.9 s) | ≈118 tokens | 1,366 tokens (1280×800) | **−91%** |
 
 **What this shows:**
 
-- A text snapshot isn't always smaller than a screenshot — it's smaller on form-like pages, larger on long link-heavy pages or tiny native windows. Its real advantage is **precision and speed**: deterministic `@eN`/`@bN` element refs with millisecond updates, without guessing coordinates.
-- The biggest token saving comes from **on-device visual verification**: the agent reads a short text answer instead of uploading a full image, at the cost of a couple seconds of local inference (bounded by 3B model accuracy).
-- Newer frontier models accept larger screenshots (up to 2576 px on the long edge) and can spend up to ~3× more tokens on large captures; this table uses the smaller limit and does not count that extra cost.
+- A text snapshot isn't always smaller than a screenshot — it's smaller on form-like pages, larger on long link-heavy pages or tiny native windows (which is why SOTA mode adds `includeOffscreen: false` default, server-side `filter`, compact short-role lines, `observationMode: "auto"` diffs, and `diffCrop` screenshots). Its real advantage is **precision and speed**: deterministic `@eN`/`@bN` element refs with millisecond updates, without guessing coordinates.
+- On-device Apple Vision OCR verification returns a short text answer in tens of milliseconds instead of uploading a full image, with zero setup or model download.
+- Newer frontier models accept larger screenshots (up to 2576 px on the long edge) and can spend up to ~3× more tokens on large captures; the baseline table uses the smaller limit and does not count that extra cost.
 
 ## Build from source
 
@@ -256,25 +270,25 @@ node --test Tests/ExtensionTests/*.test.mjs
 ./scripts/release-dmg.sh --check
 ```
 
-`swift test` includes an automated docs-sync test: every RPC method, MCP tool, and error code in the codebase must appear in `.agents/AGENTS.md`, `.agents/skills/usemac/SKILL.md`, and this README, with matching counts. Before every release, `scripts/smoke.sh` runs a live end-to-end check against the installed app ([docs/SMOKE.md](docs/SMOKE.md)).
+`swift test` includes an automated docs-sync test: every RPC method, MCP tool, and error code in the codebase must appear in `.agents/AGENTS.md`, the `usemac` skill (`.agents/skills/usemac/SKILL.md` + `references/REFERENCE.md`), and this README, with matching counts. Before every release, `scripts/smoke.sh` runs a live end-to-end check against the installed app ([docs/SMOKE.md](docs/SMOKE.md)).
 
 ## Repository layout
 
 | Path | Description |
 | :--- | :--- |
-| `.agents/` | Agent Guide (`AGENTS.md`) and `usemac` skill (`skills/usemac/SKILL.md`), bundled inside the app. |
+| `.agents/` | Agent Guide (`AGENTS.md`) and `usemac` skill (`skills/usemac/SKILL.md` + `references/REFERENCE.md`), bundled inside the app. |
 | `Assets/` | Master app icon artwork and Hardened Runtime entitlements. |
 | `Extension/` | Manifest V3 Google Chrome extension (`UseMac Browser Bridge`). |
 | `Sources/` | Swift package targets for protocol, automation engine, IPC/MCP server, macOS app, and CLI. |
 | `Tests/` | Swift unit/integration tests and Node.js Chrome extension tests. |
 | `docs/` | Chrome bridge protocol spec, smoke test guide, Web Store release guide, and release notes. |
-| `scripts/` | App bundling, DMG notarization/release, extension packaging, icon generation, local MLX vision worker, and benchmarks (`bench.sh`). |
+| `scripts/` | App bundling, DMG notarization/release, extension packaging, icon generation, and benchmarks (`bench.sh`, `bench-sota.py`, `bench/spa-fixture.html`). |
 | `website/` | Static landing page, privacy policy, and Sparkle appcast deployed to Cloudflare Workers. |
 
 ## Documentation
 
 - [Agent Guide](.agents/AGENTS.md) — Complete setup, Unix socket, MCP, CLI, and reliability reference
-- [Agent Skill](.agents/skills/usemac/SKILL.md) — Bundled skill installed by `usemac install-skill`
+- [Agent Skill](.agents/skills/usemac/SKILL.md) — Compact ≤ 5.5 KB core skill installed by `usemac install-skill` (full spec in [references/REFERENCE.md](.agents/skills/usemac/references/REFERENCE.md))
 - [Chrome Extension Bridge Protocol](docs/BRIDGE-PROTOCOL.md) — WebSocket + CDP bridge specification
 - [Live Smoke Run](docs/SMOKE.md) — Pre-release live check via `scripts/smoke.sh`
 - [Chrome Web Store Release](docs/CHROME-WEB-STORE.md) — Store ID (`USEMAC_CHROME_EXTENSION_ID`), packaging, and submission
@@ -287,7 +301,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before getting started — it explains w
 
 ### Report a problem
 
-**With your agent.** When a task fails in a way that looks like a UseMac bug, your agent can prepare a report (`report_prepare`, MCP `usemac_report_prepare`, CLI `usemac report --summary "…"`). UseMac opens a **Review problem report** window showing the exact text before anything leaves your Mac:
+**With your agent.** When a task fails in a way that looks like a UseMac bug, your agent can prepare a report (`report_prepare`, MCP `usemac_session` `action: "report_prepare"` or legacy `usemac_report_prepare`, CLI `usemac report --summary "…"`). UseMac opens a **Review problem report** window showing the exact text before anything leaves your Mac:
 
 1. Read and optionally edit the title and body.
 2. Check **I checked this report and it has no personal or sensitive data** (any subsequent edit clears the checkbox).
@@ -311,7 +325,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before getting started — it explains w
 2. Fork the repository and create a branch from `main`.
 3. Keep commits small, imperative, and signed off (`git commit -s`), explaining *why* in the body.
 4. Run `swift build`, `swift test`, and `node --test Tests/ExtensionTests/*.test.mjs` (CI runs all three on every PR).
-5. Document agent-facing changes (methods, parameters, MCP tools, error codes, defaults) across `.agents/AGENTS.md`, `.agents/skills/usemac/SKILL.md`, MCP tool descriptions, CLI help, and this README.
+5. Document agent-facing changes (methods, parameters, MCP tools, error codes, defaults) across `.agents/AGENTS.md`, `.agents/skills/usemac/SKILL.md` (and `references/REFERENCE.md`), MCP tool descriptions, CLI help, and this README.
 6. Open your PR against `main`, fill out the template, and link the issue (`Closes #123`).
 
 ## License

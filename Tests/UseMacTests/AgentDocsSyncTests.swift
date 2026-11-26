@@ -4,9 +4,10 @@ import XCTest
 @testable import UseMacIPC
 
 /// Keeps the hand-written agent docs in sync with the code. The RPC methods, the MCP tools and the error codes
-/// are read from the code, and each one must appear, in backticks, in `.agents/AGENTS.md`,
-/// `.agents/skills/usemac/SKILL.md` and the README. The method and tool counts the docs state must match, and
-/// the exit-code tables in AGENTS.md and `usemac --help` must match the CLI's mapping.
+/// are read from the code, and each one must appear, in backticks, in `.agents/AGENTS.md`, the `usemac` skill
+/// (`.agents/skills/usemac/SKILL.md` combined with `.agents/skills/usemac/references/*.md`), and the README.
+/// The method and tool counts the docs state must match, the core `SKILL.md` must stay compact (≤ 5,500 bytes),
+/// and the exit-code tables in AGENTS.md and `usemac --help` must match the CLI's mapping.
 final class AgentDocsSyncTests: XCTestCase {
     private static let repoRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()  // Tests/UseMacTests
@@ -15,6 +16,8 @@ final class AgentDocsSyncTests: XCTestCase {
 
     private static let agentGuide = ".agents/AGENTS.md"
     private static let skill = ".agents/skills/usemac/SKILL.md"
+    private static let skillReferencesDir = ".agents/skills/usemac/references"
+    private static let skillCoreMaxBytes = 5_500
     private static let readme = "README.md"
     private static let documents = [agentGuide, skill, readme]
 
@@ -49,14 +52,25 @@ final class AgentDocsSyncTests: XCTestCase {
         )
     }
 
+    func testSkillCoreStaysCompact() throws {
+        let bytes = Data(try read(Self.skill).utf8).count
+        XCTAssertLessThanOrEqual(
+            bytes,
+            Self.skillCoreMaxBytes,
+            "\(Self.skill) is \(bytes) bytes, exceeding the \(Self.skillCoreMaxBytes)-byte core skill budget. Move bulk reference details into \(Self.skillReferencesDir)/REFERENCE.md."
+        )
+    }
+
     // MARK: - Counts and exit codes
 
     func testStatedCountsMatchTheCode() async throws {
         let actual = ["methods": RPCMethod.allCases.count, "tools": try await mcpToolNames().count]
         for document in Self.documents {
-            for claim in try statedCounts(in: read(document)) {
-                guard let count = actual[claim.noun], claim.count != count else { continue }
-                XCTFail("\(document) line \(claim.line) says \(claim.count) \(claim.noun), but the code has \(count): \"\(claim.text)\"")
+            for file in try documentFiles(for: document) {
+                for claim in try statedCounts(in: read(file)) {
+                    guard let count = actual[claim.noun], claim.count != count else { continue }
+                    XCTFail("\(file) line \(claim.line) says \(claim.count) \(claim.noun), but the code has \(count): \"\(claim.text)\"")
+                }
             }
         }
 
@@ -177,6 +191,31 @@ final class AgentDocsSyncTests: XCTestCase {
 
     // MARK: - Reading the docs
 
+    /// Returns all markdown files that belong to a logical document. For the `usemac` skill, this combines
+    /// `.agents/skills/usemac/SKILL.md` with every `.md` file in `.agents/skills/usemac/references/`.
+    private func documentFiles(for document: String) throws -> [String] {
+        guard document == Self.skill else {
+            return [document]
+        }
+        var files = [Self.skill]
+        let refsURL = Self.repoRoot.appendingPathComponent(Self.skillReferencesDir)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: refsURL.path) {
+            let entries = try fm.contentsOfDirectory(atPath: refsURL.path)
+            let mdFiles = entries
+                .filter { $0.hasSuffix(".md") }
+                .sorted()
+                .map { "\(Self.skillReferencesDir)/\($0)" }
+            files.append(contentsOf: mdFiles)
+        }
+        return files
+    }
+
+    private func readCombined(_ document: String) throws -> String {
+        let files = try documentFiles(for: document)
+        return try files.map { try read($0) }.joined(separator: "\n\n")
+    }
+
     private struct CountClaim {
         let noun: String
         let count: Int
@@ -184,7 +223,7 @@ final class AgentDocsSyncTests: XCTestCase {
         let text: String
     }
 
-    /// "All 22 methods", "16 MCP tools", "Exposed tools (16)", "Methods (22)".
+    /// "All 29 methods", "9 MCP tools", "Exposed tools (9)", "Methods (29)".
     private func statedCounts(in text: String) -> [CountClaim] {
         var claims: [CountClaim] = []
         for (index, line) in text.components(separatedBy: .newlines).enumerated() {
@@ -208,12 +247,13 @@ final class AgentDocsSyncTests: XCTestCase {
         line: UInt = #line
     ) throws {
         for document in Self.documents {
-            let text = try read(document)
+            let text = try readCombined(document)
             let missing = names.filter { !text.contains("`\($0.name)`") }
             guard !missing.isEmpty else { continue }
+            let docLabel = document == Self.skill ? "\(document) (+ \(Self.skillReferencesDir)/*.md)" : document
             let list = missing.map { "  `\($0.name)` (\($0.source))" }.joined(separator: "\n")
             XCTFail(
-                "\(document) is missing \(missing.count) \(kind) that the code defines. Mention each one in backticks \(place):\n\(list)",
+                "\(docLabel) is missing \(missing.count) \(kind) that the code defines. Mention each one in backticks \(place):\n\(list)",
                 file: file,
                 line: line
             )
