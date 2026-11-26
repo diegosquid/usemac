@@ -893,7 +893,8 @@ struct UseMacCLI {
 
     private static func sendBatchAction(_ batch: BatchActionRequest, options: GlobalOptions) async throws -> Int32 {
         let req = RPCRequest(method: .act, act: batch)
-        let (res, rttMs, mode) = try await executeRPC(req, options: options)
+        // Same budget as the MCP server: an uploadFile step alone can wait ~15 s for Spotlight.
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 60_000)
         try ensureOK(res)
 
         if options.json {
