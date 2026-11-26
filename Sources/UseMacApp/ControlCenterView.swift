@@ -112,7 +112,6 @@ public struct ControlCenterView: View {
     @State private var pairingKeyFeedback: [String: String] = [:]
     @State private var pairingKeyFeedbackTokens: [String: UUID] = [:]
     @State private var integrationTab: IntegrationTab = .socket
-    @State private var auditFilter: AuditFilter = .all
     @State private var hoveredSection: ControlCenterSection?
 
     private enum IntegrationTab: String, CaseIterable, Identifiable {
@@ -120,29 +119,6 @@ public struct ControlCenterView: View {
         case mcp = "MCP"
         case cli = "CLI"
         var id: String { rawValue }
-    }
-
-    private enum AuditFilter: String, CaseIterable, Identifiable {
-        case all = "All"
-        case ok = "Done"
-        case failed = "Failed"
-        var id: String { rawValue }
-
-        var emptyTitle: String {
-            switch self {
-            case .all: return "No history yet"
-            case .ok: return "No completed actions yet"
-            case .failed: return "No failed actions"
-            }
-        }
-
-        var emptySubtitle: String {
-            switch self {
-            case .all: return "Actions performed by your agents will appear here."
-            case .ok: return "Successful requests will appear here."
-            case .failed: return "Blocked and failed requests will appear here."
-            }
-        }
     }
 
     public init(appState: AppState, router: ControlCenterRouter) {
@@ -312,7 +288,7 @@ public struct ControlCenterView: View {
             case .connect:
                 connectSection
             case .audit:
-                historySection
+                AuditLogView(appState: appState)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -348,6 +324,7 @@ public struct ControlCenterView: View {
                 localVisionGroup
                 permissionsGroup
                 safetyGroup
+                AuditLogSettingsGroup(store: appState.engine.auditStore, onOpenHistory: { router.selection = .audit })
                 SoftwareUpdatesGroupView(updater: appState.updater)
             }
             .frame(maxWidth: 640, alignment: .leading)
@@ -1128,105 +1105,6 @@ public struct ControlCenterView: View {
 
     private var cliAgentPrompt: String { appState.cliAgentPrompt }
 
-    // MARK: - History Section
-
-    private var filteredAuditEntries: [AuditEntry] {
-        switch auditFilter {
-        case .all: return appState.auditEntries
-        case .ok: return appState.auditEntries.filter { $0.success }
-        case .failed: return appState.auditEntries.filter { !$0.success }
-        }
-    }
-
-    private var historySection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("History")
-                        .font(.system(size: 20, weight: .semibold))
-                        .tracking(-0.4)
-                    Text("Recent background observations and actions.")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                CodexSegmentedControl(
-                    selection: $auditFilter,
-                    options: AuditFilter.allCases.map {
-                        CodexSegmentOption(value: $0, label: $0.rawValue)
-                    }
-                )
-            }
-            .frame(maxWidth: 640, alignment: .leading)
-            .padding(.horizontal, 34)
-            .padding(.top, 28)
-            .padding(.bottom, 22)
-
-            if filteredAuditEntries.isEmpty {
-                Spacer()
-                VStack(spacing: 8) {
-                    Text(auditFilter.emptyTitle)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(.secondary)
-
-                    Text(auditFilter.emptySubtitle)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity)
-                Spacer()
-            } else {
-                ScrollView(showsIndicators: false) {
-                    SettingsGroup {
-                        EmptyView()
-                    } content: {
-                        ForEach(Array(filteredAuditEntries.enumerated()), id: \.element.id) { index, entry in
-                            if index > 0 {
-                                InsetDivider(leading: 34)
-                            }
-                            HStack(spacing: 12) {
-                                Circle()
-                                    .fill(entry.success ? UseMacTheme.statusGreen : UseMacTheme.statusRed)
-                                    .frame(width: 6, height: 6)
-
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 6) {
-                                        if let app = entry.targetApp, !app.isEmpty {
-                                            Text(app)
-                                                .font(.system(size: 13, weight: .medium))
-                                        } else {
-                                            Text(entry.method.capitalized)
-                                                .font(.system(size: 13, weight: .medium))
-                                        }
-                                    }
-
-                                    Text(entry.summary)
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-
-                                Spacer(minLength: 12)
-
-                                Text(Self.formatTimestamp(entry.timestampMs))
-                                    .font(.system(size: 11.5, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                                    .monospacedDigit()
-                            }
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 12)
-                        }
-                    }
-                    .frame(maxWidth: 640, alignment: .leading)
-                    .padding(.horizontal, 34)
-                    .padding(.bottom, 34)
-                }
-            }
-        }
-    }
-
     // MARK: - Helpers
 
     private var daemonStatusColor: Color {
@@ -1279,28 +1157,6 @@ public struct ControlCenterView: View {
                 copiedKey = nil
             }
         }
-    }
-
-    private static let timeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter
-    }()
-
-    private static let dateTimeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "MMM d, HH:mm:ss"
-        return formatter
-    }()
-
-    private static func formatTimestamp(_ timestampMs: Int64) -> String {
-        let date = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
-        if Calendar.current.isDateInToday(date) {
-            return timeFormatter.string(from: date)
-        }
-        return dateTimeFormatter.string(from: date)
     }
 }
 
