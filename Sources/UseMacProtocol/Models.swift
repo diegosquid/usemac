@@ -38,6 +38,16 @@ public enum UseMacDefaults {
         }
         return nil
     }
+
+    /// The extension's Chrome Web Store page, or nil while no valid store ID (32 letters a–p) is set.
+    public static var chromeWebStoreListingURL: URL? {
+        guard let id = chromeWebStoreExtensionId?.lowercased(),
+              id.unicodeScalars.count == 32,
+              id.unicodeScalars.allSatisfy({ $0.value >= 97 && $0.value <= 112 }) else {
+            return nil
+        }
+        return URL(string: "https://chromewebstore.google.com/detail/\(id)")
+    }
 }
 
 public struct ScreenRect: Codable, Equatable, Sendable {
