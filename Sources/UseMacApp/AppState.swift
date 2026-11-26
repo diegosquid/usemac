@@ -544,6 +544,15 @@ public final class AppState: ObservableObject {
             }
         }
 
+        // Stop in the pill on a Chrome tab UseMac controls does what Stop in the HUD does (toggleKillSwitch), but
+        // only ever stops: when the agent is already stopped or paused it changes nothing.
+        engine.chromeBridge.onUserStopRequested = { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isAutomationPaused else { return }
+                self.setKillSwitch(true)
+            }
+        }
+
         engine.localVision.onStatusChanged = { [weak self] status in
             Task { @MainActor [weak self] in
                 self?.visionStatus = status
