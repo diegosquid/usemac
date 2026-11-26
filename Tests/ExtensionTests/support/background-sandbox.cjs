@@ -178,6 +178,10 @@ function createBackgroundSandbox(options = {}) {
       onRemoved: tabsRemoved,
       onActivated: tabsActivated,
       get: async (id) => clone(getTabOrThrow(id)),
+      getZoom: async (id) => {
+        getTabOrThrow(id);
+        return options.zoom ? options.zoom(id) : 1;
+      },
       remove: async (id) => {
         record("tabs.remove", id);
         getTabOrThrow(id);
