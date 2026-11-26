@@ -1362,14 +1362,97 @@ async function waitForTabLoad(tabId, timeoutMs = 4500) {
 const USEMAC_GROUP_TITLE = "UseMac";
 const USEMAC_GROUP_COLOR = "blue";
 
+// One UseMac group per window. Commands for different tabs run at the same time (each tab has its own queue, and
+// opens have theirs), and Chrome only lets a new group take its title after it exists. Two calls that both looked
+// for the titled group before either had set it each made one, so a window could end up with several UseMac
+// groups side by side. Group changes now take turns, and a window that already has several is folded back into
+// one on its next use.
+let usemacGroupChain = Promise.resolve();
+
+function withUsemacGroupLock(fn) {
+  const next = usemacGroupChain.then(fn, fn);
+  usemacGroupChain = next.catch(() => {});
+  return next;
+}
+
+// The group each window's UseMac tabs are in, so folding keeps the one agents already use. Kept in session
+// storage so a service-worker restart remembers it; only trusted while that window still has a UseMac group with
+// that id (it may have closed, moved to another window, or been renamed by the user, and then it is theirs).
+const USEMAC_GROUPS_KEY = "usemacGroupIdsByWindow";
+let usemacGroupIdsByWindow = null;
+
+async function rememberedUsemacGroupIds() {
+  if (!usemacGroupIdsByWindow) {
+    try {
+      const stored = await chrome.storage.session.get(USEMAC_GROUPS_KEY);
+      const value = stored?.[USEMAC_GROUPS_KEY];
+      usemacGroupIdsByWindow = value && typeof value === "object" ? value : {};
+    } catch (_) {
+      usemacGroupIdsByWindow = {};
+    }
+  }
+  return usemacGroupIdsByWindow;
+}
+
+async function rememberUsemacGroup(windowId, groupId) {
+  const remembered = await rememberedUsemacGroupIds();
+  const key = String(windowId);
+  if ((remembered[key] ?? null) === (groupId ?? null)) return;
+  if (groupId == null) {
+    delete remembered[key];
+  } else {
+    remembered[key] = groupId;
+  }
+  try {
+    await chrome.storage.session.set({ [USEMAC_GROUPS_KEY]: remembered });
+  } catch (_) {}
+}
+
+// Moves the tabs of every other UseMac group in the window into one; Chrome drops the groups left empty. Keeps the
+// remembered group, else the leftmost. Returns the kept group and the ids of the tabs it moved. If Chrome refuses
+// the move (the user is dragging a tab), the kept group is still used and the next call tries again.
+async function foldUsemacGroups(groups, preferredId) {
+  const entries = [];
+  for (const group of groups) {
+    let tabs = [];
+    try {
+      tabs = (await chrome.tabs.query({ groupId: group.id })) || [];
+    } catch (_) {}
+    const firstIndex = tabs.reduce((min, t) => Math.min(min, t.index ?? Infinity), Infinity);
+    entries.push({ group, tabs, firstIndex });
+  }
+  const keeper =
+    entries.find((e) => e.group.id === preferredId) || entries.slice().sort((a, b) => a.firstIndex - b.firstIndex)[0];
+  const strays = entries
+    .filter((e) => e !== keeper)
+    .flatMap((e) => e.tabs)
+    .filter((t) => !t.pinned)
+    .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    .map((t) => t.id);
+  if (strays.length > 0) {
+    try {
+      await chrome.tabs.group({ groupId: keeper.group.id, tabIds: strays });
+    } catch (_) {
+      return { group: keeper.group, movedTabIds: new Set() };
+    }
+  }
+  return { group: keeper.group, movedTabIds: new Set(strays) };
+}
+
+// The window's UseMac group ({ group, movedTabIds }), folding duplicates into one, or null when it has none. Call
+// with the group lock held. Throws when Chrome cannot list the groups, so the caller does not make another one.
 async function findUsemacGroupInWindow(windowId) {
   if (!chrome.tabGroups?.query || windowId == null) return null;
-  try {
-    const groups = await chrome.tabGroups.query({ windowId, title: USEMAC_GROUP_TITLE });
-    return groups && groups.length > 0 ? groups[0] : null;
-  } catch (_) {
+  const groups = (await chrome.tabGroups.query({ windowId, title: USEMAC_GROUP_TITLE })) || [];
+  if (groups.length === 0) {
+    await rememberUsemacGroup(windowId, null);
     return null;
   }
+  const preferredId = (await rememberedUsemacGroupIds())[String(windowId)];
+  const found =
+    groups.length > 1 ? await foldUsemacGroups(groups, preferredId) : { group: groups[0], movedTabIds: new Set() };
+  await rememberUsemacGroup(windowId, found.group.id);
+  return found;
 }
 
 async function ensureTabInUsemacGroup(tabId) {
@@ -1377,31 +1460,36 @@ async function ensureTabInUsemacGroup(tabId) {
     return;
   }
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab || tab.pinned || tab.windowId == null) {
-      return;
-    }
-    const existingGroup = await findUsemacGroupInWindow(tab.windowId);
-    if (existingGroup) {
-      if (tab.groupId === existingGroup.id) {
-        return;
-      }
-      await chrome.tabs.group({ groupId: existingGroup.id, tabIds: [tabId] });
-      return;
-    }
-    const groupId = await chrome.tabs.group({
-      createProperties: { windowId: tab.windowId },
-      tabIds: [tabId]
-    });
-    if (groupId != null && groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-      await chrome.tabGroups.update(groupId, {
-        title: USEMAC_GROUP_TITLE,
-        color: USEMAC_GROUP_COLOR,
-        collapsed: false
-      });
-    }
+    await withUsemacGroupLock(() => groupTabWithUsemac(tabId));
   } catch (_) {
     // Non-fatal: tab may be closing, pinned, or in a popup window that disallows tab groups
+  }
+}
+
+async function groupTabWithUsemac(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab || tab.pinned || tab.windowId == null) {
+    return;
+  }
+  const existing = await findUsemacGroupInWindow(tab.windowId);
+  if (existing) {
+    if (tab.groupId === existing.group.id || existing.movedTabIds.has(tabId)) {
+      return;
+    }
+    await chrome.tabs.group({ groupId: existing.group.id, tabIds: [tabId] });
+    return;
+  }
+  const groupId = await chrome.tabs.group({
+    createProperties: { windowId: tab.windowId },
+    tabIds: [tabId]
+  });
+  if (groupId != null && groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    await chrome.tabGroups.update(groupId, {
+      title: USEMAC_GROUP_TITLE,
+      color: USEMAC_GROUP_COLOR,
+      collapsed: false
+    });
+    await rememberUsemacGroup(tab.windowId, groupId);
   }
 }
 
