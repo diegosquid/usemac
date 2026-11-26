@@ -890,6 +890,8 @@ public struct ControlCenterView: View {
         SettingsGroup(title: "Safety") {
             EmptyView()
         } content: {
+            SafetySealNoticeRow(appState: appState)
+
             VStack(alignment: .leading, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2.5) {
                     Text("Execution mode")

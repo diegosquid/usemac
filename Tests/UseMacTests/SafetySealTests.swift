@@ -440,6 +440,49 @@ final class SafetySealTests: XCTestCase {
         XCTAssertEqual(launch.state.policy, .paused)
     }
 
+    /// Every write of a `usemac.safety.*` key goes through SafetySettingsStore, so none can skip the seal. Only
+    /// StartupSafetyState.swift (where the keys are named) and the store may name them; the approval timeout is a
+    /// different setting that isn't sealed.
+    func testOnlyTheStoreWritesTheSafetySettings() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sources = root.appendingPathComponent("Sources")
+        let namesKeys = "Sources/UseMacEngine/StartupSafetyState.swift"
+        let writer = "Sources/UseMacEngine/SafetySettingsStore.swift"
+        let keyNames = ["policy", "policyBeforePause", "killSwitchTripped", "debugCaptureEnabled", "seal", "sealVersion"]
+        let mentions = ["usemac.safety.", "StartupSafetyState.DefaultsKey"] + keyNames.map { "DefaultsKey.\($0)" }
+        let writes = [".set(", "setValue(", "removeObject(", "PersistentDomain(", "CFPreferencesSet", "@AppStorage("]
+
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(atPath: sources.path))
+        var offenders: [String] = []
+        var scanned = 0
+        while let relative = enumerator.nextObject() as? String {
+            guard relative.hasSuffix(".swift") else { continue }
+            let path = "Sources/\(relative)"
+            let text = try String(contentsOf: sources.appendingPathComponent(relative), encoding: .utf8)
+            scanned += 1
+            for (number, rawLine) in text.components(separatedBy: .newlines).enumerated() {
+                let line = rawLine
+                    .replacingOccurrences(of: "usemac.safety.approvalTimeoutSeconds", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("//") { continue }
+                let names = mentions.contains { line.contains($0) }
+                let isWrite = writes.contains { line.contains($0) }
+                switch path {
+                case writer:
+                    continue
+                case namesKeys where isWrite:
+                    offenders.append("\(path):\(number + 1)")
+                case namesKeys:
+                    continue
+                default:
+                    if names { offenders.append("\(path):\(number + 1)") }
+                }
+            }
+        }
+        XCTAssertGreaterThan(scanned, 50)
+        XCTAssertEqual(offenders, [], "save safety settings through SafetySettingsStore so they stay sealed")
+    }
+
     // MARK: - History and the notice
 
     func testHistoryRecordsTheFirstSealAndAChangeOutsideUseMac() {

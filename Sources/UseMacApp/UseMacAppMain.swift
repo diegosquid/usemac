@@ -315,6 +315,15 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
         statusHeaderItem = headerItem
         menu.addItem(headerItem)
 
+        // Once after the safety settings were changed outside UseMac (it started paused), until the user resumes or
+        // dismisses it in Settings → Safety.
+        if let notice = appState.safetySealNotice {
+            let noticeItem = NSMenuItem(title: notice.menuTitle, action: #selector(openSafetySettings), keyEquivalent: "")
+            noticeItem.subtitle = notice.menuSubtitle
+            noticeItem.target = self
+            menu.addItem(noticeItem)
+        }
+
         // "Mode: Read-only" while the mode isn't Autonomous, so a mode the user didn't mean to keep can't hide.
         let policy = appState.status.policy
         if let modeTitle = ExecutionModeNotice.menuTitle(policy: policy) {
