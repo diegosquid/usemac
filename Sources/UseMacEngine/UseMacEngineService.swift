@@ -6,7 +6,7 @@ import UseMacProtocol
 public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendable {
     private let socketPath: String
     private let permissionManager = PermissionManager()
-    private let killSwitch = KillSwitch()
+    let killSwitch = KillSwitch()
     let workspaceMonitor = WorkspaceMonitor()
     /// Which running task owns which Chrome tabs UseMac opened (see TaskTabRegistry).
     let taskTabs = TaskTabRegistry()
@@ -16,6 +16,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     public let chromeBridge: ChromeExtensionBridge
     public let localVision = LocalVisionEngine()
     private let actionExecutor: ActionExecutor
+    /// Ask mode: sensitive requests waiting for the user's answer in the HUD.
+    public let approvals = ApprovalBroker()
     /// The audit log on disk; nil keeps it in memory only (tests, in-process CLI calls).
     public let auditStore: AuditLogStore?
 
@@ -296,6 +298,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
             } else {
                 liveActivity = onLiveActivity
+            }
+            if let refusal = await approvalRefusal(for: request, startNs: startNs) {
+                response = refusal
+                break
             }
             let (actResult, resolvedApp) = await actionExecutor.executeBatch(
                 actReq,
@@ -827,6 +833,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
+            if let refusal = await approvalRefusal(for: request, startNs: startNs) {
+                response = refusal
+                break
+            }
             let bridgeResp = await chromeBridge.extract(params)
             let latencyMs = elapsedMs(since: startNs)
             let resolvedProfile = bridgeResp.profileName ?? params.profile ?? "Browser"
@@ -1005,6 +1015,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
+            if let refusal = await approvalRefusal(for: request, startNs: startNs, browserAct: params) {
+                response = refusal
+                break
+            }
             let targetProfile = params.profile ?? chromeBridge.connectedProfiles().first?.profileName ?? "Browser"
             let targetLabel = "Chrome (\(targetProfile))"
             emitLiveActivity(LiveActivityItem(
@@ -1521,6 +1535,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
                 return nil
             }()
+            approvals.endTask(completion.taskId)
             let resolvedApp = params.app.flatMap { workspaceMonitor.resolveApp(query: $0) }
             let targetName = resolvedProfile.map { "Chrome (\($0))" } ?? resolvedApp?.name ?? params.app ?? "Agent"
             let summaryText = (params.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -2146,7 +2161,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         stateLock.unlock()
     }
 
-    private func appendAudit(
+    func appendAudit(
         method: String,
         targetApp: String?,
         summary: String,

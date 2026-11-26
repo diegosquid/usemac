@@ -127,6 +127,8 @@ struct UseMacCLI {
     private static let policyBlockCodes: Set<String> = [
         "POLICY_BLOCKED",
         "POLICY_LOCKED",
+        "APPROVAL_DENIED",
+        "APPROVAL_TIMEOUT",
         "URL_BLOCKED",
         "UPLOAD_BLOCKED",
         "SELF_TARGET_BLOCKED",
@@ -508,7 +510,9 @@ struct UseMacCLI {
             return (response, elapsedMs, .inProcess)
         }
 
-        let client = UnixSocketClient(socketPath: options.socketPath, timeoutMs: timeoutMs, keepAlive: false)
+        // In Ask mode a sensitive step waits for the user's answer before it runs.
+        let waitMs = timeoutMs + ApprovalTiming.clientAllowanceMs(for: request.method)
+        let client = UnixSocketClient(socketPath: options.socketPath, timeoutMs: waitMs, keepAlive: false)
         if client.isDaemonReachable() {
             defer { client.close() }
             let (response, rttMs) = try client.send(request)
@@ -2140,7 +2144,7 @@ struct UseMacCLI {
           1  Command or RPC failure (find: nothing matched)
           2  Invalid usage, unknown flag or key, or invalid JSON
           3  Daemon required (DAEMON_REQUIRED): ask the user to open UseMac
-          4  Blocked by a safety rule (POLICY_BLOCKED, POLICY_LOCKED, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED, TARGET_BLOCKED): stop and tell the user
+          4  Blocked by a safety rule or the user (POLICY_BLOCKED, POLICY_LOCKED, APPROVAL_DENIED, APPROVAL_TIMEOUT, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED, TARGET_BLOCKED): stop and tell the user
           5  The screen is not what you expected (STALE_SNAPSHOT, ELEMENT_NOT_FOUND, WAIT_TIMEOUT): observe again, then retry
           6  Needs the app in front, or the user or another task is busy there (TARGET_NOT_FRONTMOST, USER_ACTIVE, TARGET_BUSY): use a background step, or wait and retry
           7  This route cannot reach it (RESTRICTED_PAGE, CAPTURE_TOO_SMALL): switch route (see 'usemac help browser')
@@ -2282,7 +2286,8 @@ struct UseMacCLI {
                     "Step actions: target, openURL, navigate, click, doubleClick, rightClick, hover, setValue, type, pressKey, scroll, focus, wait, uploadFile, scrollIntoView, axAction (actionName, e.g. AXOpen), waitFor (match or elementId, timeoutMs default 5000, gone: true to wait until it disappears).",
                     "Target a step with \"elementId\": \"@e12\" or with \"match\": {\"role\", \"title\", \"value\", \"text\", \"exact\", \"index\"}, resolved when the step runs. Prefer match when the window may have changed.",
                     "Each step reports effect: changed, none or unverified. \"⚠ no visible effect\" means the step reported ok but nothing changed: observe before continuing.",
-                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder. Files in /tmp, $TMPDIR or hidden folders fail with TARGET_NOT_FRONTMOST in the background: upload a copy from ~/Downloads, or rerun with --foreground."
+                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder. Files in /tmp, $TMPDIR or hidden folders fail with TARGET_NOT_FRONTMOST in the background: upload a copy from ~/Downloads, or rerun with --foreground.",
+                    "In Ask mode a step with an upload or a cmd/ctrl shortcut waits (up to 45 s) for the user to allow it in UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT (exit 4) means nothing ran."
                 ],
                 examples: [
                     "usemac act '{\"app\":\"Notes\",\"steps\":[{\"action\":\"click\",\"match\":{\"role\":\"button\",\"title\":\"New Note\"}},{\"action\":\"type\",\"text\":\"Hello\"}]}'",
@@ -2321,6 +2326,7 @@ struct UseMacCLI {
                 usage: ["usemac key <chord> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
                 summary: "Press a key or shortcut. Modifiers: cmd, shift, opt (alt), ctrl, fn. Keys: return, tab, space, escape, delete, arrows, a–z, 0–9.",
                 flags: batchFlagHelp,
+                notes: ["In Ask mode a step with an upload or a cmd/ctrl shortcut waits (up to 45 s) for the user to allow it in UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT (exit 4) means nothing ran."],
                 examples: ["usemac key cmd+shift+n --app \"Finder\""],
                 json: batchResultJSON
             )
@@ -2429,7 +2435,7 @@ struct UseMacCLI {
         case "browser extract":
             return CommandHelp(
                 usage: ["usemac browser extract [auto|tables|text|kpis|eval|downloads] [--profile <name>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]"],
-                summary: "Extract structured data from a tab. auto, tables, text and kpis only read; downloads lists files downloaded during the UseMac session; eval runs JavaScript in the page (autonomous mode only, logged).",
+                summary: "Extract structured data from a tab. auto, tables, text and kpis only read; downloads lists files downloaded during the UseMac session; eval runs JavaScript in the page (autonomous mode, or Ask mode once the user allows it; logged).",
                 flags: [
                     ("--tab <id>", "Tab to read"),
                     ("--selector <css>", "Scope extraction to one container"),
@@ -2465,7 +2471,8 @@ struct UseMacCLI {
                 ],
                 notes: [
                     "JSON keys: profile, tabId, steps, stopOnError, returnObservation, returnDiffOnly, readOnly, verify, returnImageContent.",
-                    restrictedPageNote
+                    restrictedPageNote,
+                    "In Ask mode a step with an upload or a cmd/ctrl shortcut waits (up to 45 s) for the user to allow it in UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT (exit 4) means nothing ran."
                 ],
                 examples: ["usemac browser act '[{\"action\":\"setValue\",\"elementId\":\"@b2\",\"text\":\"UseMac\"},{\"action\":\"click\",\"elementId\":\"@b3\"}]' --tab 123"],
                 json: batchResultJSON

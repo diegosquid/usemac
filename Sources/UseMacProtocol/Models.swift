@@ -82,6 +82,8 @@ public enum GovernancePolicy: String, Codable, CaseIterable, Sendable {
     case readOnly
     case confirmSensitive
     case paused
+    /// "Ask": a sensitive step waits for the user to allow it in the HUD (denied when nobody answers in time).
+    case ask
 }
 
 public struct AppDescriptor: Codable, Equatable, Identifiable, Sendable {

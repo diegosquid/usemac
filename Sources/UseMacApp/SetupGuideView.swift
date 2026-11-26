@@ -677,6 +677,7 @@ public struct SetupGuideView: View {
     private var executionModeDetail: String {
         switch appState.status.policy {
         case .autonomous: return "Agents can read and act without asking."
+        case .ask: return "Uploads, page scripts and ⌘/⌃ shortcuts wait for your OK."
         case .confirmSensitive: return "Uploads, page scripts and ⌘/⌃ shortcuts are blocked."
         case .readOnly: return "Agents can look and scroll. Clicks and typing are blocked."
         case .paused: return "Agents are paused until you resume."
