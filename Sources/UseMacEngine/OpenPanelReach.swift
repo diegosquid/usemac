@@ -38,7 +38,7 @@ enum OpenPanelReach {
     static func backgroundMessage(fileName: String, reason: String, appName: String) -> String {
         "\(fileName) is in \(reason), which the file picker cannot reach while \(appName) is in the background: "
             + "browsing its folders did not get there, its search (Spotlight) never lists such files, and Go to Folder (⌘⇧G) "
-            + "only takes keys with the app in front. Rerun this step in a batch with \"foreground\": true (UseMac types the "
-            + "path with ⌘⇧G and gives focus back), or copy the file to a folder such as ~/Downloads and upload the copy."
+            + "only takes keys with the app in front. Copy the file to a folder such as ~/Downloads and upload the copy, or "
+            + "rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back)."
     }
 }

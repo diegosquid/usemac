@@ -1289,7 +1289,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         properties["files"] = [
             "type": "array",
             "items": ["type": "string"],
-            "description": "Absolute local file path(s) for uploadFile. With an open panel, UseMac types the file name into the panel's search field and opens the matching row with AXOpen (no Finder browsing). Files in /tmp, $TMPDIR or hidden folders fail fast with TARGET_NOT_FRONTMOST in the background: rerun with foreground: true or upload a copy from ~/Downloads."
+            "description": "Absolute local file path(s) for uploadFile. With an open panel, UseMac types the file name into the panel's search field and opens the matching row with AXOpen (no Finder browsing). Files in /tmp, $TMPDIR or hidden folders fail fast with TARGET_NOT_FRONTMOST in the background: upload a copy from ~/Downloads, or rerun with foreground: true."
         ]
         return [
             "type": "object",
