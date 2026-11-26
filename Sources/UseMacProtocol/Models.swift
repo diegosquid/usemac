@@ -1621,6 +1621,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     public var taskTabIds: [Int]?
     /// The agent or client of the task the item belongs to, shown on its preview card.
     public var agentName: String?
+    /// The task the item belongs to, when UseMac could tell. The preview gives each task's cards one color.
+    public var taskId: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -1643,7 +1645,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         browserProfile: String? = nil,
         targetGuessed: Bool? = nil,
         taskTabIds: [Int]? = nil,
-        agentName: String? = nil
+        agentName: String? = nil,
+        taskId: String? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1666,6 +1669,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.targetGuessed = targetGuessed
         self.taskTabIds = taskTabIds
         self.agentName = agentName
+        self.taskId = taskId
     }
 }
 
