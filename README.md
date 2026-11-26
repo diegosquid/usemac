@@ -25,6 +25,8 @@ UseMac is a native macOS app and background daemon (written in Swift) that lets 
 printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
+Methods (22): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one.
+
 ### MCP (`stdio`)
 
 Add the bundled helper binary to your MCP client configuration under the `"usemac"` key:
@@ -71,6 +73,19 @@ USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 ```
 
 When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and action requests return `DAEMON_REQUIRED`. Passing `--standalone` runs in-process without the app and without its safety controls.
+
+### Error codes
+
+Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error-codes) explains each one and what the agent should do next.
+
+- **Stop and tell the user** (a safety rule blocked it, or UseMac isn't running): `POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DAEMON_REQUIRED`.
+- **The screen changed** (observe again): `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`.
+- **Needs the app in front, or the user is busy**: `TARGET_NOT_FRONTMOST`, `USER_ACTIVE`.
+- **Wrong route** (switch to native observe or the hybrid Chrome flow): `RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`.
+- **Chrome extension**: `EXTENSION_NOT_CONNECTED`, `EXTENSION_NOT_PAIRED`, `EXTENSION_TIMEOUT`, `NO_USEMAC_TAB`, `CANCELLED`, `WINDOW_ERROR`, `EVAL_ERROR`.
+- **Apps, permissions and captures**: `APP_NOT_FOUND`, `PERMISSION_DENIED`, `CAPTURE_FAILED`, `UPLOAD_FAILED`, `NO_IMAGE_SOURCE`.
+- **Malformed requests**: `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND`, `INVALID_MODEL`.
+- **Unexpected failures**: `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED`.
 
 ## Safety model
 
