@@ -25,6 +25,7 @@ public enum RPCMethod: String, Codable, Sendable, CaseIterable {
     case taskComplete = "task_complete"
     case browserReloadExtension = "browser_reload_extension"
     case reportPrepare = "report_prepare"
+    case debugCapture = "debug_capture"
 }
 
 public struct ObserveParams: Codable, Equatable, Sendable {
@@ -87,6 +88,7 @@ public struct RPCRequest: Codable, Sendable {
     public var taskId: String?
     public var browserReloadExtension: BrowserReloadExtensionParams?
     public var reportPrepare: ReportPrepareParams?
+    public var debugCapture: DebugCaptureParams?
 
     public init(
         id: String = UUID().uuidString,
@@ -111,7 +113,8 @@ public struct RPCRequest: Codable, Sendable {
         auditLog: AuditLogParams? = nil,
         taskId: String? = nil,
         browserReloadExtension: BrowserReloadExtensionParams? = nil,
-        reportPrepare: ReportPrepareParams? = nil
+        reportPrepare: ReportPrepareParams? = nil,
+        debugCapture: DebugCaptureParams? = nil
     ) {
         self.id = id
         self.method = method
@@ -136,6 +139,7 @@ public struct RPCRequest: Codable, Sendable {
         self.taskId = taskId
         self.browserReloadExtension = browserReloadExtension
         self.reportPrepare = reportPrepare
+        self.debugCapture = debugCapture
     }
 
     public init(from decoder: Decoder) throws {
@@ -163,6 +167,7 @@ public struct RPCRequest: Codable, Sendable {
         self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
         self.browserReloadExtension = try c.decodeIfPresent(BrowserReloadExtensionParams.self, forKey: .browserReloadExtension)
         self.reportPrepare = try c.decodeIfPresent(ReportPrepareParams.self, forKey: .reportPrepare)
+        self.debugCapture = try c.decodeIfPresent(DebugCaptureParams.self, forKey: .debugCapture)
     }
 }
 
@@ -206,6 +211,8 @@ public struct RPCResponse: Codable, Sendable {
     public var taskSummary: TaskSummary?
     /// The draft `report_prepare` put in UseMac's review window.
     public var problemReport: ProblemReportReceipt?
+    /// The PNGs `debug_capture` saved.
+    public var debugCapture: DebugCaptureResult?
     public var error: RPCErrorPayload?
 
     public init(
@@ -230,7 +237,8 @@ public struct RPCResponse: Codable, Sendable {
         taskId: String? = nil,
         taskSummary: TaskSummary? = nil,
         error: RPCErrorPayload? = nil,
-        problemReport: ProblemReportReceipt? = nil
+        problemReport: ProblemReportReceipt? = nil,
+        debugCapture: DebugCaptureResult? = nil
     ) {
         self.id = id
         self.ok = ok
@@ -254,6 +262,7 @@ public struct RPCResponse: Codable, Sendable {
         self.taskSummary = taskSummary
         self.error = error
         self.problemReport = problemReport
+        self.debugCapture = debugCapture
     }
 
     public static func success(
@@ -276,7 +285,8 @@ public struct RPCResponse: Codable, Sendable {
         visionResult: VisionQueryResult? = nil,
         taskId: String? = nil,
         taskSummary: TaskSummary? = nil,
-        problemReport: ProblemReportReceipt? = nil
+        problemReport: ProblemReportReceipt? = nil,
+        debugCapture: DebugCaptureResult? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
@@ -300,7 +310,8 @@ public struct RPCResponse: Codable, Sendable {
             taskId: taskId,
             taskSummary: taskSummary,
             error: nil,
-            problemReport: problemReport
+            problemReport: problemReport,
+            debugCapture: debugCapture
         )
     }
 

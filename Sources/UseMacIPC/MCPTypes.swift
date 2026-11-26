@@ -93,6 +93,8 @@ public enum UseMacErrorGuide {
             return "Nobody answered UseMac's approval prompt in time, so the step did not run. Tell the user what needs their OK and retry once they say they are at the Mac."
         case "SELF_TARGET_BLOCKED":
             return "UseMac never observes or acts on its own windows. Stop and tell the user; never try to change UseMac's settings through its UI."
+        case "DEBUG_CAPTURE_OFF":
+            return "Debug capture is off, so nothing was captured. Ask the user to turn it on in UseMac → Settings → Developer if they want you to see UseMac's own windows. Only they can turn it on; don't look for another route."
         case "TARGET_BLOCKED":
             return "The user's app and site rules block this app or site. Stop and tell the user; only they can change the rules, in UseMac Settings. Do not reach it another way. Only when the message says UseMac couldn't confirm the tab's site, retry once first."
         case "TARGET_BUSY":

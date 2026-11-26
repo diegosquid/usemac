@@ -6,7 +6,7 @@ import UseMacProtocol
 public enum AuditEntryKind: String, CaseIterable, Hashable, Sendable {
     /// Changed something: `act`, `browser_act`, `browser_open`, and `browser_extract` in `eval` mode.
     case action
-    /// Only read: observe, screenshots, tab lists, extracts, vision queries, status.
+    /// Only read: observe, screenshots (`debug_capture` too), tab lists, extracts, vision queries, status.
     case observation
     /// Neither: tasks starting and ending, policy and pairing changes, approvals, installs, problem reports. A
     /// method UseMac doesn't know lands here too, so a new kind of request is never hidden with the observations.
@@ -29,7 +29,7 @@ public enum AuditEntryKind: String, CaseIterable, Hashable, Sendable {
             // `AuditRedactor.evalSummary` starts every eval entry this way; the other modes only read the page.
             self = summary.hasPrefix("Eval (") ? .action : .observation
         case .observe, .screenshot, .listApps, .highlight, .browserStatus, .browserTabs, .browserObserve,
-             .browserScreenshot, .visionStatus, .visionQuery, .status, .ping, .auditLog:
+             .browserScreenshot, .visionStatus, .visionQuery, .status, .ping, .auditLog, .debugCapture:
             self = .observation
         case .setPolicy, .pairApp, .visionInstall, .taskStart, .taskComplete, .browserReloadExtension, .reportPrepare:
             self = .other
