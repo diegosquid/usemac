@@ -4583,6 +4583,372 @@ async function fitJpegInBox(base64, box, quality) {
   }
 }
 
+// The image and its size: from the JPEG header, or `estimate` (marked estimated) when the header can't be read.
+function jpegShot(data, estimate) {
+  const size = jpegSize(data);
+  return size ? { data, ...size } : { data, ...estimate, estimated: true };
+}
+
+// --- Element and full-page screenshots ----------------------------------------------------------------------------
+// Neither one makes Chrome draw more than is on screen: Page.captureScreenshot never gets captureBeyondViewport. An
+// element is scrolled into view when it is not fully on screen, then captured with a clip inside the viewport. A full
+// page is scrolled through one viewport at a time and the captures are stitched. Both put every scroll position back
+// afterwards, also when the capture fails.
+
+// Full-page limits. A page taller than maxHeight (CSS px), or one that needs more than maxTiles captures or more than
+// timeBudgetMs, is cut and the response says so (screenshotTruncated). The stitched image stays under maxSide pixels
+// per side and maxPixels in total, so a very long page is drawn at a lower pixel density. settleMs is the wait
+// between a scroll and its capture. Tests change these.
+const FULL_PAGE_LIMITS = {
+  maxHeight: 16384,
+  maxTiles: 40,
+  timeBudgetMs: 12000,
+  maxSide: 16384,
+  maxPixels: 32 * 1024 * 1024,
+  settleMs: 50,
+  tileQuality: 95
+};
+
+// The top-level page's scroll position, its viewport without scrollbars, the window's inner size and the height
+// the window can scroll through (CSS px).
+const PAGE_SCROLL_METRICS_JS = `(() => {
+  const de = document.documentElement;
+  const se = document.scrollingElement || de;
+  const vp = document.compatMode === 'BackCompat' && document.body ? document.body : de;
+  return {
+    x: window.scrollX || 0,
+    y: window.scrollY || 0,
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    viewWidth: Math.min(window.innerWidth, (vp && vp.clientWidth) || window.innerWidth),
+    viewHeight: Math.min(window.innerHeight, (vp && vp.clientHeight) || window.innerHeight),
+    contentHeight: Math.max(se ? se.scrollHeight : 0, window.innerHeight)
+  };
+})()`;
+
+// Scrolls the window to (x, y) at once (no smooth scrolling) and returns where it ended up.
+function scrollPageToJs(x, y) {
+  const left = Number(x) || 0;
+  const top = Number(y) || 0;
+  return `(() => {
+    window.scrollTo({ left: ${left}, top: ${top}, behavior: 'instant' });
+    return { x: window.scrollX || 0, y: window.scrollY || 0 };
+  })()`;
+}
+
+const SHOT_SCROLL_KEY_JS = "Symbol.for('usemac.shotScroll')";
+
+// Finds the element, remembers the scroll position of the window and of every ancestor, and scrolls it into view
+// only when it is not fully on screen: centered when it fits, its top-left corner first when it is bigger than the
+// view. `topBox` is the top-level viewport in this frame's coordinates (null in the top frame). Returns the
+// element's size and the part of it inside this frame's viewport and its scrolling ancestors.
+function elementShotScrollJs(selectorLiteral, topBox) {
+  return `(() => {
+    ${QUERY_DEEP_HELPER_JS}
+    const el = queryOneDeep(document, ${selectorLiteral});
+    if (!el) return null;
+    const de = document.documentElement;
+    const body = document.body;
+    const se = document.scrollingElement || de;
+    const parentOf = (n) => n.assignedSlot || n.parentNode || n.host || null;
+    const ancestors = [];
+    for (let n = parentOf(el); n; n = parentOf(n)) {
+      if (n.nodeType === 1) ancestors.push(n);
+    }
+    globalThis[${SHOT_SCROLL_KEY_JS}] = {
+      x: window.scrollX || 0,
+      y: window.scrollY || 0,
+      els: ancestors.filter((n) => n !== se).map((n) => [n, n.scrollLeft, n.scrollTop])
+    };
+    const vp = document.compatMode === 'BackCompat' && body ? body : de;
+    const rootStyle = getComputedStyle(de);
+    const rootVisible = rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible';
+    const clipBoxes = () => {
+      const boxes = [{ left: 0, top: 0, right: vp.clientWidth || window.innerWidth, bottom: vp.clientHeight || window.innerHeight }];
+      for (const n of ancestors) {
+        if (n === de || n === se || (n === body && rootVisible)) continue;
+        const cs = getComputedStyle(n);
+        if (cs.overflowX === 'visible' && cs.overflowY === 'visible') continue;
+        const r = n.getBoundingClientRect();
+        const left = r.left + n.clientLeft;
+        const top = r.top + n.clientTop;
+        boxes.push({ left, top, right: left + n.clientWidth, bottom: top + n.clientHeight });
+      }
+      return boxes;
+    };
+    const rectOf = () => {
+      const r = el.getBoundingClientRect();
+      const width = Math.max(4, r.width);
+      const height = Math.max(4, r.height);
+      return { left: r.left, top: r.top, right: r.left + width, bottom: r.top + height, width, height };
+    };
+    const inside = (r, b) => r.left >= b.left - 0.5 && r.top >= b.top - 0.5 && r.right <= b.right + 0.5 && r.bottom <= b.bottom + 0.5;
+    const topBox = ${JSON.stringify(topBox || null)};
+    let rect = rectOf();
+    let boxes = clipBoxes();
+    const fitBoxes = topBox ? boxes.concat([topBox]) : boxes;
+    let scrolled = false;
+    if (!fitBoxes.every((b) => inside(rect, b))) {
+      const viewW = Math.min(...fitBoxes.map((b) => b.right - b.left));
+      const viewH = Math.min(...fitBoxes.map((b) => b.bottom - b.top));
+      el.scrollIntoView({
+        block: rect.height > viewH + 0.5 ? 'start' : 'center',
+        inline: rect.width > viewW + 0.5 ? 'start' : 'center',
+        behavior: 'instant'
+      });
+      scrolled = true;
+      rect = rectOf();
+      boxes = clipBoxes();
+    }
+    const vis = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+    for (const b of boxes) {
+      vis.left = Math.max(vis.left, b.left);
+      vis.top = Math.max(vis.top, b.top);
+      vis.right = Math.min(vis.right, b.right);
+      vis.bottom = Math.min(vis.bottom, b.bottom);
+    }
+    return { scrolled, width: rect.width, height: rect.height, visible: vis };
+  })()`;
+}
+
+// Puts back the scroll positions elementShotScrollJs remembered in this frame.
+const RESTORE_SHOT_SCROLL_JS = `(() => {
+  const key = ${SHOT_SCROLL_KEY_JS};
+  const saved = globalThis[key];
+  if (!saved) return false;
+  delete globalThis[key];
+  for (const [n, left, top] of saved.els) {
+    if (n.scrollLeft !== left || n.scrollTop !== top) {
+      try { n.scrollTo({ left, top, behavior: 'instant' }); } catch (_) {}
+    }
+  }
+  if ((window.scrollX || 0) !== saved.x || (window.scrollY || 0) !== saved.y) {
+    window.scrollTo({ left: saved.x, top: saved.y, behavior: 'instant' });
+  }
+  return true;
+})()`;
+
+// The value of a page script, or a throw when it failed.
+async function pageScriptValue(tabId, frameMeta, expression) {
+  const res = await evalInFrame(tabId, frameMeta, expression);
+  if (res?.exceptionDetails) {
+    throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text || "Page script failed");
+  }
+  return res?.result?.value;
+}
+
+async function pageScrollMetrics(tabId) {
+  const page = await pageScriptValue(tabId, null, PAGE_SCROLL_METRICS_JS);
+  if (!page || !(page.viewWidth > 0) || !(page.viewHeight > 0) || !(page.innerWidth > 0) || !(page.innerHeight > 0)) {
+    throw { code: "CAPTURE_FAILED", message: "Couldn't measure the page for the screenshot." };
+  }
+  return page;
+}
+
+// Screenshot of an element (selector or @bID). The element is scrolled into view only when it is not fully on
+// screen, captured with a clip inside the viewport, and every scroll position is put back afterwards. An element
+// bigger than the view (or still partly hidden) comes back as the part on screen, from its top-left corner, with
+// truncated: true.
+async function captureElementScreenshot(tabId, session, req, quality, pixelRatio) {
+  const selLit = req.elementId ? usemacIdSelectorLiteral(req.elementId) : JSON.stringify(String(req.selector));
+  const candidateFrames = [];
+  const mapped = req.elementId ? session.elementFrameMap.get(req.elementId) : null;
+  if (mapped) candidateFrames.push(mapped);
+  if (!mapped || mapped.frameId != null) candidateFrames.push(null);
+  const childFrames = session.lastChildFrames?.length
+    ? session.lastChildFrames
+    : await discoverChildFrames(tabId).catch(() => []);
+  for (const f of childFrames) {
+    if (f !== mapped) candidateFrames.push(f);
+  }
+
+  const before = await pageScriptValue(tabId, null, PAGE_SCROLL_METRICS_JS).catch(() => null);
+  let found = null;
+  try {
+    for (const fMeta of candidateFrames) {
+      const child = Boolean(fMeta && fMeta.frameId != null);
+      let offset = { x: 0, y: 0 };
+      if (child) {
+        const fRect = await computeFrameViewportRect(tabId, fMeta, false);
+        if (!fRect || !fRect.visible) continue;
+        offset = fRect;
+      }
+      const topBox = child && before
+        ? { left: -offset.x, top: -offset.y, right: before.viewWidth - offset.x, bottom: before.viewHeight - offset.y }
+        : null;
+      const info = await pageScriptValue(tabId, fMeta, elementShotScrollJs(selLit, topBox)).catch(() => null);
+      if (!info) continue;
+      found = { fMeta, child, info, offset };
+      if (child && info.scrolled) {
+        // Scrolling inside the frame can move the frame itself; measure it again.
+        const fRect = await computeFrameViewportRect(tabId, fMeta, true);
+        if (fRect?.visible) found.offset = fRect;
+      }
+      break;
+    }
+    if (!found) {
+      throw { code: "ELEMENT_NOT_FOUND", message: `Screenshot target ${req.elementId || req.selector} not found.` };
+    }
+
+    const page = await pageScrollMetrics(tabId);
+    const { info, offset } = found;
+    const left = Math.max(0, info.visible.left + offset.x);
+    const top = Math.max(0, info.visible.top + offset.y);
+    const right = Math.min(page.viewWidth, info.visible.right + offset.x);
+    const bottom = Math.min(page.viewHeight, info.visible.bottom + offset.y);
+    if (right - left < 1 || bottom - top < 1) {
+      throw {
+        code: "ELEMENT_NOT_FOUND",
+        message: `Screenshot target ${req.elementId || req.selector} is not on screen, even after scrolling to it.`
+      };
+    }
+    // Clip coordinates are page coordinates: the viewport rect plus the scroll position.
+    const clip = { x: page.x + left, y: page.y + top, width: right - left, height: bottom - top, scale: 1 };
+    const cap = await withTabIndicatorHidden(tabId, () => sendCDP(tabId, "Page.captureScreenshot", {
+      format: "jpeg",
+      quality,
+      fromSurface: true,
+      clip
+    }));
+    if (!cap?.data) {
+      throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
+    }
+    const shot = jpegShot(cap.data, {
+      width: Math.round(clip.width * pixelRatio),
+      height: Math.round(clip.height * pixelRatio)
+    });
+    shot.truncated = clip.width < info.width - 1 || clip.height < info.height - 1;
+    return shot;
+  } finally {
+    if (found) {
+      await pageScriptValue(tabId, found.fMeta, RESTORE_SHOT_SCROLL_JS).catch(() => {});
+      if (found.child && before) {
+        await pageScriptValue(tabId, null, scrollPageToJs(before.x, before.y)).catch(() => {});
+      }
+    }
+  }
+}
+
+// The stitched image's size for a page of width x height device pixels: inside the agent's box when there is one,
+// and always inside FULL_PAGE_LIMITS.maxSide per side and maxPixels in total.
+function stitchedImageSize(width, height, fitBox) {
+  let size = fitBox ? sizeInBox(width, height, fitBox) : { width: Math.max(1, Math.round(width)), height: Math.max(1, Math.round(height)) };
+  size = sizeInBox(size.width, size.height, { width: FULL_PAGE_LIMITS.maxSide, height: FULL_PAGE_LIMITS.maxSide });
+  const pixels = size.width * size.height;
+  if (pixels > FULL_PAGE_LIMITS.maxPixels) {
+    const k = Math.sqrt(FULL_PAGE_LIMITS.maxPixels / pixels);
+    size = { width: Math.max(1, Math.floor(size.width * k)), height: Math.max(1, Math.floor(size.height * k)) };
+  }
+  return size;
+}
+
+// Full-page screenshot: scrolls the window down one viewport at a time from the top, captures each viewport as it
+// is on screen and draws the captures one under the other, at the tab's width. Fixed and sticky elements show in
+// every capture. A page that fits in one viewport, or that scrolls inside an element instead of the window, is one
+// plain capture. The scroll position is put back afterwards, also when a capture fails.
+async function captureFullPageScreenshot(tabId, quality, fitBox, pixelRatio) {
+  const page = await pageScrollMetrics(tabId);
+  const viewW = page.viewWidth;
+  const viewH = page.viewHeight;
+  const pageH = page.contentHeight;
+  if (pageH <= viewH + 1) {
+    const cap = await withTabIndicatorHidden(tabId, () => sendCDP(tabId, "Page.captureScreenshot", {
+      format: "jpeg",
+      quality,
+      fromSurface: true
+    }));
+    if (!cap?.data) {
+      throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
+    }
+    const shot = jpegShot(cap.data, { width: Math.round(page.innerWidth * pixelRatio), height: Math.round(page.innerHeight * pixelRatio) });
+    shot.truncated = false;
+    return shot;
+  }
+
+  const wanted = Math.min(pageH, FULL_PAGE_LIMITS.maxHeight);
+  let truncated = pageH > wanted;
+  const startedAt = performance.now();
+  let canvas = null;
+  let ctx = null;
+  let scaleX = 1;
+  let scaleY = 1;
+  let covered = 0;
+  let tiles = 0;
+  try {
+    await withTabIndicatorHidden(tabId, async () => {
+      while (covered < wanted - 0.5) {
+        if (tiles >= FULL_PAGE_LIMITS.maxTiles || (tiles > 0 && performance.now() - startedAt > FULL_PAGE_LIMITS.timeBudgetMs)) {
+          truncated = true;
+          break;
+        }
+        const at = await pageScriptValue(tabId, null, scrollPageToJs(0, covered));
+        const scrollTop = Number(at?.y) || 0;
+        if (FULL_PAGE_LIMITS.settleMs > 0) await sleep(FULL_PAGE_LIMITS.settleMs);
+        const cap = await sendCDP(tabId, "Page.captureScreenshot", {
+          format: "jpeg",
+          quality: FULL_PAGE_LIMITS.tileQuality,
+          fromSurface: true
+        });
+        if (!cap?.data) {
+          throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
+        }
+        tiles++;
+        const bitmap = await createImageBitmap(new Blob([base64ToBytes(cap.data)], { type: "image/jpeg" }));
+        try {
+          // Device pixels per CSS px in this capture (the page's pixel ratio, zoom included).
+          const ratioX = bitmap.width / page.innerWidth;
+          const ratioY = bitmap.height / page.innerHeight;
+          if (!canvas) {
+            const size = stitchedImageSize(viewW * ratioX, wanted * ratioY, fitBox);
+            canvas = new OffscreenCanvas(size.width, size.height);
+            ctx = canvas.getContext("2d");
+            ctx.imageSmoothingQuality = "high";
+            // White, not transparent (black in a JPEG), where a capture leaves a gap.
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, size.width, size.height);
+            scaleX = size.width / viewW;
+            scaleY = size.height / wanted;
+          }
+          // This capture shows page rows scrollTop .. scrollTop + viewH; draw the ones not drawn yet. (A page that
+          // snaps its scroll can land past `covered`; those rows stay white.)
+          const from = Math.max(covered, scrollTop);
+          const to = Math.min(scrollTop + viewH, wanted);
+          if (to <= covered + 0.5) break; // the page did not scroll any further: it ends here
+          const destTop = Math.round(from * scaleY);
+          const destBottom = Math.round(to * scaleY);
+          ctx.drawImage(
+            bitmap,
+            0, (from - scrollTop) * ratioY, viewW * ratioX, (to - from) * ratioY,
+            0, destTop, Math.round(viewW * scaleX), destBottom - destTop
+          );
+          covered = to;
+        } finally {
+          bitmap.close?.();
+        }
+      }
+    });
+  } finally {
+    await pageScriptValue(tabId, null, scrollPageToJs(page.x, page.y)).catch(() => {});
+  }
+  if (!canvas || covered < 1) {
+    throw { code: "CAPTURE_FAILED", message: "The full-page screenshot captured nothing." };
+  }
+  const height = Math.round(covered * scaleY);
+  if (height < canvas.height) {
+    // The page ended before it was expected to (it got shorter while it was scrolled): drop the empty rows.
+    const cropped = new OffscreenCanvas(canvas.width, Math.max(1, height));
+    cropped.getContext("2d").drawImage(canvas, 0, 0);
+    canvas = cropped;
+  }
+  const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: quality / 100 });
+  return {
+    data: bytesToBase64(new Uint8Array(await blob.arrayBuffer())),
+    width: canvas.width,
+    height: canvas.height,
+    truncated
+  };
+}
+
 async function handleScreenshotCommand(req, preResolvedTab = null) {
   const start = performance.now();
   const tab = preResolvedTab || await resolveTargetTab(req.tabId);
@@ -4597,110 +4963,37 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
   const session = getOrCreateTabSession(tab.id);
   await refreshLiveViewport(tab.id, session);
   const quality = clamp(Number(req.quality) || 84, 30, 100);
-  const fullPage = req.fullPage === true;
-
-  // outW/outH estimate the image size (CSS px times the page's pixel ratio) for when the JPEG header can't be read.
-  let clip = undefined;
+  const fitBox = screenshotBox(req);
+  // The page's pixel ratio, to estimate the image size when the JPEG header can't be read.
   const viewport = effectiveViewport(session);
   const pixelRatio = viewport.scale || 1;
-  let outW = Math.round(viewport.width * pixelRatio);
-  let outH = Math.round(viewport.height * pixelRatio);
 
+  let shot;
   if (req.elementId || req.selector) {
-    const selLit = req.elementId
-      ? usemacIdSelectorLiteral(req.elementId)
-      : JSON.stringify(String(req.selector));
-    const candidateFrames = [];
-    const mapped = req.elementId ? session.elementFrameMap.get(req.elementId) : null;
-    if (mapped) candidateFrames.push(mapped);
-    if (!mapped || mapped.frameId != null) candidateFrames.push(null);
-    const childFrames = session.lastChildFrames?.length
-      ? session.lastChildFrames
-      : await discoverChildFrames(tab.id).catch(() => []);
-    for (const f of childFrames) {
-      if (f !== mapped) candidateFrames.push(f);
+    shot = await captureElementScreenshot(tab.id, session, req, quality, pixelRatio);
+  } else if (req.fullPage === true) {
+    shot = await captureFullPageScreenshot(tab.id, quality, fitBox, pixelRatio);
+  } else {
+    const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", {
+      format: "jpeg",
+      quality,
+      fromSurface: true
+    }));
+    if (!cap?.data) {
+      throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
     }
-
-    let box = null;
-    for (const fMeta of candidateFrames) {
-      let offsetX = 0;
-      let offsetY = 0;
-      if (fMeta && fMeta.frameId != null) {
-        const fRect = await computeFrameViewportRect(tab.id, fMeta, true);
-        if (!fRect || !fRect.visible) continue;
-        offsetX = fRect.x;
-        offsetY = fRect.y;
-      }
-      const rectEval = await evalInFrame(tab.id, fMeta, `(() => {
-        ${QUERY_DEEP_HELPER_JS}
-        const el = queryOneDeep(document, ${selLit});
-        if (!el) return null;
-        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-        const r = el.getBoundingClientRect();
-        return {
-          left: r.left,
-          top: r.top,
-          width: Math.max(4, r.width),
-          height: Math.max(4, r.height)
-        };
-      })()`).catch(() => null);
-      const localBox = rectEval?.result?.value;
-      if (localBox) {
-        const topScroll = await sendCDP(tab.id, "Runtime.evaluate", {
-          expression: `({ sx: window.scrollX || 0, sy: window.scrollY || 0 })`,
-          returnByValue: true
-        }).catch(() => null);
-        const sx = topScroll?.result?.value?.sx || 0;
-        const sy = topScroll?.result?.value?.sy || 0;
-        box = {
-          x: Math.max(0, localBox.left + offsetX + sx),
-          y: Math.max(0, localBox.top + offsetY + sy),
-          width: localBox.width,
-          height: localBox.height
-        };
-        break;
-      }
-    }
-    if (!box) {
-      throw { code: "ELEMENT_NOT_FOUND", message: `Screenshot target ${req.elementId || req.selector} not found.` };
-    }
-    clip = { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 };
-    outW = Math.round(box.width * pixelRatio);
-    outH = Math.round(box.height * pixelRatio);
-  } else if (fullPage) {
-    const metrics = await sendCDP(tab.id, "Page.getLayoutMetrics").catch(() => null);
-    const cs = metrics?.cssContentSize || metrics?.contentSize;
-    if (cs && cs.width > 0 && cs.height > 0) {
-      const cappedH = Math.min(cs.height, 6000);
-      clip = { x: 0, y: 0, width: cs.width, height: cappedH, scale: 1 };
-      outW = Math.round(cs.width * pixelRatio);
-      outH = Math.round(cappedH * pixelRatio);
-    }
+    shot = jpegShot(cap.data, {
+      width: Math.round(viewport.width * pixelRatio),
+      height: Math.round(viewport.height * pixelRatio)
+    });
   }
 
-  const capParams = {
-    format: "jpeg",
-    quality,
-    fromSurface: true
-  };
-  if (clip) {
-    capParams.clip = clip;
-    capParams.captureBeyondViewport = true;
-  }
-
-  const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", capParams));
-  if (!cap?.data) {
-    throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
-  }
-
-  const capturedSize = jpegSize(cap.data);
-  let shot = { data: cap.data, ...(capturedSize || { width: outW, height: outH }) };
-  const fitBox = screenshotBox(req);
   if (fitBox) {
-    const fitted = capturedSize && sizeInBox(capturedSize.width, capturedSize.height, fitBox);
-    if (!fitted || fitted.width !== capturedSize.width || fitted.height !== capturedSize.height) {
+    const fitted = sizeInBox(shot.width, shot.height, fitBox);
+    if (shot.estimated || fitted.width !== shot.width || fitted.height !== shot.height) {
       // If the image can't be decoded here, the capture is returned as it is, with its own size.
-      shot = (await fitJpegInBox(cap.data, fitBox, quality).catch(() => null)) || shot;
+      const scaled = await fitJpegInBox(shot.data, fitBox, quality).catch(() => null);
+      if (scaled) shot = { ...scaled, truncated: shot.truncated };
     }
   }
 
@@ -4720,6 +5013,8 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
     screenshotWidth: shot.width,
     screenshotHeight: shot.height,
     screenshotLatencyMs: latencyMs,
+    // The image doesn't show all of the element or page: see captureElementScreenshot and captureFullPageScreenshot.
+    screenshotTruncated: shot.truncated === true,
     snapshot: null,
     actionResult: null,
     error: null

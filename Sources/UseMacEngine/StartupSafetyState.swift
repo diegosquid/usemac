@@ -5,13 +5,18 @@ import UseMacProtocol
 /// from what the app saved in UserDefaults. Nothing saved (a new install), or a mode this build doesn't know, starts in
 /// Autonomous with the Emergency stop and Debug capture off.
 public struct StartupSafetyState: Equatable, Sendable {
-    /// The UserDefaults keys the app saves the safety settings under.
+    /// The UserDefaults keys the app saves the safety settings under. Only `SafetySettingsStore` writes them, always
+    /// with a new seal (SafetySeal.swift).
     public enum DefaultsKey {
         public static let policy = "usemac.safety.policy"
         public static let policyBeforePause = "usemac.safety.policyBeforePause"
         public static let killSwitchTripped = "usemac.safety.killSwitchTripped"
-        /// Written only by the app, when the user confirms in Settings → Developer (DebugCapture.swift).
+        /// Turned on only when the user confirms in Settings → Developer (DebugCapture.swift).
         public static let debugCaptureEnabled = "usemac.safety.debugCaptureEnabled"
+        /// The HMAC over the four values above and the save count kept in the Keychain, base64.
+        public static let seal = "usemac.safety.seal"
+        /// The seal format (`SafetySeal.version`) once the values are sealed. Its presence means a seal is expected.
+        public static let sealVersion = "usemac.safety.sealVersion"
     }
 
     public var policy: GovernancePolicy
@@ -57,14 +62,10 @@ public struct StartupSafetyState: Equatable, Sendable {
         )
     }
 
-    /// Reads the saved safety settings from `defaults`.
+    /// Reads the saved safety settings from `defaults` without checking their seal. The app starts from
+    /// `SafetySettingsStore.load()`, which does.
     public static func load(from defaults: UserDefaults) -> StartupSafetyState {
-        resolve(
-            savedPolicy: defaults.string(forKey: DefaultsKey.policy),
-            savedPolicyBeforePause: defaults.string(forKey: DefaultsKey.policyBeforePause),
-            savedKillSwitchTripped: defaults.bool(forKey: DefaultsKey.killSwitchTripped),
-            savedDebugCaptureEnabled: defaults.bool(forKey: DefaultsKey.debugCaptureEnabled)
-        )
+        SafetySettingsStore.readSaved(from: defaults).state
     }
 
     /// Puts `engine` in this state. The mode is always set, so the starting mode never depends on `KillSwitch`'s own

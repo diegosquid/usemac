@@ -113,10 +113,7 @@ public final class AppState: ObservableObject {
         static let autoShowHUDOnActivity = "usemac.hud.autoShowOnActivity"
         static let hudStreamMode = "usemac.hud.streamMode"
         static let hudIsLarge = "usemac.hud.isLarge"
-        static let safetyPolicy = StartupSafetyState.DefaultsKey.policy
-        static let safetyPolicyBeforePause = StartupSafetyState.DefaultsKey.policyBeforePause
-        static let safetyKillSwitchTripped = StartupSafetyState.DefaultsKey.killSwitchTripped
-        static let safetyDebugCaptureEnabled = StartupSafetyState.DefaultsKey.debugCaptureEnabled
+        // The safety settings are saved only by `safetySettings` (SafetySettingsStore), always sealed.
         static let onboardingAgentConnected = "usemac.onboarding.agentConnected"
         static let onboardingDismissed = "usemac.onboarding.dismissed"
         static let setupGuideCompleted = "usemac.onboarding.setupGuideCompleted"
@@ -141,6 +138,10 @@ public final class AppState: ObservableObject {
     @Published public var daemonError: String?
     /// Agents may capture UseMac's own windows (`debug_capture`). Only the user turns it on, in Settings → Developer.
     @Published public private(set) var isDebugCaptureEnabled: Bool
+    /// Set when the safety settings were changed outside UseMac, so it started paused (AppState+SafetySeal.swift).
+    @Published public internal(set) var safetySealNotice: SafetySealNotice?
+    /// Saves the execution mode, pause, Emergency stop and Debug capture, each time with a new seal.
+    let safetySettings: SafetySettingsStore
 
     // Chrome Extension bridge state
     @Published public var isBrowserStreamActive: Bool = false
@@ -229,7 +230,6 @@ public final class AppState: ObservableObject {
     private var captionClearTask: Task<Void, Never>?
     private var virtualAgentFadeTask: Task<Void, Never>?
     private var virtualAgentMoveTask: Task<Void, Never>?
-    private var previewResizeHoldTask: Task<Void, Never>?
     private var activityIndicatorHoldTask: Task<Void, Never>?
     private var hudAutoHideTask: Task<Void, Never>?
     /// Removes finished cards after the completion check. Separate from hudAutoHideTask so another agent's activity,
@@ -253,8 +253,12 @@ public final class AppState: ObservableObject {
         let defaults = UserDefaults.standard
 
         // Nothing saved, or an unknown mode, starts in Autonomous with the Emergency stop off (StartupSafetyStateTests).
-        let startupSafety = StartupSafetyState.load(from: defaults)
+        // Values changed outside UseMac start Paused with Debug capture off (SafetySealTests).
+        let safetySettings = SafetySettingsStore(defaults: defaults, secretStore: SafetySealKeychain())
+        let safetyLaunch = safetySettings.load()
+        let startupSafety = safetyLaunch.state
         startupSafety.apply(to: engineService)
+        engineService.recordSafetySealCheck(safetyLaunch)
 
         let savedCorner = defaults.string(forKey: DefaultsKeys.hudCorner)
             .flatMap(HUDCorner.init(rawValue:)) ?? .bottomTrailing
@@ -269,6 +273,8 @@ public final class AppState: ObservableObject {
         self.engine = engineService
         self.policyBeforePause = startupSafety.policyBeforePause
         self.isDebugCaptureEnabled = startupSafety.debugCaptureEnabled
+        self.safetySettings = safetySettings
+        self.safetySealNotice = SafetySealNotice(safetyLaunch.check)
         self.status = engineService.currentStatus()
         self.pairedApp = engineService.getPairedApp()
         self.runningApps = engineService.listRunningApps()
@@ -834,15 +840,7 @@ public final class AppState: ObservableObject {
     }
 
     private func persistSafetyPolicy(_ policy: GovernancePolicy, previous: GovernancePolicy) {
-        let defaults = UserDefaults.standard
-        if policy != .paused {
-            policyBeforePause = policy
-            defaults.set(policy.rawValue, forKey: DefaultsKeys.safetyPolicyBeforePause)
-        } else if previous != .paused {
-            policyBeforePause = previous
-            defaults.set(previous.rawValue, forKey: DefaultsKeys.safetyPolicyBeforePause)
-        }
-        defaults.set(policy.rawValue, forKey: DefaultsKeys.safetyPolicy)
+        policyBeforePause = safetySettings.savePolicy(policy, previous: previous)
     }
 
     /// Whether the first-run setup guide was finished or closed at least once.
@@ -1021,6 +1019,10 @@ public final class AppState: ObservableObject {
         let previous = engine.getGovernancePolicy()
         persistSafetyPolicy(policy, previous: previous)
         engine.setGovernancePolicy(policy)
+        if policy != .paused {
+            // The user resumed: the notice about the pause after a seal check has done its job.
+            safetySealNotice = nil
+        }
         if policy == .paused {
             isAgentBusy = false
             clearActivityIndicator()
@@ -1043,13 +1045,13 @@ public final class AppState: ObservableObject {
     }
 
     private func setDebugCapture(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: DefaultsKeys.safetyDebugCaptureEnabled)
+        safetySettings.saveDebugCapture(enabled)
         engine.setDebugCaptureEnabled(enabled)
         isDebugCaptureEnabled = enabled
     }
 
     public func setKillSwitch(_ tripped: Bool) {
-        UserDefaults.standard.set(tripped, forKey: DefaultsKeys.safetyKillSwitchTripped)
+        safetySettings.saveKillSwitch(tripped)
         engine.tripKillSwitch(tripped)
         if tripped {
             hudAutoHideTask?.cancel()
@@ -1770,28 +1772,6 @@ public final class AppState: ObservableObject {
         return cached?.allowed
     }
 
-    /// Keeps the HUD size steady while an action batch runs; an aspect change that persists applies once
-    /// the batch ends.
-    private func updatePreviewResizeHold(for item: LiveActivityItem) {
-        switch item.kind {
-        case .actionStart, .actionStep:
-            videoSink.setAspectRatioHold(true)
-            previewResizeHoldTask?.cancel()
-            previewResizeHoldTask = Task { @MainActor [weak self] in
-                // Safety release in case the batch never reports completion.
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-                guard !Task.isCancelled else { return }
-                self?.videoSink.setAspectRatioHold(false)
-            }
-        case .actionComplete, .taskComplete, .policyOrSafety:
-            previewResizeHoldTask?.cancel()
-            previewResizeHoldTask = nil
-            videoSink.setAspectRatioHold(false)
-        case .taskStart, .observe, .screenshot, .highlight:
-            break
-        }
-    }
-
     // MARK: - Live Activity Stream Handling
 
     private func handleLiveActivity(_ item: LiveActivityItem) {
@@ -1802,7 +1782,6 @@ public final class AppState: ObservableObject {
         // Golden rule: the preview only shows UseMac's tabs and apps an agent named. Work on a guessed target (no app
         // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
         guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
-        updatePreviewResizeHold(for: item)
 
         // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
         // cursor or stream target on the large preview of the card the user is watching.

@@ -52,6 +52,10 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 - **Tabs**: without `tabId`, a browser call of a task (see `task_start`) goes to the last tab that task opened or named, so it never lands in another agent's tab. Without a task it uses the last tab UseMac used or a tab in the `UseMac` tab group; if there is none it returns `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
 - **URLs**: `browser_open` and the `openURL`/`navigate` steps accept only `http://`, `https://` and `about:blank`. A URL without a scheme gets `https://`; anything else returns `URL_BLOCKED`.
 - **Tab size**: UseMac never resizes a tab. Pages are observed and captured at the size Chrome gives them, background tabs included, and `@bN` coordinates use that size. On `browser_screenshot`, `viewportWidth`/`viewportHeight` (CLI `--width`/`--height`) are the largest image size: a bigger capture is scaled down to fit, keeping its aspect ratio. `browser_observe` ignores them, and `deviceScaleFactor` (CLI `--scale`) is ignored everywhere.
+- **Element and full-page screenshots** only capture what is on screen, so the page scrolls while they are taken and goes back to where it was afterwards, also when the capture fails.
+  - With `elementId` or `selector` (CLI `--element`/`--selector`), the element is scrolled into view only if it isn't fully visible. An element bigger than the tab's viewport comes back as the part on screen, from its top-left corner, with `truncated: true`.
+  - With `fullPage` (CLI `--full-page`), UseMac scrolls down one viewport at a time from the top and stitches the captures at the tab's width. It stops at 16384 CSS px, 40 captures or 12 s, with `truncated: true`. A very long page comes back at a lower pixel density (at most 16384 px a side). Fixed or sticky headers show in every viewport, and a page that scrolls inside an element instead of the window gives one viewport.
+  - `truncated` is on the `screenshot` result (absent when the image shows everything); MCP and the CLI print a `Truncated:` line.
 
 ---
 
@@ -85,7 +89,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `browser_open` | Open a URL in a new background tab, navigate an existing `tabId`, make a tab active (`activate`), or open a new unfocused window (`newWindow`). |
 | `browser_observe` | Chrome tab DOM (`@b1..@bN` across cross-origin iframes and Shadow DOM), tables, readable text and overlays. |
 | `browser_extract` | Tables and grids (optional horizontal scan), KPIs, text, session downloads, or JavaScript `eval` (`autonomous` mode, or `ask` once the user allows it). |
-| `browser_screenshot` | JPEG of a Chrome tab or element, saved to a private temp folder (pruned after 30 minutes). |
+| `browser_screenshot` | JPEG of a Chrome tab, an element or the whole page (stitched), saved to a private temp folder (pruned after 30 minutes). |
 | `browser_act` | DOM action steps in a Chrome tab, with optional `readOnly`, on-device `verify` or post-action screenshot. |
 | `browser_reload_extension` | Reload the Chrome extension so it runs the code now in its folder, then wait until it has paired again (`profile` optional, `force` to interrupt running commands). Stops every agent's browser work: only when the user asks or nothing else uses Chrome. |
 | `vision_status` | Local vision readiness (Apple Vision OCR plus optional on-device MLX model). |

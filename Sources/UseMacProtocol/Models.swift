@@ -763,6 +763,10 @@ public struct ScreenshotResult: Codable, Equatable, Sendable {
     public var byteCount: Int
     public var latencyMs: Double
     public var base64Data: String?
+    /// Browser screenshots only: true when the image doesn't show all of it. An element bigger than the tab's
+    /// viewport shows the part on screen, from its top-left corner; a full page stops at 16384 CSS px (or 40
+    /// captures, or 12 s). Absent otherwise.
+    public var truncated: Bool?
 
     public init(
         path: String,
@@ -771,7 +775,8 @@ public struct ScreenshotResult: Codable, Equatable, Sendable {
         height: Int,
         byteCount: Int,
         latencyMs: Double,
-        base64Data: String? = nil
+        base64Data: String? = nil,
+        truncated: Bool? = nil
     ) {
         self.path = path
         self.mimeType = mimeType
@@ -780,6 +785,14 @@ public struct ScreenshotResult: Codable, Equatable, Sendable {
         self.byteCount = byteCount
         self.latencyMs = latencyMs
         self.base64Data = base64Data
+        self.truncated = truncated
+    }
+
+    /// The line the MCP tool and the CLI print for a truncated browser screenshot of an element or a full page.
+    public static func truncatedNote(element: Bool) -> String {
+        element
+            ? "Truncated: the element doesn't fit in the tab's viewport, so the image shows only the part on screen, from its top-left corner."
+            : "Truncated: the page is longer than a full-page screenshot covers (16384 CSS px, 40 captures or 12 s), so the image shows only its top part."
     }
 }
 

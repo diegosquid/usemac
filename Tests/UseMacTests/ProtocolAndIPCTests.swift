@@ -850,6 +850,8 @@ final class ProtocolAndIPCTests: XCTestCase {
                     resp["screenshotWidth"] = 2880
                     resp["screenshotHeight"] = 1800
                     resp["screenshotLatencyMs"] = 19.2
+                    // A long page: the extension cut the full-page shot.
+                    resp["screenshotTruncated"] = obj["fullPage"] as? Bool == true
                 case "observe":
                     resp["tabId"] = 77
                     resp["url"] = "https://adsmanager.facebook.com/adsmanager/manage/campaigns"
@@ -951,6 +953,25 @@ final class ProtocolAndIPCTests: XCTestCase {
         XCTAssertEqual(shotContent.count, 2)
         XCTAssertEqual(shotContent[1]["type"] as? String, "image")
         XCTAssertEqual(shotContent[1]["data"] as? String, mockB64)
+        XCTAssertFalse((shotContent[0]["text"] as? String ?? "").contains("Truncated"))
+
+        // 6b. A cut full-page shot says so: `truncated` on the socket, a "Truncated:" line in MCP
+        let fullShot = await service.handle(RPCRequest(
+            method: .browserScreenshot,
+            browserScreenshot: BrowserScreenshotParams(profile: "Diego", tabId: 77, fullPage: true)
+        ))
+        XCTAssertTrue(fullShot.ok, fullShot.error?.message ?? "")
+        XCTAssertEqual(fullShot.screenshot?.truncated, true)
+        let plainShot = await service.handle(RPCRequest(
+            method: .browserScreenshot,
+            browserScreenshot: BrowserScreenshotParams(profile: "Diego", tabId: 77)
+        ))
+        XCTAssertNil(plainShot.screenshot?.truncated, "absent when the image shows everything")
+        let fullShotCall = #"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"usemac_browser_screenshot","arguments":{"profile":"Diego","tabId":77,"fullPage":true}}}"#
+        let fullShotRaw = await mcp.processLine(fullShotCall)
+        let fullShotObj = try parseJSON(try XCTUnwrap(fullShotRaw))
+        let fullShotText = try XCTUnwrap(((fullShotObj["result"] as? [String: Any])?["content"] as? [[String: Any]])?.first?["text"] as? String)
+        XCTAssertTrue(fullShotText.contains(ScreenshotResult.truncatedNote(element: false)), fullShotText)
 
         // 7. Per-request readOnly=true blocks click, allows hover
         let blockedClickRes = await service.handle(RPCRequest(

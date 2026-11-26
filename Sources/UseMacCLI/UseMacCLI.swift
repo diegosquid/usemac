@@ -1374,6 +1374,9 @@ struct UseMacCLI {
             throw CLIError.rpcFailure(code: "empty_screenshot", message: "Response missing ScreenshotResult.")
         }
         print(String(format: "[%@] Browser screenshot: %@ (%dx%d, %d bytes, %.1f ms)", mode.rawValue, shot.path, shot.width, shot.height, shot.byteCount, rttMs))
+        if shot.truncated == true {
+            print(ScreenshotResult.truncatedNote(element: params.elementId != nil || params.selector != nil))
+        }
         return 0
     }
 
@@ -2573,14 +2576,14 @@ struct UseMacCLI {
                 usage: ["usemac browser screenshot [--profile <name>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--quality <n>]"],
                 summary: "Capture a JPEG of a tab at its real size, or crop it around a selector or @bID. UseMac never resizes the tab. Prefer observe/extract or on-device vision first.",
                 flags: [
-                    ("--selector <css> | --element <@bID>", "Crop around this element"),
-                    ("--full-page", "Capture the full scrollable height (capped at 6000 px)"),
+                    ("--selector <css> | --element <@bID>", "Capture this element, scrolled into view if needed; one bigger than the tab shows its top-left part (truncated)"),
+                    ("--full-page", "Scroll through the page and stitch it at the tab's width, up to 16384 CSS px (longer pages are truncated)"),
                     ("--width/--height <px>", "Scale the image down to fit this box, keeping its aspect ratio (one is enough); the page is not resized"),
                     ("--scale <n>", "Ignored (still accepted, for old scripts)"),
                     ("--quality <n>", "JPEG quality 30–100 (default 84)")
                 ],
                 examples: ["usemac browser screenshot --tab 123 --selector \"#chart\"", "usemac browser screenshot --tab 123 --width 1280 --height 800"],
-                json: "ScreenshotResult {path, mimeType, width, height, byteCount, latencyMs}"
+                json: "ScreenshotResult {path, mimeType, width, height, byteCount, latencyMs, truncated}"
             )
         case "browser act":
             return CommandHelp(

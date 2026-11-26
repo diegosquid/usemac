@@ -28,6 +28,33 @@ Include:
 Fixes go into the latest stable release and the latest beta. Older versions don't get fixes; update with
 **Check for Updates…** in UseMac's menu bar menu.
 
+## Saved safety settings
+
+UseMac saves the execution mode, the mode Resume goes back to, the Emergency stop and Debug capture in its
+preferences (`app.usemac`), which any process running as you can edit. So UseMac seals them: an HMAC-SHA256 over
+the four values, with a 32-byte key in your login Keychain (the item `app.usemac.safety-seal`). UseMac created the
+item, so other apps, the `security` tool included, can't read the key unless you allow it in a macOS prompt. Every
+change UseMac saves gets a new seal, and a count in the Keychain item goes up, so an older copy of the settings and
+its seal doesn't match either.
+
+At launch:
+
+- **The seal matches:** UseMac uses the saved settings.
+- **The settings were changed outside UseMac,** or the seal, the Keychain item or the marker that sealing is on is
+  missing, or the Keychain can't be read: UseMac starts **Paused** with Debug capture off. The Emergency stop stays
+  on if it was saved on. UseMac records it in History and says so in the menu bar menu and **Settings → Safety**.
+  Only you resume, and Resume goes back to the saved mode, so check it first.
+- **No seal and no Keychain item** (a new install, or the first launch of a version that seals): UseMac seals the
+  saved settings, with Debug capture off.
+
+Known limits:
+
+- Deleting both the marker in the preferences and the Keychain item looks like a new install, so the saved mode and
+  Emergency stop are used again (Debug capture still starts off). The Keychain stops other apps from reading the
+  key, but may not stop them from deleting the item.
+- Putting back older copies of both the preferences and the whole login keychain brings back the older settings.
+- If macOS asks whether another app may use `app.usemac.safety-seal`, deny it unless you started that yourself.
+
 ## Scope
 
 In scope, for example:
