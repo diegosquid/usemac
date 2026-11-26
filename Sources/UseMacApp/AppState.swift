@@ -163,7 +163,14 @@ public final class AppState: ObservableObject {
     // Live Activity HUD & PiP Stream state
     @Published public var liveActivities: [LiveActivityItem] = []
     @Published public var hudDeck: [HUDSessionCard] = [] {
-        didSet { deckDidChange(from: oldValue) }
+        didSet {
+            // Each card id at most once: the preview draws cards by id, and two cards under one id put a card from
+            // the back of the deck on top of the front one. Assigning here doesn't run didSet again.
+            if PreviewDeckFocus.hasDuplicateIds(hudDeck.map(\.id)) {
+                hudDeck = PreviewDeckFocus.firstOfEachId(hudDeck, id: \.id)
+            }
+            deckDidChange(from: oldValue)
+        }
     }
     /// Palette slot of each task in the deck (PreviewTaskColors), by `PreviewTaskColors.key`.
     @Published public internal(set) var hudTaskColorSlots: [String: Int] = [:]
@@ -703,13 +710,17 @@ public final class AppState: ObservableObject {
         profileName: String,
         title: String
     ) {
-        let cardId = browserCardIdForTab(tabId) ?? Self.browserCardId(profile: profileName, tabId: tabId)
+        let shownCardId = browserCardIdForTab(tabId)
+        let cardId = shownCardId ?? Self.browserCardId(profile: profileName, tabId: tabId)
         let displayTitle = title.isEmpty ? "Chrome (\(profileName))" : title
         let bounds = ScreenRect(x: 0, y: 0, width: Double(width), height: Double(height))
         let aspect = width > 0 && height > 0 ? min(max(CGFloat(width) / CGFloat(height), 0.62), 2.15) : (268.0 / 172.0)
 
-        // Attach to pending placeholder card for same profile without tabId yet, if any
+        // Attach to a pending placeholder card for the same profile without a tab yet, if any, but only when no card
+        // shows this tab already: with several tasks, that placeholder is another task's, and taking it made a
+        // second card under this tab's id.
         if let tabId,
+           shownCardId == nil,
            let pendingIdx = hudDeck.firstIndex(where: { $0.isBrowser && $0.browserTabId == nil && $0.browserProfile?.caseInsensitiveCompare(profileName) == .orderedSame }) {
             let existing = hudDeck[pendingIdx]
             hudDeck[pendingIdx] = HUDSessionCard(
@@ -1357,6 +1368,7 @@ public final class AppState: ObservableObject {
             }
         } else if isBrowser,
                   let browserTabId,
+                  !hudDeck.contains(where: { $0.isBrowser && $0.browserTabId == browserTabId }),
                   let pendingIdx = hudDeck.firstIndex(where: { card in
                       card.isBrowser && card.browserTabId == nil && (
                           browserProfile == nil ||

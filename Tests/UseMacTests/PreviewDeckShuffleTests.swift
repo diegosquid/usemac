@@ -128,4 +128,14 @@ final class PreviewTaskColorsTests: XCTestCase {
         XCTAssertEqual(slots.count, keys.count)
         XCTAssertTrue(slots.values.allSatisfy { (0..<PreviewTaskColors.paletteSize).contains($0) })
     }
+
+    // MARK: One card per id
+
+    func testDeckKeepsTheFirstCardOfEachId() {
+        let ids = ["browser:Diego:1", "browser:Diego:1", "browser:Diego:2", "browser:Diego:1"]
+        XCTAssertTrue(PreviewDeckFocus.hasDuplicateIds(ids))
+        XCTAssertEqual(PreviewDeckFocus.firstOfEachId(ids, id: { $0 }), ["browser:Diego:1", "browser:Diego:2"])
+        XCTAssertFalse(PreviewDeckFocus.hasDuplicateIds(["a", "b"]))
+        XCTAssertEqual(PreviewDeckFocus.firstOfEachId([String](), id: { $0 }), [])
+    }
 }

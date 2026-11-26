@@ -8,6 +8,18 @@ import Foundation
 /// when the deck shuffles: after `shuffleDwell` in front, the next card behind with new work comes forward
 /// (`shuffleTarget`). Activity on the other cards updates their own card and nothing else.
 public enum PreviewDeckFocus {
+    /// Whether a deck holds some card id more than once.
+    public static func hasDuplicateIds(_ ids: [String]) -> Bool {
+        Set(ids).count != ids.count
+    }
+
+    /// The deck with only the first card of each id, in order. The preview draws cards by id, so a deck must never
+    /// hold two cards under one id.
+    public static func firstOfEachId<Card>(_ cards: [Card], id: (Card) -> String) -> [Card] {
+        var seen = Set<String>()
+        return cards.filter { seen.insert(id($0)).inserted }
+    }
+
     /// How long a card stays in front at least before the deck shuffles to another one.
     public static let shuffleDwell: TimeInterval = 5
 
