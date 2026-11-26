@@ -22,6 +22,8 @@ Use **UseMac** to inspect and control macOS desktop applications and Google Chro
 ### Option A — Direct Unix Socket NDJSON (Default)
 Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u)/usemac.sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
 
+Methods: `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`.
+
 - **Status**:
   ```json
   {"id":"1","method":"status"}
@@ -246,6 +248,16 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 | `USER_ACTIVE` | A foreground burst was refused because the user is typing or using the mouse. | Wait and retry later; never force it. |
 | `RESTRICTED_PAGE` | The Chrome extension can't script this page (Chrome Web Store, `chrome://`). | Use the hybrid flow (section 2, item 10). |
 | `CAPTURE_TOO_SMALL` | The captured window is too small to trust (a helper strip or hidden window). | Don't answer from that image. Observe the app, or bring up the right window and retry. |
+| `APP_NOT_FOUND` | No running app matches `app`, or a step that needs a target app has none. | Check the name with `list_apps`, or launch the app with `open -g -a "<App>"`, then observe. |
+| `PERMISSION_DENIED` | Screen Recording is not granted, so no screenshot was taken. | Ask the user to allow it in **UseMac → Settings → General → Permissions**. |
+| `CAPTURE_FAILED` | The screenshot couldn't be taken. | Retry once. If it fails again, observe instead. |
+| `UPLOAD_FAILED` | A native `uploadFile` step found the file but couldn't confirm it in the open panel. | Rerun that step with `"foreground": true`. |
+| `IMAGE_PATH_BLOCKED` | `vision_query.imagePath` is outside the user's temp folder and `/tmp`. | Save the image there, or pass `app` or `tabId` to let `vision_query` capture it. |
+| `NO_IMAGE_SOURCE` | `vision_query` had nothing to look at: no `imagePath`, screenshot or browser frame. | Pass `imagePath`, `app` or `tabId`. |
+| `EVAL_ERROR` | The `browser_extract` `eval` expression threw in the page. | Fix the expression. The message has the page's error. |
+| `WINDOW_ERROR` | Chrome couldn't create the UseMac window for `newWindow`. | Retry once, or open a background tab without `newWindow`. |
+| `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND` | The request is malformed: a missing payload or field, invalid JSON, a bad CLI flag or argument, or a command the Chrome extension doesn't know. | Fix the request from the message (`"$USEMAC" help <command>` for the CLI). `UNKNOWN_COMMAND` usually means the extension is out of date: tell the user. |
+| `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED` | An unexpected failure in UseMac or the Chrome extension, with no more specific code. | Read the message, check `status` (or `browser_status`), and retry at most once. |
 
 ---
 

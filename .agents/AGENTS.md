@@ -375,6 +375,16 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 | `EXTENSION_TIMEOUT` | The extension didn't answer in time; running `browser_act` batches are cancelled. | Check `browser_status` or `browser_observe` before retrying. |
 | `NO_USEMAC_TAB` | No `tabId` and no UseMac tab to fall back to. | Open one with `browser_open`, or pass a `tabId` from `browser_tabs`. |
 | `CANCELLED` | The Chrome batch was cancelled (Kill Switch or timeout). | Stop, check `status`, and tell the user before doing more. |
+| `APP_NOT_FOUND` | No running app matches `app`, or a step that needs a target app has none. | Check the name with `list_apps`, or launch the app with `open -g -a "<App>"`, then observe. |
+| `PERMISSION_DENIED` | Screen Recording is not granted, so no screenshot was taken. | Ask the user to allow it in **UseMac → Settings → General → Permissions**. |
+| `CAPTURE_FAILED` | The screenshot couldn't be taken. | Retry once. If it fails again, observe instead. |
+| `UPLOAD_FAILED` | A native `uploadFile` step found the file but couldn't confirm it in the open panel. | Rerun that step with `foreground: true`. |
+| `IMAGE_PATH_BLOCKED` | `vision_query.imagePath` is outside the user's temp folder and `/tmp`. | Save the image there, or pass `app` or `tabId` to let `vision_query` capture it. |
+| `NO_IMAGE_SOURCE` | `vision_query` had nothing to look at: no `imagePath`, screenshot or browser frame. | Pass `imagePath`, `app` or `tabId`. |
+| `EVAL_ERROR` | The `browser_extract` `eval` expression threw in the page. | Fix the expression. The message has the page's error. |
+| `WINDOW_ERROR` | Chrome couldn't create the UseMac window for `newWindow`. | Retry once, or open a background tab without `newWindow`. |
+| `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND` | The request is malformed: a missing payload or field, invalid JSON, a bad CLI flag or argument, or a command the Chrome extension doesn't know. | Fix the request from the message (`usemac help <command>` for the CLI). `UNKNOWN_COMMAND` usually means the extension is out of date: tell the user. |
+| `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED` | An unexpected failure in UseMac or the Chrome extension, with no more specific code. | Read the message, check `status` (or `browser_status`), and retry at most once. |
 
 ---
 

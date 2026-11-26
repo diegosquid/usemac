@@ -1,6 +1,6 @@
 import Foundation
 
-public enum RPCMethod: String, Codable, Sendable {
+public enum RPCMethod: String, Codable, Sendable, CaseIterable {
     case ping
     case status
     case listApps = "list_apps"
