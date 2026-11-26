@@ -32,8 +32,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 APP_DIR="$ROOT_DIR/dist/UseMac.app"
-APP_VERSION="${USEMAC_VERSION:-0.7.0-beta.1}"
-APP_BUILD="${USEMAC_BUILD_NUMBER:-63}"
+APP_VERSION="${USEMAC_VERSION:-0.8.0-beta.1}"
+APP_BUILD="${USEMAC_BUILD_NUMBER:-64}"
 APPCAST_URL="${USEMAC_APPCAST_URL:-https://usemac.app/appcast.xml}"
 SPARKLE_PUBLIC_KEY="${USEMAC_SPARKLE_PUBLIC_KEY:-}"
 # The EdDSA public key that update signatures are checked against (the private key stays in the
