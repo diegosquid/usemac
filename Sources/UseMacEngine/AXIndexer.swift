@@ -72,6 +72,8 @@ public final class AXIndexer: @unchecked Sendable {
         /// Window the snapshot was taken from (for the stale-snapshot check).
         var windowId: UInt32?
         var windowTitle: String?
+        /// Web areas and scroll areas of the snapshot, with the range of `snapshot.elements` inside each.
+        var scrollContainers: [ScrollContainer] = []
     }
 
     /// Stable ids: the same AX element keeps its `@eN` id for the lifetime of the app's cache.
@@ -105,6 +107,7 @@ public final class AXIndexer: @unchecked Sendable {
         var focusedElementId: String?
         var visibleCount: Int = 0
         var offscreenCount: Int = 0
+        var scrollContainers: [ScrollContainer] = []
     }
 
     public struct SnapshotContext: Equatable, Sendable {
@@ -321,7 +324,8 @@ public final class AXIndexer: @unchecked Sendable {
             dirty: false,
             lastTimestampMs: completedMs,
             windowId: rootWindowId,
-            windowTitle: rootTitle
+            windowTitle: rootTitle,
+            scrollContainers: ctx.scrollContainers
         )
         lock.unlock()
 
@@ -442,6 +446,15 @@ public final class AXIndexer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return cache[pid]?.snapshot.elements ?? []
+    }
+
+    /// Elements from the last observe of `pid` with the web areas and scroll areas they sit in (indexes into
+    /// `nodes`), read together so they always match.
+    public func latestScrollLayout(pid: Int32) -> (nodes: [ElementNode], containers: [ScrollContainer]) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = cache[pid] else { return ([], []) }
+        return (state.snapshot.elements, state.scrollContainers)
     }
 
     /// Window and title the last observe of `pid` was taken from.
@@ -576,8 +589,10 @@ public final class AXIndexer: @unchecked Sendable {
             && (value == nil || value?.isEmpty == true)
             && !actions.contains("AXPress")
 
+        var knownFrame: ScreenRect?
         if !isEmptyLayoutContainer {
             let frame = copyFrame(element)
+            knownFrame = frame
             let offscreen = Self.isOffscreen(frame: frame, viewport: context.viewport)
             let meaningful = title != nil || value != nil
                 || Self.interactiveRoles.contains(role)
@@ -613,6 +628,7 @@ public final class AXIndexer: @unchecked Sendable {
             return
         }
 
+        let descendantsStart = context.elements.count
         if let children = copyElementArrayAttribute(element, attribute: kAXChildrenAttribute) {
             for child in children {
                 traverse(element: child, depth: depth + 1, context: &context)
@@ -620,6 +636,15 @@ public final class AXIndexer: @unchecked Sendable {
                     break
                 }
             }
+        }
+        if ScrollFallback.containerRoles.contains(role) {
+            // Recorded even when the container itself is flattened out of the list (an unlabeled scroll area).
+            context.scrollContainers.append(ScrollContainer(
+                role: role,
+                frame: knownFrame ?? copyFrame(element),
+                descendants: descendantsStart..<context.elements.count,
+                depth: depth
+            ))
         }
     }
 

@@ -375,6 +375,14 @@ Before the first step, if a step uses an `elementId` from your last observe and 
 
 Steps that need real keyboard or mouse input only run when the target app is in front. Otherwise they fail with `TARGET_NOT_FRONTMOST` and nothing is sent to the wrong app.
 
+The window counts too. Real mouse input only goes out when a window of the target app is on top at that point. With `window` (the pin), it must be that window, and real keys go out only when it is the app's focused window. This matters for a window UseMac works in that sits behind the user's own window of the same app, or under another app's window:
+
+- `scroll` and `hover` go to that window in the background.
+- Clicks at coordinates, `type` and `pressKey` fail with `TARGET_NOT_FRONTMOST`.
+- `setValue` sets the value without focusing the field, so that window never comes forward.
+
+A burst brings the app forward, not a particular window, so steps on a window that stays covered fail the same way.
+
 1. Try the background first: `click`/`setValue`/`axAction` on an `elementId` or `match`.
 2. Only when a step fails with `TARGET_NOT_FRONTMOST`, or keeps returning `effect: none`, rerun just the steps that need it with `"foreground": true` (CLI `--foreground`). UseMac brings the app forward, runs the steps, then gives focus back to the previous app and restores the cursor.
 3. A burst is refused with `USER_ACTIVE` when the user used the keyboard or mouse in the last 1.5 s. Wait and retry later. Never loop on it or force focus while the user is typing. If the user switches apps mid-burst, the remaining steps fail with `TARGET_NOT_FRONTMOST`.
@@ -414,7 +422,7 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 | `STALE_SNAPSHOT` | The window changed since your last observe (or `expectWindowTitle` didn't match). Nothing ran. | Observe again and use the new ids, or use `match`. |
 | `ELEMENT_NOT_FOUND` | No element matched `match` (or the id is gone). | Observe again (raise `maxDepth`/`maxElements`, scroll the list), loosen the match, or check `index`. |
 | `WAIT_TIMEOUT` | `waitFor` ran out of time. | Observe to see the current state before retrying. |
-| `TARGET_NOT_FRONTMOST` | A step needed real input but the app was not in front. Nothing was sent. | Use a background step, or rerun those steps with `foreground: true`. |
+| `TARGET_NOT_FRONTMOST` | A step needed real input but the app was not in front, or another window was on top of the target window (for keys: the app's focused window was another one). Nothing was sent. | Use a background step (`setValue`, `axAction`, `scrollIntoView`), or rerun those steps with `foreground: true` when the app was not in front. |
 | `USER_ACTIVE` | A foreground burst was refused because the user is typing or using the mouse. | Wait and retry later; never force it. |
 | `TARGET_BUSY` | Another running task is working in this window or tab (it leased it with its first action). Nothing ran. | Wait and retry once it finishes, or work in your own window or tab. Observe and screenshot still work. |
 | `RESTRICTED_PAGE` | The Chrome extension can't script this page (Chrome Web Store, `chrome://`). | Use the hybrid flow above. |
