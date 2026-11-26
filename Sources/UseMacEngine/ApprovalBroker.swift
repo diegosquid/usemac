@@ -258,12 +258,15 @@ public final class ApprovalBroker: @unchecked Sendable {
             while true {
                 try? await Task.sleep(nanoseconds: pollNs)
                 guard let self else { return }
-                guard let (index, deadline) = self.position(of: id) else { return }
+                guard let (index, deadline, headDeadline) = self.position(of: id) else { return }
                 if let reason = cancelReason() {
                     self.finish(id: id, outcome: .cancelled(reason: reason))
                     return
                 }
-                if Date() >= deadline {
+                let now = Date()
+                // A queued request times out only while the prompt on screen is still live (it got extra time);
+                // when that one is about to time out too, wait for it, then get the time on screen.
+                if now >= deadline, index == 0 || headDeadline > now {
                     let waited = max(timeout, Date().timeIntervalSince(arrivedAt))
                     self.finish(id: id, outcome: .timedOut(seconds: Int(waited.rounded()), whileQueued: index > 0))
                     return
@@ -272,10 +275,10 @@ public final class ApprovalBroker: @unchecked Sendable {
         }
     }
 
-    private func position(of id: String) -> (index: Int, deadline: Date)? {
+    private func position(of id: String) -> (index: Int, deadline: Date, headDeadline: Date)? {
         lock.lock(); defer { lock.unlock() }
         guard let index = entries.firstIndex(where: { $0.prompt.id == id }) else { return nil }
-        return (index, entries[index].prompt.deadline)
+        return (index, entries[index].prompt.deadline, entries[0].prompt.deadline)
     }
 
     @discardableResult

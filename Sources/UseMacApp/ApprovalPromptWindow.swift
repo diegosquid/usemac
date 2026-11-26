@@ -133,6 +133,10 @@ final class ApprovalPromptController {
         let fitting = hostingView.fittingSize
         let size = NSSize(width: width, height: max(120, ceil(fitting.height)))
         let frame = dockedFrame(size: size)
+        if panel.isVisible, panel.frame != frame {
+            // The buttons moved (the HUD opened or moved): re-arm them so a click aimed at the old spot never counts.
+            model.armedAt = max(model.armedAt, ProcessInfo.processInfo.systemUptime + ApprovalInputCheck.armingDelaySeconds)
+        }
         panel.setFrame(frame, display: true)
         appState.engine.setApprovalPromptFrame(Self.globalTopLeftRect(frame))
     }
