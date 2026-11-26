@@ -38,6 +38,16 @@ public enum UseMacDefaults {
         }
         return nil
     }
+
+    /// The extension's Chrome Web Store page, or nil while no valid store ID (32 letters a–p) is set.
+    public static var chromeWebStoreListingURL: URL? {
+        guard let id = chromeWebStoreExtensionId?.lowercased(),
+              id.unicodeScalars.count == 32,
+              id.unicodeScalars.allSatisfy({ $0.value >= 97 && $0.value <= 112 }) else {
+            return nil
+        }
+        return URL(string: "https://chromewebstore.google.com/detail/\(id)")
+    }
 }
 
 public struct ScreenRect: Codable, Equatable, Sendable {
@@ -810,6 +820,19 @@ public struct BrowserProfileStatus: Codable, Equatable, Identifiable, Sendable {
     public var streamingTabId: Int?
     public var streamingUrl: String?
     public var streamingTitle: String?
+    /// The extension's Chrome ID (`chrome.runtime.id`; for extensions that predate it, the WebSocket Origin).
+    public var extensionId: String?
+    /// Where Chrome loads the extension from: `app` (UseMac.app's own folder), `web_store`, `other_folder`
+    /// (unpacked from another folder, so app updates never reach it) or `unknown`.
+    public var extensionSource: String?
+    /// The version of the extension copy inside UseMac.app.
+    public var bundledExtensionVersion: String?
+    /// True when Chrome runs an older extension than the app ships. Reload it (`browser_reload_extension`).
+    public var extensionOutdated: Bool?
+    /// The extension accepts `browser_reload_extension`. Older ones must be reloaded once in chrome://extensions.
+    public var extensionReloadable: Bool?
+    /// One line for people and agents when the extension needs attention (outdated, or loaded from another folder).
+    public var extensionNote: String?
 
     public init(
         id: String,
@@ -819,7 +842,13 @@ public struct BrowserProfileStatus: Codable, Equatable, Identifiable, Sendable {
         tabCount: Int,
         streamingTabId: Int? = nil,
         streamingUrl: String? = nil,
-        streamingTitle: String? = nil
+        streamingTitle: String? = nil,
+        extensionId: String? = nil,
+        extensionSource: String? = nil,
+        bundledExtensionVersion: String? = nil,
+        extensionOutdated: Bool? = nil,
+        extensionReloadable: Bool? = nil,
+        extensionNote: String? = nil
     ) {
         self.id = id
         self.profileName = profileName
@@ -829,6 +858,24 @@ public struct BrowserProfileStatus: Codable, Equatable, Identifiable, Sendable {
         self.streamingTabId = streamingTabId
         self.streamingUrl = streamingUrl
         self.streamingTitle = streamingTitle
+        self.extensionId = extensionId
+        self.extensionSource = extensionSource
+        self.bundledExtensionVersion = bundledExtensionVersion
+        self.extensionOutdated = extensionOutdated
+        self.extensionReloadable = extensionReloadable
+        self.extensionNote = extensionNote
+    }
+}
+
+public struct BrowserReloadExtensionParams: Codable, Equatable, Sendable {
+    /// The Chrome profile to reload (matched like other browser methods). Omit to reload every connected profile.
+    public var profile: String?
+    /// Reload even while agents still have Chrome commands running in that profile (they fail).
+    public var force: Bool?
+
+    public init(profile: String? = nil, force: Bool? = nil) {
+        self.profile = profile
+        self.force = force
     }
 }
 
@@ -1414,6 +1461,8 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
     public var summary: String
     public var latencyMs: Double
     public var success: Bool
+    /// The task the request belonged to (from `task_start`), when UseMac could tell.
+    public var taskId: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -1422,7 +1471,8 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
         targetApp: String? = nil,
         summary: String,
         latencyMs: Double,
-        success: Bool
+        success: Bool,
+        taskId: String? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1431,6 +1481,7 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
         self.summary = summary
         self.latencyMs = latencyMs
         self.success = success
+        self.taskId = taskId
     }
 }
 
@@ -1477,19 +1528,23 @@ public struct TaskStartParams: Codable, Equatable, Sendable {
     public var summary: String?
     /// Optional id for the task; UseMac makes one when omitted. The response's `taskId` is the one to pass on.
     public var taskId: String?
+    /// Optional agent or client name shown on the task's preview cards (MCP: the client's name by default).
+    public var agent: String?
 
     public init(
         profile: String? = nil,
         tabId: Int? = nil,
         app: String? = nil,
         summary: String? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        agent: String? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
         self.app = app
         self.summary = summary
         self.taskId = taskId
+        self.agent = agent
     }
 }
 
@@ -1564,6 +1619,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     /// On `taskComplete`: the tabs of the task that finished, so the preview marks only their cards as done. Nil when
     /// UseMac could not tell which task finished and no other task is running (every card is that task's).
     public var taskTabIds: [Int]?
+    /// The agent or client of the task the item belongs to, shown on its preview card.
+    public var agentName: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -1585,7 +1642,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         browserTabId: Int? = nil,
         browserProfile: String? = nil,
         targetGuessed: Bool? = nil,
-        taskTabIds: [Int]? = nil
+        taskTabIds: [Int]? = nil,
+        agentName: String? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1607,6 +1665,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.browserProfile = browserProfile
         self.targetGuessed = targetGuessed
         self.taskTabIds = taskTabIds
+        self.agentName = agentName
     }
 }
 

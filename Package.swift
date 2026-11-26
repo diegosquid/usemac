@@ -11,7 +11,9 @@ let package = Package(
         .library(name: "UseMacEngine", targets: ["UseMacEngine"]),
         .library(name: "UseMacIPC", targets: ["UseMacIPC"]),
         .executable(name: "UseMac", targets: ["UseMacApp"]),
-        .executable(name: "usemac", targets: ["UseMacCLI"])
+        // Not "usemac": on a case-insensitive volume it would overwrite the app's "UseMac" binary in
+        // .build/<config>/. The bundle installs it as Contents/Helpers/usemac.
+        .executable(name: "usemac-cli", targets: ["UseMacCLI"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.4")

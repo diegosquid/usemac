@@ -1,5 +1,6 @@
 import XCTest
 @testable import UseMacEngine
+@testable import UseMacProtocol
 
 final class TaskTabRegistryTests: XCTestCase {
     private let t0 = Date(timeIntervalSince1970: 1_000_000)
@@ -80,9 +81,22 @@ final class TaskTabRegistryTests: XCTestCase {
         XCTAssertEqual(registry.start(taskId: "  mine ", now: t0), "mine")
         let other = registry.start(now: t0)
         XCTAssertTrue(other.hasPrefix("task-"))
-        // An id that is not running falls back to the other rules (here: two tasks, nothing named).
+        // An id that is not running belongs to no task, even when its tab or a single running task would say otherwise.
         XCTAssertNil(registry.resolve(taskId: "gone", tabId: nil, now: t0))
         XCTAssertEqual(registry.resolve(taskId: "mine", tabId: nil, now: t0), "mine")
+    }
+
+    func testAFinishedTasksIdNeverFinishesTheOnlyOtherTask() {
+        // Agent B finished (or expired) and calls done --task B again while only A runs: A must keep its tabs.
+        let registry = TaskTabRegistry()
+        let a = registry.start(now: t0)
+        registry.recordOpenedTab(1, taskId: a, now: t0)
+
+        let done = registry.complete(taskId: "task-b", tabId: nil, now: t0)
+        XCTAssertNil(done.taskId)
+        XCTAssertEqual(done.protectedTabIds, [1], "A's tab stays open")
+        XCTAssertEqual(done.ownTabIds, [])
+        XCTAssertEqual(registry.runningTaskCount, 1)
     }
 
     func testIdleTasksStopProtectingTheirTabs() {

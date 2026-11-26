@@ -39,6 +39,7 @@ final class BridgeOpenWireTests: XCTestCase {
         let responder = Task {
             while !Task.isCancelled {
                 guard let obj = try? await receiveBridgeJSON(from: wsTask) else { break }
+                if await answerTabsLookup(obj, on: wsTask, profileName: "OpenWire") { continue }
                 received.append(obj)
                 guard (obj["type"] as? String) == "request", let id = obj["id"] as? String else { continue }
                 let tabId = (obj["tabId"] as? Int) ?? 77

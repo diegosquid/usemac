@@ -259,7 +259,7 @@ final class MCPReliabilityContractTests: XCTestCase {
         let raw = try XCTUnwrap(output)
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
         let instructions = try XCTUnwrap((obj["result"] as? [String: Any])?["instructions"] as? String)
-        for phrase in ["untrusted data", "background", "match", "effect", "RESTRICTED_PAGE", "newWindow", "uploadFile", "foreground", "USER_ACTIVE", "POLICY_BLOCKED", "SELF_TARGET_BLOCKED"] {
+        for phrase in ["untrusted data", "background", "match", "effect", "RESTRICTED_PAGE", "newWindow", "uploadFile", "foreground", "USER_ACTIVE", "POLICY_BLOCKED", "SELF_TARGET_BLOCKED", "TARGET_BLOCKED"] {
             XCTAssertTrue(instructions.contains(phrase), "Instructions should mention \(phrase)")
         }
     }
@@ -308,7 +308,7 @@ final class MCPReliabilityContractTests: XCTestCase {
     }
 
     func testEveryNewErrorCodeHasAHint() {
-        for code in ["TARGET_NOT_FRONTMOST", "STALE_SNAPSHOT", "USER_ACTIVE", "ELEMENT_NOT_FOUND", "WAIT_TIMEOUT", "RESTRICTED_PAGE", "CAPTURE_TOO_SMALL", "POLICY_BLOCKED", "SELF_TARGET_BLOCKED", "DAEMON_REQUIRED"] {
+        for code in ["TARGET_NOT_FRONTMOST", "STALE_SNAPSHOT", "USER_ACTIVE", "ELEMENT_NOT_FOUND", "WAIT_TIMEOUT", "RESTRICTED_PAGE", "CAPTURE_TOO_SMALL", "POLICY_BLOCKED", "SELF_TARGET_BLOCKED", "TARGET_BLOCKED", "DAEMON_REQUIRED"] {
             XCTAssertNotNil(UseMacErrorGuide.hint(for: code), "Missing hint for \(code)")
         }
         XCTAssertNil(UseMacErrorGuide.hint(for: "SOMETHING_ELSE"))

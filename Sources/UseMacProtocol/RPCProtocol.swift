@@ -1,6 +1,6 @@
 import Foundation
 
-public enum RPCMethod: String, Codable, Sendable {
+public enum RPCMethod: String, Codable, Sendable, CaseIterable {
     case ping
     case status
     case listApps = "list_apps"
@@ -23,6 +23,7 @@ public enum RPCMethod: String, Codable, Sendable {
     case visionQuery = "vision_query"
     case taskStart = "task_start"
     case taskComplete = "task_complete"
+    case browserReloadExtension = "browser_reload_extension"
 }
 
 public struct ObserveParams: Codable, Equatable, Sendable {
@@ -80,6 +81,10 @@ public struct RPCRequest: Codable, Sendable {
     public var visionQuery: VisionQueryParams?
     public var taskStart: TaskStartParams?
     public var taskComplete: TaskCompleteParams?
+    public var auditLog: AuditLogParams?
+    /// The task this request belongs to (from `task_start`). Any method takes it; see `namedTaskId`.
+    public var taskId: String?
+    public var browserReloadExtension: BrowserReloadExtensionParams?
 
     public init(
         id: String = UUID().uuidString,
@@ -100,7 +105,10 @@ public struct RPCRequest: Codable, Sendable {
         visionInstall: VisionInstallParams? = nil,
         visionQuery: VisionQueryParams? = nil,
         taskStart: TaskStartParams? = nil,
-        taskComplete: TaskCompleteParams? = nil
+        taskComplete: TaskCompleteParams? = nil,
+        auditLog: AuditLogParams? = nil,
+        taskId: String? = nil,
+        browserReloadExtension: BrowserReloadExtensionParams? = nil
     ) {
         self.id = id
         self.method = method
@@ -121,6 +129,9 @@ public struct RPCRequest: Codable, Sendable {
         self.visionQuery = visionQuery
         self.taskStart = taskStart
         self.taskComplete = taskComplete
+        self.auditLog = auditLog
+        self.taskId = taskId
+        self.browserReloadExtension = browserReloadExtension
     }
 
     public init(from decoder: Decoder) throws {
@@ -144,6 +155,9 @@ public struct RPCRequest: Codable, Sendable {
         self.visionQuery = try c.decodeIfPresent(VisionQueryParams.self, forKey: .visionQuery)
         self.taskStart = try c.decodeIfPresent(TaskStartParams.self, forKey: .taskStart)
         self.taskComplete = try c.decodeIfPresent(TaskCompleteParams.self, forKey: .taskComplete)
+        self.auditLog = try c.decodeIfPresent(AuditLogParams.self, forKey: .auditLog)
+        self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
+        self.browserReloadExtension = try c.decodeIfPresent(BrowserReloadExtensionParams.self, forKey: .browserReloadExtension)
     }
 }
 
@@ -179,6 +193,8 @@ public struct RPCResponse: Codable, Sendable {
     /// The task a `task_start` opened. Pass it to `browser_open` and `task_complete` so finishing this task only
     /// closes this task's tabs.
     public var taskId: String?
+    /// What the task did, on `task_complete`.
+    public var taskSummary: TaskSummary?
     public var error: RPCErrorPayload?
 
     public init(
@@ -201,6 +217,7 @@ public struct RPCResponse: Codable, Sendable {
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
         taskId: String? = nil,
+        taskSummary: TaskSummary? = nil,
         error: RPCErrorPayload? = nil
     ) {
         self.id = id
@@ -222,6 +239,7 @@ public struct RPCResponse: Codable, Sendable {
         self.visionStatus = visionStatus
         self.visionResult = visionResult
         self.taskId = taskId
+        self.taskSummary = taskSummary
         self.error = error
     }
 
@@ -243,7 +261,8 @@ public struct RPCResponse: Codable, Sendable {
         browserTitle: String? = nil,
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        taskSummary: TaskSummary? = nil
     ) -> RPCResponse {
         RPCResponse(
             id: id,
@@ -265,6 +284,7 @@ public struct RPCResponse: Codable, Sendable {
             visionStatus: visionStatus,
             visionResult: visionResult,
             taskId: taskId,
+            taskSummary: taskSummary,
             error: nil
         )
     }

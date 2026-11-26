@@ -208,11 +208,9 @@ extension UseMacEngineService {
         return named
     }
 
-    /// The task id a held request carries. None of the methods Ask mode holds has a `taskId` param of its own, so
-    /// this stays nil until requests carry the envelope `taskId` (#36): then it is `request.namedTaskId`.
+    /// The task id a held request carries: its own `taskId` (envelope or params), never a guess.
     static func namedTaskIdForApproval(_ request: RPCRequest) -> String? {
-        // TODO(integration #36): return request.namedTaskId
-        nil
+        request.namedTaskId
     }
 
     private func browserTargetLabel(profile: String, tabId: Int?) -> String {

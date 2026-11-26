@@ -100,8 +100,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 bundleId: currentApp?.bundleId,
                 windowTitle: currentApp?.windowTitle,
                 windowBounds: currentApp?.windowBounds,
-                title: "Did not run",
-                subtitle: refusal.message,
+                title: ActivityCaption.refusedBatchTitle(stepCount: request.steps.count),
+                subtitle: ActivityCaption.reason(errorCode: refusal.errorCode, message: refusal.message) ?? refusal.message,
                 mechanism: refusal.mechanism,
                 latencyMs: 0,
                 success: false,
@@ -166,8 +166,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     bundleId: currentApp?.bundleId,
                     windowTitle: currentApp?.windowTitle,
                     windowBounds: currentApp?.windowBounds,
-                    title: "Blocked \(step.action.rawValue)",
-                    subtitle: blockReason,
+                    title: ActivityCaption.failedStepTitle(step: step, position: (index + 1, request.steps.count)),
+                    subtitle: ActivityCaption.reason(errorCode: "POLICY_BLOCKED"),
                     elementId: step.elementId,
                     mechanism: "blocked",
                     latencyMs: 0,
@@ -217,10 +217,15 @@ public final class ActionExecutor: @unchecked Sendable {
             )
             stepResults.append(result)
 
-            let stepTitle = formatStepTitle(step: step, node: outcome.node, app: currentApp)
+            // A failed step says what UseMac couldn't do and why, in plain words (ActivityCaption).
+            let stepTitle = outcome.success
+                ? formatStepTitle(step: step, node: outcome.node, app: currentApp)
+                : ActivityCaption.failedStepTitle(step: step, targetName: outcome.node?.title, position: (index + 1, request.steps.count))
             let baseSubtitle = "\(outcome.mechanism) · \(String(format: "%.1f ms", stepLatencyMs))"
             let stepSubtitle: String
-            if !outcome.success, let msg = outcome.message, !msg.isEmpty {
+            if !outcome.success, let reason = ActivityCaption.reason(errorCode: outcome.errorCode, message: outcome.message) {
+                stepSubtitle = reason
+            } else if !outcome.success, let msg = outcome.message, !msg.isEmpty {
                 stepSubtitle = "\(baseSubtitle) · \(msg)"
             } else if outcome.effect == ActionEffect.none {
                 stepSubtitle = "\(baseSubtitle) · no visible effect"
@@ -460,6 +465,10 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Stale-snapshot and expected-title checks. Returns a refusal when the batch must not run.
     private func preflightRefusal(_ request: BatchActionRequest, targetApp: AppDescriptor?) -> Refusal? {
+        // The app the batch resolved to, named or not (the app in front), may be one the user's rules block.
+        if let blocked = TargetRulesStore.shared.blockedMessage(for: targetApp) {
+            return Refusal(mechanism: "target-rules", errorCode: TargetRules.errorCode, message: blocked)
+        }
         guard let pid = targetApp?.pid, pid > 0 else { return nil }
         if let pinned = WindowResolver.pinnedTitle(pid: pid), WindowResolver.window(pid: pid, titleContains: pinned) == nil {
             return Refusal(
@@ -608,6 +617,14 @@ public final class ActionExecutor: @unchecked Sendable {
         // Without a target app, keys and clicks go to whatever app is in front.
         if (targetApp?.pid ?? 0) <= 0, let front = WindowResolver.frontmostPid() {
             receivers.append(front)
+        }
+        if receivers.contains(where: { !workspaceMonitor.isUseMacProcess(pid: $0) && TargetRulesStore.shared.blocksProcess(pid: $0) }) {
+            return StepOutcome(
+                success: false,
+                mechanism: "target-rules",
+                message: "This input would land in a window of an app the user's UseMac rules block, so nothing was sent. \(TargetRules.stopHint)",
+                errorCode: TargetRules.errorCode
+            )
         }
         guard receivers.contains(where: { workspaceMonitor.isUseMacProcess(pid: $0) }) else { return nil }
         return StepOutcome(
@@ -800,6 +817,7 @@ public final class ActionExecutor: @unchecked Sendable {
             if let pid = targetApp?.pid, pid > 0, let live = axIndexer.liveNode(for: id, pid: pid) {
                 resolved = ResolvedElement(pid: pid, element: live.element, node: live.node)
             } else if let other = axIndexer.node(for: id), !workspaceMonitor.isUseMacProcess(pid: other.pid),
+                      !TargetRulesStore.shared.blocksProcess(pid: other.pid),
                       let live = axIndexer.liveNode(for: id, pid: other.pid) {
                 resolved = ResolvedElement(pid: other.pid, element: live.element, node: live.node)
             } else {
@@ -1690,7 +1708,8 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Picks a file in an open panel without Finder navigation or focus: type the file name in the panel's
     /// search field, select the result row with exactly that path and press the panel's Open button (AXOpen
-    /// as a fallback). Falls back to ⌘⇧G only when the app is already in front.
+    /// as a fallback). Falls back to ⌘⇧G only when the app is already in front. A file the search can never list
+    /// (/tmp, $TMPDIR, hidden folders) goes straight to ⌘⇧G in front, and fails fast in the background.
     private func performNativeUploadFile(
         step: ActionStep,
         resolved: ResolvedElement,
@@ -1744,8 +1763,20 @@ public final class ActionExecutor: @unchecked Sendable {
             return StepOutcome(success: true, mechanism: "nsopenpanel-navigate", message: "Selected \(fileName).\(extra)", effect: .changed)
         }
 
+        // Spotlight never lists files in /tmp, $TMPDIR or hidden folders, and Go to Folder takes no keys in the
+        // background (see OpenPanelReach). Say so now instead of searching; with the app in front, go to ⌘⇧G.
+        let searchBlocker = OpenPanelReach.searchBlocker(for: file)
+        if let searchBlocker, !WindowResolver.isFrontmost(pid: pid) {
+            return StepOutcome(
+                success: false,
+                mechanism: "nsopenpanel-unreachable",
+                message: OpenPanelReach.backgroundMessage(fileName: fileName, reason: searchBlocker, appName: targetApp?.name ?? "the app"),
+                errorCode: "TARGET_NOT_FRONTMOST"
+            )
+        }
+
         // 2. Search by name (Spotlight) when the file's folders are not reachable from the sidebar.
-        if let search = panel.searchField {
+        if searchBlocker == nil, let search = panel.searchField {
             // The picker search is Spotlight: index the file now so a file created seconds ago is found.
             await Self.indexForSpotlight(file)
             _ = AXUIElementSetAttributeValue(search, kAXValueAttribute as CFString, fileName as CFTypeRef)
@@ -1815,7 +1846,7 @@ public final class ActionExecutor: @unchecked Sendable {
                     mechanism: "nsopenpanel-search",
                     message: ambiguous
                         ? "Several files named \(fileName) showed up in the picker search. Give the file a unique name, or rerun this step in a batch with \"foreground\": true."
-                        : "The picker could not be driven in the background: browsing its folders did not enable Open, and its search (Spotlight) did not list \(fileName) yet. Rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back), or retry once Spotlight has indexed the file (not /tmp or hidden folders).",
+                        : "The picker could not be driven in the background: browsing its folders did not enable Open, and its search (Spotlight) did not list \(fileName) yet. Rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back), or retry once Spotlight has indexed the file.",
                     errorCode: "ELEMENT_NOT_FOUND"
                 )
             }
@@ -1837,8 +1868,7 @@ public final class ActionExecutor: @unchecked Sendable {
         _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
         try? await Task.sleep(nanoseconds: 300_000_000)
         _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        let closed = findOpenPanel(pid: pid) == nil
+        let closed = await waitForPanelToClose(pid: pid)
         return StepOutcome(
             success: closed,
             mechanism: "nsopenpanel-goto",

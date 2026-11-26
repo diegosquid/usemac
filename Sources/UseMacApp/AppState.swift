@@ -210,7 +210,9 @@ public final class AppState: ObservableObject {
     /// which cancels auto-hide, never keeps a finished card in the filmstrip.
     private var completionCleanupTask: Task<Void, Never>?
     private var taskIdleSettleTask: Task<Void, Never>?
-    private var isHUDManuallyPinned: Bool = false
+    /// Ghost-card cleanup and background card stills (AppState+DeckHygiene.swift).
+    var deckHygiene = DeckHygieneState()
+    var isHUDManuallyPinned: Bool = false
     private var isHUDShowingStoppedPill: Bool = false
     private var wasHUDCollapsedBeforeKillSwitch: Bool = false
     private var showingFrozenBrowserFrame: Bool = false
@@ -220,7 +222,7 @@ public final class AppState: ObservableObject {
     private var policyBeforePause: GovernancePolicy?
 
     public init(socketPath: String = UseMacDefaults.defaultSocketPath) {
-        let engineService = UseMacEngineService(socketPath: socketPath)
+        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore())
         let defaults = UserDefaults.standard
 
         let savedPolicy = defaults.string(forKey: DefaultsKeys.safetyPolicy)
@@ -298,8 +300,9 @@ public final class AppState: ObservableObject {
         if FileManager.default.isExecutableFile(atPath: helper.path) {
             return helper.path
         }
-        let sibling = executableURL.deletingLastPathComponent().appendingPathComponent("usemac")
-        if FileManager.default.isExecutableFile(atPath: sibling.path) && sibling.lastPathComponent == "usemac" && sibling.path != executableURL.path {
+        // A SwiftPM build folder (.build/<config>/) holds the CLI product next to the app as usemac-cli.
+        let sibling = executableURL.deletingLastPathComponent().appendingPathComponent("usemac-cli")
+        if FileManager.default.isExecutableFile(atPath: sibling.path) {
             return sibling.path
         }
         if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/usemac") {
@@ -381,38 +384,17 @@ public final class AppState: ObservableObject {
         UseMacDefaults.chromeWebStoreExtensionId
     }
 
-    private static func isValidChromeExtensionId(_ extId: String) -> Bool {
-        let scalars = extId.unicodeScalars
-        guard scalars.count == 32 else { return false }
-        return scalars.allSatisfy { scalar in
-            scalar.value >= 97 && scalar.value <= 112 // 'a'...'p'
-        }
-    }
-
-    /// Registers Chrome's official External Extension JSON so Chrome installs the published
-    /// Chrome Web Store extension automatically on next launch, and opens its store page.
+    /// Opens the extension's Chrome Web Store page in Chrome, where the user clicks Add to Chrome.
+    /// Returns false while no valid store ID is set (beta builds load the extension unpacked).
     @discardableResult
     public func installPublishedChromeExtension() -> Bool {
-        guard let extId = chromeWebStoreExtensionId,
-              Self.isValidChromeExtensionId(extId) else {
+        guard let storeURL = UseMacDefaults.chromeWebStoreListingURL else {
             return false
         }
-        let externalDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Google/Chrome/External Extensions", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: externalDir, withIntermediateDirectories: true)
-            let jsonURL = externalDir.appendingPathComponent("\(extId).json")
-            let payload = #"{"external_update_url":"https://clients2.google.com/service/update2/crx"}"# + "\n"
-            try payload.write(to: jsonURL, atomically: true, encoding: .utf8)
-        } catch {
-            return false
-        }
-        if let storeURL = URL(string: "https://chromewebstore.google.com/detail/\(extId)") {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-a", "Google Chrome", storeURL.absoluteString]
-            try? process.run()
-        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", "Google Chrome", storeURL.absoluteString]
+        try? process.run()
         return true
     }
 
@@ -526,6 +508,7 @@ public final class AppState: ObservableObject {
                 self.streamStatus = status
                 if case .idle = status, !self.isBrowserStreamActive && !self.showingFrozenBrowserFrame {
                     self.videoSink.reset()
+                    self.showFrontCardStillIfStreamIdle()
                     if self.hudStreamMode == .autoWindow && !self.isHUDManuallyPinned && !self.isAgentBusy && self.isHUDVisible && !self.hasCompletedHUDAction && self.hudDeck.isEmpty && !self.status.killSwitchTripped {
                         self.hideHUD(userInitiated: false)
                     }
@@ -541,6 +524,15 @@ public final class AppState: ObservableObject {
                 guard let self else { return }
                 self.connectedBrowserProfiles = profiles
                 self.refreshState()
+            }
+        }
+
+        // Stop in the pill on a Chrome tab UseMac controls does what Stop in the HUD does (toggleKillSwitch), but
+        // only ever stops: when the agent is already stopped or paused it changes nothing.
+        engine.chromeBridge.onUserStopRequested = { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isAutomationPaused else { return }
+                self.setKillSwitch(true)
             }
         }
 
@@ -1465,7 +1457,7 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func syncFrontCardToUI() {
+    func syncFrontCardToUI() {
         guard let front = hudDeck.first else {
             showingFrozenBrowserFrame = false
             isBrowserStreamActive = false
@@ -1917,9 +1909,14 @@ public final class AppState: ObservableObject {
             // other agents' running tasks stay as they are.
             for idx in hudDeck.indices {
                 let card = hudDeck[idx]
-                let isFinishedTasks: Bool = card.isBrowser
-                    ? card.browserTabId.map { finishedTabs.contains($0) || $0 == item.browserTabId } ?? false
-                    : item.appPid != nil && card.appDescriptor?.pid == item.appPid
+                let isFinishedTasks = PreviewCardLifecycle.taskCompleteFinishes(
+                    isBrowser: card.isBrowser,
+                    browserTabId: card.browserTabId,
+                    appPid: card.appDescriptor?.pid,
+                    finishedTabIds: finishedTabs,
+                    finishedTabId: item.browserTabId,
+                    finishedAppPid: item.appPid
+                )
                 if isFinishedTasks {
                     hudDeck[idx].isBusy = false
                     hudDeck[idx].isCompleted = item.success && !engine.isKillSwitchTripped()
@@ -2027,6 +2024,7 @@ public final class AppState: ObservableObject {
             if hudDeck.first?.id == cardId {
                 syncFrontCardToUI()
             }
+            deckCardDidRecordActivity(cardId: cardId)
         }
 
         let hasStreamTarget = (pairedApp != nil || activeTargetApp != nil || hudStreamMode == .fullDisplay || isBrowserStreamActive || showingFrozenBrowserFrame || !hudDeck.isEmpty)

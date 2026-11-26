@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build and test
+    # Apple Silicon. Signing, notarization and releases stay on the maintainer's Mac.
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      # Pinned to the Xcode the releases are built with, so CI and local builds use the same Swift.
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          node --version
+
+      - name: Restore .build
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: build-${{ runner.os }}-${{ runner.arch }}-xcode26.2-${{ hashFiles('Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ runner.arch }}-xcode26.2-${{ hashFiles('Package.resolved') }}-
+
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        run: swift test
+
+      - name: Extension tests
+        run: node --test Tests/ExtensionTests/*.test.mjs

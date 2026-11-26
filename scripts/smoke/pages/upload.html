@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UseMac smoke upload</title>
+<script>
+  const t = new URLSearchParams(location.search).get("t");
+  if (t) document.title = t;
+</script>
+</head>
+<body>
+<h1>UseMac smoke: uploadFile</h1>
+
+<section>
+  <h2>File input in the page</h2>
+  <label for="f">Choose a file</label>
+  <input type="file" id="f">
+  <div id="out">no file yet</div>
+</section>
+
+<section>
+  <h2>File input created on click</h2>
+  <!-- The input only exists while the click handler runs, so UseMac has to intercept the file chooser. -->
+  <div id="dynbox"><button id="dyn" type="button">Upload with a picker</button></div>
+  <div id="out2">no file yet</div>
+</section>
+
+<script>
+  function show(file, target) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      document.getElementById(target).textContent =
+        "name=" + file.name + " size=" + file.size + " text=" + String(reader.result).trim();
+    };
+    reader.onerror = () => {
+      document.getElementById(target).textContent = "read error: " + reader.error;
+    };
+    reader.readAsText(file);
+  }
+  document.getElementById("f").addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) show(file, "out");
+  });
+  document.getElementById("dyn").addEventListener("click", () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.addEventListener("change", () => {
+      const file = input.files && input.files[0];
+      if (file) show(file, "out2");
+    });
+    input.click();
+  });
+</script>
+</body>
+</html>

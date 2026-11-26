@@ -1,4 +1,5 @@
 importScripts("bridge-auth.js");
+importScripts("tab-indicator.js");
 
 const WS_URL = "ws://127.0.0.1:49222/usemac-bridge";
 const BRIDGE_ENDPOINT = "127.0.0.1:49222";
@@ -185,6 +186,12 @@ function getOrCreateTabSession(tabId) {
       metricsKeepLiveLayout: false,
       explicitViewport: false,
       liveViewport: null,
+      // A visible tab whose window is covered polls again (see checkCoveredWhileVisible).
+      lastScreencastFrameAt: 0,
+      coveredWhileVisible: false,
+      coverProbeAt: 0,
+      coverProbeInFlight: false,
+      stallWatchTimer: null,
       visibilitySyncQueued: false,
       visibilitySyncRemeasure: false,
       cursor: { x: 640, y: 400 },
@@ -360,6 +367,7 @@ async function sendHello(socket = state.ws) {
     type: "hello",
     protocol: PROTOCOL_VERSION,
     extensionVersion: EXTENSION_VERSION,
+    extensionId: typeof chrome.runtime.id === "string" ? chrome.runtime.id : undefined,
     profileName: state.profileName,
     clientNonce,
     hasKey: Boolean(keyBytes)
@@ -597,6 +605,7 @@ function connectWS(force = false) {
         state.authState = "ready";
         state.awaitingAuthResult = false;
         state.nextReconnectAllowedAt = 0;
+        state.appExtensionStatus = msg.extensionStatus && typeof msg.extensionStatus === "object" ? msg.extensionStatus : null;
         sendProfileInfo();
       } else if (state.authState === "authenticating") {
         enterKeyMismatch(socket);
@@ -615,6 +624,11 @@ function connectWS(force = false) {
 
     if (msg.type === "cancel") {
       handleCancel(msg.tabId ?? null);
+      return;
+    }
+
+    if (msg.type === "tab_control") {
+      handleTabControlMessage(msg);
       return;
     }
 
@@ -655,6 +669,7 @@ function ensureConnected() {
 }
 
 async function sendCDP(tabId, method, params = {}, cdpSessionId = null) {
+  if (!cdpSessionId && TAB_INDICATOR_POINTER_METHODS.has(method)) await tabIndicatorBeforeAgentPointer(tabId, method, params);
   const target = cdpSessionId ? { tabId, sessionId: cdpSessionId } : { tabId };
   return chrome.debugger.sendCommand(target, method, params);
 }
@@ -736,6 +751,7 @@ function resetIdleTimer(tabId) {
   const session = state.tabSessions.get(tabId);
   if (!session) return;
   clearIdleTimer(session);
+  markTabControlled(tabId);
   session.lastActiveAt = Date.now();
   session.idleTimer = setTimeout(() => {
     session.idleTimer = null;
@@ -774,7 +790,8 @@ async function captureAndEmitFrame(tabId) {
         title: tab?.title || session.title,
         viewportWidth: viewport.width,
         viewportHeight: viewport.height,
-        jpegBase64: res.data
+        jpegBase64: res.data,
+        indicator: tabIndicatorFrameFlag(tabId)
       });
     }
   } catch (_) {
@@ -789,7 +806,9 @@ function startCapturePump(tabId) {
   stopCapturePump(session);
   session.capturePumpTimer = setInterval(() => {
     // A tab the user can see gets its frames from the screencast; polling screenshots there forces repaints.
-    if (!session.streaming || !session.attached || session.captureInFlight || session.visibleToUser) {
+    // A covered window's tab is the exception (see checkCoveredWhileVisible).
+    const onScreen = session.visibleToUser && !session.coveredWhileVisible;
+    if (!session.streaming || !session.attached || session.captureInFlight || onScreen) {
       return;
     }
     if (Date.now() - session.lastFrameAt > CAPTURE_STALE_MS) {
@@ -835,6 +854,7 @@ async function stopStreamingAndDetach(tabId, emitStopped = true, reason = "stopp
   const session = state.tabSessions.get(tabId);
   if (!session) return;
 
+  await tabIndicatorBeforeDetach(tabId, session);
   clearIdleTimer(session);
   stopCapturePump(session);
   clearPendingFileChooser(session, null);
@@ -1038,6 +1058,83 @@ async function restoreVisibleViewport(tabId) {
   } catch (_) {}
 }
 
+// --- Covered windows ----------------------------------------------------------------------------------------------
+// isTabVisibleToUser cannot tell a window covered by other windows (or on another Space) from one on screen, and
+// Chrome stops painting a page it knows is occluded, so its screencast goes quiet and the preview froze until the
+// next command. A quiet screencast alone proves nothing (a static page sends no frames either, and polling a tab
+// on screen flickers), so when frames stop the watch asks the page: document.visibilityState is "hidden" only when
+// Chrome is not showing it. Then the tab goes back to screenshot polling, keeping its real size (no metrics
+// override, so nothing reflows), until the page reports "visible" again.
+const SCREENCAST_STALL_MS = 1000;
+const COVER_CHECK_INTERVAL_MS = CAPTURE_INTERVAL_MS;
+const COVER_PROBE_INTERVAL_MS = 1000;
+
+function startScreencastStallWatch(tabId) {
+  const session = state.tabSessions.get(tabId);
+  if (!session || session.stallWatchTimer) return;
+  session.stallWatchTimer = setInterval(() => {
+    if (state.tabSessions.get(tabId) !== session || !session.attached || !session.streaming) {
+      clearInterval(session.stallWatchTimer);
+      session.stallWatchTimer = null;
+      session.coveredWhileVisible = false;
+      return;
+    }
+    checkCoveredWhileVisible(tabId, session).catch(() => {});
+  }, COVER_CHECK_INTERVAL_MS);
+}
+
+async function probePageHidden(tabId) {
+  try {
+    const res = await sendCDP(tabId, "Runtime.evaluate", {
+      expression: "document.visibilityState",
+      returnByValue: true
+    });
+    const value = res?.result?.value;
+    return value === "hidden" ? true : value === "visible" ? false : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function checkCoveredWhileVisible(tabId, session) {
+  if (!session.visibleToUser) {
+    // Hidden tabs already poll (applyVisibilityMetrics); the cover state starts over when the tab is shown again.
+    session.coveredWhileVisible = false;
+    return;
+  }
+  if (session.coverProbeInFlight) return;
+  const now = Date.now();
+  const lastScreencastFrameAt = session.lastScreencastFrameAt || 0;
+  if (session.coveredWhileVisible) {
+    if (!session.capturePumpTimer) startCapturePump(tabId);
+    // Re-check about once a second, and at once when the screencast speaks again (the window may be back on top).
+    const frameSinceProbe = lastScreencastFrameAt > (session.coverProbeAt || 0);
+    if (!frameSinceProbe && now - (session.coverProbeAt || 0) < COVER_PROBE_INTERVAL_MS) return;
+  } else {
+    if (now - lastScreencastFrameAt < SCREENCAST_STALL_MS) return;
+    if (now - (session.coverProbeAt || 0) < COVER_PROBE_INTERVAL_MS) return;
+  }
+  session.coverProbeInFlight = true;
+  session.coverProbeAt = now;
+  let hidden;
+  try {
+    hidden = await probePageHidden(tabId);
+  } finally {
+    session.coverProbeInFlight = false;
+  }
+  if (state.tabSessions.get(tabId) !== session || !session.attached || !session.streaming || !session.visibleToUser) {
+    return;
+  }
+  if (hidden === true && !session.coveredWhileVisible) {
+    session.coveredWhileVisible = true;
+    startCapturePump(tabId);
+    await captureAndEmitFrame(tabId);
+  } else if (hidden === false && session.coveredWhileVisible) {
+    session.coveredWhileVisible = false;
+    stopCapturePump(session);
+  }
+}
+
 async function applyViewportMetrics(tabId, width = null, height = null, scale = null) {
   const session = getOrCreateTabSession(tabId);
   const nextW = width != null ? clamp(Math.round(Number(width)), 400, 3840) : session.viewportWidth;
@@ -1135,6 +1232,7 @@ async function ensureStreaming(tabId) {
     if (!session.visibleToUser) {
       startCapturePump(tabId);
     }
+    startScreencastStallWatch(tabId);
     await captureAndEmitFrame(tabId);
   }
   resetIdleTimer(tabId);
@@ -1224,6 +1322,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       sendCDP(source.tabId, "Page.screencastFrameAck", { sessionId }).catch(() => {});
     }
     session.lastFrameAt = Date.now();
+    session.lastScreencastFrameAt = session.lastFrameAt;
     const viewport = effectiveViewport(session);
     sendWS({
       type: "frame",
@@ -1233,7 +1332,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       title: session.title,
       viewportWidth: viewport.width,
       viewportHeight: viewport.height,
-      jpegBase64: params.data
+      jpegBase64: params.data,
+      indicator: tabIndicatorFrameFlag(source.tabId)
     });
   }
 });
@@ -1362,14 +1462,97 @@ async function waitForTabLoad(tabId, timeoutMs = 4500) {
 const USEMAC_GROUP_TITLE = "UseMac";
 const USEMAC_GROUP_COLOR = "blue";
 
+// One UseMac group per window. Commands for different tabs run at the same time (each tab has its own queue, and
+// opens have theirs), and Chrome only lets a new group take its title after it exists. Two calls that both looked
+// for the titled group before either had set it each made one, so a window could end up with several UseMac
+// groups side by side. Group changes now take turns, and a window that already has several is folded back into
+// one on its next use.
+let usemacGroupChain = Promise.resolve();
+
+function withUsemacGroupLock(fn) {
+  const next = usemacGroupChain.then(fn, fn);
+  usemacGroupChain = next.catch(() => {});
+  return next;
+}
+
+// The group each window's UseMac tabs are in, so folding keeps the one agents already use. Kept in session
+// storage so a service-worker restart remembers it; only trusted while that window still has a UseMac group with
+// that id (it may have closed, moved to another window, or been renamed by the user, and then it is theirs).
+const USEMAC_GROUPS_KEY = "usemacGroupIdsByWindow";
+let usemacGroupIdsByWindow = null;
+
+async function rememberedUsemacGroupIds() {
+  if (!usemacGroupIdsByWindow) {
+    try {
+      const stored = await chrome.storage.session.get(USEMAC_GROUPS_KEY);
+      const value = stored?.[USEMAC_GROUPS_KEY];
+      usemacGroupIdsByWindow = value && typeof value === "object" ? value : {};
+    } catch (_) {
+      usemacGroupIdsByWindow = {};
+    }
+  }
+  return usemacGroupIdsByWindow;
+}
+
+async function rememberUsemacGroup(windowId, groupId) {
+  const remembered = await rememberedUsemacGroupIds();
+  const key = String(windowId);
+  if ((remembered[key] ?? null) === (groupId ?? null)) return;
+  if (groupId == null) {
+    delete remembered[key];
+  } else {
+    remembered[key] = groupId;
+  }
+  try {
+    await chrome.storage.session.set({ [USEMAC_GROUPS_KEY]: remembered });
+  } catch (_) {}
+}
+
+// Moves the tabs of every other UseMac group in the window into one; Chrome drops the groups left empty. Keeps the
+// remembered group, else the leftmost. Returns the kept group and the ids of the tabs it moved. If Chrome refuses
+// the move (the user is dragging a tab), the kept group is still used and the next call tries again.
+async function foldUsemacGroups(groups, preferredId) {
+  const entries = [];
+  for (const group of groups) {
+    let tabs = [];
+    try {
+      tabs = (await chrome.tabs.query({ groupId: group.id })) || [];
+    } catch (_) {}
+    const firstIndex = tabs.reduce((min, t) => Math.min(min, t.index ?? Infinity), Infinity);
+    entries.push({ group, tabs, firstIndex });
+  }
+  const keeper =
+    entries.find((e) => e.group.id === preferredId) || entries.slice().sort((a, b) => a.firstIndex - b.firstIndex)[0];
+  const strays = entries
+    .filter((e) => e !== keeper)
+    .flatMap((e) => e.tabs)
+    .filter((t) => !t.pinned)
+    .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    .map((t) => t.id);
+  if (strays.length > 0) {
+    try {
+      await chrome.tabs.group({ groupId: keeper.group.id, tabIds: strays });
+    } catch (_) {
+      return { group: keeper.group, movedTabIds: new Set() };
+    }
+  }
+  return { group: keeper.group, movedTabIds: new Set(strays) };
+}
+
+// The window's UseMac group ({ group, movedTabIds }), folding duplicates into one, or null when it has none. Call
+// with the group lock held. Throws when Chrome cannot list the groups, so the caller does not make another one.
 async function findUsemacGroupInWindow(windowId) {
   if (!chrome.tabGroups?.query || windowId == null) return null;
-  try {
-    const groups = await chrome.tabGroups.query({ windowId, title: USEMAC_GROUP_TITLE });
-    return groups && groups.length > 0 ? groups[0] : null;
-  } catch (_) {
+  const groups = (await chrome.tabGroups.query({ windowId, title: USEMAC_GROUP_TITLE })) || [];
+  if (groups.length === 0) {
+    await rememberUsemacGroup(windowId, null);
     return null;
   }
+  const preferredId = (await rememberedUsemacGroupIds())[String(windowId)];
+  const found =
+    groups.length > 1 ? await foldUsemacGroups(groups, preferredId) : { group: groups[0], movedTabIds: new Set() };
+  await rememberUsemacGroup(windowId, found.group.id);
+  return found;
 }
 
 async function ensureTabInUsemacGroup(tabId) {
@@ -1377,31 +1560,36 @@ async function ensureTabInUsemacGroup(tabId) {
     return;
   }
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab || tab.pinned || tab.windowId == null) {
-      return;
-    }
-    const existingGroup = await findUsemacGroupInWindow(tab.windowId);
-    if (existingGroup) {
-      if (tab.groupId === existingGroup.id) {
-        return;
-      }
-      await chrome.tabs.group({ groupId: existingGroup.id, tabIds: [tabId] });
-      return;
-    }
-    const groupId = await chrome.tabs.group({
-      createProperties: { windowId: tab.windowId },
-      tabIds: [tabId]
-    });
-    if (groupId != null && groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-      await chrome.tabGroups.update(groupId, {
-        title: USEMAC_GROUP_TITLE,
-        color: USEMAC_GROUP_COLOR,
-        collapsed: false
-      });
-    }
+    await withUsemacGroupLock(() => groupTabWithUsemac(tabId));
   } catch (_) {
     // Non-fatal: tab may be closing, pinned, or in a popup window that disallows tab groups
+  }
+}
+
+async function groupTabWithUsemac(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab || tab.pinned || tab.windowId == null) {
+    return;
+  }
+  const existing = await findUsemacGroupInWindow(tab.windowId);
+  if (existing) {
+    if (tab.groupId === existing.group.id || existing.movedTabIds.has(tabId)) {
+      return;
+    }
+    await chrome.tabs.group({ groupId: existing.group.id, tabIds: [tabId] });
+    return;
+  }
+  const groupId = await chrome.tabs.group({
+    createProperties: { windowId: tab.windowId },
+    tabIds: [tabId]
+  });
+  if (groupId != null && groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    await chrome.tabGroups.update(groupId, {
+      title: USEMAC_GROUP_TITLE,
+      color: USEMAC_GROUP_COLOR,
+      collapsed: false
+    });
+    await rememberUsemacGroup(tab.windowId, groupId);
   }
 }
 
@@ -2869,11 +3057,11 @@ async function observeTabNow(tabId, maxElements = 280, options = {}) {
   let screenshotBase64 = null;
   if (options.includeScreenshot) {
     try {
-      const cap = await sendCDP(tabId, "Page.captureScreenshot", {
+      const cap = await withTabIndicatorHidden(tabId, () => sendCDP(tabId, "Page.captureScreenshot", {
         format: "jpeg",
         quality: 82,
         fromSurface: true
-      });
+      }));
       if (cap?.data) {
         screenshotBase64 = cap.data;
       }
@@ -2909,6 +3097,7 @@ async function observeTabNow(tabId, maxElements = 280, options = {}) {
 }
 
 function emitCursor(tabId, x, y, phase, label = null) {
+  noteTabIndicatorStep(tabId, label);
   const viewport = effectiveViewport(state.tabSessions.get(tabId));
   sendWS({
     type: "cursor",
@@ -4502,7 +4691,7 @@ async function captureTabScreenshot(req, tab, start) {
     capParams.captureBeyondViewport = true;
   }
 
-  const cap = await sendCDP(tab.id, "Page.captureScreenshot", capParams);
+  const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", capParams));
   if (!cap?.data) {
     throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
   }
@@ -4584,6 +4773,8 @@ function hasRunningDownloadFrom(tabUrl, busyDownloadUrls) {
 // the focused window) and tabs with a download still in progress. Returns what was closed and what was kept.
 async function handleCloseOwnedTabsCommand(req) {
   const keep = new Set(Array.isArray(req.keepTabIds) ? req.keepTabIds.map(Number) : []);
+  // closeTabIds: the finished task's own tabs. Only those close, so a tab another agent's task opened stays open.
+  const only = Array.isArray(req.closeTabIds) ? new Set(req.closeTabIds.map(Number)) : null;
   const owned = await loadOwnedTabIds();
   const closed = [];
   const kept = [];
@@ -4605,6 +4796,7 @@ async function handleCloseOwnedTabsCommand(req) {
       owned.delete(tabId);
       continue;
     }
+    if (only && !only.has(tabId)) continue;
     let reason = null;
     if (keep.has(tabId)) reason = "asked to keep";
     else if (tab.active && tab.windowId === focusedWindowId) reason = "the user is looking at it";
@@ -5018,11 +5210,11 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
   } else if (req.includeScreenshot === true) {
     const shotStart = performance.now();
     try {
-      const cap = await sendCDP(tab.id, "Page.captureScreenshot", {
+      const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", {
         format: "jpeg",
         quality: 82,
         fromSurface: true
-      });
+      }));
       if (cap?.data) {
         screenshotBase64 = cap.data;
         const viewport = effectiveViewport(session);
@@ -5129,6 +5321,10 @@ function sendCancelledResponse(req, tabId = null) {
 }
 
 function dispatchDaemonRequest(req) {
+  if (req.command === "reload_extension") {
+    handleDaemonRequest(req);
+    return;
+  }
   if (req.command === "tabs" || req.command === "close_owned_tabs" || (req.command === "extract" && String(req.mode || "").toLowerCase() === "downloads")) {
     handleDaemonRequest(req);
     return;
@@ -5196,6 +5392,37 @@ function dispatchDaemonRequest(req) {
   })();
 }
 
+// Answers first, then reloads, so the daemon gets the answer before the socket closes. Chrome restarts the service
+// worker with the code now in the extension's folder, which reconnects and pairs again on its own (the key is in
+// chrome.storage.local). Debugger sessions end, and the list of tabs UseMac opened (chrome.storage.session) is lost.
+function handleReloadExtensionCommand(req) {
+  const startedAt = Date.now();
+  const reloadWhenSent = () => {
+    const pending = state.ws && state.ws.readyState === WebSocket.OPEN ? state.ws.bufferedAmount : 0;
+    if (pending > 0 && Date.now() - startedAt < 1000) {
+      setTimeout(reloadWhenSent, 50);
+      return;
+    }
+    try {
+      chrome.runtime.reload();
+    } catch (_) {}
+  };
+  setTimeout(reloadWhenSent, 150);
+  return {
+    type: "response",
+    id: req.id,
+    ok: true,
+    tabId: null,
+    profileName: state.profileName,
+    extensionVersion: EXTENSION_VERSION,
+    url: null,
+    title: null,
+    snapshot: null,
+    actionResult: null,
+    error: null
+  };
+}
+
 async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = null) {
   await resolveProfileInfo();
   const targetTabId = preResolvedTab?.id ?? req.tabId ?? null;
@@ -5232,6 +5459,9 @@ async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = nul
         break;
       case "close_owned_tabs":
         response = await handleCloseOwnedTabsCommand(req);
+        break;
+      case "reload_extension":
+        response = handleReloadExtensionCommand(req);
         break;
       default:
         throw { code: "UNKNOWN_COMMAND", message: `Unknown command: ${req.command}` };
@@ -5285,7 +5515,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           hasKey: state.hasKey,
           profileName: state.profileName,
           tabs,
-          endpoint: BRIDGE_ENDPOINT
+          endpoint: BRIDGE_ENDPOINT,
+          extensionStatus: state.authState === "ready" ? state.appExtensionStatus || null : null
         });
       } catch (_) {
         sendResponse({

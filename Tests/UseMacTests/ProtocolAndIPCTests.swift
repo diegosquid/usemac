@@ -454,6 +454,7 @@ final class ProtocolAndIPCTests: XCTestCase {
                     "elements": [sampleNode]
                 ]
 
+                if await answerTabsLookup(obj, on: wsTask) { continue }
                 switch command {
                 case "open":
                     let frameMsg: [String: Any] = [
@@ -1076,9 +1077,11 @@ final class ProtocolAndIPCTests: XCTestCase {
                 guard let msg = try? await wsTask.receive(),
                       case .string(let raw) = msg,
                       let data = raw.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let reqId = obj["id"] as? String,
-                      (obj["command"] as? String) == "act" else {
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continue
+                }
+                if await answerTabsLookup(obj, on: wsTask) { continue }
+                guard let reqId = obj["id"] as? String, (obj["command"] as? String) == "act" else {
                     continue
                 }
                 if let steps = obj["steps"] as? [[String: Any]],
@@ -1368,6 +1371,7 @@ final class ProtocolAndIPCTests: XCTestCase {
                       let cmd = obj["command"] as? String else {
                     break
                 }
+                if await answerTabsLookup(obj, on: wsTask) { continue }
                 if cmd == "open" {
                     captured.setOpen(tabId: obj["tabId"] as? Int, newTab: obj["newTab"] as? Bool)
                     let resp: [String: Any] = [
