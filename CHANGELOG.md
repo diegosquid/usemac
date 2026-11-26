@@ -14,6 +14,10 @@ All notable changes to UseMac are documented here. The format follows
 - A Chrome tab no longer changes size when you switch away from it while an agent works there. In the
   background it keeps the size it had on screen instead of jumping to 1280×800, so the page doesn't reflow and
   the agent's clicks land where it measured them.
+- When several agents work at once, one finishing no longer closes the other's Chrome tabs. `task_start` returns a
+  `taskId`; pass it to `browser_open` and `task_complete` (CLI `--task`) and only that task's tabs close and only its
+  preview cards are marked done. A finished agent's card now leaves the filmstrip after its check even while others
+  keep working, and the preview closes only when every task is done.
 
 ### Security
 

@@ -842,6 +842,8 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
     /// Open the URL in a new, unfocused Chrome window owned by UseMac, so native observe/act can work there
     /// without switching the user's tabs.
     public var newWindow: Bool?
+    /// The task this tab belongs to (from `task_start`), so `task_complete` of another task never closes it.
+    public var taskId: String?
 
     public init(
         url: String,
@@ -850,7 +852,8 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
         newTab: Bool? = nil,
         stream: Bool? = nil,
         activate: Bool? = nil,
-        newWindow: Bool? = nil
+        newWindow: Bool? = nil,
+        taskId: String? = nil
     ) {
         self.url = url
         self.profile = profile
@@ -859,6 +862,7 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
         self.stream = stream
         self.activate = activate
         self.newWindow = newWindow
+        self.taskId = taskId
     }
 }
 
@@ -1469,17 +1473,21 @@ public struct TaskStartParams: Codable, Equatable, Sendable {
     public var tabId: Int?
     public var app: String?
     public var summary: String?
+    /// Optional id for the task; UseMac makes one when omitted. The response's `taskId` is the one to pass on.
+    public var taskId: String?
 
     public init(
         profile: String? = nil,
         tabId: Int? = nil,
         app: String? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        taskId: String? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
         self.app = app
         self.summary = summary
+        self.taskId = taskId
     }
 }
 
@@ -1494,6 +1502,9 @@ public struct TaskCompleteParams: Codable, Equatable, Sendable {
     public var keepTabs: Bool?
     /// Keep only these tabs open (e.g. the page that shows the result the user should see).
     public var keepTabIds: [Int]?
+    /// The task to finish (from `task_start`). Only this task's tabs are closed and only its cards marked done;
+    /// tabs other running tasks opened are never closed.
+    public var taskId: String?
 
     public init(
         profile: String? = nil,
@@ -1501,7 +1512,8 @@ public struct TaskCompleteParams: Codable, Equatable, Sendable {
         app: String? = nil,
         summary: String? = nil,
         keepTabs: Bool? = nil,
-        keepTabIds: [Int]? = nil
+        keepTabIds: [Int]? = nil,
+        taskId: String? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
@@ -1509,6 +1521,7 @@ public struct TaskCompleteParams: Codable, Equatable, Sendable {
         self.summary = summary
         self.keepTabs = keepTabs
         self.keepTabIds = keepTabIds
+        self.taskId = taskId
     }
 }
 
@@ -1546,6 +1559,9 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     /// True when the request named no app and UseMac fell back to the app in front (usually the user's own). The
     /// live preview never shows such work: only UseMac tabs and apps an agent named are shown.
     public var targetGuessed: Bool?
+    /// On `taskComplete`: the tabs of the task that finished, so the preview marks only their cards as done. Nil when
+    /// UseMac could not tell which task finished and no other task is running (every card is that task's).
+    public var taskTabIds: [Int]?
 
     public init(
         id: String = UUID().uuidString,
@@ -1566,7 +1582,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         isInProgress: Bool = false,
         browserTabId: Int? = nil,
         browserProfile: String? = nil,
-        targetGuessed: Bool? = nil
+        targetGuessed: Bool? = nil,
+        taskTabIds: [Int]? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1587,6 +1604,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.browserTabId = browserTabId
         self.browserProfile = browserProfile
         self.targetGuessed = targetGuessed
+        self.taskTabIds = taskTabIds
     }
 }
 
