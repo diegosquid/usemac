@@ -325,6 +325,7 @@ public struct ControlCenterView: View {
                 permissionsGroup
                 safetyGroup
                 AuditLogSettingsGroup(store: appState.engine.auditStore, onOpenHistory: { router.selection = .audit })
+                TargetRulesGroupView()
                 SoftwareUpdatesGroupView(updater: appState.updater)
             }
             .frame(maxWidth: 640, alignment: .leading)

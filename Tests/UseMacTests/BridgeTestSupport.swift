@@ -99,6 +99,16 @@ func sendBridgeJSON(_ object: [String: Any], on wsTask: URLSessionWebSocketTask)
     try await wsTask.send(.string(text))
 }
 
+/// Answers the `tabs` lookup the bridge sends before a tab command (the site rules check, TargetRules) with an
+/// empty tab list, so a mock that only knows its own commands does not wait for the lookup to time out.
+/// Returns true when `request` was that lookup.
+func answerTabsLookup(_ request: [String: Any], on wsTask: URLSessionWebSocketTask, profileName: String = "Diego") async -> Bool {
+    guard (request["type"] as? String) == "request", (request["command"] as? String) == "tabs",
+          let id = request["id"] as? String else { return false }
+    try? await sendBridgeJSON(["type": "response", "id": id, "ok": true, "profileName": profileName, "tabs": [Any]()], on: wsTask)
+    return true
+}
+
 func receiveBridgeJSON(from wsTask: URLSessionWebSocketTask) async throws -> [String: Any] {
     let message = try await wsTask.receive()
     guard case .string(let text) = message,

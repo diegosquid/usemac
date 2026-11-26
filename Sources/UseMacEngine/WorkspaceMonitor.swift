@@ -159,6 +159,16 @@ public final class WorkspaceMonitor: @unchecked Sendable {
         Self.isGuessedTarget(requestApp: requestApp, stepApps: stepApps, hasPairedApp: getPairedApp() != nil)
     }
 
+    /// The running app `query` names (name, bundle ID or PID), matched like `resolveTarget` but without window
+    /// metadata, so it is cheap. nil for no query, no match, or UseMac itself.
+    public func namedApp(_ query: String?) -> AppDescriptor? {
+        guard let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case .app(let app) = Self.matchQuery(query, in: regularApps(withWindowMetadata: false), selfPid: selfPid) else {
+            return nil
+        }
+        return app
+    }
+
     /// True when `pid` is UseMac (this process, or the app seen from a `--standalone` CLI).
     public func isUseMacProcess(pid: Int32) -> Bool {
         Self.isUseMac(
