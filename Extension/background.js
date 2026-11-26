@@ -23,7 +23,11 @@ const MIN_USABLE_VIEWPORT = 100;
 const IDLE_TIMEOUT_MS = 180000;
 const CAPTURE_INTERVAL_MS = 240;
 const CAPTURE_STALE_MS = 220;
-const METRICS_SETTLE_MS = 60;
+const DEFAULT_SCREENSHOT_MAX_WIDTH = 1280;
+const DEFAULT_SCREENSHOT_MAX_HEIGHT = 800;
+const NETWORK_RING_MAX = 25;
+const NETWORK_ERRORS_MAX = 50;
+const PREVIEW_DEBOUNCE_MS = 80;
 const PING_INTERVAL_MS = 20000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 const KEY_MISMATCH_RETRY_MS = 30000;
@@ -195,7 +199,15 @@ function getOrCreateTabSession(tabId) {
       childTargets: new Map(), // childSessionId -> { sessionId, targetId, parentSessionId, url, title, type, ready, initPromise }
       executionContexts: new Map(), // `${sessionId||"top"}:${frameId}` -> default main-world contextId
       elementFrameMap: new Map(), // "@bN" -> { sessionId, contextId, frameId, parentSessionId, offsetX, offsetY, url, ancestors }
+      frameSlots: new Map(), // frameId -> stable slot number >= 1 for non-colliding parallel @bN ranges
+      nextFrameSlot: 1,
       lastChildFrames: [], // cached visible child frames from latest discovery
+      lastSnapshot: null, // { url, elementsById: Map<id, ElementNode>, tablesHash, textHash, timestampMs }
+      networkPending: new Map(), // requestId -> { requestId, url, method, resourceType, timestampMs }
+      networkRing: [], // last 25 XHR/Fetch JSON responses
+      networkErrors: [], // recent 4xx/5xx or failed XHR/Fetch responses
+      navigating: false,
+      previewDebounceTimer: null,
       url: "",
       title: "",
       lastActiveAt: Date.now()
@@ -675,22 +687,16 @@ async function initChildTargetSession(tabId, childSessionId) {
   if (!session || !session.attached) return;
   const entry = session.childTargets.get(childSessionId);
   if (!entry) return;
-  try {
-    await sendCDP(tabId, "Runtime.enable", {}, childSessionId);
-  } catch (_) {}
-  try {
-    await sendCDP(tabId, "DOM.enable", {}, childSessionId);
-  } catch (_) {}
-  try {
-    await sendCDP(tabId, "Page.enable", {}, childSessionId);
-  } catch (_) {}
-  try {
-    await sendCDP(tabId, "Target.setAutoAttach", {
+  await Promise.all([
+    sendCDP(tabId, "Runtime.enable", {}, childSessionId).catch(() => {}),
+    sendCDP(tabId, "DOM.enable", {}, childSessionId).catch(() => {}),
+    sendCDP(tabId, "Page.enable", {}, childSessionId).catch(() => {}),
+    sendCDP(tabId, "Target.setAutoAttach", {
       autoAttach: true,
       waitForDebuggerOnStart: false,
       flatten: true
-    }, childSessionId);
-  } catch (_) {}
+    }, childSessionId).catch(() => {})
+  ]);
   entry.ready = true;
 }
 
@@ -719,7 +725,18 @@ function clearSessionFrameState(session) {
   session.childTargets?.clear();
   session.executionContexts?.clear();
   session.elementFrameMap?.clear();
+  session.frameSlots?.clear();
+  session.nextFrameSlot = 1;
   session.lastChildFrames = [];
+  session.lastSnapshot = null;
+  session.networkPending?.clear();
+  session.networkRing = [];
+  session.networkErrors = [];
+  session.navigating = false;
+  if (session.previewDebounceTimer) {
+    clearTimeout(session.previewDebounceTimer);
+    session.previewDebounceTimer = null;
+  }
 }
 
 async function refreshTabMeta(tabId) {
@@ -762,6 +779,24 @@ function stopCapturePump(session) {
   }
 }
 
+function emitPreviewFrameData(tabId, jpegBase64, indicatorOverride = undefined) {
+  const session = state.tabSessions.get(tabId);
+  if (!session || !jpegBase64) return;
+  session.lastFrameAt = Date.now();
+  const viewport = effectiveViewport(session);
+  sendWS({
+    type: "frame",
+    tabId,
+    profileName: state.profileName,
+    url: session.url,
+    title: session.title,
+    viewportWidth: viewport.width,
+    viewportHeight: viewport.height,
+    jpegBase64,
+    indicator: indicatorOverride !== undefined ? indicatorOverride : tabIndicatorFrameFlag(tabId)
+  });
+}
+
 async function captureAndEmitFrame(tabId) {
   const session = state.tabSessions.get(tabId);
   if (!session || !session.attached || session.captureInFlight) {
@@ -775,26 +810,28 @@ async function captureAndEmitFrame(tabId) {
       optimizeForSpeed: true
     });
     if (res?.data) {
-      session.lastFrameAt = Date.now();
-      const tab = await refreshTabMeta(tabId);
-      const viewport = effectiveViewport(session);
-      sendWS({
-        type: "frame",
-        tabId,
-        profileName: state.profileName,
-        url: tab?.url || session.url,
-        title: tab?.title || session.title,
-        viewportWidth: viewport.width,
-        viewportHeight: viewport.height,
-        jpegBase64: res.data,
-        indicator: tabIndicatorFrameFlag(tabId)
-      });
+      if (!session.url && !session.title) {
+        await refreshTabMeta(tabId);
+      }
+      emitPreviewFrameData(tabId, res.data);
     }
   } catch (_) {
     // Tab may have navigated or detached
   } finally {
     session.captureInFlight = false;
   }
+}
+
+function schedulePreviewFrame(tabId) {
+  const session = state.tabSessions.get(tabId);
+  if (!session || !session.attached) return;
+  if (session.previewDebounceTimer) {
+    clearTimeout(session.previewDebounceTimer);
+  }
+  session.previewDebounceTimer = setTimeout(() => {
+    session.previewDebounceTimer = null;
+    captureAndEmitFrame(tabId).catch(() => {});
+  }, PREVIEW_DEBOUNCE_MS);
 }
 
 function startCapturePump(tabId) {
@@ -903,9 +940,9 @@ function effectiveViewport(session) {
 
 // The user can see a tab when it is the active tab of a window that is not minimized. A failed lookup counts as
 // hidden, which keeps the pump.
-async function isTabVisibleToUser(tabId) {
+async function isTabVisibleToUser(tabId, knownTab = null) {
   try {
-    const tab = await chrome.tabs.get(tabId);
+    const tab = knownTab || await chrome.tabs.get(tabId);
     if (!tab?.active) return false;
     const win = await chrome.windows.get(tab.windowId);
     return Boolean(win) && win.state !== "minimized";
@@ -917,29 +954,28 @@ async function isTabVisibleToUser(tabId) {
 // Measures the page's real size into session.liveViewport. A tab Chrome has not laid out yet can report 0x0 (or
 // close to it): then the tab's size in Chrome is used instead, and if that is not known either the last
 // measurement stays.
-async function refreshLiveViewport(tabId, session) {
-  let measured = null;
-  try {
-    const res = await sendCDP(tabId, "Runtime.evaluate", {
+async function refreshLiveViewport(tabId, session, knownTab = null) {
+  const [evalRes, zoomVal] = await Promise.all([
+    sendCDP(tabId, "Runtime.evaluate", {
       expression: "({ width: window.innerWidth, height: window.innerHeight, scale: window.devicePixelRatio })",
       returnByValue: true
-    });
-    measured = res?.result?.value || null;
-  } catch (_) {}
+    }).catch(() => null),
+    chrome.tabs.getZoom(tabId).catch(() => 1)
+  ]);
+  const measured = evalRes?.result?.value || null;
   // The page zoom turns window pixels into CSS pixels (at 90%, a 1512 px window lays out 1680 px wide).
-  let zoom = 1;
-  try {
-    const z = Number(await chrome.tabs.getZoom(tabId));
-    if (z > 0) zoom = z;
-  } catch (_) {}
+  const z = Number(zoomVal);
+  const zoom = z > 0 ? z : 1;
   let width = Number(measured?.width) || 0;
   let height = Number(measured?.height) || 0;
   const scale = Number(measured?.scale) > 0 ? Number(measured.scale) : session.liveViewport?.scale || 1;
   if (width < MIN_USABLE_VIEWPORT || height < MIN_USABLE_VIEWPORT) {
-    let tab = null;
-    try {
-      tab = await chrome.tabs.get(tabId);
-    } catch (_) {}
+    let tab = knownTab;
+    if (!tab || !(Number(tab.width) > 0) || !(Number(tab.height) > 0)) {
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch (_) {}
+    }
     width = Number(tab?.width) / zoom || 0;
     height = Number(tab?.height) / zoom || 0;
     if (width < MIN_USABLE_VIEWPORT || height < MIN_USABLE_VIEWPORT) return;
@@ -1082,7 +1118,7 @@ async function ensureAttached(tabId) {
   }
 
   // Fail fast (before evicting other sessions) on pages Chrome will refuse to attach to.
-  await assertTabScriptable(tabId);
+  const tab = await assertTabScriptable(tabId);
 
   const session = getOrCreateTabSession(tabId);
   session.lastActiveAt = Date.now();
@@ -1096,31 +1132,33 @@ async function ensureAttached(tabId) {
     throw await toRestrictedPageErrorIfNeeded(err, tabId);
   }
   session.attached = true;
-  await refreshTabMeta(tabId);
+  if (tab) {
+    session.url = tab.url || session.url || "";
+    session.title = tab.title || session.title || "";
+  }
 
-  await sendCDP(tabId, "Page.enable");
-  await sendCDP(tabId, "Runtime.enable");
-  await sendCDP(tabId, "DOM.enable");
-  try {
-    await sendCDP(tabId, "Target.setAutoAttach", {
+  // Parallel cold attach: enable all CDP domains + focus emulation + auto-attach + viewport/visibility in one wave.
+  const [, , , , , , frameTreeRes, visible] = await Promise.all([
+    sendCDP(tabId, "Page.enable"),
+    sendCDP(tabId, "Runtime.enable"),
+    sendCDP(tabId, "DOM.enable"),
+    sendCDP(tabId, "Network.enable", { maxPostDataSize: 0 }).catch(() => {}),
+    sendCDP(tabId, "Target.setAutoAttach", {
       autoAttach: true,
       waitForDebuggerOnStart: false,
       flatten: true
-    });
-  } catch (_) {
-    // Non-fatal on older Chrome builds without flattened OOPIF auto-attach
+    }).catch(() => {}),
+    sendCDP(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {}),
+    sendCDP(tabId, "Page.getFrameTree").catch(() => null),
+    isTabVisibleToUser(tabId, tab),
+    refreshLiveViewport(tabId, session, tab)
+  ]);
+
+  session.visibleToUser = visible;
+  // Wait briefly for OOPIF Target.attachedToTarget events ONLY when Page.getFrameTree actually reports child frames.
+  if (Array.isArray(frameTreeRes?.frameTree?.childFrames) && frameTreeRes.frameTree.childFrames.length > 0) {
+    await sleep(25);
   }
-  // UseMac never resizes a tab, but an older extension version may have left a metrics override on this one: clear
-  // it so the page gets its real size back, then measure that size.
-  try {
-    await sendCDP(tabId, "Emulation.clearDeviceMetricsOverride");
-    await sleep(METRICS_SETTLE_MS);
-  } catch (_) {}
-  session.visibleToUser = await isTabVisibleToUser(tabId);
-  await refreshLiveViewport(tabId, session);
-  await sendCDP(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true });
-  // Give already-loaded OOPIF targets a brief moment to emit Target.attachedToTarget
-  await sleep(35);
 }
 
 async function ensureStreaming(tabId) {
@@ -1142,7 +1180,8 @@ async function ensureStreaming(tabId) {
       startCapturePump(tabId);
     }
     startScreencastStallWatch(tabId);
-    await captureAndEmitFrame(tabId);
+    // Non-blocking initial preview frame so observe/act never stalls waiting on a preview JPEG.
+    captureAndEmitFrame(tabId).catch(() => {});
   }
   resetIdleTimer(tabId);
 }
@@ -1225,6 +1264,110 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     clearPendingFileChooser(session, { ...(params || {}), sessionId: source.sessionId || null });
     return;
   }
+  if ((method === "Page.frameStartedNavigating" || method === "Page.frameStartedLoading") && !source.sessionId) {
+    session.navigating = true;
+    return;
+  }
+  if (method === "Page.loadEventFired" && !source.sessionId) {
+    session.navigating = false;
+    return;
+  }
+  if (method === "Page.frameNavigated" && !source.sessionId && params?.frame && !params.frame.parentId) {
+    session.navigating = false;
+    if (params.frame.url) session.url = params.frame.url;
+    return;
+  }
+  if (method === "Network.requestWillBeSent" && !source.sessionId) {
+    const reqId = params?.requestId;
+    const reqType = params?.type || "";
+    const reqUrl = params?.request?.url || "";
+    if (reqId && (reqType === "XHR" || reqType === "Fetch")) {
+      session.networkPending.set(reqId, {
+        requestId: reqId,
+        url: reqUrl,
+        method: params?.request?.method || "GET",
+        resourceType: reqType,
+        timestampMs: Date.now()
+      });
+      if (session.networkPending.size > 200) {
+        const oldestKey = session.networkPending.keys().next().value;
+        if (oldestKey != null) session.networkPending.delete(oldestKey);
+      }
+    }
+    return;
+  }
+  if (method === "Network.responseReceived" && !source.sessionId) {
+    const reqId = params?.requestId;
+    const pending = reqId ? session.networkPending.get(reqId) : null;
+    const reqType = params?.type || pending?.resourceType || "";
+    const resp = params?.response || {};
+    const status = Number(resp.status) || 0;
+    const url = resp.url || pending?.url || "";
+    const reqMethod = pending?.method || "GET";
+    const headers = resp.headers || {};
+    let contentType = resp.mimeType || "";
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === "content-type" && typeof v === "string") {
+        contentType = v;
+        break;
+      }
+    }
+    const isXhrFetch = reqType === "XHR" || reqType === "Fetch" || Boolean(pending);
+    if (isXhrFetch) {
+      const now = Date.now();
+      if (status >= 400) {
+        session.networkErrors.push({
+          url,
+          method: reqMethod,
+          status,
+          statusText: resp.statusText || "",
+          timestampMs: now
+        });
+        if (session.networkErrors.length > NETWORK_ERRORS_MAX) {
+          session.networkErrors.splice(0, session.networkErrors.length - NETWORK_ERRORS_MAX);
+        }
+      }
+      const isJson = /json/i.test(contentType);
+      if (reqId && (isJson || status >= 400)) {
+        session.networkRing.push({
+          url,
+          method: reqMethod,
+          status,
+          contentType,
+          requestId: reqId,
+          timestampMs: now,
+          bodyLoaded: false,
+          body: null
+        });
+        if (session.networkRing.length > NETWORK_RING_MAX) {
+          session.networkRing.splice(0, session.networkRing.length - NETWORK_RING_MAX);
+        }
+      }
+    }
+    return;
+  }
+  if (method === "Network.loadingFinished" && !source.sessionId) {
+    if (params?.requestId) session.networkPending.delete(params.requestId);
+    return;
+  }
+  if (method === "Network.loadingFailed" && !source.sessionId) {
+    const reqId = params?.requestId;
+    const pending = reqId ? session.networkPending.get(reqId) : null;
+    if (reqId) session.networkPending.delete(reqId);
+    if (pending && !params?.canceled) {
+      session.networkErrors.push({
+        url: pending.url,
+        method: pending.method,
+        status: 0,
+        statusText: params?.errorText || "Network error",
+        timestampMs: Date.now()
+      });
+      if (session.networkErrors.length > NETWORK_ERRORS_MAX) {
+        session.networkErrors.splice(0, session.networkErrors.length - NETWORK_ERRORS_MAX);
+      }
+    }
+    return;
+  }
   if (method === "Page.screencastFrame" && !source.sessionId && params?.data) {
     const sessionId = params.sessionId;
     if (sessionId !== undefined) {
@@ -1274,11 +1417,40 @@ chrome.debugger.onDetach.addListener((source) => {
   sendWS({ type: "stream_stopped", tabId: detachedTabId, reason: "detached" });
 });
 
+chrome.tabs.onCreated?.addListener((tab) => {
+  if (!tab || tab.id == null) return;
+  sendWS({
+    type: "tab_url",
+    tabId: tab.id,
+    windowId: tab.windowId ?? null,
+    url: tab.url || tab.pendingUrl || "",
+    pendingUrl: tab.pendingUrl || null,
+    title: tab.title || "",
+    active: Boolean(tab.active)
+  });
+});
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const session = state.tabSessions.get(tabId);
   if (session && (changeInfo.url || changeInfo.title || tab)) {
     session.url = tab?.url || changeInfo.url || session.url;
     session.title = tab?.title || changeInfo.title || session.title;
+  }
+  if (session && changeInfo?.status === "loading") {
+    session.navigating = true;
+  } else if (session && changeInfo?.status === "complete") {
+    session.navigating = false;
+  }
+  if (changeInfo.url || changeInfo.title || changeInfo.status === "complete") {
+    sendWS({
+      type: "tab_url",
+      tabId,
+      windowId: tab?.windowId ?? null,
+      url: tab?.url || changeInfo.url || "",
+      pendingUrl: tab?.pendingUrl || null,
+      title: tab?.title || changeInfo.title || "",
+      active: typeof tab?.active === "boolean" ? tab.active : undefined
+    });
   }
   if (session?.attached && changeInfo?.status === "complete") {
     scheduleVisibilitySync(tabId, { remeasure: true });
@@ -1294,6 +1466,7 @@ chrome.windows?.onBoundsChanged?.addListener(() => scheduleVisibilitySyncForAtta
 chrome.tabs.onRemoved.addListener((tabId) => {
   forgetOwnedTab(tabId).catch(() => {});
   state.tabCancelGeneration.delete(tabId);
+  sendWS({ type: "tab_url", tabId, removed: true });
   const session = state.tabSessions.get(tabId);
   if (session) {
     clearIdleTimer(session);
@@ -1310,6 +1483,32 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     sendWS({ type: "stream_stopped", tabId, reason: "closed" });
   }
 });
+
+// Double requestAnimationFrame settle (~16-33ms on visible tabs, immediate when hidden or in headless/test mocks,
+// capped at maxWaitMs so throttled background tabs never stall).
+async function waitForAnimationFrames(tabId, maxWaitMs = 40) {
+  const session = state.tabSessions.get(tabId);
+  if (!session?.attached) return;
+  try {
+    await Promise.race([
+      sendCDP(tabId, "Runtime.evaluate", {
+        expression: `new Promise((resolve) => {
+          if (typeof requestAnimationFrame !== 'function' || document.visibilityState === 'hidden') {
+            resolve(true);
+            return;
+          }
+          let done = false;
+          const finish = () => { if (!done) { done = true; resolve(true); } };
+          requestAnimationFrame(() => requestAnimationFrame(finish));
+          setTimeout(finish, ${Math.max(10, Number(maxWaitMs) || 40)});
+        })`,
+        returnByValue: true,
+        awaitPromise: true
+      }),
+      sleep(maxWaitMs + 25)
+    ]);
+  } catch (_) {}
+}
 
 async function waitForTabLoad(tabId, timeoutMs = 4500) {
   let completed = false;
@@ -1342,28 +1541,42 @@ async function waitForTabLoad(tabId, timeoutMs = 4500) {
     });
   }
 
-  await sleep(160);
-  // Brief SPA mount settle if debugger is already attached and body is still sparse
+  // Event-driven settle: double-rAF + MutationObserver only if body is sparse/busy (replaces blind 160ms + 700ms poll).
   const session = state.tabSessions.get(tabId);
   if (session?.attached) {
-    const settleDeadline = Date.now() + 700;
-    while (Date.now() < settleDeadline) {
-      try {
-        const probe = await sendCDP(tabId, "Runtime.evaluate", {
-          expression: `(() => {
-            const len = (document.body?.innerText || '').trim().length;
-            const busy = Boolean(document.querySelector('[aria-busy="true"], [role="progressbar"]'));
-            return { len, busy };
-          })()`,
-          returnByValue: true
-        });
-        const v = probe?.result?.value;
-        if (v && v.len >= 60 && !v.busy) break;
-      } catch (_) {
-        break;
-      }
-      await sleep(140);
-    }
+    await waitForAnimationFrames(tabId, 40);
+    try {
+      await Promise.race([
+        sendCDP(tabId, "Runtime.evaluate", {
+          expression: `new Promise((resolve) => {
+            const ready = () => {
+              const len = (document.body?.innerText || '').trim().length;
+              const busy = Boolean(document.querySelector('[aria-busy="true"], [role="progressbar"]'));
+              return len >= 60 && !busy;
+            };
+            if (ready() || typeof MutationObserver !== 'function' || !document.documentElement) {
+              resolve(true);
+              return;
+            }
+            let done = false;
+            let mo = null;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              if (mo) try { mo.disconnect(); } catch (_) {}
+              clearTimeout(timer);
+              resolve(true);
+            };
+            mo = new MutationObserver(() => { if (ready()) finish(); });
+            mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+            const timer = setTimeout(finish, 450);
+          })`,
+          returnByValue: true,
+          awaitPromise: true
+        }),
+        sleep(500)
+      ]);
+    } catch (_) {}
   }
   return refreshTabMeta(tabId);
 }
@@ -1770,7 +1983,7 @@ function restrictedPageFeedback(tab, reason, { activated = false } = {}) {
 function stepNeedsDebugger(step) {
   const action = step?.action;
   if (action === "openURL" || action === "navigate") return false;
-  if (action === "wait") return Boolean(step.selector || step.text);
+  if (action === "wait") return Boolean(step.selector || step.text || hasNonEmptyMatch(step.match));
   return true;
 }
 
@@ -1805,15 +2018,32 @@ function restrictedPageSnapshot(tab, reason, options = {}) {
 }
 
 const QUERY_DEEP_HELPER_JS = `
-function queryAllDeep(root, sel, maxRoots = 140) {
+function collectRoots(root, maxRoots = 140) {
+  const roots = [root];
+  const visited = new Set([root]);
+  for (let q = 0; q < roots.length && roots.length < maxRoots; q++) {
+    const cur = roots[q];
+    if (!cur) continue;
+    try {
+      const all = cur.querySelectorAll('*');
+      for (let i = 0; i < all.length && roots.length < maxRoots; i++) {
+        const sr = all[i].shadowRoot;
+        if (sr && !visited.has(sr)) {
+          visited.add(sr);
+          roots.push(sr);
+        }
+      }
+    } catch (_) {}
+  }
+  return roots;
+}
+
+function queryAllInRoots(roots, sel) {
   const out = [];
   const seenNodes = new Set();
-  const visited = new Set();
-  const queue = [root];
-  while (queue.length > 0 && visited.size < maxRoots) {
-    const cur = queue.shift();
-    if (!cur || visited.has(cur)) continue;
-    visited.add(cur);
+  for (let r = 0; r < roots.length; r++) {
+    const cur = roots[r];
+    if (!cur) continue;
     try {
       const matched = cur.querySelectorAll(sel);
       for (let i = 0; i < matched.length; i++) {
@@ -1823,16 +2053,12 @@ function queryAllDeep(root, sel, maxRoots = 140) {
         }
       }
     } catch (_) {}
-    try {
-      const all = cur.querySelectorAll('*');
-      for (let i = 0; i < all.length && visited.size + queue.length < maxRoots; i++) {
-        if (all[i].shadowRoot && !visited.has(all[i].shadowRoot)) {
-          queue.push(all[i].shadowRoot);
-        }
-      }
-    } catch (_) {}
   }
   return out;
+}
+
+function queryAllDeep(root, sel, maxRoots = 140) {
+  return queryAllInRoots(collectRoots(root, maxRoots), sel);
 }
 
 function queryOneDeep(root, sel, maxRoots = 140) {
@@ -1840,29 +2066,11 @@ function queryOneDeep(root, sel, maxRoots = 140) {
     const direct = root.querySelector(sel);
     if (direct) return direct;
   } catch (_) {}
-  const visited = new Set([root]);
-  const queue = [];
-  try {
-    const all = root.querySelectorAll('*');
-    for (let i = 0; i < all.length && queue.length < maxRoots; i++) {
-      if (all[i].shadowRoot) queue.push(all[i].shadowRoot);
-    }
-  } catch (_) {}
-  while (queue.length > 0 && visited.size < maxRoots) {
-    const cur = queue.shift();
-    if (!cur || visited.has(cur)) continue;
-    visited.add(cur);
+  const roots = collectRoots(root, maxRoots);
+  for (let i = 1; i < roots.length; i++) {
     try {
-      const hit = cur.querySelector(sel);
+      const hit = roots[i].querySelector(sel);
       if (hit) return hit;
-    } catch (_) {}
-    try {
-      const all = cur.querySelectorAll('*');
-      for (let i = 0; i < all.length && visited.size + queue.length < maxRoots; i++) {
-        if (all[i].shadowRoot && !visited.has(all[i].shadowRoot)) {
-          queue.push(all[i].shadowRoot);
-        }
-      }
     } catch (_) {}
   }
   return null;
@@ -1874,6 +2082,207 @@ function getDeepActiveElement() {
     active = active.shadowRoot.activeElement;
   }
   return active;
+}
+
+function getUsemacRefRegistry(idBase = 1) {
+  let reg = globalThis.__usemacRefRegistry;
+  if (!reg || !(reg.nodeToId instanceof WeakMap) || !(reg.idToNode instanceof Map)) {
+    const nodeToId = globalThis.__usemacNodeIds instanceof WeakMap ? globalThis.__usemacNodeIds : new WeakMap();
+    reg = {
+      nodeToId,
+      idToNode: new Map(),
+      nextCounter: Math.max(1, Number(idBase) || 1)
+    };
+    globalThis.__usemacRefRegistry = reg;
+    globalThis.__usemacNodeIds = nodeToId;
+  } else {
+    globalThis.__usemacNodeIds = reg.nodeToId;
+    if (Number(idBase) > reg.nextCounter) {
+      reg.nextCounter = Number(idBase);
+    }
+  }
+  if (reg.idToNode.size > 1500) {
+    for (const [k, v] of reg.idToNode.entries()) {
+      const el = typeof WeakRef === 'function' && v instanceof WeakRef ? v.deref() : v;
+      if (!el || !el.isConnected) reg.idToNode.delete(k);
+    }
+  }
+  return reg;
+}
+
+function lookupUsemacNodeId(el, reg) {
+  let id = reg.nodeToId.get(el);
+  if (id) return id;
+  const attr = el.getAttribute ? el.getAttribute('data-usemac-id') : null;
+  if (attr && /^@b\\d+$/.test(attr)) {
+    reg.nodeToId.set(el, attr);
+    reg.idToNode.set(attr, typeof WeakRef === 'function' ? new WeakRef(el) : el);
+    const num = parseInt(attr.slice(2), 10);
+    if (Number.isFinite(num) && num >= reg.nextCounter) reg.nextCounter = num + 1;
+    return attr;
+  }
+  return null;
+}
+
+function assignUsemacNodeId(el, reg) {
+  const existing = lookupUsemacNodeId(el, reg);
+  if (existing) return existing;
+  const id = '@b' + (reg.nextCounter++);
+  reg.nodeToId.set(el, id);
+  reg.idToNode.set(id, typeof WeakRef === 'function' ? new WeakRef(el) : el);
+  return id;
+}
+
+function findByUsemacId(id, root = document) {
+  if (!id) return null;
+  const reg = globalThis.__usemacRefRegistry;
+  if (reg && reg.idToNode instanceof Map && reg.idToNode.has(id)) {
+    const ref = reg.idToNode.get(id);
+    const el = typeof WeakRef === 'function' && ref instanceof WeakRef ? ref.deref() : ref;
+    if (el && el.isConnected) return el;
+    reg.idToNode.delete(id);
+  }
+  const escaped = String(id).replace(/["\\\\]/g, '\\\\$&');
+  const found = queryOneDeep(root, '[data-usemac-id="' + escaped + '"]');
+  if (found && reg) {
+    reg.nodeToId.set(found, id);
+    reg.idToNode.set(id, typeof WeakRef === 'function' ? new WeakRef(found) : found);
+  }
+  return found;
+}
+
+function normalizeMatchText(str) {
+  if (str == null) return '';
+  let s = String(str);
+  try { s = s.normalize('NFD').replace(/[\\u0300-\\u036f]/g, ''); } catch (_) {}
+  return s.toLowerCase().replace(/\\s+/g, ' ').trim();
+}
+
+function mapElementRole(el) {
+  const tag = (el.tagName || '').toLowerCase();
+  const ariaRole = (el.getAttribute ? (el.getAttribute('role') || '') : '').toLowerCase();
+  if (tag === 'a' || ariaRole === 'link') return 'AXLink';
+  if (ariaRole === 'checkbox' || ariaRole === 'switch' || ariaRole === 'menuitemcheckbox') return 'AXCheckBox';
+  if (ariaRole === 'radio' || ariaRole === 'tab' || ariaRole === 'menuitemradio') return 'AXRadioButton';
+  if (ariaRole === 'combobox' || ariaRole === 'listbox' || tag === 'select') return 'AXPopUpButton';
+  if (ariaRole === 'menuitem' || ariaRole === 'option' || ariaRole === 'treeitem') return 'AXMenuItem';
+  if (ariaRole === 'slider') return 'AXSlider';
+  if (ariaRole === 'spinbutton' || ariaRole === 'textbox' || ariaRole === 'searchbox') return 'AXTextField';
+  if (tag === 'button' || tag === 'summary' || ariaRole === 'button') return 'AXButton';
+  if (tag === 'h1' || tag === 'h2' || tag === 'h3') return 'AXHeading';
+  if (tag === 'input') {
+    const t = (el.type || 'text').toLowerCase();
+    if (t === 'file') return 'AXFileUpload';
+    if (t === 'checkbox') return 'AXCheckBox';
+    if (t === 'radio') return 'AXRadioButton';
+    if (t === 'button' || t === 'submit' || t === 'reset') return 'AXButton';
+    return 'AXTextField';
+  }
+  if (tag === 'textarea' || el.isContentEditable) return 'AXTextField';
+  return 'AXGroup';
+}
+
+function roleMatchesQuery(el, mappedRole, wantedRole) {
+  if (!wantedRole) return true;
+  const w = normalizeMatchText(wantedRole);
+  if (!w) return true;
+  const mr = normalizeMatchText(mappedRole);
+  const tag = normalizeMatchText(el.tagName || '');
+  const aria = normalizeMatchText(el.getAttribute ? (el.getAttribute('role') || '') : '');
+  if (w === mr || w === tag || (aria && w === aria)) return true;
+  const stripped = w.startsWith('ax') ? w.slice(2) : w;
+  const mrStripped = mr.startsWith('ax') ? mr.slice(2) : mr;
+  if (stripped === mrStripped) return true;
+  const aliases = {
+    btn: 'axbutton', button: 'axbutton',
+    link: 'axlink', a: 'axlink',
+    input: 'axtextfield', textbox: 'axtextfield', textfield: 'axtextfield', textarea: 'axtextfield', searchbox: 'axtextfield', text: 'axtextfield',
+    checkbox: 'axcheckbox', switch: 'axcheckbox',
+    radio: 'axradiobutton', tab: 'axradiobutton',
+    select: 'axpopupbutton', combobox: 'axpopupbutton', dropdown: 'axpopupbutton', popup: 'axpopupbutton', listbox: 'axpopupbutton',
+    menuitem: 'axmenuitem', option: 'axmenuitem', treeitem: 'axmenuitem',
+    heading: 'axheading', h1: 'axheading', h2: 'axheading', h3: 'axheading',
+    slider: 'axslider',
+    file: 'axfileupload', fileupload: 'axfileupload'
+  };
+  if (aliases[stripped] && aliases[stripped] === mr) return true;
+  return false;
+}
+
+function extractElementTitleValue(el, labelMap) {
+  const tag = (el.tagName || '').toLowerCase();
+  let labelFromFor = null;
+  if ((tag === 'input' || tag === 'textarea' || tag === 'select') && el.id) {
+    if (labelMap && labelMap.has(el.id)) {
+      labelFromFor = labelMap.get(el.id);
+    } else {
+      const lbl = document.querySelector ? document.querySelector('label[for="' + String(el.id).replace(/["\\\\]/g, '\\\\$&') + '"]') : null;
+      if (lbl) labelFromFor = lbl.innerText || lbl.textContent;
+    }
+  }
+  if (!labelFromFor && (tag === 'input' || tag === 'textarea' || tag === 'select') && el.closest) {
+    const parentLbl = el.closest('label');
+    if (parentLbl) labelFromFor = parentLbl.innerText || parentLbl.textContent;
+  }
+  let labelFromAriaBy = null;
+  const ariaBy = el.getAttribute ? el.getAttribute('aria-labelledby') : null;
+  if (ariaBy) {
+    const parts = ariaBy.split(/\\s+/).map((rid) => document.getElementById?.(rid)?.innerText || '').filter(Boolean);
+    if (parts.length > 0) labelFromAriaBy = parts.join(' ');
+  }
+  const rawTitle =
+    (el.getAttribute && el.getAttribute('aria-label')) ||
+    labelFromAriaBy ||
+    el.innerText ||
+    el.textContent ||
+    labelFromFor ||
+    (el.getAttribute && el.getAttribute('placeholder')) ||
+    (el.getAttribute && el.getAttribute('title')) ||
+    (el.getAttribute && el.getAttribute('alt')) ||
+    (el.getAttribute && el.getAttribute('name')) ||
+    '';
+  const title = String(rawTitle).replace(/\\s+/g, ' ').trim();
+
+  let value = '';
+  if (tag === 'select') {
+    const selectedOpt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+    value = selectedOpt ? (selectedOpt.text || selectedOpt.value || '').trim() : String(el.value || '');
+  } else if (tag === 'input' || tag === 'textarea') {
+    if (el.type === 'checkbox' || el.type === 'radio') {
+      value = el.checked ? 'checked=true' : 'checked=false';
+    } else if (el.type !== 'password' && el.type !== 'file') {
+      value = String(el.value || '');
+    }
+  } else if (el.isContentEditable) {
+    value = String(el.innerText || '').replace(/\\s+/g, ' ').trim();
+  }
+  return { title, value };
+}
+
+function matchesElementSpec(el, spec, labelMap, precomputed) {
+  if (!spec || typeof spec !== 'object') return false;
+  const mappedRole = precomputed?.role || mapElementRole(el);
+  if (spec.role && !roleMatchesQuery(el, mappedRole, spec.role)) return false;
+  const info = precomputed || extractElementTitleValue(el, labelMap);
+  const exact = spec.exact === true;
+  const cmp = (haystack, needle) => {
+    const h = normalizeMatchText(haystack);
+    const n = normalizeMatchText(needle);
+    if (!n) return true;
+    return exact ? h === n : h.includes(n);
+  };
+  if (spec.title != null && String(spec.title).trim() !== '') {
+    const desc = (el.getAttribute && (el.getAttribute('aria-description') || el.getAttribute('title') || el.getAttribute('placeholder'))) || '';
+    if (!cmp(info.title, spec.title) && !cmp(desc, spec.title)) return false;
+  }
+  if (spec.value != null && String(spec.value).trim() !== '') {
+    if (!cmp(info.value, spec.value)) return false;
+  }
+  if (spec.text != null && String(spec.text).trim() !== '') {
+    const combined = [info.title, info.value, (el.innerText || '').slice(0, 200)].filter(Boolean);
+    if (!combined.some((part) => cmp(part, spec.text))) return false;
+  }
+  return true;
 }
 `;
 
@@ -2194,65 +2603,152 @@ async function discoverChildFrames(tabId) {
   return discovered;
 }
 
+function getFrameSlot(session, frameId) {
+  if (!session || !frameId) return 1;
+  let slot = session.frameSlots.get(frameId);
+  if (slot == null) {
+    slot = session.nextFrameSlot++;
+    session.frameSlots.set(frameId, slot);
+  }
+  return slot;
+}
+
+function hashString(str) {
+  if (!str) return null;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function framesSignificantlyChanged(a, b) {
+  if (!a && !b) return false;
+  if (!a || !b) return true;
+  return (
+    Math.abs((a.x || 0) - (b.x || 0)) >= 5 ||
+    Math.abs((a.y || 0) - (b.y || 0)) >= 5 ||
+    Math.abs((a.width || 0) - (b.width || 0)) >= 5 ||
+    Math.abs((a.height || 0) - (b.height || 0)) >= 5
+  );
+}
+
+function elementNodeChanged(prev, cur) {
+  return (
+    prev.role !== cur.role ||
+    (prev.title ?? null) !== (cur.title ?? null) ||
+    (prev.value ?? null) !== (cur.value ?? null) ||
+    Boolean(prev.enabled) !== Boolean(cur.enabled) ||
+    Boolean(prev.focused) !== Boolean(cur.focused) ||
+    Boolean(prev.offscreen) !== Boolean(cur.offscreen) ||
+    framesSignificantlyChanged(prev.frame, cur.frame)
+  );
+}
+
+function computeSnapshotDiff(prevElementsById, currentElements) {
+  if (!prevElementsById || !(prevElementsById instanceof Map)) return null;
+  const added = [];
+  const changed = [];
+  const removedIds = [];
+  const curIds = new Set();
+
+  for (const el of currentElements) {
+    curIds.add(el.id);
+    const prev = prevElementsById.get(el.id);
+    if (!prev) {
+      added.push(el);
+    } else if (elementNodeChanged(prev, el)) {
+      changed.push(el);
+    }
+  }
+  for (const prevId of prevElementsById.keys()) {
+    if (!curIds.has(prevId)) {
+      removedIds.push(prevId);
+    }
+  }
+
+  const parts = [];
+  if (added.length > 0) parts.push(`+${added.length} added`);
+  if (changed.length > 0) parts.push(`~${changed.length} changed`);
+  if (removedIds.length > 0) parts.push(`-${removedIds.length} removed`);
+  const summary = parts.length > 0 ? parts.join(", ") : "No element changes";
+
+  const denom = Math.max(prevElementsById.size, currentElements.length, 1);
+  const churn = (added.length + changed.length + removedIds.length) / denom;
+  return {
+    diff: { added, removedIds, changed, summary },
+    churn
+  };
+}
+
+function hasActiveFilter(filter) {
+  if (!filter || typeof filter !== "object") return false;
+  return Boolean(
+    (typeof filter.role === "string" && filter.role.trim()) ||
+    (typeof filter.text === "string" && filter.text.trim()) ||
+    (typeof filter.selector === "string" && filter.selector.trim()) ||
+    filter.viewportOnly === true
+  );
+}
+
 function buildFrameIndexExpression({
-  startIndex = 1,
+  idBase = 1,
   limit = 280,
   includeText = true,
   includeTables = true,
+  includeOffscreen = false,
+  filter = null,
   curVpW = FALLBACK_VIEWPORT_WIDTH,
   curVpH = FALLBACK_VIEWPORT_HEIGHT,
+  topVpW = FALLBACK_VIEWPORT_WIDTH,
+  topVpH = FALLBACK_VIEWPORT_HEIGHT,
   isTopFrame = true,
   offsetX = 0,
   offsetY = 0
 }) {
+  const filterLit = filter && typeof filter === "object" ? JSON.stringify(filter) : "null";
   return `(() => {
       ${QUERY_DEEP_HELPER_JS}
-      const startIndex = ${startIndex};
+      const idBase = ${Number(idBase) || 1};
       const limit = ${limit};
       const includeText = ${includeText ? "true" : "false"};
       const includeTables = ${includeTables ? "true" : "false"};
+      const includeOffscreen = ${includeOffscreen ? "true" : "false"};
+      const filter = ${filterLit};
       const isTopFrame = ${isTopFrame ? "true" : "false"};
       const offsetX = ${Number(offsetX) || 0};
       const offsetY = ${Number(offsetY) || 0};
+      const topVpW = ${Number(topVpW) || FALLBACK_VIEWPORT_WIDTH};
+      const topVpH = ${Number(topVpH) || FALLBACK_VIEWPORT_HEIGHT};
 
-      const prev = queryAllDeep(document, '[data-usemac-id]');
-      for (let i = 0; i < prev.length; i++) {
-        prev[i].removeAttribute('data-usemac-id');
-      }
+      const reg = getUsemacRefRegistry(idBase);
+      // Single ShadowRoot pass across the document (reused by all queries below).
+      const roots = collectRoots(document);
 
-      const selector = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [contenteditable="true"], summary, h1, h2, h3';
-      const nodes = queryAllDeep(document, selector);
-      const elements = [];
-      let focusedElementId = null;
-      const activeEl = getDeepActiveElement();
+      const vw = window.innerWidth || ${curVpW};
+      const vh = window.innerHeight || ${curVpH};
 
-      function mapRole(el) {
-        const tag = el.tagName.toLowerCase();
-        const ariaRole = (el.getAttribute('role') || '').toLowerCase();
-        if (tag === 'a' || ariaRole === 'link') return 'AXLink';
-        if (ariaRole === 'checkbox' || ariaRole === 'switch' || ariaRole === 'menuitemcheckbox') return 'AXCheckBox';
-        if (ariaRole === 'radio' || ariaRole === 'tab' || ariaRole === 'menuitemradio') return 'AXRadioButton';
-        if (ariaRole === 'combobox' || ariaRole === 'listbox' || tag === 'select') return 'AXPopUpButton';
-        if (ariaRole === 'menuitem' || ariaRole === 'option' || ariaRole === 'treeitem') return 'AXMenuItem';
-        if (ariaRole === 'slider') return 'AXSlider';
-        if (ariaRole === 'spinbutton') return 'AXTextField';
-        if (tag === 'button' || tag === 'summary' || ariaRole === 'button') return 'AXButton';
-        if (tag === 'h1' || tag === 'h2' || tag === 'h3') return 'AXHeading';
-        if (tag === 'input') {
-          const t = (el.type || 'text').toLowerCase();
-          if (t === 'file') return 'AXFileUpload';
-          if (t === 'checkbox') return 'AXCheckBox';
-          if (t === 'radio') return 'AXRadioButton';
-          if (t === 'button' || t === 'submit' || t === 'reset') return 'AXButton';
-          return 'AXTextField';
+      // Pre-index <label for="..."> once across all roots instead of querying per input.
+      const labelMap = new Map();
+      const labelNodes = queryAllInRoots(roots, 'label[for]');
+      for (let i = 0; i < labelNodes.length; i++) {
+        const lbl = labelNodes[i];
+        const forId = lbl.getAttribute('for');
+        if (forId && !labelMap.has(forId)) {
+          const t = (lbl.innerText || lbl.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (t) labelMap.set(forId, t);
         }
-        if (tag === 'textarea' || el.isContentEditable) return 'AXTextField';
-        return 'AXGroup';
       }
+
+      const selector = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [role="textbox"], [role="searchbox"], [contenteditable="true"], summary, h1, h2, h3';
+      const nodes = queryAllInRoots(roots, selector);
+      const activeEl = getDeepActiveElement();
 
       function mapActions(role) {
         if (role === 'AXTextField') return ['AXConfirm', 'AXSetValue'];
         if (role === 'AXHeading') return [];
+        if (role === 'AXFileUpload') return ['AXUploadFile'];
         return ['AXPress'];
       }
 
@@ -2273,24 +2769,60 @@ function buildFrameIndexExpression({
         return true;
       }
 
-      function addElement(el, forcedRole = null, forcedTitle = null) {
-        const existingId = el.getAttribute('data-usemac-id');
-        if (existingId) return existingId;
+      function isRectInViewport(rect) {
+        const localVis = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+        if (!localVis) return false;
+        if (!isTopFrame) {
+          const absLeft = rect.left + offsetX;
+          const absTop = rect.top + offsetY;
+          const absRight = absLeft + rect.width;
+          const absBottom = absTop + rect.height;
+          return absBottom > 0 && absTop < topVpH && absRight > 0 && absLeft < topVpW;
+        }
+        return true;
+      }
+
+      function matchesObservationFilter(el, role, title, value, offscreen) {
+        if (!filter) return true;
+        if (filter.viewportOnly === true && offscreen) return false;
+        if (filter.role && !roleMatchesQuery(el, role, filter.role)) return false;
+        if (filter.selector) {
+          try {
+            if (!el.matches || !el.matches(filter.selector)) return false;
+          } catch (_) {
+            return false;
+          }
+        }
+        if (filter.text && String(filter.text).trim() !== '') {
+          const needle = normalizeMatchText(filter.text);
+          const hayTitle = normalizeMatchText(title || '');
+          const hayVal = normalizeMatchText(value || '');
+          if (!hayTitle.includes(needle) && !hayVal.includes(needle)) return false;
+        }
+        return true;
+      }
+
+      // --- PASS 1: READ-ONLY (batch all DOM/layout reads before any attribute writes) ---
+      const seenElements = new Set();
+      const inViewportDrafts = [];
+      const offscreenDrafts = [];
+
+      function collectElementDraft(el, forcedRole = null, forcedTitle = null, bypassFilter = false) {
+        if (!el || seenElements.has(el)) return null;
         const rect = el.getBoundingClientRect();
         if (!isVisibleRect(el, rect)) return null;
 
-        const id = '@b' + (startIndex + elements.length);
-        el.setAttribute('data-usemac-id', id);
-
-        const role = forcedRole || mapRole(el);
+        const role = forcedRole || mapElementRole(el);
         const tag = el.tagName.toLowerCase();
         const isFocused = activeEl === el;
-        if (isFocused) focusedElementId = id;
 
         let labelFromFor = null;
         if (!forcedTitle && (tag === 'input' || tag === 'textarea' || tag === 'select') && el.id) {
-          const lbl = queryOneDeep(document, 'label[for="' + el.id.replace(/["\\\\]/g, '\\\\$&') + '"]');
-          if (lbl) labelFromFor = lbl.innerText || lbl.textContent;
+          labelFromFor = labelMap.get(el.id) || null;
+        }
+        if (!forcedTitle && !labelFromFor && (tag === 'input' || tag === 'textarea' || tag === 'select') && el.closest) {
+          const pLbl = el.closest('label');
+          if (pLbl) labelFromFor = pLbl.innerText || pLbl.textContent || null;
         }
         let labelFromAriaBy = null;
         const ariaBy = el.getAttribute('aria-labelledby');
@@ -2359,16 +2891,23 @@ function buildFrameIndexExpression({
           if (states.length > 0) value = states.join(',');
         }
 
-        const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+        const offscreen = !isRectInViewport(rect);
+        if (!bypassFilter && !matchesObservationFilter(el, role, title, value, offscreen)) {
+          return null;
+        }
 
-        elements.push({
-          id,
+        seenElements.add(el);
+        const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+        const draft = {
+          el,
+          id: lookupUsemacNodeId(el, reg),
           role,
           title,
           value,
           roleDescription: el.getAttribute('role') || tag,
           enabled,
           focused: isFocused,
+          offscreen,
           frame: {
             x: Math.round((rect.left + offsetX) * 10) / 10,
             y: Math.round((rect.top + offsetY) * 10) / 10,
@@ -2376,28 +2915,29 @@ function buildFrameIndexExpression({
             height: Math.round(rect.height * 10) / 10
           },
           actions: mapActions(role)
-        });
-        return id;
+        };
+        if (offscreen) offscreenDrafts.push(draft);
+        else inViewportDrafts.push(draft);
+        return draft;
       }
 
-      for (let i = 0; i < nodes.length && elements.length < limit; i++) {
-        addElement(nodes[i]);
+      // Cap scan generously so offscreen elements before in-viewport ones never starve in-viewport discovery.
+      const maxScan = Math.max(limit * 4, 1200);
+      for (let i = 0; i < nodes.length && (inViewportDrafts.length + offscreenDrafts.length) < maxScan; i++) {
+        collectElementDraft(nodes[i]);
       }
 
       // Always expose <input type="file"> controls even when hidden behind styled upload buttons/dropzones
-      const fileInputs = queryAllDeep(document, 'input[type="file"]');
-      for (let i = 0; i < fileInputs.length && elements.length < limit + 16; i++) {
+      const fileInputDrafts = [];
+      const fileInputs = queryAllInRoots(roots, 'input[type="file"]');
+      for (let i = 0; i < fileInputs.length && fileInputDrafts.length < 16; i++) {
         const fi = fileInputs[i];
-        if (fi.getAttribute('data-usemac-id')) continue;
-        const id = '@b' + (startIndex + elements.length);
-        fi.setAttribute('data-usemac-id', id);
-
+        if (seenElements.has(fi)) continue;
         let labelText = fi.getAttribute('aria-label') || fi.getAttribute('title') || '';
         if (!labelText && fi.id) {
-          const explicitLbl = queryOneDeep(document, 'label[for="' + fi.id.replace(/["\\\\]/g, '\\\\$&') + '"]');
-          if (explicitLbl) labelText = explicitLbl.innerText || explicitLbl.textContent || '';
+          labelText = labelMap.get(fi.id) || '';
         }
-        if (!labelText) {
+        if (!labelText && fi.closest) {
           const parentLbl = fi.closest('label');
           if (parentLbl) labelText = parentLbl.innerText || parentLbl.textContent || '';
         }
@@ -2418,7 +2958,6 @@ function buildFrameIndexExpression({
             ancestor = ancestor.parentElement;
           }
         }
-
         const metaParts = [];
         if (fi.files && fi.files.length > 0) {
           metaParts.push('files=' + Array.from(fi.files).map((f) => f.name).join(','));
@@ -2426,15 +2965,21 @@ function buildFrameIndexExpression({
         if (fi.accept) metaParts.push('accept=' + fi.accept);
         if (fi.multiple) metaParts.push('multiple=true');
         if (isHiddenInput) metaParts.push('hidden=true');
-
-        elements.push({
-          id,
+        const fiTitle = cleanText(labelText, 120) || 'File upload input';
+        const fiVal = metaParts.length > 0 ? metaParts.join(';') : null;
+        const fiOffscreen = !isRectInViewport(anchorRect);
+        if (!matchesObservationFilter(fi, 'AXFileUpload', fiTitle, fiVal, fiOffscreen)) continue;
+        seenElements.add(fi);
+        fileInputDrafts.push({
+          el: fi,
+          id: lookupUsemacNodeId(fi, reg),
           role: 'AXFileUpload',
-          title: cleanText(labelText, 120) || 'File upload input',
-          value: metaParts.length > 0 ? metaParts.join(';') : null,
+          title: fiTitle,
+          value: fiVal,
           roleDescription: 'input[type=file]',
           enabled: !fi.disabled,
           focused: activeEl === fi,
+          offscreen: fiOffscreen,
           frame: {
             x: Math.round(((anchorRect.left || 0) + offsetX) * 10) / 10,
             y: Math.round(((anchorRect.top || 0) + offsetY) * 10) / 10,
@@ -2445,8 +2990,6 @@ function buildFrameIndexExpression({
         });
       }
 
-      const vw = window.innerWidth || ${curVpW};
-      const vh = window.innerHeight || ${curVpH};
       const docEl = document.documentElement;
       const bodyEl = document.body;
       const scrollX = Math.round(window.scrollX || docEl?.scrollLeft || bodyEl?.scrollLeft || 0);
@@ -2507,13 +3050,14 @@ function buildFrameIndexExpression({
 
       const scrollableContainers = findScrollableContainers();
 
-      function detectBlockingOverlay() {
+      function detectBlockingOverlayReadOnly() {
         const candidates = [];
         const probePoints = [
           [vw * 0.5, vh * 0.5],
           [vw * 0.5, vh * 0.3],
           [vw * 0.5, vh * 0.25],
-          [vw * 0.5, vh * 0.7]
+          [vw * 0.5, vh * 0.7],
+          [vw * 0.5, vh * 0.9]
         ];
         const seen = new Set();
 
@@ -2525,15 +3069,16 @@ function buildFrameIndexExpression({
             const pos = st?.position;
             const z = parseInt(st?.zIndex, 10);
             const isDialog = cur.getAttribute?.('role') === 'dialog' || cur.getAttribute?.('aria-modal') === 'true' || cur.tagName?.toLowerCase() === 'dialog';
-            if (isDialog || ((pos === 'fixed' || pos === 'sticky') && (Number.isFinite(z) && z >= 10))) {
+            const clsId = (((cur.className && typeof cur.className === 'string' ? cur.className : '') + ' ' + (cur.id || '')).toLowerCase());
+            const isCookieConsent = /cookie|consent|gdpr|onetrust|cookiebot|didomi|quantcast|privacy-banner|lgpd/.test(clsId);
+            if (isDialog || isCookieConsent || ((pos === 'fixed' || pos === 'sticky') && (Number.isFinite(z) && z >= 10))) {
               const r = cur.getBoundingClientRect();
               const area = r.width * r.height;
-              const isHeaderOrNav = (r.height < 110 && r.top <= 10 && r.width > vw * 0.85 && !isDialog);
-              // Do not misclassify main workspace iframes as blocking overlays when we index their contents
+              const isHeaderOrNav = (r.height < 110 && r.top <= 10 && r.width > vw * 0.85 && !isDialog && !isCookieConsent);
               const isWorkspaceIframe = cur.tagName?.toLowerCase() === 'iframe' && r.width > vw * 0.5 && r.height > vh * 0.5;
-              if (!isHeaderOrNav && !isWorkspaceIframe && r.width >= 200 && r.height >= 90 && area > 22000 && st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity) > 0.05) {
+              if (!isHeaderOrNav && !isWorkspaceIframe && r.width >= 200 && r.height >= 60 && area > 18000 && st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity) > 0.05) {
                 seen.add(cur);
-                candidates.push({ el: cur, rect: r, z: Number.isFinite(z) ? z : 10, isDialog });
+                candidates.push({ el: cur, rect: r, z: Number.isFinite(z) ? z : 10, isDialog, isCookieConsent });
               }
             }
             cur = cur.parentElement;
@@ -2541,17 +3086,17 @@ function buildFrameIndexExpression({
         }
 
         for (const [px, py] of probePoints) {
-          const hit = document.elementFromPoint(px, py);
+          const hit = document.elementFromPoint ? document.elementFromPoint(px, py) : null;
           if (hit) considerContainer(hit);
         }
 
-        const explicitDialogs = queryAllDeep(document, '[role="dialog"], [aria-modal="true"], dialog[open], div[class*="modal"], div[class*="popup"], div[class*="notification"], div[id*="onesignal"], div[id*="push"], div[class*="banner"]');
+        const explicitDialogs = queryAllInRoots(roots, '[role="dialog"], [aria-modal="true"], dialog[open], [id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"], [id*="onetrust"], [id*="didomi"], div[class*="modal"], div[class*="popup"], div[class*="notification"], div[id*="onesignal"], div[id*="push"], div[class*="banner"]');
         for (let i = 0; i < explicitDialogs.length && i < 40; i++) {
           considerContainer(explicitDialogs[i]);
         }
 
         if (candidates.length === 0) return null;
-        candidates.sort((a, b) => (b.isDialog ? 1 : 0) - (a.isDialog ? 1 : 0) || b.z - a.z);
+        candidates.sort((a, b) => (b.isCookieConsent ? 2 : 0) - (a.isCookieConsent ? 2 : 0) || (b.isDialog ? 1 : 0) - (a.isDialog ? 1 : 0) || b.z - a.z);
         const top = candidates[0];
         const container = top.el;
         const cr = top.rect;
@@ -2562,8 +3107,13 @@ function buildFrameIndexExpression({
         }
         if (!summary) summary = 'Modal/overlay covering viewport';
 
+        const containerTextLower = (summary || '').toLowerCase();
+        const isCookieText = top.isCookieConsent || /cookie|consent|gdpr|privacy|privacidade|lgpd|we use cookies|usamos cookies/.test(containerTextLower);
+
         let closeEl = null;
-        const dismissRegex = /^(x|×|✕|✖|fechar|close|não|nao|agora não|agora nao|recusar|rejeitar|dispensar|cancelar|dismiss|no thanks|not now|reject|decline|skip)$/i;
+        let closeRect = null;
+        const dismissRegex = /^(x|×|✕|✖|fechar|close|não|nao|agora não|agora nao|recusar|rejeitar|dispensar|cancelar|dismiss|no thanks|not now|reject|reject all|decline|skip)$/i;
+        const acceptConsentRegex = /^(accept|accept all|allow all|agree|i agree|got it|ok|aceitar|aceitar todos|concordo|entendi)$/i;
         const innerCandidates = queryAllDeep(container, 'button, a, [role="button"], span, div, svg, i');
         let bestScore = -1;
 
@@ -2571,12 +3121,14 @@ function buildFrameIndexExpression({
           const c = innerCandidates[i];
           const r = c.getBoundingClientRect();
           if (!isVisibleRect(c, r)) continue;
-          if (r.width > 240 || r.height > 80) continue;
+          if (r.width > 260 || r.height > 80) continue;
           const label = ((c.getAttribute('aria-label') || '') + ' ' + (c.getAttribute('title') || '') + ' ' + (c.innerText || '')).replace(/\\s+/g, ' ').trim();
           const cls = ((c.className && typeof c.className === 'string' ? c.className : '') + ' ' + (c.id || '')).toLowerCase();
           let score = 0;
           if (dismissRegex.test(label)) score += 10;
-          if (/close|fechar|dismiss|cancel|decline|reject|deny|later/.test(cls) || /close|fechar|agora não|não obrigad|recusar|rejeitar|no thanks|not now/i.test(label)) score += 6;
+          if (isCookieText && acceptConsentRegex.test(label)) score += 11;
+          if (/close|fechar|dismiss|cancel|decline|reject|deny|later/.test(cls) || /close|fechar|agora não|não obrigad|recusar|rejeitar|no thanks|not now|reject all/i.test(label)) score += 6;
+          if (isCookieText && (/accept|allow|agree|consent|onetrust-accept/.test(cls) || /accept all|aceitar todos|allow all/i.test(label))) score += 7;
           const nearTopRight = (r.right >= cr.right - 64 && r.top <= cr.top + 64 && r.width <= 48 && r.height <= 48);
           if (nearTopRight) {
             const st = window.getComputedStyle(c);
@@ -2587,24 +3139,16 @@ function buildFrameIndexExpression({
           if (score > bestScore) {
             bestScore = score;
             closeEl = c;
+            closeRect = r;
           }
         }
 
-        let closeElementId = null;
-        let closeX = null;
-        let closeY = null;
-        if (closeEl && bestScore >= 5) {
-          closeElementId = addElement(closeEl, 'AXButton', cleanText(closeEl.getAttribute('aria-label') || closeEl.innerText || 'Close overlay', 40) || 'Close overlay');
-          const br = closeEl.getBoundingClientRect();
-          closeX = Math.round((br.left + offsetX + br.width / 2) * 10) / 10;
-          closeY = Math.round((br.top + offsetY + br.height / 2) * 10) / 10;
-        }
-
+        const hasAction = Boolean(closeEl && bestScore >= 5);
         return {
           summary,
-          closeElementId,
-          closeX,
-          closeY,
+          closeEl: hasAction ? closeEl : null,
+          closeRect: hasAction ? closeRect : null,
+          highConfidence: Boolean(hasAction && (isCookieText || bestScore >= 10)),
           frame: {
             x: Math.round((cr.left + offsetX) * 10) / 10,
             y: Math.round((cr.top + offsetY) * 10) / 10,
@@ -2655,7 +3199,7 @@ function buildFrameIndexExpression({
         const blocks = [];
         let totalLen = 0;
 
-        const htmlTables = queryAllDeep(document, 'table');
+        const htmlTables = queryAllInRoots(roots, 'table');
         for (let t = 0; t < htmlTables.length && blocks.length < 4 && totalLen < maxChars; t++) {
           const table = htmlTables[t];
           const tr = table.getBoundingClientRect();
@@ -2673,7 +3217,7 @@ function buildFrameIndexExpression({
           }
         }
 
-        const grids = queryAllDeep(document, '[role="grid"], [role="table"], [role="treegrid"]');
+        const grids = queryAllInRoots(roots, '[role="grid"], [role="table"], [role="treegrid"]');
         for (let g = 0; g < grids.length && blocks.length < 4 && totalLen < maxChars; g++) {
           const grid = grids[g];
           const gr = grid.getBoundingClientRect();
@@ -2757,9 +3301,137 @@ function buildFrameIndexExpression({
         return out.length > 0 ? out.join('\\n').slice(0, textCap) : null;
       }
 
-      const blockingOverlay = detectBlockingOverlay();
+      // WebMCP discovery (navigator.modelContext / document.modelContext)
+      let webMcpTools = null;
+      if (isTopFrame) {
+        try {
+          const mc = (typeof navigator !== 'undefined' && navigator?.modelContext) || document?.modelContext || null;
+          if (mc) {
+            let rawTools = null;
+            if (typeof mc.getTools === 'function') rawTools = mc.getTools();
+            else if (typeof mc.listTools === 'function') rawTools = mc.listTools();
+            else if (Array.isArray(mc.tools)) rawTools = mc.tools;
+            else if (mc.tools && typeof mc.tools === 'object') rawTools = Object.keys(mc.tools);
+            if (Array.isArray(rawTools)) {
+              const names = rawTools
+                .map((t) => (typeof t === 'string' ? t : (t?.name || t?.id || '')))
+                .map((s) => String(s).trim())
+                .filter(Boolean);
+              if (names.length > 0) webMcpTools = Array.from(new Set(names)).slice(0, 50);
+            }
+          }
+        } catch (_) {}
+      }
+
+      const overlayRaw = detectBlockingOverlayReadOnly();
       const tablesMarkdown = extractTablesMarkdown();
       const readableText = extractReadableText();
+
+      // Sort in-viewport first; respect includeOffscreen (default false) and report offscreenCount.
+      const allowOffscreen = includeOffscreen && filter?.viewportOnly !== true;
+      const offscreenCount = offscreenDrafts.length + fileInputDrafts.filter((d) => d.offscreen).length;
+      const orderedDrafts = allowOffscreen
+        ? inViewportDrafts.concat(offscreenDrafts).slice(0, limit)
+        : inViewportDrafts.slice(0, limit);
+      const visibleFileInputs = allowOffscreen ? fileInputDrafts : fileInputDrafts.filter((d) => !d.offscreen);
+      const selectedDrafts = orderedDrafts.concat(visibleFileInputs);
+
+      // Ensure overlay close control is included if detected
+      let overlayCloseDraft = null;
+      if (overlayRaw?.closeEl) {
+        overlayCloseDraft = selectedDrafts.find((d) => d.el === overlayRaw.closeEl) || null;
+        if (!overlayCloseDraft) {
+          const br = overlayRaw.closeRect;
+          overlayCloseDraft = {
+            el: overlayRaw.closeEl,
+            id: lookupUsemacNodeId(overlayRaw.closeEl, reg),
+            role: 'AXButton',
+            title: cleanText(overlayRaw.closeEl.getAttribute('aria-label') || overlayRaw.closeEl.innerText || 'Close overlay', 40) || 'Close overlay',
+            value: null,
+            roleDescription: overlayRaw.closeEl.getAttribute('role') || overlayRaw.closeEl.tagName.toLowerCase(),
+            enabled: !overlayRaw.closeEl.disabled,
+            focused: activeEl === overlayRaw.closeEl,
+            offscreen: false,
+            frame: {
+              x: Math.round((br.left + offsetX) * 10) / 10,
+              y: Math.round((br.top + offsetY) * 10) / 10,
+              width: Math.round(br.width * 10) / 10,
+              height: Math.round(br.height * 10) / 10
+            },
+            actions: ['AXPress']
+          };
+          selectedDrafts.unshift(overlayCloseDraft);
+        }
+      }
+
+      // --- PASS 2: WRITE-ONLY (assign stable @bN IDs + batch data-usemac-id writes with zero layout thrash) ---
+      const elements = [];
+      let focusedElementId = null;
+      for (let i = 0; i < selectedDrafts.length; i++) {
+        const d = selectedDrafts[i];
+        const id = d.id || assignUsemacNodeId(d.el, reg);
+        d.id = id;
+        if (d.el.getAttribute && d.el.getAttribute('data-usemac-id') !== id) {
+          d.el.setAttribute('data-usemac-id', id);
+        }
+        if (d.focused) focusedElementId = id;
+        const nodeObj = {
+          id,
+          role: d.role,
+          title: d.title,
+          value: d.value,
+          roleDescription: d.roleDescription,
+          enabled: d.enabled,
+          focused: d.focused,
+          frame: d.frame,
+          actions: d.actions
+        };
+        if (d.offscreen) nodeObj.offscreen = true;
+        elements.push(nodeObj);
+      }
+
+      let blockingOverlay = null;
+      let overlayHighConfidence = false;
+      if (overlayRaw) {
+        let closeElementId = null;
+        let closeX = null;
+        let closeY = null;
+        if (overlayCloseDraft && overlayRaw.closeRect) {
+          closeElementId = overlayCloseDraft.id;
+          closeX = Math.round((overlayRaw.closeRect.left + offsetX + overlayRaw.closeRect.width / 2) * 10) / 10;
+          closeY = Math.round((overlayRaw.closeRect.top + offsetY + overlayRaw.closeRect.height / 2) * 10) / 10;
+        }
+        overlayHighConfidence = Boolean(overlayRaw.highConfidence);
+        blockingOverlay = {
+          summary: overlayRaw.summary,
+          closeElementId,
+          closeX,
+          closeY,
+          frame: overlayRaw.frame,
+          blocksScroll: overlayRaw.blocksScroll
+        };
+      }
+
+      const pageState = {
+        scrollX,
+        scrollY,
+        scrollHeight,
+        scrollWidth,
+        viewportWidth: vw,
+        viewportHeight: vh,
+        canScrollDown,
+        canScrollUp,
+        canScrollRight,
+        canScrollLeft,
+        scrollLocked,
+        blockingOverlay,
+        readableText,
+        tablesMarkdown,
+        scrollableContainers
+      };
+      if (webMcpTools && webMcpTools.length > 0) {
+        pageState.webMcpTools = webMcpTools;
+      }
 
       return {
         title: document.title || '',
@@ -2767,55 +3439,58 @@ function buildFrameIndexExpression({
         hasFocus: typeof document.hasFocus === 'function' ? document.hasFocus() : false,
         focusedElementId,
         elements,
-        pageState: {
-          scrollX,
-          scrollY,
-          scrollHeight,
-          scrollWidth,
-          viewportWidth: vw,
-          viewportHeight: vh,
-          canScrollDown,
-          canScrollUp,
-          canScrollRight,
-          canScrollLeft,
-          scrollLocked,
-          blockingOverlay,
-          readableText,
-          tablesMarkdown,
-          scrollableContainers
-        }
+        offscreenCount,
+        overlayHighConfidence,
+        pageState
       };
     })()`;
 }
 
-// Observes the page at its real size. viewportWidth/viewportHeight/deviceScaleFactor on the request are ignored:
-// UseMac never resizes a tab.
+// Observes the page at its real size. viewportWidth/viewportHeight/deviceScaleFactor on the request are ignored
+// for layout (UseMac never resizes a tab); for includeScreenshot, viewportWidth/viewportHeight act as a downscale box
+// defaulting to 1280x800 (unless fullResolution: true).
 async function observeTab(tabId, maxElements = 280, options = {}) {
   const start = performance.now();
+  const rawMode = typeof options.observationMode === "string" ? options.observationMode.trim().toLowerCase() : null;
+  const effectiveMode = rawMode || (options.returnDiffOnly === true ? "delta" : "full");
+  if (effectiveMode === "none") {
+    const tab = await refreshTabMeta(tabId);
+    return { tab, screenshotBase64: null, screenshotWidth: null, screenshotHeight: null, snapshot: null, overlayHighConfidence: false };
+  }
+
   const limit = clamp(Number(maxElements) || 280, 1, 600);
-  const includeText = options.includeText !== false;
-  const includeTables = options.includeTables !== false;
+  const includeText = effectiveMode === "interactive" ? options.includeText === true : options.includeText !== false;
+  const includeTables = effectiveMode === "interactive" ? options.includeTables === true : options.includeTables !== false;
+  const includeOffscreen = options.includeOffscreen === true;
+  const filter = hasActiveFilter(options.filter) ? options.filter : null;
 
   const session = getOrCreateTabSession(tabId);
   await refreshLiveViewport(tabId, session);
   const { width: curVpW, height: curVpH } = effectiveViewport(session);
-  session.elementFrameMap.clear();
 
-  const evalResult = await sendCDP(tabId, "Runtime.evaluate", {
-    expression: buildFrameIndexExpression({
-      startIndex: 1,
-      limit,
-      includeText,
-      includeTables,
-      curVpW,
-      curVpH,
-      isTopFrame: true,
-      offsetX: 0,
-      offsetY: 0
+  // Run top-frame DOM index and child-frame discovery in parallel.
+  const [evalResult, childFrames] = await Promise.all([
+    sendCDP(tabId, "Runtime.evaluate", {
+      expression: buildFrameIndexExpression({
+        idBase: 1,
+        limit,
+        includeText,
+        includeTables,
+        includeOffscreen,
+        filter,
+        curVpW,
+        curVpH,
+        topVpW: curVpW,
+        topVpH: curVpH,
+        isTopFrame: true,
+        offsetX: 0,
+        offsetY: 0
+      }),
+      returnByValue: true,
+      awaitPromise: false
     }),
-    returnByValue: true,
-    awaitPromise: false
-  });
+    discoverChildFrames(tabId).catch(() => [])
+  ]);
 
   if (evalResult?.exceptionDetails) {
     throw new Error(evalResult.exceptionDetails.text || "DOM observation failed.");
@@ -2826,10 +3501,13 @@ async function observeTab(tabId, maxElements = 280, options = {}) {
     url: "",
     focusedElementId: null,
     elements: [],
+    offscreenCount: 0,
+    overlayHighConfidence: false,
     pageState: null
   };
 
   const mergedElements = Array.isArray(pageData.elements) ? pageData.elements.slice() : [];
+  let totalOffscreenCount = Number(pageData.offscreenCount) || 0;
   let focusedElementId = pageData.focusedElementId || null;
   const topFrameMeta = {
     sessionId: null,
@@ -2848,106 +3526,163 @@ async function observeTab(tabId, maxElements = 280, options = {}) {
     session.elementFrameMap.set(el.id, topFrameMeta);
   }
 
-  // Traverse cross-origin OOPIFs and same-origin child iframes and unify @bN refs + text + tables
-  const childFrames = await discoverChildFrames(tabId).catch(() => []);
   const tableBlocks = pageData.pageState?.tablesMarkdown ? [pageData.pageState.tablesMarkdown] : [];
   const textBlocks = pageData.pageState?.readableText ? [pageData.pageState.readableText] : [];
   const mergedScrollables = Array.isArray(pageData.pageState?.scrollableContainers)
     ? pageData.pageState.scrollableContainers.slice()
     : [];
   let mergedOverlay = pageData.pageState?.blockingOverlay || null;
+  let overlayHighConfidence = Boolean(pageData.overlayHighConfidence);
 
-  for (const frameMeta of childFrames) {
-    const hardCap = Math.min(600, Math.max(limit + 120, 360));
-    if (mergedElements.length >= hardCap) break;
-    const isLargeWorkspaceFrame = frameMeta.width >= 300 && frameMeta.height >= 200;
-    const remaining = Math.max(limit - mergedElements.length, isLargeWorkspaceFrame ? 120 : 40);
-    const frameBudget = Math.min(remaining, hardCap - mergedElements.length);
-    if (frameBudget <= 0) break;
+  // Index all discovered child frames in parallel using non-colliding stable slot-based ID ranges.
+  const hardCap = Math.min(600, Math.max(limit + 120, 360));
+  if (childFrames.length > 0 && mergedElements.length < hardCap) {
+    const childOutputs = await Promise.all(
+      childFrames.map(async (frameMeta) => {
+        const isLargeWorkspaceFrame = frameMeta.width >= 300 && frameMeta.height >= 200;
+        const frameBudget = isLargeWorkspaceFrame ? Math.min(200, hardCap) : 80;
+        const slot = getFrameSlot(session, frameMeta.frameId);
+        const idBase = slot * 10000 + 1;
+        try {
+          const childRes = await evalInFrame(
+            tabId,
+            frameMeta,
+            buildFrameIndexExpression({
+              idBase,
+              limit: frameBudget,
+              includeText,
+              includeTables,
+              includeOffscreen,
+              filter,
+              curVpW: Math.round(frameMeta.width) || curVpW,
+              curVpH: Math.round(frameMeta.height) || curVpH,
+              topVpW: curVpW,
+              topVpH: curVpH,
+              isTopFrame: false,
+              offsetX: frameMeta.offsetX,
+              offsetY: frameMeta.offsetY
+            })
+          );
+          return { frameMeta, isLargeWorkspaceFrame, childData: childRes?.result?.value || null };
+        } catch (_) {
+          return { frameMeta, isLargeWorkspaceFrame, childData: null };
+        }
+      })
+    );
 
-    let childRes = null;
-    try {
-      childRes = await evalInFrame(
-        tabId,
-        frameMeta,
-        buildFrameIndexExpression({
-          startIndex: mergedElements.length + 1,
-          limit: frameBudget,
-          includeText,
-          includeTables,
-          curVpW: Math.round(frameMeta.width) || curVpW,
-          curVpH: Math.round(frameMeta.height) || curVpH,
-          isTopFrame: false,
-          offsetX: frameMeta.offsetX,
-          offsetY: frameMeta.offsetY
-        })
-      );
-    } catch (_) {
-      continue;
-    }
-
-    const childData = childRes?.result?.value;
-    if (!childData) continue;
-
-    const childEls = Array.isArray(childData.elements) ? childData.elements : [];
-    for (const el of childEls) {
-      mergedElements.push(el);
-      session.elementFrameMap.set(el.id, frameMeta);
-    }
-
-    if (childData.focusedElementId && (!focusedElementId || childData.hasFocus)) {
-      focusedElementId = childData.focusedElementId;
-    }
-
-    const cs = childData.pageState;
-    if (cs) {
-      if (cs.tablesMarkdown && tableBlocks.join("\n\n").length < 6200) {
-        tableBlocks.push(cs.tablesMarkdown);
+    for (const { frameMeta, isLargeWorkspaceFrame, childData } of childOutputs) {
+      if (!childData) continue;
+      if (mergedElements.length >= hardCap) break;
+      const remaining = hardCap - mergedElements.length;
+      const childEls = (Array.isArray(childData.elements) ? childData.elements : []).slice(0, remaining);
+      for (const el of childEls) {
+        mergedElements.push(el);
+        session.elementFrameMap.set(el.id, frameMeta);
       }
-      if (cs.readableText && textBlocks.join("\n\n").length < 5600) {
-        let frameLabel = frameMeta.title || childData.title || "";
-        if (!frameLabel && frameMeta.url) {
-          try {
-            const u = new URL(frameMeta.url);
-            frameLabel = u.host + (u.pathname && u.pathname !== "/" ? u.pathname.slice(0, 40) : "");
-          } catch (_) {
-            frameLabel = frameMeta.url.slice(0, 48);
+      totalOffscreenCount += Number(childData.offscreenCount) || 0;
+
+      if (childData.focusedElementId && (!focusedElementId || childData.hasFocus)) {
+        focusedElementId = childData.focusedElementId;
+      }
+
+      const cs = childData.pageState;
+      if (cs) {
+        if (cs.tablesMarkdown && tableBlocks.join("\n\n").length < 6200) {
+          tableBlocks.push(cs.tablesMarkdown);
+        }
+        if (cs.readableText && textBlocks.join("\n\n").length < 5600) {
+          let frameLabel = frameMeta.title || childData.title || "";
+          if (!frameLabel && frameMeta.url) {
+            try {
+              const u = new URL(frameMeta.url);
+              frameLabel = u.host + (u.pathname && u.pathname !== "/" ? u.pathname.slice(0, 40) : "");
+            } catch (_) {
+              frameLabel = frameMeta.url.slice(0, 48);
+            }
+          }
+          const header = frameLabel ? `[iframe: ${frameLabel}]` : "[iframe]";
+          textBlocks.push(`${header}\n${cs.readableText}`);
+        }
+        if (Array.isArray(cs.scrollableContainers)) {
+          for (const sc of cs.scrollableContainers) {
+            if (mergedScrollables.length < 8 && !mergedScrollables.includes(sc)) {
+              mergedScrollables.push(sc);
+            }
           }
         }
-        const header = frameLabel ? `[iframe: ${frameLabel}]` : "[iframe]";
-        textBlocks.push(`${header}\n${cs.readableText}`);
-      }
-      if (Array.isArray(cs.scrollableContainers)) {
-        for (const sc of cs.scrollableContainers) {
-          if (mergedScrollables.length < 8 && !mergedScrollables.includes(sc)) {
-            mergedScrollables.push(sc);
-          }
+        if (!mergedOverlay && cs.blockingOverlay) {
+          mergedOverlay = cs.blockingOverlay;
+          overlayHighConfidence = Boolean(childData.overlayHighConfidence);
         }
-      }
-      if (!mergedOverlay && cs.blockingOverlay) {
-        mergedOverlay = cs.blockingOverlay;
-      }
-      if (isLargeWorkspaceFrame && pageData.pageState) {
-        if (cs.canScrollDown) pageData.pageState.canScrollDown = true;
-        if (cs.canScrollUp) pageData.pageState.canScrollUp = true;
-        if (cs.canScrollRight) pageData.pageState.canScrollRight = true;
-        if (cs.canScrollLeft) pageData.pageState.canScrollLeft = true;
+        if (isLargeWorkspaceFrame && pageData.pageState) {
+          if (cs.canScrollDown) pageData.pageState.canScrollDown = true;
+          if (cs.canScrollUp) pageData.pageState.canScrollUp = true;
+          if (cs.canScrollRight) pageData.pageState.canScrollRight = true;
+          if (cs.canScrollLeft) pageData.pageState.canScrollLeft = true;
+        }
       }
     }
   }
 
+  // Stable sort: in-viewport elements first, offscreen elements second (preserving reading order inside each bucket).
+  mergedElements.sort((a, b) => (a.offscreen ? 1 : 0) - (b.offscreen ? 1 : 0));
+
+  const fullTablesMarkdown = tableBlocks.length > 0 ? tableBlocks.join("\n\n").slice(0, 6500) : null;
+  const fullReadableText = textBlocks.length > 0 ? textBlocks.join("\n\n").slice(0, 6000) : null;
   if (pageData.pageState) {
-    pageData.pageState.tablesMarkdown = tableBlocks.length > 0 ? tableBlocks.join("\n\n").slice(0, 6500) : null;
-    pageData.pageState.readableText = textBlocks.length > 0 ? textBlocks.join("\n\n").slice(0, 6000) : null;
+    pageData.pageState.tablesMarkdown = fullTablesMarkdown;
+    pageData.pageState.readableText = fullReadableText;
     pageData.pageState.scrollableContainers = mergedScrollables;
     pageData.pageState.blockingOverlay = mergedOverlay;
   }
 
   const tab = await refreshTabMeta(tabId);
+  const currentUrl = tab?.url || pageData.url || session.url || "";
+  const prevSnap = session.lastSnapshot;
+  const diffInfo = prevSnap ? computeSnapshotDiff(prevSnap.elementsById, mergedElements) : null;
+  const sameUrl = Boolean(prevSnap && prevSnap.url && prevSnap.url === currentUrl);
+  const tablesHash = hashString(fullTablesMarkdown);
+  const textHash = hashString(fullReadableText);
+
+  let useDiffOnly = false;
+  if (prevSnap && diffInfo) {
+    if (effectiveMode === "delta") {
+      useDiffOnly = true;
+    } else if (effectiveMode === "auto") {
+      useDiffOnly = sameUrl && diffInfo.churn < 0.4;
+    }
+  }
+
+  // Omit unchanged tables/readableText in delta or same-URL auto mode to slash token bloat.
+  if (pageData.pageState && prevSnap && sameUrl && (useDiffOnly || effectiveMode === "auto")) {
+    if (tablesHash && prevSnap.tablesHash === tablesHash) {
+      pageData.pageState.tablesMarkdown = null;
+      pageData.pageState.tablesSummary = "unchanged";
+    }
+    if (textHash && prevSnap.textHash === textHash) {
+      pageData.pageState.readableText = null;
+    }
+  }
+
+  // Update session baseline when not narrowed by a custom filter.
+  if (!filter) {
+    const nextMap = new Map();
+    for (const el of mergedElements) nextMap.set(el.id, el);
+    session.lastSnapshot = {
+      url: currentUrl,
+      elementsById: nextMap,
+      tablesHash: includeTables ? tablesHash : (sameUrl ? prevSnap?.tablesHash ?? null : null),
+      textHash: includeText ? textHash : (sameUrl ? prevSnap?.textHash ?? null : null),
+      timestampMs: Date.now()
+    };
+  }
+
   const latencyMs = Math.round((performance.now() - start) * 100) / 100;
   const windowTitle = tab?.title || pageData.title || "";
 
   let screenshotBase64 = null;
+  let screenshotWidth = null;
+  let screenshotHeight = null;
   if (options.includeScreenshot) {
     try {
       const cap = await withTabIndicatorHidden(tabId, () => sendCDP(tabId, "Page.captureScreenshot", {
@@ -2956,36 +3691,63 @@ async function observeTab(tabId, maxElements = 280, options = {}) {
         fromSurface: true
       }));
       if (cap?.data) {
-        screenshotBase64 = cap.data;
+        const viewport = effectiveViewport(session);
+        const pixelRatio = viewport.scale || 1;
+        let shot = jpegShot(cap.data, {
+          width: Math.round(viewport.width * pixelRatio),
+          height: Math.round(viewport.height * pixelRatio)
+        });
+        const fitBox = screenshotBox(options);
+        if (fitBox) {
+          const fitted = sizeInBox(shot.width, shot.height, fitBox);
+          if (shot.estimated || fitted.width !== shot.width || fitted.height !== shot.height) {
+            const scaled = await fitJpegInBox(shot.data, fitBox, 82).catch(() => null);
+            if (scaled) shot = scaled;
+          }
+        }
+        screenshotBase64 = shot.data;
+        screenshotWidth = shot.width;
+        screenshotHeight = shot.height;
+        // Reuse this capture for the preview frame (no indicator since it was captured with indicator hidden).
+        emitPreviewFrameData(tabId, shot.data, false);
       }
     } catch (_) {}
+  }
+
+  const snapshot = {
+    app: {
+      pid: 0,
+      name: `Chrome (${state.profileName})`,
+      bundleId: "com.google.Chrome",
+      isActive: false,
+      isHidden: false,
+      windowTitle,
+      windowBounds: {
+        x: 0,
+        y: 0,
+        width: curVpW,
+        height: curVpH
+      }
+    },
+    timestampMs: Date.now(),
+    latencyMs,
+    fromHotCache: false,
+    focusedElementId,
+    elements: useDiffOnly ? [] : mergedElements,
+    diff: diffInfo ? diffInfo.diff : null,
+    pageState: pageData.pageState || null
+  };
+  if (totalOffscreenCount > 0) {
+    snapshot.offscreenCount = totalOffscreenCount;
   }
 
   return {
     tab,
     screenshotBase64,
-    snapshot: {
-      app: {
-        pid: 0,
-        name: `Chrome (${state.profileName})`,
-        bundleId: "com.google.Chrome",
-        isActive: false,
-        isHidden: false,
-        windowTitle,
-        windowBounds: {
-          x: 0,
-          y: 0,
-          width: curVpW,
-          height: curVpH
-        }
-      },
-      timestampMs: Date.now(),
-      latencyMs,
-      fromHotCache: false,
-      focusedElementId,
-      elements: mergedElements,
-      pageState: pageData.pageState || null
-    }
+    screenshotWidth,
+    screenshotHeight,
+    overlayHighConfidence,
+    snapshot
   };
 }
 
@@ -3011,24 +3773,14 @@ async function moveCursorSmoothly(tabId, targetX, targetY, label = null) {
   const maxH = session.liveViewport?.height ?? Infinity;
   const tx = clamp(Number(targetX), 0, maxW);
   const ty = clamp(Number(targetY), 0, maxH);
-  const startX = clamp(session.cursor.x, 0, maxW);
-  const startY = clamp(session.cursor.y, 0, maxH);
-  const steps = 3;
-
-  for (let i = 1; i <= steps; i++) {
-    const t = i / steps;
-    const ix = startX + (tx - startX) * t;
-    const iy = startY + (ty - startY) * t;
-    session.cursor = { x: ix, y: iy };
-    emitCursor(tabId, ix, iy, "move", label);
-    await sendCDP(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: ix,
-      y: iy,
-      button: "none"
-    });
-    await sleep(18);
-  }
+  session.cursor = { x: tx, y: ty };
+  emitCursor(tabId, tx, ty, "move", label);
+  await sendCDP(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: tx,
+    y: ty,
+    button: "none"
+  });
   return { x: tx, y: ty };
 }
 
@@ -3037,7 +3789,34 @@ function usemacIdSelectorLiteral(elementId) {
   return JSON.stringify(`[data-usemac-id="${escapedId}"]`);
 }
 
-async function resolveInSpecificFrame(tabId, frameMeta, selectorLit, scrollOwnerIntoView = true) {
+function hasNonEmptyMatch(match) {
+  if (!match || typeof match !== "object") return false;
+  const nonBlank = (v) => typeof v === "string" && v.trim() !== "";
+  return nonBlank(match.role) || nonBlank(match.title) || nonBlank(match.value) || nonBlank(match.text);
+}
+
+function formatMatchDesc(match) {
+  if (!match || typeof match !== "object") return "match";
+  const parts = [];
+  if (match.role) parts.push(`role=${match.role}`);
+  if (match.title) parts.push(`title="${match.title}"`);
+  if (match.value) parts.push(`value="${match.value}"`);
+  if (match.text) parts.push(`text="${match.text}"`);
+  if (Number.isFinite(match.index) && match.index > 0) parts.push(`index=${match.index}`);
+  return parts.join(", ") || "match";
+}
+
+function findElementExprJs({ elementId = null, selector = null }) {
+  if (elementId) {
+    return `findByUsemacId(${JSON.stringify(String(elementId))}, document)`;
+  }
+  if (selector) {
+    return `queryOneDeep(document, ${JSON.stringify(String(selector))})`;
+  }
+  return "null";
+}
+
+async function resolveInSpecificFrame(tabId, frameMeta, { elementId = null, selector = null }, scrollOwnerIntoView = true) {
   let offsetX = 0;
   let offsetY = 0;
   if (frameMeta && frameMeta.frameId != null) {
@@ -3048,9 +3827,10 @@ async function resolveInSpecificFrame(tabId, frameMeta, selectorLit, scrollOwner
     offsetX = fRect.x;
     offsetY = fRect.y;
   }
+  const lookupExpr = findElementExprJs({ elementId, selector });
   const res = await evalInFrame(tabId, frameMeta, `(() => {
     ${QUERY_DEEP_HELPER_JS}
-    const el = queryOneDeep(document, ${selectorLit});
+    const el = ${lookupExpr};
     if (!el) return null;
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     const rect = el.getBoundingClientRect();
@@ -3069,13 +3849,128 @@ async function resolveInSpecificFrame(tabId, frameMeta, selectorLit, scrollOwner
     x: point.x + offsetX,
     y: point.y + offsetY,
     label: point.label || null,
+    elementId: elementId || null,
     frameMeta: frameMeta || null
   };
 }
 
+async function resolveMatchInSpecificFrame(tabId, session, frameMeta, match, remainingSkip = 0, scrollOwnerIntoView = true) {
+  let offsetX = 0;
+  let offsetY = 0;
+  if (frameMeta && frameMeta.frameId != null) {
+    const fRect = await computeFrameViewportRect(tabId, frameMeta, scrollOwnerIntoView);
+    if (!fRect || !fRect.visible) {
+      return { found: false, matchCount: 0 };
+    }
+    offsetX = fRect.x;
+    offsetY = fRect.y;
+  }
+  const idBase = frameMeta?.frameId ? getFrameSlot(session, frameMeta.frameId) * 10000 + 1 : 1;
+  const matchLit = JSON.stringify(match);
+  const res = await evalInFrame(tabId, frameMeta, `(() => {
+    ${QUERY_DEEP_HELPER_JS}
+    const spec = ${matchLit};
+    const skip = ${Math.max(0, Number(remainingSkip) || 0)};
+    const reg = getUsemacRefRegistry(${idBase});
+    const roots = collectRoots(document);
+    const labelMap = new Map();
+    const labelNodes = queryAllInRoots(roots, 'label[for]');
+    for (let i = 0; i < labelNodes.length; i++) {
+      const f = labelNodes[i].getAttribute('for');
+      if (f && !labelMap.has(f)) {
+        const t = (labelNodes[i].innerText || labelNodes[i].textContent || '').replace(/\\s+/g, ' ').trim();
+        if (t) labelMap.set(f, t);
+      }
+    }
+    const sel = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [role="textbox"], [role="searchbox"], [contenteditable="true"], summary, h1, h2, h3';
+    const candidates = queryAllInRoots(roots, sel);
+    let matchCount = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      const el = candidates[i];
+      const st = window.getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2 || el.getClientRects().length === 0) continue;
+      if (!matchesElementSpec(el, spec, labelMap)) continue;
+      if (matchCount === skip) {
+        const id = assignUsemacNodeId(el, reg);
+        if (el.getAttribute('data-usemac-id') !== id) el.setAttribute('data-usemac-id', id);
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const rect = el.getBoundingClientRect();
+        const label = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.tagName || '').replace(/\\s+/g, ' ').trim().slice(0, 40);
+        return {
+          found: true,
+          matchCount: matchCount + 1,
+          id,
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          label
+        };
+      }
+      matchCount += 1;
+    }
+    return { found: false, matchCount };
+  })()`).catch(() => null);
+  const v = res?.result?.value;
+  if (!v) return { found: false, matchCount: 0 };
+  if (v.found && Number.isFinite(v.x) && Number.isFinite(v.y)) {
+    if (v.id) {
+      const targetFrameMeta = frameMeta || {
+        sessionId: null, contextId: null, frameId: null, parentSessionId: null,
+        offsetX: 0, offsetY: 0, isOOPIF: false, hops: []
+      };
+      session.elementFrameMap.set(v.id, targetFrameMeta);
+    }
+    return {
+      found: true,
+      matchCount: v.matchCount,
+      target: {
+        x: v.x + offsetX,
+        y: v.y + offsetY,
+        label: v.label || null,
+        elementId: v.id || null,
+        frameMeta: frameMeta || null
+      }
+    };
+  }
+  return { found: false, matchCount: v.matchCount || 0 };
+}
+
+async function resolveMatchCenter(tabId, match) {
+  const session = getOrCreateTabSession(tabId);
+  const desiredIndex = Math.max(0, Number(match?.index) || 0);
+  let remaining = desiredIndex;
+
+  const topRes = await resolveMatchInSpecificFrame(tabId, session, null, match, remaining, false);
+  if (topRes.found) return topRes.target;
+  remaining -= topRes.matchCount;
+
+  let frames = session.lastChildFrames && session.lastChildFrames.length > 0
+    ? session.lastChildFrames
+    : await discoverChildFrames(tabId).catch(() => []);
+  for (const frameMeta of frames) {
+    const hit = await resolveMatchInSpecificFrame(tabId, session, frameMeta, match, remaining, true);
+    if (hit.found) return hit.target;
+    remaining -= hit.matchCount;
+  }
+  // Fresh discovery pass in case an iframe mounted since last observe
+  if (session.lastChildFrames && session.lastChildFrames.length > 0) {
+    const freshFrames = await discoverChildFrames(tabId).catch(() => []);
+    for (const frameMeta of freshFrames) {
+      if (frames.some((f) => f.frameId === frameMeta.frameId && f.sessionId === frameMeta.sessionId)) continue;
+      const hit = await resolveMatchInSpecificFrame(tabId, session, frameMeta, match, remaining, true);
+      if (hit.found) return hit.target;
+      remaining -= hit.matchCount;
+    }
+  }
+  throw {
+    code: "ELEMENT_NOT_FOUND",
+    message: `No element matched {${formatMatchDesc(match)}} in tab ${tabId}.`
+  };
+}
+
 async function resolveSelectorCenter(tabId, cssSelector) {
-  const selectorLit = JSON.stringify(String(cssSelector));
-  const topHit = await resolveInSpecificFrame(tabId, null, selectorLit, false);
+  const topHit = await resolveInSpecificFrame(tabId, null, { selector: cssSelector }, false);
   if (topHit) return topHit;
 
   const session = getOrCreateTabSession(tabId);
@@ -3083,30 +3978,29 @@ async function resolveSelectorCenter(tabId, cssSelector) {
     ? session.lastChildFrames
     : await discoverChildFrames(tabId).catch(() => []);
   for (const frameMeta of frames) {
-    const hit = await resolveInSpecificFrame(tabId, frameMeta, selectorLit, true);
+    const hit = await resolveInSpecificFrame(tabId, frameMeta, { selector: cssSelector }, true);
     if (hit) return hit;
   }
   // One fresh discovery pass in case a new OOPIF mounted after last observe
   frames = await discoverChildFrames(tabId).catch(() => []);
   for (const frameMeta of frames) {
-    const hit = await resolveInSpecificFrame(tabId, frameMeta, selectorLit, true);
+    const hit = await resolveInSpecificFrame(tabId, frameMeta, { selector: cssSelector }, true);
     if (hit) return hit;
   }
-  throw new Error(`Selector ${cssSelector} not found in tab ${tabId}.`);
+  throw { code: "ELEMENT_NOT_FOUND", message: `Selector ${cssSelector} not found in tab ${tabId}.` };
 }
 
 async function resolveElementCenter(tabId, elementId) {
-  const selectorLit = usemacIdSelectorLiteral(elementId);
   const session = getOrCreateTabSession(tabId);
   const mappedFrame = session.elementFrameMap.get(elementId);
   if (mappedFrame) {
-    const mappedHit = await resolveInSpecificFrame(tabId, mappedFrame, selectorLit, true);
+    const mappedHit = await resolveInSpecificFrame(tabId, mappedFrame, { elementId }, true);
     if (mappedHit) return mappedHit;
   }
 
   // Fallback: top frame then all discovered child frames
   if (!mappedFrame || mappedFrame.frameId != null) {
-    const topHit = await resolveInSpecificFrame(tabId, null, selectorLit, false);
+    const topHit = await resolveInSpecificFrame(tabId, null, { elementId }, false);
     if (topHit) return topHit;
   }
   const frames = session.lastChildFrames && session.lastChildFrames.length > 0
@@ -3114,10 +4008,10 @@ async function resolveElementCenter(tabId, elementId) {
     : await discoverChildFrames(tabId).catch(() => []);
   for (const frameMeta of frames) {
     if (mappedFrame && frameMeta === mappedFrame) continue;
-    const hit = await resolveInSpecificFrame(tabId, frameMeta, selectorLit, true);
+    const hit = await resolveInSpecificFrame(tabId, frameMeta, { elementId }, true);
     if (hit) return hit;
   }
-  throw new Error(`Element ${elementId} not found in tab ${tabId}.`);
+  throw { code: "ELEMENT_NOT_FOUND", message: `Element ${elementId} not found in tab ${tabId}.` };
 }
 
 function findChildFrameAtPoint(session, x, y) {
@@ -3144,11 +4038,14 @@ function findChildFrameAtPoint(session, x, y) {
 }
 
 async function resolveStepTarget(tabId, step) {
-  if (step.elementId) {
-    return resolveElementCenter(tabId, step.elementId);
+  if (typeof step.elementId === "string" && step.elementId.trim() !== "") {
+    return resolveElementCenter(tabId, step.elementId.trim());
   }
-  if (step.selector) {
-    return resolveSelectorCenter(tabId, step.selector);
+  if (typeof step.selector === "string" && step.selector.trim() !== "") {
+    return resolveSelectorCenter(tabId, step.selector.trim());
+  }
+  if (hasNonEmptyMatch(step.match)) {
+    return resolveMatchCenter(tabId, step.match);
   }
   if (Number.isFinite(step.x) && Number.isFinite(step.y)) {
     return { x: Number(step.x), y: Number(step.y), label: null };
@@ -3156,10 +4053,10 @@ async function resolveStepTarget(tabId, step) {
   return null;
 }
 
-// True when a step says where to act: a non-blank elementId or selector, or a point.
+// True when a step says where to act: a non-blank elementId, selector, match, or a full point.
 function stepNamesTarget(step) {
   const named = (value) => typeof value === "string" && value.trim() !== "";
-  return named(step?.elementId) || named(step?.selector) || (Number.isFinite(step?.x) && Number.isFinite(step?.y));
+  return named(step?.elementId) || named(step?.selector) || hasNonEmptyMatch(step?.match) || (Number.isFinite(step?.x) && Number.isFinite(step?.y));
 }
 
 function buildKeyDescriptor(keyName) {
@@ -3245,7 +4142,6 @@ async function dispatchMouseClick(tabId, x, y, button = "left", clickCount = 1) 
     button,
     clickCount
   });
-  await sleep(25);
   await sendCDP(tabId, "Input.dispatchMouseEvent", {
     type: "mouseReleased",
     x,
@@ -3253,6 +4149,880 @@ async function dispatchMouseClick(tabId, x, y, button = "left", clickCount = 1) 
     button,
     clickCount
   });
+}
+
+function buildWaitForMutationPromiseJs({ selector = null, elementId = null, match = null, text = null, gone = false, timeoutMs = 5000 }) {
+  const selLit = selector ? JSON.stringify(String(selector)) : "null";
+  const elIdLit = elementId ? JSON.stringify(String(elementId)) : "null";
+  const matchLit = hasNonEmptyMatch(match) ? JSON.stringify(match) : "null";
+  const txtLit = text ? JSON.stringify(String(text)) : "null";
+  const goneLit = gone ? "true" : "false";
+  const ms = clamp(Number(timeoutMs) || 5000, 50, 30000);
+  return `(() => {
+    ${QUERY_DEEP_HELPER_JS}
+    const sel = ${selLit};
+    const elId = ${elIdLit};
+    const spec = ${matchLit};
+    const txt = ${txtLit};
+    const txtNorm = txt ? normalizeMatchText(txt) : null;
+    const gone = ${goneLit};
+    const timeoutMs = ${ms};
+
+    function isElVisible(el) {
+      if (!el || !el.isConnected) return false;
+      const r = el.getBoundingClientRect();
+      const st = window.getComputedStyle(el);
+      return Boolean(st && st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity) !== 0 && r.width >= 2 && r.height >= 2);
+    }
+
+    function isPresent() {
+      if (elId) {
+        const el = findByUsemacId(elId, document);
+        if (!isElVisible(el)) return false;
+        if (!txtNorm) return true;
+        return normalizeMatchText(el.innerText || el.textContent || el.value || '').includes(txtNorm);
+      }
+      if (sel) {
+        const el = queryOneDeep(document, sel);
+        if (!isElVisible(el)) return false;
+        if (!txtNorm) return true;
+        return normalizeMatchText(el.innerText || el.textContent || el.value || '').includes(txtNorm);
+      }
+      if (spec) {
+        const roots = collectRoots(document);
+        const labelMap = new Map();
+        const labelNodes = queryAllInRoots(roots, 'label[for]');
+        for (let i = 0; i < labelNodes.length; i++) {
+          const f = labelNodes[i].getAttribute('for');
+          if (f && !labelMap.has(f)) {
+            const t = (labelNodes[i].innerText || labelNodes[i].textContent || '').replace(/\\s+/g, ' ').trim();
+            if (t) labelMap.set(f, t);
+          }
+        }
+        const candSel = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [role="textbox"], [role="searchbox"], [contenteditable="true"], summary, h1, h2, h3';
+        const cands = queryAllInRoots(roots, candSel);
+        const targetIndex = Math.max(0, Number(spec.index) || 0);
+        let seen = 0;
+        for (let i = 0; i < cands.length; i++) {
+          const el = cands[i];
+          if (!isElVisible(el)) continue;
+          if (!matchesElementSpec(el, spec, labelMap)) continue;
+          if (seen === targetIndex) {
+            if (!txtNorm) return true;
+            return normalizeMatchText(el.innerText || el.textContent || el.value || '').includes(txtNorm);
+          }
+          seen++;
+        }
+        return false;
+      }
+      if (txtNorm) {
+        const roots = collectRoots(document);
+        for (let r = 0; r < roots.length; r++) {
+          const chunk = r === 0
+            ? (document.body?.innerText || document.documentElement?.textContent || '')
+            : (roots[r].textContent || '');
+          if (normalizeMatchText(chunk).includes(txtNorm)) return true;
+        }
+        return false;
+      }
+      return true;
+    }
+
+    function satisfied() {
+      const present = isPresent();
+      return gone ? !present : present;
+    }
+
+    const started = performance.now();
+    if (satisfied()) {
+      return Promise.resolve({ matched: true, elapsedMs: 0 });
+    }
+
+    return new Promise((resolve) => {
+      let done = false;
+      let mo = null;
+      let timer = null;
+      let fallback = null;
+      const finish = (matched) => {
+        if (done) return;
+        done = true;
+        if (mo) try { mo.disconnect(); } catch (_) {}
+        if (timer) clearTimeout(timer);
+        if (fallback) clearInterval(fallback);
+        resolve({ matched, elapsedMs: Math.round((performance.now() - started) * 100) / 100 });
+      };
+      if (typeof MutationObserver === 'function' && document.documentElement) {
+        mo = new MutationObserver(() => {
+          if (satisfied()) finish(true);
+        });
+        const obsOpts = { childList: true, subtree: true, attributes: true, characterData: true };
+        try { mo.observe(document.documentElement, obsOpts); } catch (_) {}
+        const roots = collectRoots(document);
+        for (let i = 1; i < roots.length; i++) {
+          try { mo.observe(roots[i], obsOpts); } catch (_) {}
+        }
+      }
+      fallback = setInterval(() => {
+        if (satisfied()) finish(true);
+      }, 200);
+      timer = setTimeout(() => finish(false), timeoutMs);
+    });
+  })()`;
+}
+
+async function runWaitForStep(tabId, step, cancelToken = null) {
+  const timeoutMs = clamp(Number(step.timeoutMs ?? step.durationMs ?? 5000), 50, 30000);
+  const gone = step.gone === true;
+  const desc = step.selector || step.elementId || (hasNonEmptyMatch(step.match) ? `{${formatMatchDesc(step.match)}}` : null) || (step.text ? `"${step.text}"` : "condition");
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (isCancelled(tabId, cancelToken)) {
+      throw CANCELLED_ERROR;
+    }
+    const remaining = Math.max(50, deadline - Date.now());
+    const expr = buildWaitForMutationPromiseJs({
+      selector: step.selector || null,
+      elementId: step.elementId || null,
+      match: step.match || null,
+      text: step.text || null,
+      gone,
+      timeoutMs: remaining
+    });
+
+    const session = getOrCreateTabSession(tabId);
+    const childFrames = session.lastChildFrames || [];
+    const frames = [null, ...childFrames];
+
+    // Race MutationObserver Promise(s) against cancellation without polling overhead.
+    let cancelTimer = null;
+    const cancelRace = new Promise((resolve) => {
+      if (!cancelToken) return;
+      cancelTimer = setInterval(() => {
+        if (isCancelled(tabId, cancelToken)) {
+          clearInterval(cancelTimer);
+          cancelTimer = null;
+          resolve({ cancelled: true });
+        }
+      }, CANCEL_POLL_SLICE_MS);
+    });
+
+    try {
+      if (gone || frames.length === 1) {
+        // Single frame (fast path) or gone check on top frame
+        const evalPromise = evalInFrame(tabId, null, expr, { returnByValue: true, awaitPromise: true })
+          .then((r) => ({ res: r?.result?.value || null }))
+          .catch((err) => ({ err }));
+        const outcome = await Promise.race([evalPromise, cancelRace]);
+        if (outcome?.cancelled || isCancelled(tabId, cancelToken)) {
+          throw CANCELLED_ERROR;
+        }
+        if (outcome?.res?.matched === true) {
+          if (gone && childFrames.length > 0) {
+            // Also verify none of the child frames still show the element
+            const childCheckExpr = buildWaitForMutationPromiseJs({
+              selector: step.selector || null,
+              elementId: step.elementId || null,
+              match: step.match || null,
+              text: step.text || null,
+              gone: true,
+              timeoutMs: Math.max(50, deadline - Date.now())
+            });
+            const childChecks = await Promise.all(
+              childFrames.map((f) => evalInFrame(tabId, f, childCheckExpr, { returnByValue: true, awaitPromise: true }).catch(() => null))
+            );
+            if (childChecks.every((c) => c?.result?.value?.matched !== false)) {
+              return { mechanism: "mutation-observer", message: `${desc} is gone` };
+            }
+          } else {
+            return {
+              mechanism: "mutation-observer",
+              message: gone ? `${desc} is gone` : `Matched ${desc}`
+            };
+          }
+        }
+        if (outcome?.err) {
+          // Execution context may have been destroyed by a navigation: retry briefly until deadline.
+          await sleepCancellable(Math.min(80, Math.max(0, deadline - Date.now())), tabId, cancelToken);
+          continue;
+        }
+        if (outcome?.res && outcome.res.matched === false) {
+          break;
+        }
+        // Fallback when mock sandbox returns {} (no JS evaluation)
+        if (!outcome?.res) {
+          break;
+        }
+      } else {
+        // Multiple frames for appearance: resolve as soon as ANY frame's MutationObserver matches!
+        const framePromises = frames.map((fMeta) =>
+          evalInFrame(tabId, fMeta, expr, { returnByValue: true, awaitPromise: true })
+            .then((r) => {
+              if (r?.result?.value?.matched === true) {
+                return { matched: true, isChild: Boolean(fMeta) };
+              }
+              return new Promise(() => {}); // wait for other frames or timeout
+            })
+            .catch(() => new Promise(() => {}))
+        );
+        const timeoutPromise = sleep(remaining).then(() => ({ matched: false }));
+        const outcome = await Promise.race([...framePromises, timeoutPromise, cancelRace]);
+        if (outcome?.cancelled || isCancelled(tabId, cancelToken)) {
+          throw CANCELLED_ERROR;
+        }
+        if (outcome?.matched) {
+          return {
+            mechanism: outcome.isChild ? "mutation-observer (iframe)" : "mutation-observer",
+            message: `Matched ${desc}`
+          };
+        }
+        break;
+      }
+    } finally {
+      if (cancelTimer) clearInterval(cancelTimer);
+    }
+  }
+
+  if (isCancelled(tabId, cancelToken)) {
+    throw CANCELLED_ERROR;
+  }
+  throw {
+    code: "WAIT_TIMEOUT",
+    message: `Timed out after ${timeoutMs}ms waiting for ${desc}${gone ? " to disappear" : ""}`
+  };
+}
+
+async function executeAssertStep(tabId, step) {
+  const session = getOrCreateTabSession(tabId);
+  const tabInfo = await refreshTabMeta(tabId);
+  const actualUrl = tabInfo?.url || session.url || "";
+  const actualTitle = tabInfo?.title || session.title || "";
+  const failures = [];
+  let resolvedElementId = null;
+
+  if (typeof step.expectUrl === "string" && step.expectUrl.trim() !== "") {
+    const wanted = step.expectUrl.trim();
+    if (!actualUrl.toLowerCase().includes(wanted.toLowerCase())) {
+      failures.push(`Expected URL to contain "${wanted}", got "${actualUrl}"`);
+    }
+  }
+
+  const needsDomCheck =
+    (typeof step.expectTitle === "string" && step.expectTitle.trim() !== "") ||
+    (typeof step.expectText === "string" && step.expectText.trim() !== "") ||
+    (typeof step.expectNotText === "string" && step.expectNotText.trim() !== "") ||
+    hasNonEmptyMatch(step.match) ||
+    (typeof step.selector === "string" && step.selector.trim() !== "") ||
+    (typeof step.elementId === "string" && step.elementId.trim() !== "");
+
+  if (needsDomCheck) {
+    const checkSpec = {
+      expectTitle: typeof step.expectTitle === "string" ? step.expectTitle.trim() : "",
+      expectText: typeof step.expectText === "string" ? step.expectText.trim() : "",
+      expectNotText: typeof step.expectNotText === "string" ? step.expectNotText.trim() : "",
+      selector: typeof step.selector === "string" ? step.selector.trim() : "",
+      elementId: typeof step.elementId === "string" ? step.elementId.trim() : "",
+      match: hasNonEmptyMatch(step.match) ? step.match : null
+    };
+    const specLit = JSON.stringify(checkSpec);
+    const frameCheckExpr = `(() => {
+      ${QUERY_DEEP_HELPER_JS}
+      const s = ${specLit};
+      const title = document.title || '';
+      const roots = collectRoots(document);
+      const textParts = [document.body?.innerText || document.documentElement?.textContent || ''];
+      for (let r = 1; r < roots.length; r++) {
+        if (roots[r]?.textContent) textParts.push(roots[r].textContent);
+      }
+      const bodyNorm = normalizeMatchText(textParts.join(' '));
+      const hasExpectText = s.expectText ? bodyNorm.includes(normalizeMatchText(s.expectText)) : null;
+      const hasNotText = s.expectNotText ? bodyNorm.includes(normalizeMatchText(s.expectNotText)) : null;
+
+      function isElVisible(el) {
+        if (!el || !el.isConnected) return false;
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el);
+        return Boolean(st && st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity) !== 0 && r.width >= 2 && r.height >= 2);
+      }
+
+      let elementFound = null;
+      let elementId = null;
+      if (s.elementId || s.selector || s.match) {
+        let hit = null;
+        if (s.elementId) {
+          const el = findByUsemacId(s.elementId, document);
+          if (isElVisible(el)) hit = el;
+        } else if (s.selector) {
+          const el = queryOneDeep(document, s.selector);
+          if (isElVisible(el)) hit = el;
+        } else if (s.match) {
+          const roots = collectRoots(document);
+          const labelMap = new Map();
+          const labelNodes = queryAllInRoots(roots, 'label[for]');
+          for (let i = 0; i < labelNodes.length; i++) {
+            const f = labelNodes[i].getAttribute('for');
+            if (f && !labelMap.has(f)) {
+              const t = (labelNodes[i].innerText || labelNodes[i].textContent || '').replace(/\\s+/g, ' ').trim();
+              if (t) labelMap.set(f, t);
+            }
+          }
+          const candSel = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [role="textbox"], [role="searchbox"], [contenteditable="true"], summary, h1, h2, h3';
+          const cands = queryAllInRoots(roots, candSel);
+          const idx = Math.max(0, Number(s.match.index) || 0);
+          let seen = 0;
+          for (let i = 0; i < cands.length; i++) {
+            if (!isElVisible(cands[i])) continue;
+            if (!matchesElementSpec(cands[i], s.match, labelMap)) continue;
+            if (seen === idx) { hit = cands[i]; break; }
+            seen++;
+          }
+        }
+        elementFound = Boolean(hit);
+        if (hit) {
+          const reg = getUsemacRefRegistry(1);
+          elementId = lookupUsemacNodeId(hit, reg) || hit.getAttribute('data-usemac-id') || null;
+        }
+      }
+      return { title, hasExpectText, hasNotText, elementFound, elementId };
+    })()`;
+
+    const frames = [null, ...(session.lastChildFrames || [])];
+    const results = await Promise.all(
+      frames.map((f) => evalInFrame(tabId, f, frameCheckExpr).then((r) => r?.result?.value || null).catch(() => null))
+    );
+    const topRes = results[0];
+    const docTitle = topRes?.title || actualTitle;
+
+    if (checkSpec.expectTitle) {
+      if (!docTitle.toLowerCase().includes(checkSpec.expectTitle.toLowerCase())) {
+        failures.push(`Expected title to contain "${checkSpec.expectTitle}", got "${docTitle}"`);
+      }
+    }
+    if (checkSpec.expectText) {
+      const foundText = results.some((r) => r?.hasExpectText === true);
+      if (!foundText) {
+        failures.push(`Expected text "${checkSpec.expectText}" not found on page`);
+      }
+    }
+    if (checkSpec.expectNotText) {
+      const foundForbidden = results.some((r) => r?.hasNotText === true);
+      if (foundForbidden) {
+        failures.push(`Unexpected text "${checkSpec.expectNotText}" was found on page`);
+      }
+    }
+    if (checkSpec.elementId || checkSpec.selector || checkSpec.match) {
+      const hitRes = results.find((r) => r?.elementFound === true) || null;
+      const found = Boolean(hitRes);
+      if (hitRes?.elementId) resolvedElementId = hitRes.elementId;
+      const desc = checkSpec.selector || checkSpec.elementId || `{${formatMatchDesc(checkSpec.match)}}`;
+      if (step.gone === true) {
+        if (found) failures.push(`Expected element ${desc} to be gone, but it is still visible`);
+      } else {
+        if (!found) failures.push(`Expected element ${desc} not found`);
+      }
+    }
+  }
+
+  if (failures.length > 0) {
+    throw { code: "ASSERTION_FAILED", message: failures.join("; ") };
+  }
+  return {
+    mechanism: "cdp-assert",
+    message: "Assertion passed",
+    resolvedElementId
+  };
+}
+
+async function executeScrollUntilStep(tabId, step, cancelToken = null) {
+  const session = getOrCreateTabSession(tabId);
+  const maxScrolls = clamp(Number(step.maxScrolls) || 8, 1, 30);
+  const deltaY = Number.isFinite(Number(step.deltaY)) && Number(step.deltaY) !== 0
+    ? Number(step.deltaY)
+    : (Number.isFinite(Number(step.deltaX)) && Number(step.deltaX) !== 0 ? 0 : 600);
+  const deltaX = Number.isFinite(Number(step.deltaX)) ? Number(step.deltaX) : 0;
+
+  const checkSpec = {
+    elementId: typeof step.elementId === "string" ? step.elementId.trim() : "",
+    selector: typeof step.selector === "string" ? step.selector.trim() : "",
+    match: hasNonEmptyMatch(step.match) ? step.match : null,
+    text: typeof step.text === "string" ? step.text.trim() : ""
+  };
+  if (!checkSpec.elementId && !checkSpec.selector && !checkSpec.match && !checkSpec.text) {
+    throw { code: "INVALID_REQUEST", message: "scrollUntil requires match, selector, elementId, or text." };
+  }
+  const specLit = JSON.stringify(checkSpec);
+  const desc = checkSpec.selector || checkSpec.elementId || (checkSpec.match ? `{${formatMatchDesc(checkSpec.match)}}` : `"${checkSpec.text}"`);
+
+  const probeInViewportExpr = `(() => {
+    ${QUERY_DEEP_HELPER_JS}
+    const s = ${specLit};
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+    const sx = window.scrollX || document.documentElement?.scrollLeft || document.body?.scrollLeft || 0;
+    const sy = window.scrollY || document.documentElement?.scrollTop || document.body?.scrollTop || 0;
+
+    function isVisibleInViewport(el) {
+      if (!el || !el.isConnected) return false;
+      const st = window.getComputedStyle(el);
+      if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return false;
+      return r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+    }
+
+    let hit = null;
+    if (s.elementId) {
+      const el = findByUsemacId(s.elementId, document);
+      if (isVisibleInViewport(el)) hit = el;
+    } else if (s.selector) {
+      const el = queryOneDeep(document, s.selector);
+      if (isVisibleInViewport(el)) hit = el;
+    } else if (s.match) {
+      const roots = collectRoots(document);
+      const labelMap = new Map();
+      const labelNodes = queryAllInRoots(roots, 'label[for]');
+      for (let i = 0; i < labelNodes.length; i++) {
+        const f = labelNodes[i].getAttribute('for');
+        if (f && !labelMap.has(f)) {
+          const t = (labelNodes[i].innerText || labelNodes[i].textContent || '').replace(/\\s+/g, ' ').trim();
+          if (t) labelMap.set(f, t);
+        }
+      }
+      const candSel = 'a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="radio"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="treeitem"], [role="slider"], [role="spinbutton"], [role="textbox"], [role="searchbox"], [contenteditable="true"], summary, h1, h2, h3';
+      const cands = queryAllInRoots(roots, candSel);
+      const idx = Math.max(0, Number(s.match.index) || 0);
+      let seen = 0;
+      for (let i = 0; i < cands.length; i++) {
+        if (!matchesElementSpec(cands[i], s.match, labelMap)) continue;
+        if (seen === idx) {
+          if (isVisibleInViewport(cands[i])) hit = cands[i];
+          break;
+        }
+        seen++;
+      }
+    } else if (s.text) {
+      const needle = normalizeMatchText(s.text);
+      const all = document.querySelectorAll('h1, h2, h3, h4, p, a, button, li, td, th, span, div, label, [role="row"], [role="gridcell"]');
+      for (let i = 0; i < all.length && i < 1200; i++) {
+        const el = all[i];
+        if (!isVisibleInViewport(el)) continue;
+        if (el.children.length > 6) continue;
+        if (normalizeMatchText(el.innerText || el.textContent || '').includes(needle)) {
+          hit = el;
+          break;
+        }
+      }
+    }
+
+    let id = null;
+    if (hit) {
+      const reg = getUsemacRefRegistry(1);
+      id = assignUsemacNodeId(hit, reg);
+      if (hit.getAttribute && hit.getAttribute('data-usemac-id') !== id) hit.setAttribute('data-usemac-id', id);
+    }
+    return { found: Boolean(hit), id, scrollX: sx, scrollY: sy };
+  })()`;
+
+  const vp = effectiveViewport(session);
+  const scrollXPt = Number.isFinite(step.x) ? Number(step.x) : Math.round(vp.width / 2);
+  const scrollYPt = Number.isFinite(step.y) ? Number(step.y) : Math.round(vp.height / 2);
+  let totalDeltaX = 0;
+  let totalDeltaY = 0;
+
+  for (let i = 0; i <= maxScrolls; i++) {
+    if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
+    const probeRes = await evalInFrame(tabId, null, probeInViewportExpr).catch(() => null);
+    const probe = probeRes?.result?.value;
+    if (probe?.found) {
+      if (probe.id) {
+        session.elementFrameMap.set(probe.id, {
+          sessionId: null, contextId: null, frameId: null, parentSessionId: null,
+          offsetX: 0, offsetY: 0, isOOPIF: false, hops: []
+        });
+      }
+      return {
+        mechanism: "cdp-scroll-until",
+        message: `Found ${desc} after ${i} scroll(s)`,
+        scrollDeltaX: totalDeltaX,
+        scrollDeltaY: totalDeltaY,
+        resolvedElementId: probe.id || null
+      };
+    }
+    if (i === maxScrolls) break;
+
+    const beforeX = probe?.scrollX ?? 0;
+    const beforeY = probe?.scrollY ?? 0;
+    await sendCDP(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseWheel",
+      x: scrollXPt,
+      y: scrollYPt,
+      deltaX,
+      deltaY
+    });
+    await waitForAnimationFrames(tabId, 40);
+
+    const afterRes = await evalInFrame(tabId, null, `({
+      scrollX: window.scrollX || document.documentElement?.scrollLeft || document.body?.scrollLeft || 0,
+      scrollY: window.scrollY || document.documentElement?.scrollTop || document.body?.scrollTop || 0
+    })`).catch(() => null);
+    const after = afterRes?.result?.value;
+    if (after) {
+      const dx = Math.round((after.scrollX - beforeX) * 10) / 10;
+      const dy = Math.round((after.scrollY - beforeY) * 10) / 10;
+      totalDeltaX += dx;
+      totalDeltaY += dy;
+      // Hit end of scroll (no movement)
+      if (Math.abs(dx) < 2 && Math.abs(dy) < 2) {
+        // One final check in case an inner scrollable container moved instead of window
+        const finalProbe = await evalInFrame(tabId, null, probeInViewportExpr).catch(() => null);
+        if (finalProbe?.result?.value?.found) {
+          return {
+            mechanism: "cdp-scroll-until",
+            message: `Found ${desc} after ${i + 1} scroll(s)`,
+            scrollDeltaX: totalDeltaX,
+            scrollDeltaY: totalDeltaY,
+            resolvedElementId: finalProbe.result.value.id || null
+          };
+        }
+        throw {
+          code: "ELEMENT_NOT_FOUND",
+          message: `scrollUntil reached end of scroll after ${i + 1} scroll(s) without finding ${desc}`
+        };
+      }
+    }
+  }
+
+  throw {
+    code: "ELEMENT_NOT_FOUND",
+    message: `scrollUntil did not find ${desc} within ${maxScrolls} scroll(s)`
+  };
+}
+
+async function executeFillFormStep(tabId, step, cancelToken = null) {
+  const fields = Array.isArray(step.fields) ? step.fields : [];
+  if (fields.length === 0) {
+    throw { code: "INVALID_REQUEST", message: "fillForm requires a non-empty 'fields' array." };
+  }
+
+  const session = getOrCreateTabSession(tabId);
+  const childFrames = session.lastChildFrames || [];
+  const candidateFrames = [null, ...childFrames];
+  const filledSummaries = [];
+  const fieldErrors = [];
+
+  for (let fi = 0; fi < fields.length; fi++) {
+    if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
+    const field = fields[fi];
+    if (!field || typeof field !== "object") continue;
+    const fieldDesc = field.label || field.selector || field.elementId || (hasNonEmptyMatch(field.match) ? formatMatchDesc(field.match) : `field[${fi}]`);
+    const fieldLit = JSON.stringify(field);
+
+    let outcome = null;
+    for (const fMeta of candidateFrames) {
+      const res = await evalInFrame(tabId, fMeta, `(() => {
+        ${QUERY_DEEP_HELPER_JS}
+        const f = ${fieldLit};
+        const roots = collectRoots(document);
+        const labelMap = new Map();
+        const labelNodes = queryAllInRoots(roots, 'label[for]');
+        for (let i = 0; i < labelNodes.length; i++) {
+          const forId = labelNodes[i].getAttribute('for');
+          if (forId && !labelMap.has(forId)) {
+            const t = (labelNodes[i].innerText || labelNodes[i].textContent || '').replace(/\\s+/g, ' ').trim();
+            if (t) labelMap.set(forId, t);
+          }
+        }
+
+        function isInteractable(el) {
+          if (!el || !el.isConnected) return false;
+          const st = window.getComputedStyle(el);
+          if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+          const r = el.getBoundingClientRect();
+          return r.width >= 2 && r.height >= 2;
+        }
+
+        function findControl() {
+          if (f.elementId && String(f.elementId).trim()) {
+            const el = findByUsemacId(String(f.elementId).trim(), document);
+            if (el) return el;
+          }
+          if (f.selector && String(f.selector).trim()) {
+            const el = queryOneDeep(document, String(f.selector).trim());
+            if (el) return el;
+          }
+          const controlSel = 'input, textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="checkbox"], [role="switch"], [role="radio"], [aria-haspopup="listbox"]';
+          const controls = queryAllInRoots(roots, controlSel);
+          if (f.match && typeof f.match === 'object') {
+            const idx = Math.max(0, Number(f.match.index) || 0);
+            let seen = 0;
+            for (let i = 0; i < controls.length; i++) {
+              if (!isInteractable(controls[i])) continue;
+              if (!matchesElementSpec(controls[i], f.match, labelMap)) continue;
+              if (seen === idx) return controls[i];
+              seen++;
+            }
+          }
+          if (f.label && String(f.label).trim()) {
+            const targetNorm = normalizeMatchText(f.label);
+            let best = null;
+            let bestScore = 0;
+            for (let i = 0; i < controls.length; i++) {
+              const c = controls[i];
+              if (!isInteractable(c)) continue;
+              const info = extractElementTitleValue(c, labelMap);
+              const cands = [
+                info.title,
+                c.getAttribute?.('aria-label') || '',
+                c.getAttribute?.('placeholder') || '',
+                c.getAttribute?.('name') || '',
+                c.id ? (labelMap.get(c.id) || '') : ''
+              ];
+              for (const cand of cands) {
+                const n = normalizeMatchText(cand);
+                if (!n) continue;
+                if (n === targetNorm) return c;
+                if (n.includes(targetNorm) && bestScore < 2) { best = c; bestScore = 2; }
+                else if (targetNorm.includes(n) && n.length >= 3 && bestScore < 1) { best = c; bestScore = 1; }
+              }
+            }
+            if (best) return best;
+          }
+          return null;
+        }
+
+        const el = findControl();
+        if (!el) return { found: false };
+
+        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const tag = (el.tagName || '').toLowerCase();
+        const ariaRole = (el.getAttribute?.('role') || '').toLowerCase();
+        const isCombobox = ariaRole === 'combobox' || el.getAttribute?.('aria-haspopup') === 'listbox';
+
+        if (isCombobox && tag !== 'select') {
+          el.focus();
+          el.click();
+          const wantedVal = f.value != null ? String(f.value) : '';
+          if (wantedVal) {
+            const filterInput = tag === 'input' ? el : el.querySelector?.('input');
+            if (filterInput) {
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+              if (setter) setter.call(filterInput, wantedVal);
+              else filterInput.value = wantedVal;
+              filterInput.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          }
+          return { found: true, kind: 'combobox', wanted: wantedVal };
+        }
+
+        if (tag === 'select') {
+          const wanted = String(f.value ?? '').trim();
+          const wantedLower = wanted.toLowerCase();
+          const opts = Array.from(el.options || []);
+          const opt =
+            opts.find((o) => o.value === wanted) ||
+            opts.find((o) => (o.value || '').toLowerCase() === wantedLower) ||
+            opts.find((o) => (o.text || '').trim().toLowerCase() === wantedLower) ||
+            opts.find((o) => (o.text || '').trim().toLowerCase().includes(wantedLower));
+          if (!opt) {
+            const sample = opts.slice(0, 10).map((o) => (o.text || o.value || '').trim()).join(', ');
+            return { found: true, ok: false, error: 'No matching <option> for "' + wanted + '" (available: ' + sample + ')' };
+          }
+          el.focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+          if (setter) setter.call(el, opt.value);
+          else el.value = opt.value;
+          opt.selected = true;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return { found: true, ok: true, kind: 'select', detail: (opt.text || opt.value).trim() };
+        }
+
+        const isCheckable =
+          (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) ||
+          ariaRole === 'checkbox' || ariaRole === 'switch' || ariaRole === 'radio';
+        if (isCheckable) {
+          let desired;
+          if (typeof f.checked === 'boolean') {
+            desired = f.checked;
+          } else {
+            const lower = String(f.value ?? 'true').trim().toLowerCase();
+            desired = ['true', 'checked', 'on', '1', 'yes'].includes(lower);
+          }
+          const current = tag === 'input' ? Boolean(el.checked) : el.getAttribute('aria-checked') === 'true';
+          if (current !== desired) el.click();
+          const finalState = tag === 'input' ? Boolean(el.checked) : el.getAttribute('aria-checked') === 'true';
+          return { found: true, ok: true, kind: 'check', detail: 'checked=' + finalState };
+        }
+
+        const valStr = String(f.value ?? '');
+        el.focus();
+        if (tag === 'textarea' || tag === 'input') {
+          const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, valStr);
+          else el.value = valStr;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new Event('blur', { bubbles: false }));
+          return { found: true, ok: true, kind: tag, detail: valStr.length + ' chars' };
+        }
+        if (el.isContentEditable) {
+          el.textContent = valStr;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return { found: true, ok: true, kind: 'contenteditable', detail: valStr.length + ' chars' };
+        }
+        return { found: true, ok: false, error: 'Unsupported form control: ' + tag };
+      })()`).catch(() => null);
+
+      const v = res?.result?.value;
+      if (v?.found) {
+        outcome = { ...v, frameMeta: fMeta };
+        break;
+      }
+    }
+
+    if (!outcome) {
+      fieldErrors.push(`Field "${fieldDesc}" not found`);
+      continue;
+    }
+
+    if (outcome.kind === "combobox") {
+      // Wait via MutationObserver Promise (up to 350ms) for [role="option"] to appear, then click the matching option.
+      const wantedLit = JSON.stringify(outcome.wanted || "");
+      const comboRes = await evalInFrame(tabId, outcome.frameMeta, `(() => {
+        ${QUERY_DEEP_HELPER_JS}
+        const wantedNorm = normalizeMatchText(${wantedLit});
+        function findOption() {
+          const roots = collectRoots(document);
+          const opts = queryAllInRoots(roots, '[role="option"], [role="listbox"] li');
+          let partial = null;
+          for (let i = 0; i < opts.length; i++) {
+            const o = opts[i];
+            const st = window.getComputedStyle(o);
+            if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+            const r = o.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            const txt = normalizeMatchText(o.innerText || o.textContent || o.getAttribute('aria-label') || '');
+            if (!wantedNorm || txt === wantedNorm) return o;
+            if (!partial && txt.includes(wantedNorm)) partial = o;
+          }
+          return partial;
+        }
+        const immediate = findOption();
+        if (immediate) {
+          immediate.click();
+          return Promise.resolve({ ok: true, detail: (immediate.innerText || immediate.textContent || '').trim() });
+        }
+        return new Promise((resolve) => {
+          let done = false;
+          let mo = null;
+          const finish = (res) => {
+            if (done) return;
+            done = true;
+            if (mo) try { mo.disconnect(); } catch (_) {}
+            clearTimeout(timer);
+            resolve(res);
+          };
+          if (typeof MutationObserver === 'function' && document.documentElement) {
+            mo = new MutationObserver(() => {
+              const hit = findOption();
+              if (hit) {
+                hit.click();
+                finish({ ok: true, detail: (hit.innerText || hit.textContent || '').trim() });
+              }
+            });
+            mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+          }
+          const timer = setTimeout(() => {
+            const hit = findOption();
+            if (hit) {
+              hit.click();
+              finish({ ok: true, detail: (hit.innerText || hit.textContent || '').trim() });
+            } else {
+              finish({ ok: false, error: 'No [role="option"] matched "' + ${wantedLit} + '"' });
+            }
+          }, 350);
+        });
+      })()`, { returnByValue: true, awaitPromise: true }).catch(() => null);
+      const cv = comboRes?.result?.value;
+      if (cv?.ok) {
+        filledSummaries.push(`${fieldDesc}=${cv.detail}`);
+      } else {
+        fieldErrors.push(`${fieldDesc}: ${cv?.error || "combobox option not found"}`);
+      }
+      continue;
+    }
+
+    if (outcome.ok === false) {
+      fieldErrors.push(`${fieldDesc}: ${outcome.error || "failed"}`);
+    } else {
+      filledSummaries.push(`${fieldDesc}`);
+    }
+  }
+
+  // Optional submit action
+  if (fieldErrors.length === 0 && (hasNonEmptyMatch(step.submitMatch) || (typeof step.submitSelector === "string" && step.submitSelector.trim() !== ""))) {
+    const submitStep = {
+      action: "click",
+      match: hasNonEmptyMatch(step.submitMatch) ? step.submitMatch : undefined,
+      selector: typeof step.submitSelector === "string" && step.submitSelector.trim() !== "" ? step.submitSelector.trim() : undefined
+    };
+    await executeActionStep(tabId, submitStep, cancelToken);
+  } else {
+    await waitForAnimationFrames(tabId, 40);
+  }
+
+  // Automatically surface HTML5 validation errors, aria-invalid fields, and visible alerts
+  const validationRes = await evalInFrame(tabId, null, `(() => {
+    ${QUERY_DEEP_HELPER_JS}
+    const roots = collectRoots(document);
+    const errors = [];
+    const seen = new Set();
+    const pushErr = (s) => {
+      const clean = String(s || '').replace(/\\s+/g, ' ').trim().slice(0, 160);
+      if (clean && !seen.has(clean)) { seen.add(clean); errors.push(clean); }
+    };
+    const invalids = queryAllInRoots(roots, ':invalid, [aria-invalid="true"]');
+    for (let i = 0; i < invalids.length && errors.length < 10; i++) {
+      const el = invalids[i];
+      const tag = (el.tagName || '').toLowerCase();
+      if (tag === 'form' || tag === 'fieldset') continue;
+      const name = el.getAttribute('aria-label') || el.getAttribute('name') || el.getAttribute('placeholder') || el.id || tag;
+      let msg = el.validationMessage || '';
+      const errId = el.getAttribute('aria-errormessage') || el.getAttribute('aria-describedby');
+      if (!msg && errId) {
+        msg = errId.split(/\\s+/).map((id) => document.getElementById(id)?.innerText || '').filter(Boolean).join(' ');
+      }
+      if (msg) pushErr(name + ': ' + msg);
+      else if (el.getAttribute('aria-invalid') === 'true') pushErr(name + ': invalid');
+    }
+    const alerts = queryAllInRoots(roots, '[role="alert"], [aria-live="assertive"]');
+    for (let i = 0; i < alerts.length && errors.length < 12; i++) {
+      const a = alerts[i];
+      const st = window.getComputedStyle(a);
+      if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+      const txt = (a.innerText || a.textContent || '').trim();
+      if (txt) pushErr('alert: ' + txt);
+    }
+    return errors;
+  })()`).catch(() => null);
+  const validationErrors = Array.isArray(validationRes?.result?.value) ? validationRes.result.value : [];
+
+  if (fieldErrors.length > 0) {
+    const detail = validationErrors.length > 0 ? `; validation: ${validationErrors.join(" | ")}` : "";
+    throw { code: "FORM_FILL_FAILED", message: `${fieldErrors.join("; ")}${detail}` };
+  }
+
+  const msgParts = [`Filled ${filledSummaries.length} field(s)`];
+  if (validationErrors.length > 0) {
+    msgParts.push(`validationErrors=[${validationErrors.join(" | ")}]`);
+  }
+  return {
+    mechanism: "cdp-fill-form",
+    message: msgParts.join(" · "),
+    blockedWarning: validationErrors.length > 0 ? `Form validation errors: ${validationErrors.join(" | ")}` : null
+  };
 }
 
 async function executeActionStep(tabId, step, cancelToken = null) {
@@ -3269,10 +5039,38 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     return { mechanism: "tabs-update", message: null };
   }
 
+  if (action === "assert") {
+    return executeAssertStep(tabId, step);
+  }
+
+  if (action === "scrollUntil") {
+    return executeScrollUntilStep(tabId, step, cancelToken);
+  }
+
+  if (action === "fillForm") {
+    return executeFillFormStep(tabId, step, cancelToken);
+  }
+
+  if (action === "waitFor") {
+    return runWaitForStep(tabId, step, cancelToken);
+  }
+
+  if (action === "scrollIntoView") {
+    const target = await resolveStepTarget(tabId, step);
+    if (!target) {
+      throw { code: "ELEMENT_NOT_FOUND", message: "scrollIntoView requires elementId, selector, or match." };
+    }
+    return {
+      mechanism: "cdp-scroll-into-view",
+      message: target.label || null,
+      resolvedElementId: target.elementId || null
+    };
+  }
+
   if (action === "click" || action === "doubleClick" || action === "rightClick") {
     const target = await resolveStepTarget(tabId, step);
     if (!target) {
-      throw new Error(`${action} requires elementId or (x, y).`);
+      throw new Error(`${action} requires elementId, selector, match, or (x, y).`);
     }
     const label =
       action === "doubleClick"
@@ -3283,7 +5081,9 @@ async function executeActionStep(tabId, step, cancelToken = null) {
             ? `Clicking ${target.label}`
             : "Clicking";
     const clickStartAt = Date.now();
-    const beforeTab = await refreshTabMeta(tabId);
+    const session = getOrCreateTabSession(tabId);
+    const beforeUrl = session.url || "";
+    session.navigating = false;
     const pt = await moveCursorSmoothly(tabId, target.x, target.y, label);
     emitCursor(tabId, pt.x, pt.y, "click", label);
 
@@ -3291,65 +5091,66 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
     } else if (action === "doubleClick") {
       await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
-      await sleep(25);
       await dispatchMouseClick(tabId, pt.x, pt.y, "left", 2);
     } else {
       await dispatchMouseClick(tabId, pt.x, pt.y, "right", 1);
     }
 
-    // Smart post-click settle: detect triggered navigation or download without blind 3s sleeps
-    await sleep(140);
+    // Event-driven post-click settle: double-rAF (~16-33ms) + navigation/download detection instead of blind 140ms sleep.
+    await waitForAnimationFrames(tabId, 40);
     if (state.lastDownloadAt >= clickStartAt) {
       const dl = await waitForDownloadCompletion(state.lastDownloadId, 4500);
       const path = dl?.filename || state.lastDownloadFilename || null;
       return {
         mechanism: "cdp-mouse (download)",
         message: path ? `Download ${dl?.state || "started"}: ${path}` : "Download started",
-        downloadPath: path
+        downloadPath: path,
+        resolvedElementId: target.elementId || null
       };
     }
     const afterTab = await refreshTabMeta(tabId);
-    if (afterTab && (afterTab.status === "loading" || (beforeTab?.url && afterTab.url !== beforeTab.url))) {
+    if (session.navigating || (afterTab && (afterTab.status === "loading" || (beforeUrl && afterTab.url && afterTab.url !== beforeUrl)))) {
       await waitForTabLoad(tabId, 3200);
-      return { mechanism: "cdp-mouse (navigated)", message: afterTab.url || null };
+      return {
+        mechanism: "cdp-mouse (navigated)",
+        message: afterTab?.url || session.url || null,
+        resolvedElementId: target.elementId || null
+      };
     }
-    return { mechanism: "cdp-mouse", message: null };
+    return { mechanism: "cdp-mouse", message: null, resolvedElementId: target.elementId || null };
   }
 
   if (action === "hover") {
     const target = await resolveStepTarget(tabId, step);
     if (!target) {
-      throw new Error("hover requires elementId, selector, or (x, y).");
+      throw new Error("hover requires elementId, selector, match, or (x, y).");
     }
     const label = target.label ? `Hovering ${target.label}` : "Hovering";
     const pt = await moveCursorSmoothly(tabId, target.x, target.y, label);
     emitCursor(tabId, pt.x, pt.y, "hover", label);
-    await sendCDP(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: pt.x,
-      y: pt.y,
-      button: "none"
-    });
-    await sleep(140);
-    return { mechanism: "cdp-hover", message: target.label || `(${Math.round(pt.x)}, ${Math.round(pt.y)})` };
+    await waitForAnimationFrames(tabId, 40);
+    return {
+      mechanism: "cdp-hover",
+      message: target.label || `(${Math.round(pt.x)}, ${Math.round(pt.y)})`,
+      resolvedElementId: target.elementId || null
+    };
   }
 
   if (action === "focus") {
     const target = await resolveStepTarget(tabId, step);
-    if (step.elementId || step.selector) {
-      const selectorLit = step.elementId
-        ? usemacIdSelectorLiteral(step.elementId)
-        : JSON.stringify(String(step.selector));
+    const resolvedId = target?.elementId || step.elementId || null;
+    if (resolvedId || step.selector) {
+      const lookupExpr = findElementExprJs({ elementId: resolvedId, selector: resolvedId ? null : step.selector });
       await evalInFrame(tabId, target?.frameMeta || null, `(() => {
         ${QUERY_DEEP_HELPER_JS}
-        const el = queryOneDeep(document, ${selectorLit});
+        const el = ${lookupExpr};
         if (el) el.focus();
       })()`);
     }
     if (target) {
       await moveCursorSmoothly(tabId, target.x, target.y, "Focusing");
     }
-    return { mechanism: "cdp-focus", message: null };
+    return { mechanism: "cdp-focus", message: null, resolvedElementId: resolvedId };
   }
 
   if (action === "setValue" || action === "type") {
@@ -3358,24 +5159,24 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     if (action === "setValue" && !stepNamesTarget(step)) {
       throw {
         code: "INVALID_REQUEST",
-        message: "setValue names no field: pass elementId (an @bN id from browser_observe) or selector. Nothing was typed. To type into the focused field, use type."
+        message: "setValue names no field: pass elementId (an @bN id from browser_observe), match, or selector. Nothing was typed. To type into the focused field, use type."
       };
     }
     const session = getOrCreateTabSession(tabId);
     const text = step.text ?? "";
     const target = await resolveStepTarget(tabId, step);
     const frameMeta = target?.frameMeta || null;
+    const resolvedId = target?.elementId || (typeof step.elementId === "string" && step.elementId.trim() ? step.elementId.trim() : null);
+    const hasDomRef = Boolean(resolvedId || (typeof step.selector === "string" && step.selector.trim()));
+    const lookupExpr = findElementExprJs({ elementId: resolvedId, selector: resolvedId ? null : step.selector });
 
-    // Native <select> and checkbox/radio handling in setValue (React-safe, OOPIF + Shadow DOM aware)
-    if (action === "setValue" && (step.elementId || step.selector)) {
-      const selLit = step.elementId
-        ? usemacIdSelectorLiteral(step.elementId)
-        : JSON.stringify(String(step.selector));
+    // Single collapsed eval for setValue on DOM targets: handles <select>, checkbox/radio, OR focuses & clears text input!
+    if (action === "setValue" && hasDomRef) {
       const textLit = JSON.stringify(String(text));
-      const specialRes = await evalInFrame(tabId, frameMeta, `(() => {
+      const prepRes = await evalInFrame(tabId, frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
-        const el = queryOneDeep(document, ${selLit});
-        if (!el) return { handled: false };
+        const el = ${lookupExpr};
+        if (!el) return { handled: false, cleared: false };
         const tag = (el.tagName || '').toLowerCase();
         if (tag === 'select') {
           const wanted = ${textLit}.trim();
@@ -3409,12 +5210,29 @@ async function executeActionStep(tabId, step, cancelToken = null) {
             return { handled: true, ok: true, mechanism: 'cdp-toggle', message: 'checked=' + Boolean(el.checked) };
           }
         }
-        return { handled: false };
+        el.focus();
+        if ('value' in el && el.type !== 'file') {
+          const proto = el.tagName === 'TEXTAREA'
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, '');
+          else el.value = '';
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        } else if (el.isContentEditable) {
+          el.textContent = '';
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return { handled: false, cleared: true };
       })()`);
-      const sv = specialRes?.result?.value;
+      const sv = prepRes?.result?.value;
       if (sv?.handled) {
         if (!sv.ok) throw new Error(sv.error || "Failed to select option.");
-        return { mechanism: sv.mechanism || "cdp-select", message: sv.message || null };
+        return {
+          mechanism: sv.mechanism || "cdp-select",
+          message: sv.message || null,
+          resolvedElementId: resolvedId
+        };
       }
     }
 
@@ -3426,57 +5244,33 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       emitCursor(tabId, session.cursor.x, session.cursor.y, "type", "Typing");
     }
 
-    if (action === "setValue") {
-      if (step.elementId || step.selector) {
-        const selectorLit = step.elementId
-          ? usemacIdSelectorLiteral(step.elementId)
-          : JSON.stringify(String(step.selector));
-        await evalInFrame(tabId, frameMeta, `(() => {
-          ${QUERY_DEEP_HELPER_JS}
-          const el = queryOneDeep(document, ${selectorLit});
-          if (!el) return;
-          el.focus();
-          if ('value' in el) {
-            const proto = el.tagName === 'TEXTAREA'
-              ? HTMLTextAreaElement.prototype
-              : HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            if (setter) setter.call(el, '');
-            else el.value = '';
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-          } else if (el.isContentEditable) {
-            el.textContent = '';
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        })()`);
-      } else {
-        await sendCDP(tabId, "Input.dispatchKeyEvent", {
-          type: "keyDown",
-          key: "a",
-          code: "KeyA",
-          windowsVirtualKeyCode: 65,
-          modifiers: 4
-        });
-        await sendCDP(tabId, "Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: "a",
-          code: "KeyA",
-          windowsVirtualKeyCode: 65,
-          modifiers: 4
-        });
-        await sendCDP(tabId, "Input.dispatchKeyEvent", {
-          type: "keyDown",
-          key: "Backspace",
-          code: "Backspace",
-          windowsVirtualKeyCode: 8
-        });
-        await sendCDP(tabId, "Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: "Backspace",
-          code: "Backspace",
-          windowsVirtualKeyCode: 8
-        });
-      }
+    if (action === "setValue" && !hasDomRef) {
+      await sendCDP(tabId, "Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: "a",
+        code: "KeyA",
+        windowsVirtualKeyCode: 65,
+        modifiers: 4
+      });
+      await sendCDP(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "a",
+        code: "KeyA",
+        windowsVirtualKeyCode: 65,
+        modifiers: 4
+      });
+      await sendCDP(tabId, "Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: "Backspace",
+        code: "Backspace",
+        windowsVirtualKeyCode: 8
+      });
+      await sendCDP(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "Backspace",
+        code: "Backspace",
+        windowsVirtualKeyCode: 8
+      });
     }
 
     if (text.length > 0) {
@@ -3490,49 +5284,40 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       if (!inserted) {
         await sendCDP(tabId, "Input.insertText", { text });
       }
-      // Guarantee OOPIF / Shadow DOM inputs updated even if compositor focus lagged
-      if (frameMeta && (step.elementId || step.selector)) {
-        const selectorLit = step.elementId
-          ? usemacIdSelectorLiteral(step.elementId)
-          : JSON.stringify(String(step.selector));
-        const textLit = JSON.stringify(String(text));
-        const isSetValue = action === "setValue" ? "true" : "false";
-        await evalInFrame(tabId, frameMeta, `(() => {
-          ${QUERY_DEEP_HELPER_JS}
-          const el = queryOneDeep(document, ${selectorLit});
-          if (!el) return;
-          const wanted = ${textLit};
-          if ('value' in el && el.type !== 'file') {
-            const cur = String(el.value || '');
-            if (cur === '' || (${isSetValue} && cur !== wanted && !cur.includes(wanted))) {
-              const nextVal = ${isSetValue} ? wanted : (cur + wanted);
-              const proto = el.tagName === 'TEXTAREA'
-                ? HTMLTextAreaElement.prototype
-                : HTMLInputElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-              if (setter) setter.call(el, nextVal);
-              else el.value = nextVal;
-              el.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-          }
-        })()`).catch(() => {});
-      }
     }
 
-    if (step.elementId || step.selector) {
-      const selectorLit = step.elementId
-        ? usemacIdSelectorLiteral(step.elementId)
-        : JSON.stringify(String(step.selector));
+    // Single finalization eval: dispatches 'change', plus OOPIF fallback value sync ONLY when frameMeta?.isOOPIF === true.
+    if (hasDomRef) {
+      const isOOPIF = frameMeta?.isOOPIF === true;
+      const textLit = JSON.stringify(String(text));
+      const isSetValue = action === "setValue" ? "true" : "false";
       await evalInFrame(tabId, frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
-        const el = queryOneDeep(document, ${selectorLit});
-        if (el) {
-          el.dispatchEvent(new Event('change', { bubbles: true }));
+        const el = ${lookupExpr};
+        if (!el) return;
+        if (${isOOPIF ? "true" : "false"} && ${text.length > 0 ? "true" : "false"} && 'value' in el && el.type !== 'file') {
+          const wanted = ${textLit};
+          const cur = String(el.value || '');
+          if (cur === '' || (${isSetValue} && cur !== wanted && !cur.includes(wanted))) {
+            const nextVal = ${isSetValue} ? wanted : (cur + wanted);
+            const proto = el.tagName === 'TEXTAREA'
+              ? HTMLTextAreaElement.prototype
+              : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter) setter.call(el, nextVal);
+            else el.value = nextVal;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          }
         }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
       })()`).catch(() => {});
     }
 
-    return { mechanism: frameMeta?.isOOPIF ? "cdp-input (iframe)" : "cdp-input", message: null };
+    return {
+      mechanism: frameMeta?.isOOPIF === true ? "cdp-input (iframe)" : "cdp-input",
+      message: null,
+      resolvedElementId: resolvedId
+    };
   }
 
   if (action === "pressKey") {
@@ -3551,7 +5336,6 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       text: modifiers === 0 ? desc.text : undefined,
       unmodifiedText: desc.text
     });
-    await sleep(20);
     await sendCDP(tabId, "Input.dispatchKeyEvent", {
       type: "keyUp",
       key: desc.key,
@@ -3637,7 +5421,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       deltaX: requestedDeltaX,
       deltaY: requestedDeltaY
     });
-    await sleep(95);
+    await waitForAnimationFrames(tabId, 45);
 
     // If horizontal scroll was requested on an inner container and CDP wheel didn't move it, apply direct scrollBy fallback
     if (Math.abs(requestedDeltaX) >= 10) {
@@ -3657,7 +5441,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
             cur = cur.parentElement;
           }
         })()`).catch(() => null);
-      await sleep(60);
+      await waitForAnimationFrames(tabId, 35);
     }
 
     const afterEval = await evalInFrame(tabId, scrollFrameMeta, `(() => {
@@ -3736,59 +5520,10 @@ async function executeActionStep(tabId, step, cancelToken = null) {
   }
 
   if (action === "wait") {
-    const ms = clamp(Number(step.durationMs ?? (step.selector || step.text ? 6000 : 500)), 0, 30000);
-    if (step.selector || step.text) {
-      const selLit = step.selector ? JSON.stringify(String(step.selector)) : "null";
-      const txtLit = step.text ? JSON.stringify(String(step.text).toLowerCase()) : "null";
-      const checkExpr = `(() => {
-        ${QUERY_DEEP_HELPER_JS}
-        const sel = ${selLit};
-        const txt = ${txtLit};
-        if (sel) {
-          const el = queryOneDeep(document, sel);
-          if (!el) return false;
-          const r = el.getBoundingClientRect();
-          const st = window.getComputedStyle(el);
-          if (!st || st.display === 'none' || st.visibility === 'hidden' || r.width < 2 || r.height < 2) return false;
-          if (!txt) return true;
-          return (el.innerText || '').toLowerCase().includes(txt);
-        }
-        if (txt) {
-          return (document.body?.innerText || '').toLowerCase().includes(txt);
-        }
-        return true;
-      })()`;
-      const deadline = Date.now() + ms;
-      let pollCount = 0;
-      while (Date.now() < deadline) {
-        if (isCancelled(tabId, cancelToken)) {
-          throw CANCELLED_ERROR;
-        }
-        const topRes = await evalInFrame(tabId, null, checkExpr).catch(() => null);
-        if (topRes?.result?.value === true) {
-          return { mechanism: "wait-for", message: step.selector ? `Matched ${step.selector}` : `Matched text "${step.text}"` };
-        }
-        const session = getOrCreateTabSession(tabId);
-        const childFrames = (pollCount % 3 === 0 || !session.lastChildFrames?.length)
-          ? await discoverChildFrames(tabId).catch(() => session.lastChildFrames || [])
-          : session.lastChildFrames;
-        for (const frameMeta of childFrames) {
-          if (isCancelled(tabId, cancelToken)) {
-            throw CANCELLED_ERROR;
-          }
-          const childRes = await evalInFrame(tabId, frameMeta, checkExpr).catch(() => null);
-          if (childRes?.result?.value === true) {
-            return { mechanism: "wait-for (iframe)", message: step.selector ? `Matched ${step.selector}` : `Matched text "${step.text}"` };
-          }
-        }
-        pollCount += 1;
-        await sleepCancellable(Math.min(150, Math.max(0, deadline - Date.now())), tabId, cancelToken);
-      }
-      if (isCancelled(tabId, cancelToken)) {
-        throw CANCELLED_ERROR;
-      }
-      throw new Error(`Timed out after ${ms}ms waiting for ${step.selector || step.text}`);
+    if (step.selector || step.text || hasNonEmptyMatch(step.match)) {
+      return runWaitForStep(tabId, { ...step, timeoutMs: step.timeoutMs ?? step.durationMs ?? 6000 }, cancelToken);
     }
+    const ms = clamp(Number(step.durationMs ?? step.ms ?? 500), 0, 30000);
     await sleepCancellable(ms, tabId, cancelToken);
     return { mechanism: "timer", message: null };
   }
@@ -3799,16 +5534,22 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       throw new Error("uploadFile requires a non-empty 'files' array of local file paths.");
     }
 
-    const selLit = step.elementId
-      ? usemacIdSelectorLiteral(step.elementId)
+    let resolvedUploadId = typeof step.elementId === "string" && step.elementId.trim() ? step.elementId.trim() : null;
+    if (!resolvedUploadId && !step.selector && hasNonEmptyMatch(step.match)) {
+      const mTarget = await resolveMatchCenter(tabId, step.match).catch(() => null);
+      if (mTarget?.elementId) resolvedUploadId = mTarget.elementId;
+    }
+
+    const lookupTargetJs = resolvedUploadId
+      ? `findByUsemacId(${JSON.stringify(resolvedUploadId)}, document)`
       : step.selector
-        ? JSON.stringify(String(step.selector))
+        ? `queryOneDeep(document, ${JSON.stringify(String(step.selector))})`
         : "null";
+    const hasExplicitTarget = Boolean(resolvedUploadId || step.selector);
 
     const findInputExpr = `(() => {
       ${QUERY_DEEP_HELPER_JS}
-      const sel = ${selLit};
-      let target = sel ? queryOneDeep(document, sel) : null;
+      let target = ${lookupTargetJs};
       let input = null;
       if (target) {
         if (target.tagName === 'INPUT' && target.type === 'file') {
@@ -3822,7 +5563,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
           const siblingInputs = queryAllDeep(target.parentElement, 'input[type="file"]');
           if (siblingInputs.length === 1) input = siblingInputs[0];
         }
-      } else if (!sel) {
+      } else if (!${hasExplicitTarget ? "true" : "false"}) {
         const all = queryAllDeep(document, 'input[type="file"]');
         if (all.length >= 1) input = all[0];
       }
@@ -3832,7 +5573,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     // Tier 1: Direct <input type="file"> across top frame and child OOPIFs/iframes (zero Finder!)
     const session = getOrCreateTabSession(tabId);
     const candidateFrames = [];
-    const mappedFrame = step.elementId ? session.elementFrameMap.get(step.elementId) : null;
+    const mappedFrame = resolvedUploadId ? session.elementFrameMap.get(resolvedUploadId) : null;
     if (mappedFrame) candidateFrames.push(mappedFrame);
     if (!mappedFrame || mappedFrame.frameId != null) candidateFrames.push(null);
     const extraFrames = session.lastChildFrames?.length
@@ -3863,10 +5604,11 @@ async function executeActionStep(tabId, step, cancelToken = null) {
               }`,
               returnByValue: true
             }, cdpSessionId).catch(() => {});
-            await sleep(120);
+            await waitForAnimationFrames(tabId, 40);
             return {
               mechanism: frameMeta?.isOOPIF ? "cdp-file-input (iframe)" : "cdp-file-input",
-              message: `Uploaded ${files.length} file(s): ${files.map((f) => f.split("/").pop()).join(", ")}`
+              message: `Uploaded ${files.length} file(s): ${files.map((f) => f.split("/").pop()).join(", ")}`,
+              resolvedElementId: resolvedUploadId
             };
           }
         } finally {
@@ -3878,7 +5620,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     // Tier 2: Intercept dynamic file chooser dialog before macOS Finder opens!
     const target = await resolveStepTarget(tabId, step);
     if (!target) {
-      throw new Error("uploadFile found no <input type='file'> and no clickable target (provide elementId, selector, or x/y).");
+      throw new Error("uploadFile found no <input type='file'> and no clickable target (provide elementId, selector, match, or x/y).");
     }
 
     const pt = await moveCursorSmoothly(tabId, target.x, target.y, "Uploading");
@@ -3899,10 +5641,11 @@ async function executeActionStep(tabId, step, cancelToken = null) {
           backendNodeId: chooserEvent.backendNodeId,
           files
         }, chooserEvent.sessionId || targetSessionId || null);
-        await sleep(140);
+        await waitForAnimationFrames(tabId, 40);
         return {
           mechanism: "cdp-file-chooser",
-          message: `Uploaded ${files.length} file(s) via intercepted chooser: ${files.map((f) => f.split("/").pop()).join(", ")}`
+          message: `Uploaded ${files.length} file(s) via intercepted chooser: ${files.map((f) => f.split("/").pop()).join(", ")}`,
+          resolvedElementId: target.elementId || resolvedUploadId
         };
       }
     } finally {
@@ -3920,24 +5663,23 @@ async function executeActionStep(tabId, step, cancelToken = null) {
       y: pt.y,
       data: dragData
     });
-    await sleep(40);
     await sendCDP(tabId, "Input.dispatchDragEvent", {
       type: "dragOver",
       x: pt.x,
       y: pt.y,
       data: dragData
     });
-    await sleep(40);
     await sendCDP(tabId, "Input.dispatchDragEvent", {
       type: "drop",
       x: pt.x,
       y: pt.y,
       data: dragData
     });
-    await sleep(140);
+    await waitForAnimationFrames(tabId, 40);
     return {
       mechanism: "cdp-drag-drop",
-      message: `Dropped ${files.length} file(s) at (${Math.round(pt.x)}, ${Math.round(pt.y)}): ${files.map((f) => f.split("/").pop()).join(", ")}`
+      message: `Dropped ${files.length} file(s) at (${Math.round(pt.x)}, ${Math.round(pt.y)}): ${files.map((f) => f.split("/").pop()).join(", ")}`,
+      resolvedElementId: target.elementId || resolvedUploadId
     };
   }
 
@@ -3946,7 +5688,7 @@ async function executeActionStep(tabId, step, cancelToken = null) {
     if (target) {
       await moveCursorSmoothly(tabId, target.x, target.y, "Targeting");
     }
-    return { mechanism: "cdp-target", message: null };
+    return { mechanism: "cdp-target", message: null, resolvedElementId: target?.elementId || null };
   }
 
   throw new Error(`Unsupported action step: ${action}`);
@@ -4195,7 +5937,7 @@ async function extractTablesWithHorizontalScan(tabId, scopeSelector = null, maxC
           const el = queryOneDeep(document, '[data-usemac-hscan="1"]');
           if (el) el.scrollLeft = ${pos};
         })()`);
-      await sleep(180);
+      await waitForAnimationFrames(tabId, 45);
       stepsDone += 1;
 
       const passTables = await extractTablesSinglePass(tabId, scopeSelector, frameMeta);
@@ -4266,6 +6008,213 @@ async function extractTablesWithHorizontalScan(tabId, scopeSelector = null, maxC
     rowCount: mergedRowOrder.length,
     columnCount: mergedHeaders.length,
     scannedSteps: stepsDone
+  };
+}
+
+async function extractTablesWithVerticalScan(tabId, scopeSelector = null, maxChars = 16000, frameMeta = null) {
+  const scopeLit = scopeSelector ? JSON.stringify(String(scopeSelector)) : "null";
+  const scrollerProbe = await evalInFrame(tabId, frameMeta, `(() => {
+      ${QUERY_DEEP_HELPER_JS}
+      const root = ${scopeLit} ? queryOneDeep(document, ${scopeLit}) : document;
+      if (!root) return null;
+      const candidates = queryAllDeep(root, '[role="grid"], [role="table"], [role="treegrid"], div, section, tbody');
+      let best = null;
+      let bestScore = 0;
+      for (let i = 0; i < candidates.length && i < 800; i++) {
+        const el = candidates[i];
+        const st = window.getComputedStyle(el);
+        if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+        if (st.overflowY !== 'auto' && st.overflowY !== 'scroll') continue;
+        const overflow = el.scrollHeight - el.clientHeight;
+        if (overflow <= 40 || el.clientWidth < 160 || el.clientHeight < 80) continue;
+        const hasGrid = el.matches?.('[role="grid"], [role="table"], [role="treegrid"], tbody')
+          || Boolean(el.querySelector?.('[role="gridcell"], [role="cell"], [role="row"], td, tr'))
+          || Boolean(el.closest?.('[role="grid"], [role="table"], [role="treegrid"], table'));
+        const score = overflow + (hasGrid ? 100000 : 0);
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      if (best) {
+        best.setAttribute('data-usemac-vscan', '1');
+        return {
+          isWindow: false,
+          origTop: best.scrollTop,
+          clientHeight: best.clientHeight,
+          scrollHeight: best.scrollHeight
+        };
+      }
+      const se = document.scrollingElement || document.documentElement;
+      if (se && se.scrollHeight > window.innerHeight + 40) {
+        return {
+          isWindow: true,
+          origTop: window.scrollY || se.scrollTop || 0,
+          clientHeight: window.innerHeight || se.clientHeight,
+          scrollHeight: se.scrollHeight
+        };
+      }
+      return null;
+    })()`).catch(() => null);
+
+  const info = scrollerProbe?.result?.value;
+  if (!info || info.scrollHeight <= info.clientHeight + 40) {
+    const single = await extractTablesSinglePass(tabId, scopeSelector, frameMeta);
+    const fmt = formatExtractedTablesToMarkdown(single, maxChars);
+    return { ...fmt, scannedSteps: 1 };
+  }
+
+  const maxScrollTop = info.scrollHeight - info.clientHeight;
+  const stepPx = Math.max(200, Math.round(info.clientHeight * 0.7));
+  const positions = [0];
+  for (let y = stepPx; y < maxScrollTop; y += stepPx) {
+    positions.push(y);
+    if (positions.length >= 14) break;
+  }
+  if (positions[positions.length - 1] < maxScrollTop) {
+    positions.push(maxScrollTop);
+  }
+
+  let headers = null;
+  const seenRows = new Set();
+  const mergedRows = [];
+  let stepsDone = 0;
+
+  try {
+    for (const pos of positions) {
+      await evalInFrame(tabId, frameMeta, info.isWindow
+        ? `window.scrollTo({ top: ${pos}, behavior: 'instant' })`
+        : `(() => {
+            ${QUERY_DEEP_HELPER_JS}
+            const el = queryOneDeep(document, '[data-usemac-vscan="1"]');
+            if (el) el.scrollTop = ${pos};
+          })()`);
+      await waitForAnimationFrames(tabId, 45);
+      stepsDone += 1;
+
+      const passTables = await extractTablesSinglePass(tabId, scopeSelector, frameMeta);
+      const primary = passTables.sort((a, b) => (b.rows?.length || 0) - (a.rows?.length || 0))[0];
+      if (!primary || !primary.rows || primary.rows.length < 2) continue;
+
+      if (!headers) {
+        headers = primary.rows[0].cells.map((c, idx) => (c.text || "").trim() || `Col ${idx + 1}`);
+      }
+      for (let r = 1; r < primary.rows.length; r++) {
+        const row = primary.rows[r];
+        const vals = row.cells.map((c) => c.text || "");
+        const dedupKey = row.rowKey && row.rowKey.startsWith("aria:")
+          ? row.rowKey
+          : vals.join("\u001f");
+        if (seenRows.has(dedupKey)) continue;
+        seenRows.add(dedupKey);
+        mergedRows.push(vals);
+      }
+    }
+  } finally {
+    await evalInFrame(tabId, frameMeta, info.isWindow
+      ? `window.scrollTo({ top: ${info.origTop}, behavior: 'instant' })`
+      : `(() => {
+          ${QUERY_DEEP_HELPER_JS}
+          const el = queryOneDeep(document, '[data-usemac-vscan="1"]');
+          if (el) {
+            el.scrollTop = ${info.origTop};
+            el.removeAttribute('data-usemac-vscan');
+          }
+        })()`).catch(() => {});
+  }
+
+  if (!headers || headers.length < 2 || mergedRows.length === 0) {
+    const fallback = await extractTablesSinglePass(tabId, scopeSelector, frameMeta);
+    const fmt = formatExtractedTablesToMarkdown(fallback, maxChars);
+    return { ...fmt, scannedSteps: stepsDone };
+  }
+
+  const colCount = Math.max(headers.length, ...mergedRows.map((r) => r.length));
+  const normHeaders = headers.slice();
+  while (normHeaders.length < colCount) normHeaders.push(`Col ${normHeaders.length + 1}`);
+  const headerLine = "| " + normHeaders.join(" | ") + " |";
+  const sepLine = "| " + normHeaders.map(() => "---").join(" | ") + " |";
+  const bodyLines = mergedRows.map((vals) => {
+    const row = vals.slice();
+    while (row.length < colCount) row.push("");
+    return "| " + row.join(" | ") + " |";
+  });
+
+  const md = [headerLine, sepLine, ...bodyLines].join("\n").slice(0, maxChars);
+  return {
+    markdown: md,
+    rowCount: mergedRows.length,
+    columnCount: colCount,
+    scannedSteps: stepsDone
+  };
+}
+
+async function extractNetworkResponses(tabId, { urlFilter = null, maxChars = 16000 } = {}) {
+  const session = getOrCreateTabSession(tabId);
+  const filterLower = typeof urlFilter === "string" ? urlFilter.trim().toLowerCase() : "";
+  const matching = (session.networkRing || [])
+    .filter((entry) => !filterLower || String(entry.url || "").toLowerCase().includes(filterLower))
+    .slice()
+    .reverse(); // newest first
+
+  const items = [];
+  let approxLen = 2; // "[]"
+  for (const entry of matching) {
+    if (!entry.bodyLoaded && entry.requestId) {
+      try {
+        const res = await sendCDP(tabId, "Network.getResponseBody", { requestId: entry.requestId });
+        let rawBody = res?.body ?? null;
+        if (rawBody != null && res?.base64Encoded) {
+          try { rawBody = atob(rawBody); } catch (_) {}
+        }
+        if (typeof rawBody === "string") {
+          try {
+            entry.body = JSON.parse(rawBody);
+          } catch (_) {
+            entry.body = rawBody;
+          }
+        } else {
+          entry.body = rawBody;
+        }
+      } catch (_) {
+        entry.body = null;
+      }
+      entry.bodyLoaded = true;
+    }
+
+    const record = {
+      url: entry.url,
+      method: entry.method,
+      status: entry.status,
+      contentType: entry.contentType,
+      timestampMs: entry.timestampMs,
+      body: entry.body
+    };
+    let serialized = JSON.stringify(record);
+    const budgetRemaining = maxChars - approxLen - 1;
+    if (budgetRemaining <= 60) break;
+    if (serialized.length > budgetRemaining) {
+      // Trim oversized body while preserving structured metadata as valid JSON
+      const metaOnly = { ...record, body: null, truncated: true };
+      const metaLen = JSON.stringify(metaOnly).length;
+      const bodyBudget = Math.max(0, budgetRemaining - metaLen - 32);
+      if (bodyBudget > 20 && record.body != null) {
+        const rawStr = typeof record.body === "string" ? record.body : JSON.stringify(record.body);
+        metaOnly.body = rawStr.slice(0, bodyBudget) + "...";
+      }
+      serialized = JSON.stringify(metaOnly);
+      if (serialized.length > budgetRemaining) break;
+      items.push(metaOnly);
+      approxLen += serialized.length + 1;
+      break;
+    }
+    items.push(record);
+    approxLen += serialized.length + 1;
+  }
+
+  return {
+    jsonResult: JSON.stringify(items).slice(0, maxChars),
+    count: items.length
   };
 }
 
@@ -4387,9 +6336,8 @@ async function handleExtractCommand(req, preResolvedTab = null) {
   }
   await ensureAttached(tab.id);
   resetIdleTimer(tab.id);
-  // The UseMac preview brings this tab's card to the front: send a fresh frame so it does not show
-  // whatever was captured while the page was still loading.
-  captureAndEmitFrame(tab.id).catch(() => {});
+  // Non-blocking debounced preview refresh.
+  schedulePreviewFrame(tab.id);
   const tabInfo = await refreshTabMeta(tab.id);
 
   let tablesMarkdown = null;
@@ -4400,15 +6348,33 @@ async function handleExtractCommand(req, preResolvedTab = null) {
   let jsonResult = null;
   let downloads = null;
 
-  const childFrames = mode !== "eval" ? await discoverChildFrames(tab.id).catch(() => []) : [];
+  const needsChildFrames = mode !== "network" && (mode !== "eval" || (req.frameIndex != null && Number(req.frameIndex) > 0));
+  const childFrames = needsChildFrames ? await discoverChildFrames(tab.id).catch(() => []) : [];
 
-  if (mode === "eval") {
+  if (mode === "network") {
+    const netRes = await extractNetworkResponses(tab.id, {
+      urlFilter: req.urlFilter || null,
+      maxChars
+    });
+    jsonResult = netRes.jsonResult;
+    rowCount = netRes.count;
+  } else if (mode === "eval") {
     const expr = String(req.expression || "").trim();
     if (!expr) {
       throw { code: "INVALID_ARGUMENT", message: "extract mode 'eval' requires expression." };
     }
-    const evalRes = await sendCDP(tab.id, "Runtime.evaluate", {
-      expression: expr,
+    let targetFrameMeta = null;
+    if (req.frameIndex != null && Number(req.frameIndex) > 0) {
+      const idx = Math.floor(Number(req.frameIndex)) - 1;
+      if (idx < 0 || idx >= childFrames.length) {
+        throw {
+          code: "INVALID_ARGUMENT",
+          message: `frameIndex ${req.frameIndex} is out of range (discovered ${childFrames.length} child frame(s); 0 is top frame).`
+        };
+      }
+      targetFrameMeta = childFrames[idx];
+    }
+    const evalRes = await evalInFrame(tab.id, targetFrameMeta, expr, {
       returnByValue: true,
       awaitPromise: true
     });
@@ -4417,7 +6383,8 @@ async function handleExtractCommand(req, preResolvedTab = null) {
       throw { code: "EVAL_ERROR", message: excText };
     }
     const val = evalRes?.result?.value;
-    const serialized = typeof val === "string" ? val : JSON.stringify(val ?? null, null, 2);
+    // Compact JSON without 2-space indent bloat.
+    const serialized = typeof val === "string" ? val : JSON.stringify(val ?? null);
     jsonResult = (serialized || "null").slice(0, maxChars);
   } else if (mode === "tables" || mode === "auto") {
     const framesToScan = [null, ...childFrames];
@@ -4428,7 +6395,15 @@ async function handleExtractCommand(req, preResolvedTab = null) {
     for (const fMeta of framesToScan) {
       const remainingChars = maxChars - mdParts.join("\n\n").length;
       if (remainingChars < 200) break;
-      if (req.scanHorizontal) {
+      if (req.scanVertical) {
+        const scanned = await extractTablesWithVerticalScan(tab.id, req.selector || null, remainingChars, fMeta);
+        if (scanned.markdown) {
+          mdParts.push(scanned.markdown);
+          totalRows += scanned.rowCount || 0;
+          maxCols = Math.max(maxCols, scanned.columnCount || 0);
+        }
+        totalSteps = Math.max(totalSteps, scanned.scannedSteps || 1);
+      } else if (req.scanHorizontal) {
         const scanned = await extractTablesWithHorizontalScan(tab.id, req.selector || null, remainingChars, fMeta);
         if (scanned.markdown) {
           mdParts.push(scanned.markdown);
@@ -4460,7 +6435,7 @@ async function handleExtractCommand(req, preResolvedTab = null) {
   } else if (mode === "text") {
     text = await extractTextAcrossFrames(tab.id, req.selector || null, maxChars, childFrames);
   } else {
-    throw { code: "INVALID_ARGUMENT", message: `Unsupported extract mode: ${mode}. Use auto, tables, text, kpis, eval, or downloads.` };
+    throw { code: "INVALID_ARGUMENT", message: `Unsupported extract mode: ${mode}. Use auto, tables, text, kpis, eval, network, or downloads.` };
   }
 
   resetIdleTimer(tab.id);
@@ -4502,7 +6477,9 @@ async function handleExtractCommand(req, preResolvedTab = null) {
 function screenshotBox(req) {
   const width = Number(req?.viewportWidth) > 0 ? Math.round(Number(req.viewportWidth)) : null;
   const height = Number(req?.viewportHeight) > 0 ? Math.round(Number(req.viewportHeight)) : null;
-  return width || height ? { width, height } : null;
+  if (width || height) return { width, height };
+  if (req?.fullResolution === true || req?.fullPage === true) return null;
+  return { width: DEFAULT_SCREENSHOT_MAX_WIDTH, height: DEFAULT_SCREENSHOT_MAX_HEIGHT };
 }
 
 function base64ToBytes(base64) {
@@ -4642,10 +6619,10 @@ const SHOT_SCROLL_KEY_JS = "Symbol.for('usemac.shotScroll')";
 // only when it is not fully on screen: centered when it fits, its top-left corner first when it is bigger than the
 // view. `topBox` is the top-level viewport in this frame's coordinates (null in the top frame). Returns the
 // element's size and the part of it inside this frame's viewport and its scrolling ancestors.
-function elementShotScrollJs(selectorLiteral, topBox) {
+function elementShotScrollJs(lookupExpr, topBox) {
   return `(() => {
     ${QUERY_DEEP_HELPER_JS}
-    const el = queryOneDeep(document, ${selectorLiteral});
+    const el = ${lookupExpr};
     if (!el) return null;
     const de = document.documentElement;
     const body = document.body;
@@ -4750,7 +6727,7 @@ async function pageScrollMetrics(tabId) {
 // bigger than the view (or still partly hidden) comes back as the part on screen, from its top-left corner, with
 // truncated: true.
 async function captureElementScreenshot(tabId, session, req, quality, pixelRatio) {
-  const selLit = req.elementId ? usemacIdSelectorLiteral(req.elementId) : JSON.stringify(String(req.selector));
+  const lookupExpr = findElementExprJs({ elementId: req.elementId || null, selector: req.elementId ? null : req.selector });
   const candidateFrames = [];
   const mapped = req.elementId ? session.elementFrameMap.get(req.elementId) : null;
   if (mapped) candidateFrames.push(mapped);
@@ -4776,7 +6753,7 @@ async function captureElementScreenshot(tabId, session, req, quality, pixelRatio
       const topBox = child && before
         ? { left: -offset.x, top: -offset.y, right: before.viewWidth - offset.x, bottom: before.viewHeight - offset.y }
         : null;
-      const info = await pageScriptValue(tabId, fMeta, elementShotScrollJs(selLit, topBox)).catch(() => null);
+      const info = await pageScriptValue(tabId, fMeta, elementShotScrollJs(lookupExpr, topBox)).catch(() => null);
       if (!info) continue;
       found = { fMeta, child, info, offset };
       if (child && info.scrolled) {
@@ -4958,7 +6935,7 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
   }
   await ensureAttached(tab.id);
   resetIdleTimer(tab.id);
-  captureAndEmitFrame(tab.id).catch(() => {});
+  schedulePreviewFrame(tab.id);
 
   const session = getOrCreateTabSession(tab.id);
   await refreshLiveViewport(tab.id, session);
@@ -4974,17 +6951,30 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
   } else if (req.fullPage === true) {
     shot = await captureFullPageScreenshot(tab.id, quality, fitBox, pixelRatio);
   } else {
-    const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", {
+    const captureParams = {
       format: "jpeg",
       quality,
       fromSurface: true
-    }));
+    };
+    const r = req.region;
+    if (r && Number.isFinite(Number(r.width)) && Number.isFinite(Number(r.height)) && Number(r.width) >= 1 && Number(r.height) >= 1) {
+      captureParams.clip = {
+        x: Math.max(0, Number(r.x) || 0),
+        y: Math.max(0, Number(r.y) || 0),
+        width: Number(r.width),
+        height: Number(r.height),
+        scale: 1
+      };
+    }
+    const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", captureParams));
     if (!cap?.data) {
       throw { code: "CAPTURE_FAILED", message: "CDP Page.captureScreenshot returned empty data." };
     }
+    const estW = captureParams.clip ? captureParams.clip.width : viewport.width;
+    const estH = captureParams.clip ? captureParams.clip.height : viewport.height;
     shot = jpegShot(cap.data, {
-      width: Math.round(viewport.width * pixelRatio),
-      height: Math.round(viewport.height * pixelRatio)
+      width: Math.round(estW * pixelRatio),
+      height: Math.round(estH * pixelRatio)
     });
   }
 
@@ -5164,7 +7154,144 @@ async function handleActivateTabCommand(req) {
   };
 }
 
-async function handleOpenCommand(req) {
+function collectBatchNetworkErrors(session, sinceMs) {
+  if (!session || !Array.isArray(session.networkErrors) || session.networkErrors.length === 0) {
+    return null;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const err of session.networkErrors) {
+    if (err.timestampMs < sinceMs) continue;
+    const statusPart = err.status > 0
+      ? `${err.status}${err.statusText ? " " + err.statusText : ""}`
+      : (err.statusText || "failed");
+    const line = `${err.method || "GET"} ${err.url || "(unknown)"} -> ${statusPart}`;
+    if (!seen.has(line)) {
+      seen.add(line);
+      out.push(line);
+    }
+    if (out.length >= 15) break;
+  }
+  return out.length > 0 ? out : null;
+}
+
+async function runActionStepsPipeline(tabId, steps, { stopOnError = true, cancelToken = null } = {}) {
+  const stepResults = [];
+  let allSucceeded = true;
+  let cancelled = false;
+
+  for (let i = 0; i < steps.length; i++) {
+    if (isCancelled(tabId, cancelToken)) {
+      allSucceeded = false;
+      cancelled = true;
+      for (let j = i; j < steps.length; j++) {
+        stepResults.push({
+          index: j,
+          action: steps[j]?.action,
+          success: false,
+          mechanism: "cancelled",
+          latencyMs: 0,
+          message: CANCELLED_MESSAGE
+        });
+      }
+      break;
+    }
+
+    const step = steps[i];
+    const stepStart = performance.now();
+    resetIdleTimer(tabId);
+
+    try {
+      if (stepNeedsDebugger(step)) {
+        const blocked = await restrictedPageErrorIfDetached(tabId);
+        if (blocked) throw blocked;
+      }
+      const outcome = await executeActionStep(tabId, step, cancelToken);
+      const entry = {
+        index: i,
+        action: step.action,
+        success: true,
+        mechanism: outcome.mechanism,
+        latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+        message: outcome.message ?? null,
+        scrollDeltaX: outcome.scrollDeltaX ?? null,
+        scrollDeltaY: outcome.scrollDeltaY ?? null,
+        blockedWarning: outcome.blockedWarning ?? null,
+        downloadPath: outcome.downloadPath ?? null
+      };
+      if (outcome.resolvedElementId) {
+        entry.resolvedElementId = outcome.resolvedElementId;
+      }
+      stepResults.push(entry);
+    } catch (err) {
+      if (err?.code === "URL_BLOCKED") {
+        throw err;
+      }
+      if (err?.code === "CANCELLED" || isCancelled(tabId, cancelToken)) {
+        allSucceeded = false;
+        cancelled = true;
+        stepResults.push({
+          index: i,
+          action: step.action,
+          success: false,
+          mechanism: "cancelled",
+          latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+          message: CANCELLED_MESSAGE
+        });
+        for (let j = i + 1; j < steps.length; j++) {
+          stepResults.push({
+            index: j,
+            action: steps[j]?.action,
+            success: false,
+            mechanism: "cancelled",
+            latencyMs: 0,
+            message: CANCELLED_MESSAGE
+          });
+        }
+        break;
+      }
+      // A step that navigated onto a restricted page makes Chrome detach the debugger; say so instead of
+      // reporting "Debugger is not attached" for the next step.
+      let mapped = await toRestrictedPageErrorIfNeeded(err, tabId);
+      if (mapped?.code !== "RESTRICTED_PAGE" && stepNeedsDebugger(step)) {
+        mapped = (await restrictedPageErrorIfDetached(tabId)) || mapped;
+      }
+      const restricted = mapped?.code === "RESTRICTED_PAGE";
+
+      // Resilient optional step: skip cleanly and continue unless blocked by security/restriction.
+      if (step?.optional === true && !restricted) {
+        stepResults.push({
+          index: i,
+          action: step.action,
+          success: true,
+          skipped: true,
+          mechanism: "optional-skipped",
+          latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+          message: err?.message || String(err)
+        });
+        continue;
+      }
+
+      allSucceeded = false;
+      stepResults.push({
+        index: i,
+        action: step.action,
+        success: false,
+        mechanism: restricted ? "restricted-page" : "cdp-error",
+        latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+        message: restricted ? mapped.message : (err?.message || String(err)),
+        errorCode: restricted ? "RESTRICTED_PAGE" : (typeof err?.code === "string" ? err.code : null)
+      });
+      if (stopOnError) {
+        break;
+      }
+    }
+  }
+
+  return { stepResults, allSucceeded, cancelled };
+}
+
+async function handleOpenCommand(req, cancelToken = null) {
   const targetUrl = typeof req.url === "string" ? req.url.trim() : "";
   const activate = req.activate === true;
   const newWindow = req.newWindow === true;
@@ -5185,6 +7312,14 @@ async function handleOpenCommand(req) {
     };
   }
   assertAllowedUrl(targetUrl);
+
+  // Enforce URL rule on any inline navigation steps before opening the tab.
+  const openSteps = Array.isArray(req.steps) ? req.steps : [];
+  for (const st of openSteps) {
+    if (st && (st.action === "openURL" || st.action === "navigate")) {
+      assertAllowedUrl(st.url || st.text);
+    }
+  }
 
   let tab;
   let createdByUsemac = false;
@@ -5234,7 +7369,7 @@ async function handleOpenCommand(req) {
 
   // Navigation worked, but Chrome will not let the debugger in (and would detach it if it were attached):
   // answer without streaming or observing, with guidance for native Accessibility instead.
-  const restrictedResponse = (tabNow, reason) => ({
+  const restrictedResponse = (tabNow, reason, actionResult = null) => ({
     type: "response",
     id: req.id,
     ok: true,
@@ -5244,8 +7379,8 @@ async function handleOpenCommand(req) {
     url: tabNow.url || targetUrl,
     title: tabNow.title || "",
     restricted: true,
-    snapshot: restrictedPageSnapshot(tabNow, reason),
-    actionResult: null,
+    snapshot: actionResult ? null : restrictedPageSnapshot(tabNow, reason),
+    actionResult,
     error: null
   });
   const restriction = await tabRestrictionReason(current);
@@ -5255,6 +7390,24 @@ async function handleOpenCommand(req) {
 
   let tabInfo;
   let snapshot;
+  let overlayHighConfidence = false;
+  let actionResult = null;
+  let screenshotBase64 = null;
+  let screenshotWidth = null;
+  let screenshotHeight = null;
+  const openObserveOpts = {
+    includeText: req.includeText !== false,
+    includeTables: req.includeTables !== false,
+    includeOffscreen: req.includeOffscreen === true,
+    filter: req.filter || null,
+    returnDiffOnly: req.returnDiffOnly === true,
+    observationMode: req.observationMode || null,
+    includeScreenshot: req.includeScreenshot === true || req.returnImageContent === true,
+    fullResolution: req.fullResolution === true,
+    viewportWidth: req.viewportWidth,
+    viewportHeight: req.viewportHeight
+  };
+
   try {
     if (req.stream !== false) {
       await ensureStreaming(tab.id);
@@ -5262,7 +7415,113 @@ async function handleOpenCommand(req) {
       await ensureAttached(tab.id);
       resetIdleTimer(tab.id);
     }
-    ({ tab: tabInfo, snapshot } = await observeTab(tab.id, req.maxElements || 280));
+
+    const initial = await observeTab(
+      tab.id,
+      req.maxElements || 280,
+      openSteps.length > 0
+        ? { includeText: false, includeTables: false, includeOffscreen: req.includeOffscreen === true, observationMode: "interactive" }
+        : openObserveOpts
+    );
+    tabInfo = initial.tab;
+    snapshot = initial.snapshot;
+    overlayHighConfidence = initial.overlayHighConfidence;
+    screenshotBase64 = initial.screenshotBase64;
+    screenshotWidth = initial.screenshotWidth;
+    screenshotHeight = initial.screenshotHeight;
+
+    // Auto-dismiss high-confidence cookie/consent overlay if requested.
+    if (req.autoDismissOverlays === true && overlayHighConfidence) {
+      const ov = snapshot?.pageState?.blockingOverlay;
+      if (ov && (ov.closeElementId || (Number.isFinite(ov.closeX) && Number.isFinite(ov.closeY)))) {
+        try {
+          await executeActionStep(tab.id, {
+            action: "click",
+            elementId: ov.closeElementId || undefined,
+            x: ov.closeElementId ? undefined : ov.closeX,
+            y: ov.closeElementId ? undefined : ov.closeY
+          }, cancelToken);
+          await waitForAnimationFrames(tab.id, 40);
+          if (openSteps.length === 0) {
+            const refreshed = await observeTab(tab.id, req.maxElements || 280, openObserveOpts);
+            tabInfo = refreshed.tab || tabInfo;
+            snapshot = refreshed.snapshot;
+            screenshotBase64 = refreshed.screenshotBase64;
+            screenshotWidth = refreshed.screenshotWidth;
+            screenshotHeight = refreshed.screenshotHeight;
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Inline steps execution right inside browser_open!
+    if (openSteps.length > 0) {
+      const batchStart = performance.now();
+      const batchStartWallMs = Date.now();
+      const session = getOrCreateTabSession(tab.id);
+      const { stepResults, allSucceeded, cancelled } = await runActionStepsPipeline(tab.id, openSteps, {
+        stopOnError: req.stopOnError !== false,
+        cancelToken
+      });
+
+      if (cancelled || isCancelled(tab.id, cancelToken)) {
+        const totalLatencyMs = Math.round((performance.now() - batchStart) * 100) / 100;
+        return {
+          type: "response",
+          id: req.id,
+          ok: false,
+          tabId: tab.id,
+          windowId: tabInfo?.windowId ?? current.windowId ?? null,
+          profileName: state.profileName,
+          url: session.url || targetUrl,
+          title: session.title || "",
+          snapshot: null,
+          actionResult: {
+            success: false,
+            totalLatencyMs,
+            stepResults,
+            observation: null
+          },
+          error: { code: "CANCELLED", message: CANCELLED_MESSAGE }
+        };
+      }
+
+      const finalTab = await getTabOrNull(tab.id);
+      const finalRestriction = finalTab ? await tabRestrictionReason(finalTab) : null;
+      if (finalRestriction) {
+        const totalLatencyMs = Math.round((performance.now() - batchStart) * 100) / 100;
+        return restrictedResponse(finalTab, finalRestriction, {
+          success: allSucceeded,
+          totalLatencyMs,
+          stepResults,
+          observation: null,
+          agentFeedback: restrictedPageFeedback(finalTab, finalRestriction)
+        });
+      }
+
+      const finalObs = await observeTab(tab.id, req.maxElements || 280, {
+        ...openObserveOpts,
+        observationMode: req.observationMode || (req.returnDiffOnly === true ? "delta" : "full")
+      });
+      tabInfo = finalObs.tab || tabInfo;
+      snapshot = finalObs.snapshot;
+      screenshotBase64 = finalObs.screenshotBase64;
+      screenshotWidth = finalObs.screenshotWidth;
+      screenshotHeight = finalObs.screenshotHeight;
+      if (!screenshotBase64) {
+        schedulePreviewFrame(tab.id);
+      }
+
+      const totalLatencyMs = Math.round((performance.now() - batchStart) * 100) / 100;
+      const networkErrors = collectBatchNetworkErrors(session, batchStartWallMs);
+      actionResult = {
+        success: allSucceeded,
+        totalLatencyMs,
+        stepResults,
+        observation: snapshot
+      };
+      if (networkErrors) actionResult.networkErrors = networkErrors;
+    }
   } catch (err) {
     // Still loading when we checked, then landed on (or redirected to) a restricted page.
     const mapped = await toRestrictedPageErrorIfNeeded(err, tab.id);
@@ -5282,9 +7541,12 @@ async function handleOpenCommand(req) {
     windowId: tabInfo?.windowId ?? current.windowId ?? null,
     profileName: state.profileName,
     url: tabInfo?.url || targetUrl,
-    title: tabInfo?.title || snapshot.app.windowTitle || "",
+    title: tabInfo?.title || snapshot?.app?.windowTitle || "",
+    screenshotBase64: screenshotBase64 || null,
+    screenshotWidth: screenshotWidth ?? null,
+    screenshotHeight: screenshotHeight ?? null,
     snapshot,
-    actionResult: null,
+    actionResult,
     error: null
   };
 }
@@ -5297,10 +7559,17 @@ async function handleObserveCommand(req, preResolvedTab = null) {
   }
   const session = getOrCreateTabSession(tab.id);
   await ensureStreaming(tab.id);
-  const { tab: tabInfo, snapshot, screenshotBase64 } = await observeTab(tab.id, req.maxElements || 280, {
+  const { tab: tabInfo, snapshot, screenshotBase64, screenshotWidth, screenshotHeight } = await observeTab(tab.id, req.maxElements || 280, {
     includeText: req.includeText !== false,
     includeTables: req.includeTables !== false,
-    includeScreenshot: req.includeScreenshot === true
+    includeOffscreen: req.includeOffscreen === true,
+    filter: req.filter || null,
+    returnDiffOnly: req.returnDiffOnly === true,
+    observationMode: req.observationMode || null,
+    includeScreenshot: req.includeScreenshot === true || req.returnImageContent === true,
+    fullResolution: req.fullResolution === true,
+    viewportWidth: req.viewportWidth,
+    viewportHeight: req.viewportHeight
   });
   resetIdleTimer(tab.id);
 
@@ -5314,6 +7583,8 @@ async function handleObserveCommand(req, preResolvedTab = null) {
     title: tabInfo?.title || session.title,
     snapshot,
     screenshotBase64: screenshotBase64 || null,
+    screenshotWidth: screenshotWidth ?? null,
+    screenshotHeight: screenshotHeight ?? null,
     actionResult: null,
     error: null
   };
@@ -5329,100 +7600,14 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
   const steps = Array.isArray(req.steps) ? req.steps : [];
   const stopOnError = req.stopOnError !== false;
   const returnObservation = req.returnObservation !== false;
+  const wantScreenshot = req.includeScreenshot === true || req.returnImageContent === true;
 
   const batchStart = performance.now();
-  const stepResults = [];
-  let allSucceeded = true;
-  let cancelled = false;
-
-  for (let i = 0; i < steps.length; i++) {
-    if (isCancelled(tab.id, cancelToken)) {
-      allSucceeded = false;
-      cancelled = true;
-      for (let j = i; j < steps.length; j++) {
-        stepResults.push({
-          index: j,
-          action: steps[j]?.action,
-          success: false,
-          mechanism: "cancelled",
-          latencyMs: 0,
-          message: CANCELLED_MESSAGE
-        });
-      }
-      break;
-    }
-
-    const step = steps[i];
-    const stepStart = performance.now();
-    resetIdleTimer(tab.id);
-
-    try {
-      if (stepNeedsDebugger(step)) {
-        const blocked = await restrictedPageErrorIfDetached(tab.id);
-        if (blocked) throw blocked;
-      }
-      const outcome = await executeActionStep(tab.id, step, cancelToken);
-      stepResults.push({
-        index: i,
-        action: step.action,
-        success: true,
-        mechanism: outcome.mechanism,
-        latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-        message: outcome.message ?? null,
-        scrollDeltaX: outcome.scrollDeltaX ?? null,
-        scrollDeltaY: outcome.scrollDeltaY ?? null,
-        blockedWarning: outcome.blockedWarning ?? null,
-        downloadPath: outcome.downloadPath ?? null
-      });
-    } catch (err) {
-      if (err?.code === "URL_BLOCKED") {
-        throw err;
-      }
-      if (err?.code === "CANCELLED" || isCancelled(tab.id, cancelToken)) {
-        allSucceeded = false;
-        cancelled = true;
-        stepResults.push({
-          index: i,
-          action: step.action,
-          success: false,
-          mechanism: "cancelled",
-          latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-          message: CANCELLED_MESSAGE
-        });
-        for (let j = i + 1; j < steps.length; j++) {
-          stepResults.push({
-            index: j,
-            action: steps[j]?.action,
-            success: false,
-            mechanism: "cancelled",
-            latencyMs: 0,
-            message: CANCELLED_MESSAGE
-          });
-        }
-        break;
-      }
-      allSucceeded = false;
-      // A step that navigated onto a restricted page makes Chrome detach the debugger; say so instead of
-      // reporting "Debugger is not attached" for the next step.
-      let mapped = await toRestrictedPageErrorIfNeeded(err, tab.id);
-      if (mapped?.code !== "RESTRICTED_PAGE" && stepNeedsDebugger(step)) {
-        mapped = (await restrictedPageErrorIfDetached(tab.id)) || mapped;
-      }
-      const restricted = mapped?.code === "RESTRICTED_PAGE";
-      stepResults.push({
-        index: i,
-        action: step.action,
-        success: false,
-        mechanism: restricted ? "restricted-page" : "cdp-error",
-        latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-        message: restricted ? mapped.message : (err?.message || String(err)),
-        errorCode: restricted ? "RESTRICTED_PAGE" : (typeof err?.code === "string" ? err.code : null)
-      });
-      if (stopOnError) {
-        break;
-      }
-    }
-  }
+  const batchStartWallMs = Date.now();
+  const { stepResults, allSucceeded, cancelled } = await runActionStepsPipeline(tab.id, steps, {
+    stopOnError,
+    cancelToken
+  });
 
   if (cancelled || isCancelled(tab.id, cancelToken)) {
     const totalLatencyMs = Math.round((performance.now() - batchStart) * 100) / 100;
@@ -5484,8 +7669,6 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
     };
   }
 
-  await sleep(40);
-  await captureAndEmitFrame(tab.id);
   resetIdleTimer(tab.id);
 
   let observation = null;
@@ -5495,19 +7678,34 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
   let screenshotHeight = null;
   let screenshotLatencyMs = null;
 
-  if (returnObservation) {
+  // Determine observationMode: "auto" is the default on browser_act when returnObservation is true.
+  const effectiveActObsMode = !returnObservation
+    ? "none"
+    : (req.observationMode || (req.returnDiffOnly === true ? "delta" : "auto"));
+
+  if (effectiveActObsMode !== "none") {
     const observed = await observeTab(tab.id, req.maxElements || 280, {
-      includeScreenshot: req.includeScreenshot === true
+      observationMode: effectiveActObsMode,
+      returnDiffOnly: req.returnDiffOnly === true,
+      includeText: req.includeText !== false,
+      includeTables: req.includeTables !== false,
+      includeOffscreen: req.includeOffscreen === true,
+      filter: req.filter || null,
+      includeScreenshot: wantScreenshot,
+      fullResolution: req.fullResolution === true,
+      viewportWidth: req.viewportWidth,
+      viewportHeight: req.viewportHeight
     });
     observation = observed.snapshot;
     tabInfo = observed.tab || tabInfo;
     if (observed.screenshotBase64) {
       screenshotBase64 = observed.screenshotBase64;
-      const viewport = effectiveViewport(session);
-      screenshotWidth = Math.round(viewport.width * viewport.scale);
-      screenshotHeight = Math.round(viewport.height * viewport.scale);
+      screenshotWidth = observed.screenshotWidth;
+      screenshotHeight = observed.screenshotHeight;
+    } else {
+      schedulePreviewFrame(tab.id);
     }
-  } else if (req.includeScreenshot === true) {
+  } else if (wantScreenshot) {
     const shotStart = performance.now();
     try {
       const cap = await withTabIndicatorHidden(tab.id, () => sendCDP(tab.id, "Page.captureScreenshot", {
@@ -5516,16 +7714,42 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
         fromSurface: true
       }));
       if (cap?.data) {
-        screenshotBase64 = cap.data;
         const viewport = effectiveViewport(session);
-        screenshotWidth = Math.round(viewport.width * viewport.scale);
-        screenshotHeight = Math.round(viewport.height * viewport.scale);
+        const pixelRatio = viewport.scale || 1;
+        let shot = jpegShot(cap.data, {
+          width: Math.round(viewport.width * pixelRatio),
+          height: Math.round(viewport.height * pixelRatio)
+        });
+        const fitBox = screenshotBox(req);
+        if (fitBox) {
+          const fitted = sizeInBox(shot.width, shot.height, fitBox);
+          if (shot.estimated || fitted.width !== shot.width || fitted.height !== shot.height) {
+            const scaled = await fitJpegInBox(shot.data, fitBox, 82).catch(() => null);
+            if (scaled) shot = scaled;
+          }
+        }
+        screenshotBase64 = shot.data;
+        screenshotWidth = shot.width;
+        screenshotHeight = shot.height;
         screenshotLatencyMs = Math.round((performance.now() - shotStart) * 100) / 100;
+        emitPreviewFrameData(tab.id, shot.data, false);
       }
     } catch (_) {}
+  } else {
+    schedulePreviewFrame(tab.id);
   }
 
   const totalLatencyMs = Math.round((performance.now() - batchStart) * 100) / 100;
+  const networkErrors = collectBatchNetworkErrors(session, batchStartWallMs);
+  const actionResult = {
+    success: allSucceeded,
+    totalLatencyMs,
+    stepResults,
+    observation
+  };
+  if (networkErrors) {
+    actionResult.networkErrors = networkErrors;
+  }
 
   return {
     type: "response",
@@ -5540,12 +7764,7 @@ async function handleActCommand(req, preResolvedTab = null, cancelToken = null) 
     screenshotHeight,
     screenshotLatencyMs,
     snapshot: null,
-    actionResult: {
-      success: allSucceeded,
-      totalLatencyMs,
-      stepResults,
-      observation
-    },
+    actionResult,
     error: null
   };
 }
@@ -5737,7 +7956,7 @@ async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = nul
         response = await handleTabsCommand(req);
         break;
       case "open":
-        response = await handleOpenCommand(req);
+        response = await handleOpenCommand(req, cancelToken);
         break;
       case "observe":
         response = await handleObserveCommand(req, preResolvedTab);

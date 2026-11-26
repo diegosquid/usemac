@@ -230,7 +230,7 @@ test("an element bigger than the viewport is captured from its top-left corner a
     elements: { "#grid": { left: 200, top: 1200, width: 1500, height: 2000 } }
   });
 
-  const shot = await screenshot(sb, { selector: "#grid" });
+  const shot = await screenshot(sb, { selector: "#grid", fullResolution: true });
   assert.equal(shot.ok, true, JSON.stringify(shot.error));
   assert.deepEqual(page.intoView, [{ block: "start", inline: "start", behavior: "instant" }]);
   assert.deepEqual(page.shots[0].scroll, { x: 200, y: 1200 });

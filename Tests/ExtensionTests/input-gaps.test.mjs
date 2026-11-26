@@ -48,8 +48,9 @@ test("setValue with an empty, blank or missing target fails with INVALID_REQUEST
     { action: "setValue", selector: "", text: "secret" },
     { action: "setValue", text: "secret" },
     { action: "setValue", elementId: "", selector: " ", text: "secret" },
-    // match is a native-only field: the extension ignores it, so it is no target here.
-    { action: "setValue", match: { role: "textbox" }, text: "secret" },
+    // Empty match names no target.
+    { action: "setValue", match: {}, text: "secret" },
+    { action: "setValue", match: { role: "  " }, text: "secret" },
     // Half a point is no point.
     { action: "setValue", x: 40, text: "secret" }
   ];
@@ -100,11 +101,15 @@ test("type without a target still types into the focused element", async (t) => 
   );
 });
 
-test("stepNamesTarget accepts a non-blank elementId or selector, or a full point", (t) => {
+test("stepNamesTarget accepts a non-blank elementId, selector, match, or full point", (t) => {
   const { sb } = withSandbox(t);
   const names = (step) => sb.call("stepNamesTarget", step);
   assert.equal(names({ elementId: "@b2" }), true);
   assert.equal(names({ selector: "#email" }), true);
+  assert.equal(names({ match: { role: "textbox" } }), true);
+  assert.equal(names({ match: { title: "Email" } }), true);
+  assert.equal(names({ match: {} }), false);
+  assert.equal(names({ match: { role: "  " } }), false);
   assert.equal(names({ elementId: "", selector: "#email" }), true);
   assert.equal(names({ x: 0, y: 0 }), true);
   assert.equal(names({ elementId: "" }), false);
