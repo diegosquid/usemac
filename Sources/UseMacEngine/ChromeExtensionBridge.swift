@@ -251,6 +251,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let screenshotWidth: Int?
         let screenshotHeight: Int?
         let screenshotLatencyMs: Double?
+        let screenshotTruncated: Bool?
         let actionResult: BatchActionResult?
         let error: RPCErrorPayload?
         let windowId: Int?
@@ -1789,7 +1790,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
                 height: height,
                 byteCount: jpegData.count,
                 latencyMs: payload.screenshotLatencyMs ?? resolvedSnapshot?.latencyMs ?? 0,
-                base64Data: b64
+                base64Data: b64,
+                truncated: payload.screenshotTruncated == true ? true : nil
             )
             lock.lock()
             let cached = CachedBrowserFrame(
