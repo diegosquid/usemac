@@ -6,16 +6,20 @@ import UseMacProtocol
 public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendable {
     private let socketPath: String
     private let permissionManager = PermissionManager()
-    private let killSwitch = KillSwitch()
-    private let workspaceMonitor = WorkspaceMonitor()
+    let killSwitch = KillSwitch()
+    let workspaceMonitor = WorkspaceMonitor()
     /// Which running task owns which Chrome tabs UseMac opened (see TaskTabRegistry).
-    private let taskTabs = TaskTabRegistry()
+    let taskTabs = TaskTabRegistry()
     private let axIndexer = AXIndexer()
     private let screenCapturer = FastScreenCapturer()
     public let liveStreamer = LiveScreenStreamer()
     public let chromeBridge: ChromeExtensionBridge
     public let localVision = LocalVisionEngine()
     private let actionExecutor: ActionExecutor
+    /// Ask mode: sensitive requests waiting for the user's answer in the HUD.
+    public let approvals = ApprovalBroker()
+    /// The audit log on disk; nil keeps it in memory only (tests, in-process CLI calls).
+    public let auditStore: AuditLogStore?
 
     private let stateLock = NSLock()
     private let startedAt = Date()
@@ -53,7 +57,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         get {
             stateLock.lock()
             defer { stateLock.unlock() }
-            return _onLiveActivity
+            return _onLiveActivity.map(TaskActivityContext.labeling)
         }
         set {
             stateLock.lock()
@@ -78,9 +82,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     public init(
         socketPath: String = UseMacDefaults.defaultSocketPath,
         extensionPort: UInt16 = UseMacDefaults.defaultExtensionPort,
-        bridgeKeyDirectory: URL? = nil
+        bridgeKeyDirectory: URL? = nil,
+        auditStore: AuditLogStore? = nil
     ) {
         self.socketPath = socketPath
+        self.auditStore = auditStore
+        self.auditEntries = auditStore?.recentEntries() ?? []
         let pairingStore = bridgeKeyDirectory.map { BridgePairingStore(directory: $0) } ?? BridgePairingStore()
         self.chromeBridge = ChromeExtensionBridge(port: extensionPort, pairingStore: pairingStore)
         self.actionExecutor = ActionExecutor(
@@ -88,15 +95,30 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             workspaceMonitor: workspaceMonitor,
             killSwitch: killSwitch
         )
+        // Stop in the pill on a controlled Chrome tab. The app replaces this with the HUD's Stop (AppState).
+        self.chromeBridge.onUserStopRequested = { [weak self] _, _ in
+            self?.tripKillSwitch(true)
+        }
         self.chromeBridge.onProfilesChanged = { [weak self] _ in
             self?.notifyStateChanged()
         }
         self.chromeBridge.onPairingStateChanged = { [weak self] in
             self?.notifyStateChanged()
         }
+        self.chromeBridge.onTabStreamEnded = { [weak self] profile, tabId, reason in
+            self?.tabStreamEnded(profile: profile, tabId: tabId, reason: reason)
+        }
     }
 
-    public func handle(_ request: RPCRequest) async -> RPCResponse {
+    /// Runs one request. `handle` (UseMacEngineService+Tasks.swift) ties it to its task first; this sets the
+    /// request audit entries read to name its task and to scrub what it typed.
+    func handleRequest(_ request: RPCRequest) async -> RPCResponse {
+        await AuditRequestContext.$request.withValue(request) {
+            await handleRequestBody(request)
+        }
+    }
+
+    private func handleRequestBody(_ request: RPCRequest) async -> RPCResponse {
         let startNs = DispatchTime.now().uptimeNanoseconds
         incrementRequestCount()
         scheduleCapturePruneIfNeeded()
@@ -124,7 +146,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
-            let apps = listRunningApps()
+            let apps = TargetRulesStore.shared.rules.visibleApps(listRunningApps())
             let latencyMs = elapsedMs(since: startNs)
             response = .success(id: request.id, latencyMs: latencyMs, apps: apps)
 
@@ -143,6 +165,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let observeTarget = workspaceMonitor.resolveTarget(query: params.app)
             if observeTarget == .useMac {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Observe blocked")
+                break
+            }
+            if case .app(let app) = observeTarget, let blocked = TargetRulesStore.shared.blockedMessage(for: app) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Observe blocked", message: blocked)
                 break
             }
             guard case .app(let resolvedObserveApp) = observeTarget else {
@@ -254,6 +280,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: actReq.app, activityTitle: "Action blocked")
                 break
             }
+            if let blocked = TargetRulesStore.shared.blockedMessage(forQueries: [actReq.app] + actReq.steps.map(\.app), in: workspaceMonitor) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: actReq.app, activityTitle: "Action blocked", message: blocked)
+                break
+            }
 
             let overlay = onOverlayEvent
             // Work on a guessed target (no app named, none paired: the app in front) is marked so the live preview
@@ -268,6 +298,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
             } else {
                 liveActivity = onLiveActivity
+            }
+            if let refusal = await approvalRefusal(for: request, startNs: startNs) {
+                response = refusal
+                break
             }
             let (actResult, resolvedApp) = await actionExecutor.executeBatch(
                 actReq,
@@ -307,13 +341,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetApp?.name ?? actReq.app,
-                summary: "Executed \(actResult.stepResults.count) step(s): \(actResult.success ? "ok" : "failed")",
+                summary: "Executed \(actResult.stepResults.count) step(s): \(actResult.success ? "ok" : "failed") · \(AuditRedactor.describeSteps(actReq.steps))",
                 latencyMs: latencyMs,
                 success: actResult.success
             )
             let activityApp = observation?.app ?? targetApp
             let rawDiff = observation?.diff?.summary.trimmingCharacters(in: .whitespacesAndNewlines)
             let completeSubtitle = (rawDiff?.isEmpty == false) ? rawDiff : nil
+            // A failed batch names its failed step and why, in plain words (ActivityCaption).
+            let failure = actResult.success ? nil : ActivityCaption.batchFailure(
+                steps: actReq.steps,
+                results: actResult.stepResults,
+                elementName: { [axIndexer] id in activityApp.flatMap { axIndexer.node(for: id, pid: $0.pid) }?.title ?? axIndexer.node(for: id)?.node.title }
+            )
             emitLiveActivity(LiveActivityItem(
                 kind: .actionComplete,
                 appName: activityApp?.name,
@@ -321,10 +361,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 bundleId: activityApp?.bundleId,
                 windowTitle: activityApp?.windowTitle,
                 windowBounds: activityApp?.windowBounds,
-                title: actResult.success
-                    ? "Finished \(actResult.stepResults.count) step\(actResult.stepResults.count == 1 ? "" : "s")"
-                    : "Batch failed",
-                subtitle: completeSubtitle,
+                title: failure?.title
+                    ?? "Finished \(actResult.stepResults.count) step\(actResult.stepResults.count == 1 ? "" : "s")",
+                subtitle: failure.map { $0.reason } ?? completeSubtitle,
                 latencyMs: actResult.totalLatencyMs,
                 success: actResult.success,
                 isInProgress: false,
@@ -348,6 +387,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let screenshotTarget = workspaceMonitor.resolveTarget(query: req.app)
             if screenshotTarget == .useMac {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: req.app, activityTitle: "Screenshot blocked")
+                break
+            }
+            if case .app(let app) = screenshotTarget, let blocked = TargetRulesStore.shared.blockedMessage(for: app) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Screenshot blocked", message: blocked)
                 break
             }
             guard permissionManager.isScreenRecordingGranted() else {
@@ -455,6 +498,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: query, activityTitle: "Pair app blocked")
                 break
             }
+            if let blocked = TargetRulesStore.shared.blockedMessage(forQueries: [query], in: workspaceMonitor) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: query, activityTitle: "Pair app blocked", message: blocked)
+                break
+            }
             let paired = setPairedApp(query)
             let latencyMs = elapsedMs(since: startNs)
             if let query, !query.isEmpty, paired == nil {
@@ -466,7 +513,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }
 
         case .auditLog:
-            let entries = recentAuditEntries(limit: 50)
+            let entries = auditLog(request.auditLog)
             let latencyMs = elapsedMs(since: startNs)
             response = .success(id: request.id, latencyMs: latencyMs, auditEntries: entries)
 
@@ -514,6 +561,36 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 status: currentStatus(),
                 browserProfiles: profiles
             )
+
+        case .browserReloadExtension:
+            let params = request.browserReloadExtension ?? BrowserReloadExtensionParams()
+            if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {
+                response = blockedPolicyResponse(
+                    request: request,
+                    startNs: startNs,
+                    targetApp: params.profile ?? "Chrome",
+                    activityAppName: "Chrome (\(params.profile ?? "Browser"))",
+                    activityTitle: "Extension reload blocked",
+                    reason: blockReason
+                )
+                break
+            }
+            let outcome = await chromeBridge.reloadExtension(profile: params.profile, force: params.force ?? false)
+            let latencyMs = elapsedMs(since: startNs)
+            let summary = outcome.ok
+                ? "Reloaded the Chrome extension: " + outcome.profiles.map { "\($0.profileName) v\($0.extensionVersion)" }.joined(separator: ", ")
+                : (outcome.error?.message ?? "Extension reload failed")
+            appendAudit(method: request.method.rawValue, targetApp: "Chrome (\(params.profile ?? "all profiles"))", summary: summary, latencyMs: latencyMs, success: outcome.ok)
+            if outcome.ok {
+                response = .success(id: request.id, latencyMs: latencyMs, browserProfiles: outcome.profiles)
+            } else {
+                response = .failure(
+                    id: request.id,
+                    code: outcome.error?.code ?? "EXTENSION_ERROR",
+                    message: outcome.error?.message ?? "Extension reload failed",
+                    latencyMs: latencyMs
+                )
+            }
 
         case .browserTabs:
             let params = request.browserTabs ?? BrowserTabsParams()
@@ -615,7 +692,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if bridgeResp.ok {
                 // A tab UseMac created belongs to the request's task, so another task finishing never closes it.
                 if params.tabId == nil, let openedTabId = bridgeResp.tabId {
-                    taskTabs.recordOpenedTab(openedTabId, taskId: params.taskId)
+                    taskTabs.recordOpenedTab(openedTabId, taskId: request.namedTaskId, profile: params.profile)
                 }
                 appendAudit(
                     method: request.method.rawValue,
@@ -651,8 +728,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 emitLiveActivity(LiveActivityItem(
                     kind: .actionComplete,
                     appName: resolvedLabel,
-                    title: "Browser open failed",
-                    subtitle: message,
+                    title: ActivityCaption.hostOrText(params.url).map { "Couldn't open \($0)" } ?? "Couldn't open the page",
+                    subtitle: ActivityCaption.reason(errorCode: code, message: message, inBrowser: true) ?? message,
                     latencyMs: latencyMs,
                     success: false,
                     isInProgress: false
@@ -732,8 +809,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 emitLiveActivity(LiveActivityItem(
                     kind: .observe,
                     appName: resolvedLabel,
-                    title: "Browser observe failed",
-                    subtitle: message,
+                    title: "Couldn't read the page",
+                    subtitle: ActivityCaption.reason(errorCode: code, message: message, inBrowser: true) ?? message,
                     latencyMs: latencyMs,
                     success: false,
                     isInProgress: false
@@ -756,6 +833,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
+            if let refusal = await approvalRefusal(for: request, startNs: startNs) {
+                response = refusal
+                break
+            }
             let bridgeResp = await chromeBridge.extract(params)
             let latencyMs = elapsedMs(since: startNs)
             let resolvedProfile = bridgeResp.profileName ?? params.profile ?? "Browser"
@@ -764,12 +845,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if bridgeResp.ok, let extracted = bridgeResp.extractResult {
                 let auditSummary: String
                 if isEvalMode {
-                    let rawExpression = params.expression ?? ""
-                    let singleLine = rawExpression
-                        .replacingOccurrences(of: "\r\n", with: " ")
-                        .replacingOccurrences(of: "\n", with: " ")
-                        .replacingOccurrences(of: "\r", with: " ")
-                    auditSummary = "Eval (\(rawExpression.count) chars): \(singleLine.prefix(120))"
+                    auditSummary = AuditRedactor.evalSummary(params.expression ?? "")
                 } else {
                     auditSummary = "Extracted \(extracted.mode) (\(extracted.rowCount ?? 0) rows, \(extracted.columnCount ?? 0) cols)"
                 }
@@ -867,6 +943,13 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = .failure(id: request.id, code: "INVALID_REQUEST", message: "Missing browserAct payload", latencyMs: latencyMs)
                 break
             }
+            // A setValue with no field would type into whatever has focus in the page: refuse it before anything else.
+            if let invalid = BrowserStepValidation.targetlessSetValueMessage(in: params.steps) {
+                let latencyMs = elapsedMs(since: startNs)
+                appendAudit(method: request.method.rawValue, targetApp: params.profile ?? "Chrome", summary: invalid, latencyMs: latencyMs, success: false)
+                response = .failure(id: request.id, code: "INVALID_REQUEST", message: invalid, latencyMs: latencyMs)
+                break
+            }
 
             var urlValidationError: String?
             for idx in params.steps.indices where params.steps[idx].action == .openURL || params.steps[idx].action == .navigate {
@@ -939,6 +1022,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
+            if let refusal = await approvalRefusal(for: request, startNs: startNs, browserAct: params) {
+                response = refusal
+                break
+            }
             let targetProfile = params.profile ?? chromeBridge.connectedProfiles().first?.profileName ?? "Browser"
             let targetLabel = "Chrome (\(targetProfile))"
             emitLiveActivity(LiveActivityItem(
@@ -1148,18 +1235,23 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 appendAudit(
                     method: request.method.rawValue,
                     targetApp: resolvedLabel,
-                    summary: "Executed \(stepCount) browser step(s): \(actionSuccess ? "ok" : "failed")",
+                    summary: "Executed \(stepCount) browser step(s): \(actionSuccess ? "ok" : "failed") · \(AuditRedactor.describeSteps(params.steps))",
                     latencyMs: latencyMs,
                     success: actionSuccess
+                )
+                let browserFailure = actionSuccess ? nil : ActivityCaption.batchFailure(
+                    steps: params.steps,
+                    results: enrichedActionResult?.stepResults ?? [],
+                    inBrowser: true,
+                    elementName: { id in (bridgeResp.snapshot ?? enrichedActionResult?.observation)?.elements.first(where: { $0.id == id })?.title }
                 )
                 emitLiveActivity(LiveActivityItem(
                     kind: .actionComplete,
                     appName: resolvedLabel,
                     windowTitle: bridgeResp.title,
-                    title: actionSuccess
-                        ? "Finished \(stepCount) browser step\(stepCount == 1 ? "" : "s")"
-                        : "Browser batch failed",
-                    subtitle: bridgeResp.url,
+                    title: browserFailure?.title
+                        ?? "Finished \(stepCount) browser step\(stepCount == 1 ? "" : "s")",
+                    subtitle: browserFailure.map { $0.reason } ?? bridgeResp.url,
                     latencyMs: enrichedActionResult?.totalLatencyMs ?? latencyMs,
                     success: actionSuccess,
                     isInProgress: false,
@@ -1180,11 +1272,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 let code = bridgeResp.error?.code ?? "BROWSER_ACT_FAILED"
                 let message = bridgeResp.error?.message ?? "Failed to execute browser action"
                 appendAudit(method: request.method.rawValue, targetApp: resolvedLabel, summary: message, latencyMs: latencyMs, success: false)
+                let failedSteps = bridgeResp.actionResult.map { ActivityCaption.batchFailure(steps: params.steps, results: $0.stepResults, inBrowser: true) }
                 emitLiveActivity(LiveActivityItem(
                     kind: .actionComplete,
                     appName: resolvedLabel,
-                    title: "Browser action failed",
-                    subtitle: message,
+                    title: failedSteps?.title ?? "Couldn't act in Chrome",
+                    subtitle: ActivityCaption.reason(errorCode: code, message: message, inBrowser: true) ?? failedSteps?.reason ?? message,
                     latencyMs: latencyMs,
                     success: false,
                     isInProgress: false
@@ -1262,6 +1355,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Vision query blocked")
                 break
             }
+            if let blocked = TargetRulesStore.shared.blockedMessage(forQueries: [params.app], in: workspaceMonitor) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Vision query blocked", message: blocked)
+                break
+            }
+            if let blocked = await chromeBridge.targetRulesVisionPreflight(params) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: visionTargetLabel, activityTitle: "Vision query blocked", message: blocked.error?.message ?? "")
+                break
+            }
             if let rawImagePath = params.imagePath?.trimmingCharacters(in: .whitespacesAndNewlines), !rawImagePath.isEmpty {
                 guard isAllowedVisionImagePath(rawImagePath) else {
                     let latencyMs = elapsedMs(since: startNs)
@@ -1335,6 +1436,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let latencyMs = elapsedMs(since: startNs)
             if result.answer.hasPrefix("CAPTURE_TOO_SMALL:") {
                 let message = result.answer.dropFirst("CAPTURE_TOO_SMALL:".count).trimmingCharacters(in: .whitespaces)
+                // Settle the "…locally" caption shown above; it would otherwise spin until the next activity.
+                emitLiveActivity(LiveActivityItem(
+                    kind: .observe,
+                    appName: targetLabel,
+                    windowTitle: input.title,
+                    title: "Couldn't check the screen",
+                    subtitle: ActivityCaption.reason(errorCode: "CAPTURE_TOO_SMALL"),
+                    mechanism: result.backend,
+                    latencyMs: result.latencyMs,
+                    success: false,
+                    isInProgress: false,
+                    browserTabId: input.tabId ?? params.tabId,
+                    browserProfile: input.profileName ?? params.profile
+                ))
                 response = .failure(id: request.id, code: "CAPTURE_TOO_SMALL", message: message, latencyMs: latencyMs)
                 break
             }
@@ -1365,7 +1480,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetLabel,
-                summary: "Vision \(result.mode) [\(result.backend)]: \(result.answer.prefix(80))",
+                summary: AuditRedactor.visionSummary(mode: result.mode, backend: result.backend, answer: result.answer),
                 latencyMs: latencyMs,
                 success: true
             )
@@ -1389,12 +1504,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let summaryText = (params.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? params.summary!.trimmingCharacters(in: .whitespacesAndNewlines)
                 : "Working…"
+            let taskId = taskTabs.start(taskId: params.taskId, agent: params.agent)
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetName,
                 summary: summaryText,
                 latencyMs: latencyMs,
-                success: true
+                success: true,
+                taskId: taskId
             )
             emitLiveActivity(LiveActivityItem(
                 kind: .taskStart,
@@ -1409,14 +1526,15 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserProfile: resolvedProfile
             ))
             localVision.warmupIfReady()
-            let taskId = taskTabs.start(taskId: params.taskId)
             response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: taskId)
 
         case .taskComplete:
             let params = request.taskComplete ?? TaskCompleteParams()
             let latencyMs = elapsedMs(since: startNs)
             // Only this task's tabs close and only its cards are marked done; other running tasks keep theirs.
-            let completion = taskTabs.complete(taskId: params.taskId, tabId: params.tabId)
+            let completion = taskTabs.complete(
+                taskId: request.namedTaskId, tabId: params.tabId, keepTabIds: Set(params.keepTabIds ?? []), keepTabs: params.keepTabs == true
+            )
             let resolvedProfile: String? = {
                 if let p = params.profile, !p.isEmpty { return p }
                 if params.tabId != nil {
@@ -1424,6 +1542,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
                 return nil
             }()
+            approvals.endTask(completion.taskId)
             let resolvedApp = params.app.flatMap { workspaceMonitor.resolveApp(query: $0) }
             let targetName = resolvedProfile.map { "Chrome (\($0))" } ?? resolvedApp?.name ?? params.app ?? "Agent"
             let summaryText = (params.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -1434,8 +1553,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 targetApp: targetName,
                 summary: summaryText,
                 latencyMs: latencyMs,
-                success: true
+                success: true,
+                taskId: completion.taskId
             )
+            // The tab indicator goes away on this task's tabs (and on tabs kept with keepTabIds).
+            chromeBridge.sendTabControlEnded(keepTabIds: Array(completion.protectedTabIds))
             emitLiveActivity(LiveActivityItem(
                 kind: .taskComplete,
                 appName: targetName,
@@ -1450,10 +1572,13 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 taskTabIds: completion.ownTabIds.map { Array($0).sorted() }
             ))
             if params.keepTabs != true {
-                let keep = Set(params.keepTabIds ?? []).union(completion.protectedTabIds)
-                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: Array(keep).sorted())
+                // A finished task closes only its own tabs (closeTabIds); with no task, every owned tab as before.
+                let ownTabs = completion.taskId != nil ? completion.ownTabIds.map { Array($0).sorted() } : nil
+                scheduleOwnedTabCleanup(profile: params.profile, keepTabIds: params.keepTabIds ?? [], closeTabIds: ownTabs)
             }
-            response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId)
+            response = .success(
+                id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId, taskSummary: completion.summary
+            )
         }
 
         notifyStateChanged()
@@ -1463,17 +1588,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     /// Closes the Chrome tabs UseMac opened during the task once the completion animation has played, so the
     /// user's tab strip does not fill up with agent tabs. The extension never closes tabs the user had open,
     /// the tab the user is looking at, or tabs with a running download.
-    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int]) {
+    private func scheduleOwnedTabCleanup(profile: String?, keepTabIds: [Int], closeTabIds: [Int]? = nil) {
         let profiles: [String?] = {
             if let profile, !profile.isEmpty { return [profile] }
             let connected = chromeBridge.connectedProfiles().map(\.profileName)
             return connected.isEmpty ? [] : connected.map { Optional($0) }
         }()
         guard !profiles.isEmpty else { return }
-        Task { [chromeBridge] in
+        Task { [chromeBridge, taskTabs] in
             try? await Task.sleep(nanoseconds: 1_800_000_000)
+            // Built now, not at task_complete: a tab another task opened in the meantime stays open, also with
+            // extensions that predate closeTabIds and go by keepTabIds alone.
+            let keep = Set(keepTabIds).union(taskTabs.protectedTabIds()).sorted()
             for name in profiles {
-                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keepTabIds)
+                _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keep, closeTabIds: closeTabIds)
             }
         }
     }
@@ -1521,7 +1649,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
             // Use cached live stream frame when fresh (< 1.5s old) for zero capture latency
             if let cached = chromeBridge.latestFrame(profileQuery: params.profile, tabId: params.tabId),
-               Date().timeIntervalSince(cached.capturedAt) < 1.5 {
+               Date().timeIntervalSince(cached.capturedAt) < 1.5,
+               !cached.showsIndicator {
                 let dir = UseMacDefaults.captureDirectory
                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                 let path = (dir as NSString).appendingPathComponent("vision-browser-\(cached.tabId ?? 0)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
@@ -1625,6 +1754,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
     public func setGovernancePolicy(_ policy: GovernancePolicy) {
         killSwitch.setPolicy(policy)
+        if policy == .paused { chromeBridge.sendTabControlStopped() }
         emitLiveActivity(LiveActivityItem(
             kind: .policyOrSafety,
             title: "Policy set to \(policy.rawValue)",
@@ -1642,6 +1772,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         killSwitch.trip(tripped)
         if tripped {
             onOverlayEvent?(.clear)
+            chromeBridge.sendTabControlStopped()
             chromeBridge.cancelActiveCommands()
             chromeBridge.stopActiveStreams()
         }
@@ -1748,8 +1879,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
     public func currentStatus() -> DaemonStatus {
         let permissions = permissionManager.currentStatus(promptAccessibility: false)
-        let paired = workspaceMonitor.getPairedApp()
-        let frontmost = workspaceMonitor.currentExternalFrontmostApp()
+        // Apps the user's rules block are left out, like UseMac itself.
+        let rules = TargetRulesStore.shared.rules
+        let paired = workspaceMonitor.getPairedApp().flatMap { rules.blocksApp(bundleId: $0.bundleId) ? nil : $0 }
+        let frontmost = workspaceMonitor.currentExternalFrontmostApp().flatMap { rules.blocksApp(bundleId: $0.bundleId) ? nil : $0 }
         let policy = killSwitch.getPolicy()
         let tripped = killSwitch.isTripped
 
@@ -1882,6 +2015,33 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         return .failure(id: request.id, code: "POLICY_BLOCKED", message: reason, latencyMs: latencyMs)
     }
 
+    /// Refusal for a request whose target the user's app and site rules block (TargetRules).
+    private func targetBlockedResponse(
+        request: RPCRequest,
+        startNs: UInt64,
+        targetApp: String?,
+        activityTitle: String,
+        message: String
+    ) -> RPCResponse {
+        let latencyMs = elapsedMs(since: startNs)
+        appendAudit(
+            method: request.method.rawValue,
+            targetApp: targetApp,
+            summary: "Blocked by the app and site rules",
+            latencyMs: latencyMs,
+            success: false
+        )
+        emitLiveActivity(LiveActivityItem(
+            kind: .policyOrSafety,
+            title: activityTitle,
+            subtitle: message,
+            latencyMs: latencyMs,
+            success: false,
+            isInProgress: false
+        ))
+        return .failure(id: request.id, code: TargetRules.errorCode, message: message, latencyMs: latencyMs)
+    }
+
     /// Refusal for a request that names UseMac itself: agents never observe or act on its own windows.
     private func selfTargetResponse(
         request: RPCRequest,
@@ -1907,6 +2067,22 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             isInProgress: false
         ))
         return .failure(id: request.id, code: "SELF_TARGET_BLOCKED", message: message, latencyMs: latencyMs)
+    }
+
+    /// Refusal for an acting request on a window or tab another running task holds (TaskTabRegistry.claim).
+    func targetBusyResponse(request: RPCRequest, busy: TaskTabRegistry.Busy) -> RPCResponse {
+        let holder = busy.agent.map { "\($0) (\(busy.taskId))" } ?? busy.taskId
+        let message = "\(busy.target) is in use by another task, \(holder), active \(busy.idleSeconds) s ago. "
+            + "Wait until it finishes (task_complete), then retry; observe and screenshot still work."
+        appendAudit(method: request.method.rawValue, targetApp: busy.target, summary: "Busy: held by \(holder)", latencyMs: 0, success: false)
+        emitLiveActivity(LiveActivityItem(
+            kind: .policyOrSafety,
+            title: "\(busy.target) is busy",
+            subtitle: message,
+            success: false,
+            isInProgress: false
+        ))
+        return .failure(id: request.id, code: "TARGET_BUSY", message: message)
     }
 
     private func normalizedDirectoryPrefix(_ path: String) -> String {
@@ -1955,14 +2131,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         if step.action == .axAction, step.actionName?.lowercased() == "axopen" {
             return true
         }
-        guard step.action == .pressKey, let modifiers = step.modifiers else {
+        guard step.action == .pressKey else {
             return false
         }
-        let lower = Set(modifiers.map { $0.lowercased() })
-        return lower.contains("cmd")
-            || lower.contains("command")
-            || lower.contains("ctrl")
-            || lower.contains("control")
+        // Any spelling either path presses as ⌘ or ⌃, "meta" included (ModifierAliases).
+        return ModifierAliases.isSensitive(step.modifiers)
     }
 
     private func incrementRequestCount() {
@@ -1992,20 +2165,24 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         stateLock.unlock()
     }
 
-    private func appendAudit(
+    func appendAudit(
         method: String,
         targetApp: String?,
         summary: String,
         latencyMs: Double,
-        success: Bool
+        success: Bool,
+        taskId: String? = nil
     ) {
+        let request = AuditRequestContext.request
+        let hint = request?.auditTaskHint
         let entry = AuditEntry(
             timestampMs: Int64(Date().timeIntervalSince1970 * 1000),
             method: method,
             targetApp: targetApp,
-            summary: summary,
+            summary: AuditRedactor.scrub(summary, secrets: request?.auditSecrets ?? []),
             latencyMs: latencyMs,
-            success: success
+            success: success,
+            taskId: taskId ?? taskTabs.resolve(taskId: hint?.taskId, tabId: hint?.tabId)
         )
 
         stateLock.lock()
@@ -2014,6 +2191,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             auditEntries.removeFirst(auditEntries.count - 500)
         }
         stateLock.unlock()
+        auditStore?.append(entry)
     }
 
     private func emitLiveActivity(_ item: LiveActivityItem) {

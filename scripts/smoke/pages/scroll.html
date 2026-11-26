@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UseMac smoke scroll</title>
+<style>
+  body { font: 16px -apple-system, sans-serif; margin: 0; padding: 48px 24px; }
+  #pos { position: fixed; top: 0; right: 0; background: #ffd; padding: 6px 10px; border: 1px solid #cc9; }
+  .row { display: block; height: 56px; margin: 4px 0; width: 60%; font-size: 16px; }
+</style>
+<script>
+  const params = new URLSearchParams(location.search);
+  if (params.get("t")) document.title = params.get("t");
+  // Counts the wheel events the page receives, so a window that must not be touched can prove no input reached it.
+  window.__smokeWheels = 0;
+  window.addEventListener("wheel", () => { window.__smokeWheels += 1; }, { passive: true });
+  // ?lock=1: the page swallows wheel events, so a background wheel scroll cannot move it and UseMac has to
+  // fall back to scrolling the next offscreen element into view.
+  if (params.get("lock") === "1") {
+    window.addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
+  }
+</script>
+</head>
+<body>
+<!-- First in the DOM, so it is never "the last visible element" the scroll fallback starts from. -->
+<div id="pos" role="status">scrollY=0</div>
+<h1>UseMac smoke: background scrolling</h1>
+<div id="rows"></div>
+<script>
+  const rows = document.getElementById("rows");
+  for (let i = 1; i <= 160; i++) {
+    const b = document.createElement("button");
+    b.className = "row";
+    b.type = "button";
+    b.textContent = "Row " + i;
+    rows.appendChild(b);
+  }
+  const pos = document.getElementById("pos");
+  let pending = false;
+  window.addEventListener("scroll", () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      pos.textContent = "scrollY=" + Math.round(window.scrollY);
+    });
+  }, { passive: true });
+</script>
+</body>
+</html>

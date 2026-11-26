@@ -145,6 +145,13 @@ if [[ "$LOCAL_DEV" != "1" ]]; then
     fi
   fi
 
+  # The Chrome Web Store ID reaches Info.plist through bundle-app.sh (docs/CHROME-WEB-STORE.md).
+  if [[ -z "${USEMAC_CHROME_EXTENSION_ID:-}" ]]; then
+    echo "release preflight: warning: USEMAC_CHROME_EXTENSION_ID is not set, so the setup guide offers only Load unpacked" >&2
+  elif [[ ! "$USEMAC_CHROME_EXTENSION_ID" =~ ^[abcdefghijklmnop]{32}$ ]]; then
+    PREFLIGHT_ERRORS+=('USEMAC_CHROME_EXTENSION_ID must be 32 characters a-p')
+  fi
+
   if [[ ${#PREFLIGHT_ERRORS[@]} -gt 0 ]]; then
     for err in "${PREFLIGHT_ERRORS[@]}"; do
       echo "release preflight: $err" >&2

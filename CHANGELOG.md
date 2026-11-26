@@ -6,6 +6,63 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Ask mode**: a new execution mode between Autonomous and Block sensitive. An upload, a ⌘/⌃ shortcut or a page
+  script waits until you click **Allow once** or **Deny** in a prompt next to the live preview; nobody answering
+  within 45 s denies it. For shortcuts and page scripts you can also allow the rest of the task. Agents get
+  `APPROVAL_DENIED` or `APPROVAL_TIMEOUT` (CLI exit code 4).
+- App and site rules in **Settings → General**: block apps (by bundle ID) and sites (by host) that agents may never
+  see, control or capture, or allow only the ones you list. Password managers, Keychain Access and password-manager
+  web vaults are blocked by default. Blocked apps and tabs are hidden from `list_apps` and `browser_tabs` and left
+  out of the preview and display screenshots, and requests that would reach them fail with `TARGET_BLOCKED` (CLI
+  exit code 4). The rules can only be changed in the app.
+- Several agents can run at once without colliding. Any request can carry the `taskId` from `task_start` (top-level
+  `taskId`, CLI `--task` or `USEMAC_TASK`, automatic over MCP). A task's browser requests without `tabId` go to its
+  own last tab, and the windows and tabs it acts in are its own until it finishes: another task's action there
+  fails with `TARGET_BUSY` (CLI exit code 6, wait and retry). Reads keep working, and callers that don't use tasks
+  are never refused.
+- The live preview names the agent on each card (`task_start` `agent`, CLI `usemac start --agent`; MCP clients show
+  their own name). `task_complete` returns a `taskSummary` (requests, actions, blocked steps, tabs, duration), and
+  `usemac done` prints it.
+- The audit log is kept on disk and survives restarts: one JSON Lines file per day in `~/Library/Application
+  Support/UseMac/audit/`, kept for 30 days by default (**Settings → General → History**). Each entry names its
+  task. **Settings → History** filters by task, app and result and exports JSON Lines or CSV. `audit_log` takes
+  `limit`, `sinceMs` and `taskId`, and `usemac audit` prints the log.
+- While an agent works in a Chrome tab you're looking at, the tab shows a blue border and a pill: "UseMac is
+  controlling this tab", the current step and a **Stop** button that stops the agent like Stop in the HUD. Agents
+  never see them in observations, screenshots or vision results.
+- **Settings → Chrome Extension** and the extension popup show each profile's extension version and where Chrome
+  loads it from, flag an extension older than the app's copy or loaded from another folder, and **Reload** it with
+  no trip to `chrome://extensions`. `browser_status` reports the same (`extensionSource`, `extensionOutdated`, …),
+  and `browser_reload_extension` (CLI `usemac browser reload-extension`) reloads it and waits until it pairs again
+  (new errors: `EXTENSION_RELOAD_UNSUPPORTED`, `EXTENSION_RELOAD_TIMEOUT`, `BROWSER_BUSY`).
+- The setup guide offers **Add from Chrome Web Store** first once the app knows the store ID, with **Load it
+  unpacked instead** as the fallback. `scripts/package-extension.sh` checks the manifest version against the app
+  and keeps dev files out of the store zip.
+- `scripts/smoke.sh`, a live smoke run to use before releases (see `docs/SMOKE.md`), and `scripts/bench.sh`, a
+  reproducible benchmark for local IPC latency and snapshot vs. screenshot tokens.
+- Continuous integration: every pull request and push to `main` runs the Swift and Chrome extension tests on an
+  Apple Silicon runner.
+
+### Changed
+
+- The live preview's caption says which step failed and why, in plain words (for example "Couldn't click “Open”",
+  "needs the app in front"), instead of "Batch failed", with a failure mark instead of a spinner.
+- The CLI and the MCP server wait 75 s longer for `act`, `browser_act` and `browser_extract`, which can now wait
+  for your answer in Ask mode, and `usemac act` waits up to 60 s for a step like MCP does.
+- The agent guide, the skill and the README list every socket method and error code UseMac returns, and a test
+  keeps them in sync with the code.
+- Building from source: the CLI product is now `usemac-cli`, so it no longer overwrites the app on case-insensitive
+  volumes. The app still installs it as `Contents/Helpers/usemac`.
+- Website: the performance numbers are measured with `scripts/bench.sh` and linked to a README "Benchmarks"
+  section, the unbacked "−97% vision tokens" and "0.5 s on-device MLX" claims are gone, and the hero demo shows a
+  generic agent.
+- Bridge protocol (still v2): `hello` carries an optional `extensionId`, `ready` may carry `extensionStatus`, and
+  new `tab_control` / `stop_requested` messages drive the tab indicator.
+- Native `pressKey` takes the same key names as Chrome: `home`, `end`, `pageup`, `pagedown`, `forwarddelete`,
+  `f1`–`f12` and punctuation, and an unknown key's error lists the names it takes.
+
 ### Fixed
 
 - With several agents working at once, the preview no longer jumps between their cards every second. The card in
@@ -18,6 +75,27 @@ All notable changes to UseMac are documented here. The format follows
   `taskId`; pass it to `browser_open` and `task_complete` (CLI `--task`) and only that task's tabs close and only its
   preview cards are marked done. A finished agent's card now leaves the filmstrip after its check even while others
   keep working, and the preview closes only when every task is done.
+- Real mouse input and keys only go to the window UseMac works in. With the app in front but that window covered,
+  `scroll` and `hover` run in the background, and coordinate clicks, `type` and `pressKey` fail with
+  `TARGET_NOT_FRONTMOST` instead of landing in the window on top, which could be yours.
+- Native `scroll` on a web page that ignores the wheel now scrolls it in real Chrome, `setValue` no longer brings a
+  covered window forward or reports `effect: none` for a value Chrome took, and clicks on a tall element aim at its
+  visible part.
+- Chrome no longer ends up with several "UseMac" tab groups in one window when agents use tabs at the same time;
+  existing duplicates are merged the next time UseMac uses a tab there.
+- Finishing a task no longer closes a tab another task opened just before the cleanup, closed tabs are forgotten,
+  and a `taskId` naming a finished task no longer finishes another one.
+- The live preview no longer keeps grey placeholder cards with busy dots that never stop, and keeps the selected
+  card's picture instead of only a spinner when its window can't be streamed.
+- The live preview of a Chrome tab no longer freezes when its window is covered by other windows.
+- A native file picker step for a file in `/tmp`, `$TMPDIR` or a hidden folder answers at once with
+  `TARGET_NOT_FRONTMOST` and says how to get the file in, instead of searching for 12 s and failing with "element
+  not found".
+- Builds with a Chrome Web Store ID still accept the extension loaded unpacked from UseMac.app, and
+  `usemac.bridge.allowedExtensionIds` lets them accept a copy loaded from another folder.
+- Checking whether the local vision runtime is installed no longer scans every file of it.
+- A Chrome `setValue` step with no field (`elementId`, `selector` or a point) is refused with `INVALID_REQUEST`
+  instead of typing into whatever field had focus.
 
 ### Security
 
@@ -26,6 +104,13 @@ All notable changes to UseMac are documented here. The format follows
   app, and a failed step on a closed tab no longer leaves an empty card.
 - Agents can no longer observe or act on UseMac's own windows, such as Settings. Requests that name UseMac
   return `SELF_TARGET_BLOCKED`, and `list_apps` no longer lists it.
+- The audit log no longer copies what agents typed: typed text, `setValue` values, `eval` scripts and OCR results
+  are kept only as their length unless you turn on **Record typed text**, and URLs lose their credentials and
+  secret-looking query values.
+- Only a physical click answers an Ask prompt: clicks posted by any process and Accessibility actions are ignored,
+  UseMac refuses to send real input onto the prompt, and no socket method or MCP tool can answer it.
+- Every spelling of ⌘ and ⌃ (`meta`, `command`, `control`, …) counts as a shortcut for Block sensitive and Ask
+  mode. Before, a Chrome `pressKey` with `meta` was pressed as ⌘ without being blocked or held.
 
 ## [0.6.0-beta.2] - 2026-11-25
 

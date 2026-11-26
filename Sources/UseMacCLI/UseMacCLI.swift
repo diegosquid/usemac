@@ -29,6 +29,12 @@ struct UseMacCLI {
         var requireDaemon: Bool = false
         /// `--help` / `-h` anywhere before a literal `--`: print help for the command instead of running it.
         var help: Bool = false
+        /// `--task <taskId>` anywhere before a literal `--`: the task (from 'start') every request belongs to.
+        var taskFlag: String?
+        /// The task requests belong to: `--task`, else `$USEMAC_TASK`.
+        var taskId: String? {
+            taskFlag ?? ProcessInfo.processInfo.environment["USEMAC_TASK"].flatMap { $0.isEmpty ? nil : $0 }
+        }
     }
 
     private enum CLIError: Error {
@@ -113,16 +119,20 @@ struct UseMacCLI {
         .browserOpen,
         .visionInstall,
         .setPolicy,
-        .pairApp
+        .pairApp,
+        .browserReloadExtension
     ]
 
     /// Exit code 4: a safety rule blocked the request. Stop and tell the user.
     private static let policyBlockCodes: Set<String> = [
         "POLICY_BLOCKED",
         "POLICY_LOCKED",
+        "APPROVAL_DENIED",
+        "APPROVAL_TIMEOUT",
         "URL_BLOCKED",
         "UPLOAD_BLOCKED",
-        "SELF_TARGET_BLOCKED"
+        "SELF_TARGET_BLOCKED",
+        "TARGET_BLOCKED"
     ]
 
     /// Exit code 5: the screen is not what the caller expected. Observe again, then retry.
@@ -132,10 +142,12 @@ struct UseMacCLI {
         "WAIT_TIMEOUT"
     ]
 
-    /// Exit code 6: the step needs the app in front, or the user is busy. Use a background step or retry later.
+    /// Exit code 6: the step needs the app in front, or the user or another task is busy there. Use a background
+    /// step, or wait and retry.
     private static let focusCodes: Set<String> = [
         "TARGET_NOT_FRONTMOST",
-        "USER_ACTIVE"
+        "USER_ACTIVE",
+        "TARGET_BUSY"
     ]
 
     /// Exit code 7: this route cannot reach the content. Switch route (hybrid Chrome flow, observe instead of a capture).
@@ -253,6 +265,8 @@ struct UseMacCLI {
                 return try await handleTaskStart(args: rest, options: options)
             case "done", "complete", "stop":
                 return try await handleTaskComplete(args: rest, options: options)
+            case "audit":
+                return try await handleAudit(args: rest, options: options)
             case "serve":
                 return try await handleServe(options: options)
             case "mcp":
@@ -384,9 +398,18 @@ struct UseMacCLI {
             case "--help", "-h":
                 options.help = true
                 i += 1
+            case "--task":
+                guard i + 1 < args.count else {
+                    throw CLIError.usage("Missing taskId after --task.")
+                }
+                options.taskFlag = args[i + 1]
+                i += 2
             default:
                 if arg.hasPrefix("--socket=") {
                     options.socketPath = String(arg.dropFirst("--socket=".count))
+                    i += 1
+                } else if arg.hasPrefix("--task=") {
+                    options.taskFlag = String(arg.dropFirst("--task=".count))
                     i += 1
                 } else {
                     remaining.append(arg)
@@ -472,6 +495,10 @@ struct UseMacCLI {
         options: GlobalOptions,
         timeoutMs: Int = 10000
     ) async throws -> (response: RPCResponse, roundTripMs: Double, mode: ExecutionMode) {
+        var request = request
+        if request.taskId == nil, request.method != .taskStart {
+            request.taskId = options.taskId
+        }
         if options.standalone {
             if isActionMethod(request.method) {
                 writeStderr("Warning: running without the UseMac app. The Kill Switch and execution mode do not apply.\n")
@@ -483,7 +510,9 @@ struct UseMacCLI {
             return (response, elapsedMs, .inProcess)
         }
 
-        let client = UnixSocketClient(socketPath: options.socketPath, timeoutMs: timeoutMs, keepAlive: false)
+        // In Ask mode a sensitive step waits for the user's answer before it runs.
+        let waitMs = timeoutMs + ApprovalTiming.clientAllowanceMs(for: request.method)
+        let client = UnixSocketClient(socketPath: options.socketPath, timeoutMs: waitMs, keepAlive: false)
         if client.isDaemonReachable() {
             defer { client.close() }
             let (response, rttMs) = try client.send(request)
@@ -893,7 +922,8 @@ struct UseMacCLI {
 
     private static func sendBatchAction(_ batch: BatchActionRequest, options: GlobalOptions) async throws -> Int32 {
         let req = RPCRequest(method: .act, act: batch)
-        let (res, rttMs, mode) = try await executeRPC(req, options: options)
+        // Same budget as the MCP server: an uploadFile step alone can wait ~15 s for Spotlight.
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 60_000)
         try ensureOK(res)
 
         if options.json {
@@ -1000,7 +1030,7 @@ struct UseMacCLI {
 
     private static func handleBrowser(args: [String], options: GlobalOptions) async throws -> Int32 {
         guard let subcommand = args.first else {
-            throw CLIError.usage("Usage: usemac browser <status|tabs|open|observe|extract|screenshot|act> ...")
+            throw CLIError.usage("Usage: usemac browser <status|tabs|open|observe|extract|screenshot|act|reload-extension> ...")
         }
         let rest = Array(args.dropFirst())
         switch subcommand {
@@ -1018,10 +1048,12 @@ struct UseMacCLI {
             return try await handleBrowserScreenshot(args: rest, options: options)
         case "act":
             return try await handleBrowserAct(args: rest, options: options)
+        case "reload-extension":
+            return try await handleBrowserReloadExtension(args: rest, options: options)
         case "help":
             return try printHelp(for: ["browser"] + rest.prefix(1))
         default:
-            throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, screenshot, act.")
+            throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, screenshot, act, reload-extension.")
         }
     }
 
@@ -1080,8 +1112,51 @@ struct UseMacCLI {
                     let urlPart = profile.streamingUrl.map { " (\($0))" } ?? ""
                     return " | stream=tab:\(tabId)\(urlPart)"
                 } ?? ""
-                print("  • \(profile.profileName)\(emailPart) | v\(profile.extensionVersion) | tabs=\(profile.tabCount)\(streamPart)")
+                print("  • \(profile.profileName)\(emailPart) | v\(profile.extensionVersion) | tabs=\(profile.tabCount)\(streamPart)\(extensionStatusSuffix(profile))")
+                if let note = profile.extensionNote {
+                    print("    \(note)")
+                }
             }
+        }
+        return 0
+    }
+
+    /// " | outdated (app ships 0.6.0 beta 3) | from another folder", or "" when the app knows nothing more.
+    private static func extensionStatusSuffix(_ profile: BrowserProfileStatus) -> String {
+        var parts: [String] = []
+        if profile.extensionOutdated == true {
+            parts.append("outdated (app ships \(profile.bundledExtensionVersion ?? "a newer version"))")
+        }
+        switch profile.extensionSource {
+        case "app": parts.append("from UseMac.app")
+        case "web_store": parts.append("from Chrome Web Store")
+        case "other_folder": parts.append("from another folder")
+        default: break
+        }
+        return parts.map { " | \($0)" }.joined()
+    }
+
+    private static func handleBrowserReloadExtension(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--profile"], boolFlags: ["--force"])
+        if !parsed.positionals.isEmpty {
+            throw CLIError.usage("Usage: usemac browser reload-extension [--profile <name>] [--force]")
+        }
+        let params = BrowserReloadExtensionParams(
+            profile: parsed.values["--profile"],
+            force: parsed.flags.contains("--force") ? true : nil
+        )
+        let req = RPCRequest(method: .browserReloadExtension, browserReloadExtension: params)
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 90000)
+        try ensureOK(res)
+
+        let profiles = res.browserProfiles ?? []
+        if options.json {
+            printEncodableJSON(profiles)
+            return 0
+        }
+        print(String(format: "[%@] Reloaded the extension in %d Chrome profile(s) (%.0f ms):", mode.rawValue, profiles.count, rttMs))
+        for profile in profiles {
+            print("  • \(profile.profileName) | v\(profile.extensionVersion)\(extensionStatusSuffix(profile))")
         }
         return 0
     }
@@ -1089,7 +1164,7 @@ struct UseMacCLI {
     private static func handleBrowserOpen(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--task"],
+            valueFlags: ["--profile", "--tab"],
             boolFlags: ["--same-tab", "--new-tab", "--no-stream", "--activate", "--new-window"]
         )
         let usage = "Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream] [--task <taskId>], or: usemac browser open --tab <id> --activate"
@@ -1124,7 +1199,7 @@ struct UseMacCLI {
             stream: !parsed.flags.contains("--no-stream"),
             activate: activate ? true : nil,
             newWindow: newWindow ? true : nil,
-            taskId: parsed.values["--task"]
+            taskId: options.taskId
         )
         let req = RPCRequest(method: .browserOpen, browserOpen: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 20000)
@@ -1499,7 +1574,7 @@ struct UseMacCLI {
     private static func handleTaskStart(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--app", "--summary", "--task"]
+            valueFlags: ["--profile", "--tab", "--app", "--summary", "--agent"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let summary = parsed.values["--summary"] ?? (parsed.positionals.isEmpty ? nil : parsed.positionals.joined(separator: " "))
@@ -1508,7 +1583,8 @@ struct UseMacCLI {
             tabId: tabId,
             app: parsed.values["--app"],
             summary: summary,
-            taskId: parsed.values["--task"]
+            taskId: options.taskFlag,
+            agent: parsed.values["--agent"]
         )
         let req = RPCRequest(method: .taskStart, taskStart: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -1519,7 +1595,7 @@ struct UseMacCLI {
         }
         print(String(format: "[%@] Session started (%@) | rtt: %.2f ms", mode.rawValue, summary ?? "Working…", rttMs))
         if let taskId = res.taskId {
-            print("taskId: \(taskId)  (pass --task \(taskId) to 'browser open' and 'done', so finishing this task only closes its own tabs)")
+            print("taskId: \(taskId)  (pass --task \(taskId) to every command, or export USEMAC_TASK=\(taskId): your requests without --tab then go to this task's own last tab, and 'done' only closes this task's tabs)")
         }
         return 0
     }
@@ -1527,7 +1603,7 @@ struct UseMacCLI {
     private static func handleTaskComplete(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--app", "--summary", "--keep-tab", "--task"],
+            valueFlags: ["--profile", "--tab", "--app", "--summary", "--keep-tab"],
             boolFlags: ["--keep-tabs"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
@@ -1547,7 +1623,7 @@ struct UseMacCLI {
             summary: summary,
             keepTabs: parsed.flags.contains("--keep-tabs") ? true : nil,
             keepTabIds: keepTabIds,
-            taskId: parsed.values["--task"]
+            taskId: options.taskId
         )
         let req = RPCRequest(method: .taskComplete, taskComplete: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -1557,6 +1633,51 @@ struct UseMacCLI {
             return 0
         }
         print(String(format: "[%@] Task marked as complete (%@) | rtt: %.2f ms", mode.rawValue, summary ?? "Task completed", rttMs))
+        if let done = res.taskSummary {
+            let tabs = { (ids: [Int]) in ids.isEmpty ? "none" : ids.map(String.init).joined(separator: ",") }
+            print("Task \(done.taskId): \(done.requests) requests, \(done.actions) actions (\(done.failedActions) failed), \(done.blocked) blocked, "
+                + String(format: "%.1f s", Double(done.durationMs) / 1000)
+                + " | tabs opened: \(tabs(done.tabsOpened)), closed: \(tabs(done.tabsClosed)), closing now: \(tabs(done.tabsClosing))")
+        }
+        return 0
+    }
+
+    private static func handleAudit(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--limit", "--since", "--task"])
+        if let extra = parsed.positionals.first {
+            throw CLIError.usage("Unexpected argument '\(extra)'. Run 'usemac help audit'.")
+        }
+        let limit = try parseOptionalInt(parsed.values, flag: "--limit", positive: true)
+        var sinceMs: Int64?
+        if let rawSince = parsed.values["--since"] {
+            guard let parsedSince = AuditLogParams.parseSince(rawSince) else {
+                throw CLIError.usage("--since expects a duration (30m, 2h, 7d), a date (2026-11-25 or ISO 8601) or milliseconds since 1970.")
+            }
+            sinceMs = parsedSince
+        }
+        let taskId = parsed.values["--task"]
+        let filtered = limit != nil || sinceMs != nil || taskId != nil
+        let req = RPCRequest(
+            method: .auditLog,
+            auditLog: filtered ? AuditLogParams(limit: limit, sinceMs: sinceMs, taskId: taskId) : nil
+        )
+        let (res, rttMs, mode) = try await executeRPC(req, options: options)
+        try ensureOK(res)
+        let entries = res.auditEntries ?? []
+        if options.json {
+            printEncodableJSON(entries)
+            return 0
+        }
+        print(String(format: "[%@] %d audit entr%@, newest first (%.2f ms):", mode.rawValue, entries.count, entries.count == 1 ? "y" : "ies", rttMs))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        for entry in entries {
+            let time = formatter.string(from: Date(timeIntervalSince1970: Double(entry.timestampMs) / 1000))
+            let result = entry.success ? "ok    " : "FAILED"
+            let task = entry.taskId.map { " [\($0)]" } ?? ""
+            print("  \(time)  \(result)  \(entry.method)  \(entry.targetApp ?? "-")\(task)  \(entry.summary)")
+        }
         return 0
     }
 
@@ -1612,7 +1733,7 @@ struct UseMacCLI {
     }
 
     private static func handleServe(options: GlobalOptions) async throws -> Int32 {
-        let service = UseMacEngineService(socketPath: options.socketPath)
+        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore())
         let server = UnixSocketServer(socketPath: options.socketPath, service: service, onClientCountChange: nil)
         try server.start()
 
@@ -1968,6 +2089,7 @@ struct UseMacCLI {
           --json              Output JSON (shape below)
           --standalone        Run in-process without connecting to the UseMac daemon
           --require-daemon    Fail if the UseMac daemon is not reachable
+          --task <taskId>     The task ('start' prints it) the request belongs to (default: $USEMAC_TASK)
 
         Commands:
           ping                                       Test socket and engine latency
@@ -1986,7 +2108,7 @@ struct UseMacCLI {
                                                      (click, set, type and key also take --foreground, --expect-title, --allow-stale)
           screenshot [--app <name>] [--max-dim <n>] [--base64]
                                                      Capture a window or screen screenshot
-          browser status                             List Chrome profiles connected to the extension
+          browser status                             List Chrome profiles connected to the extension (version, outdated, source)
           browser tabs [--profile <n>] [--query <q>] List open Chrome tabs with tabId, title, and URL
           browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--activate] [--new-window] [--no-stream]
                                                      Open a URL in a background tab, navigate --tab, or open it in a new window
@@ -1999,14 +2121,18 @@ struct UseMacCLI {
                                                      Capture a crisp screenshot of the tab or a specific element
           browser act '<json>' [--profile <name>] [--tab <id>] [--read-only] [--verify "<condition>"] [--screenshot]
                                                      Execute BrowserActParams or [ActionStep] in Chrome with optional local verification or screenshot
+          browser reload-extension [--profile <n>] [--force]
+                                                     Reload the extension so Chrome runs the code now in its folder (stops running browser work)
           vision status                              Show Local Vision engine status (Apple OCR + MLX-VLM)
           vision install [--model <hf-repo>]         Install the MLX runtime and download the local model on demand
           vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
                                                      Ask the on-device vision model + Apple OCR about the screen (zero cloud image tokens)
-          start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
-                                                     Start a continuous session keeping the live preview open between steps
+          start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"] [--agent <name>]
+                                                     Start a task (prints its taskId) keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
                                                      Finish the task with a completion overlay and smoothly close the preview
+          audit [--limit <n>] [--since <time>] [--task <taskId>]
+                                                     Print the audit log (kept on disk, typed text redacted), newest first
           serve                                      Start the Unix socket RPC daemon
           mcp                                        Start the stdio MCP server
           install-skill [--workspace] [--dir <path>] [--force] [--dry-run]
@@ -2018,9 +2144,9 @@ struct UseMacCLI {
           1  Command or RPC failure (find: nothing matched)
           2  Invalid usage, unknown flag or key, or invalid JSON
           3  Daemon required (DAEMON_REQUIRED): ask the user to open UseMac
-          4  Blocked by a safety rule (POLICY_BLOCKED, POLICY_LOCKED, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED): stop and tell the user
+          4  Blocked by a safety rule or the user (POLICY_BLOCKED, POLICY_LOCKED, APPROVAL_DENIED, APPROVAL_TIMEOUT, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED, TARGET_BLOCKED): stop and tell the user
           5  The screen is not what you expected (STALE_SNAPSHOT, ELEMENT_NOT_FOUND, WAIT_TIMEOUT): observe again, then retry
-          6  Needs the app in front, or the user is busy (TARGET_NOT_FRONTMOST, USER_ACTIVE): use a background step, or wait and retry
+          6  Needs the app (and its window) in front, or the user or another task is busy there (TARGET_NOT_FRONTMOST, USER_ACTIVE, TARGET_BUSY): use a background step, or wait and retry
           7  This route cannot reach it (RESTRICTED_PAGE, CAPTURE_TOO_SMALL): switch route (see 'usemac help browser')
 
         JSON output (--json):
@@ -2061,7 +2187,8 @@ struct UseMacCLI {
         ("observe", "Inspect a tab's DOM (@b1..@bN), tables, text and overlays"),
         ("extract", "Extract tables, KPIs, text, JS results or session downloads"),
         ("screenshot", "Capture a JPEG of a tab or one element"),
-        ("act", "Run DOM action steps in a tab")
+        ("act", "Run DOM action steps in a tab"),
+        ("reload-extension", "Reload the extension so Chrome runs its current code")
     ]
 
     private static let visionSubcommands: [(String, String)] = [
@@ -2094,7 +2221,7 @@ struct UseMacCLI {
         case "apps":
             return CommandHelp(
                 usage: ["usemac apps"],
-                summary: "List running GUI apps with pid, bundle id, active state and front window title. UseMac itself is never listed or targeted.",
+                summary: "List running GUI apps with pid, bundle id, active state and front window title. UseMac itself, and apps the user's app and site rules block (TARGET_BLOCKED), are never listed or targeted.",
                 examples: ["usemac apps"],
                 json: "[AppDescriptor {pid, name, bundleId, isActive, isHidden, windowTitle, windowBounds, windowId}]"
             )
@@ -2159,7 +2286,8 @@ struct UseMacCLI {
                     "Step actions: target, openURL, navigate, click, doubleClick, rightClick, hover, setValue, type, pressKey, scroll, focus, wait, uploadFile, scrollIntoView, axAction (actionName, e.g. AXOpen), waitFor (match or elementId, timeoutMs default 5000, gone: true to wait until it disappears).",
                     "Target a step with \"elementId\": \"@e12\" or with \"match\": {\"role\", \"title\", \"value\", \"text\", \"exact\", \"index\"}, resolved when the step runs. Prefer match when the window may have changed.",
                     "Each step reports effect: changed, none or unverified. \"⚠ no visible effect\" means the step reported ok but nothing changed: observe before continuing.",
-                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder."
+                    "In an open panel (file picker) use one uploadFile step with the absolute path instead of clicking through Finder. Files in /tmp, $TMPDIR or hidden folders fail with TARGET_NOT_FRONTMOST in the background: upload a copy from ~/Downloads, or rerun with --foreground.",
+                    "In Ask mode a step with an upload or a cmd/ctrl shortcut waits (up to 45 s) for the user to allow it in UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT (exit 4) means nothing ran."
                 ],
                 examples: [
                     "usemac act '{\"app\":\"Notes\",\"steps\":[{\"action\":\"click\",\"match\":{\"role\":\"button\",\"title\":\"New Note\"}},{\"action\":\"type\",\"text\":\"Hello\"}]}'",
@@ -2196,9 +2324,14 @@ struct UseMacCLI {
         case "key":
             return CommandHelp(
                 usage: ["usemac key <chord> [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]"],
-                summary: "Press a key or shortcut. Modifiers: cmd, shift, opt (alt), ctrl, fn. Keys: return, tab, space, escape, delete, arrows, a–z, 0–9.",
+                summary: "Press a key or shortcut. Modifiers: cmd (command, meta), shift, opt (alt, option), ctrl (control). Keys: return (enter), tab, space, delete (backspace), forwarddelete, escape (esc), up, down, left, right, home, end, pageup, pagedown, f1–f12, a–z, 0–9, - = [ ] ; ' , . / \\ `.",
                 flags: batchFlagHelp,
-                examples: ["usemac key cmd+shift+n --app \"Finder\""],
+                notes: [
+                    "In Ask mode a step with an upload or a cmd/ctrl shortcut waits (up to 45 s) for the user to allow it in UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT (exit 4) means nothing ran.",
+                    "Character keys are key positions on a US keyboard: use `usemac type` to enter text, and shift plus the base key for a shifted symbol (shift+= for +).",
+                    "An unknown key fails with INVALID_REQUEST and lists these names."
+                ],
+                examples: ["usemac key cmd+shift+n --app \"Finder\"", "usemac key pagedown --app \"TextEdit\""],
                 json: batchResultJSON
             )
         case "screenshot":
@@ -2225,14 +2358,34 @@ struct UseMacCLI {
         case "browser status":
             return CommandHelp(
                 usage: ["usemac browser status"],
-                summary: "List the Chrome profiles connected to the extension (name, e-mail, extension version, tab count, streaming tab).",
+                summary: "List the Chrome profiles connected to the extension (name, e-mail, extension version, tab count, streaming tab), and whether each one runs an outdated extension or one loaded from another folder.",
+                notes: [
+                    "extensionOutdated: Chrome runs an older extension than UseMac.app ships (bundledExtensionVersion). Tell the user, or run 'usemac browser reload-extension' when nothing else is using Chrome.",
+                    "extensionSource: app (UseMac.app's folder), web_store, other_folder (unpacked from another folder: app updates won't reach it) or unknown."
+                ],
                 examples: ["usemac browser status"],
-                json: "[BrowserProfileStatus {profileName, profileEmail, extensionVersion, tabCount, streamingTabId, streamingUrl}]"
+                json: "[BrowserProfileStatus {profileName, profileEmail, extensionVersion, tabCount, streamingTabId, streamingUrl, extensionId, extensionSource, bundledExtensionVersion, extensionOutdated, extensionReloadable, extensionNote}]"
+            )
+        case "browser reload-extension":
+            return CommandHelp(
+                usage: ["usemac browser reload-extension [--profile <name>] [--force]"],
+                summary: "Reload the UseMac extension so Chrome runs the code now in its folder (after an app update, or a change in the folder it was loaded from). Waits until it has reconnected and prints its new version.",
+                flags: [
+                    ("--profile <name>", "Reload only this Chrome profile (default: every connected profile)"),
+                    ("--force", "Reload even while agents have Chrome commands running (they fail)")
+                ],
+                notes: [
+                    "Reloading stops every agent's browser work in that profile: run it only when the user asks, or when nothing else is using Chrome. Without --force it fails with BROWSER_BUSY while commands are running.",
+                    "Tabs UseMac opened before the reload stay open, but 'done' no longer closes them.",
+                    "EXTENSION_RELOAD_UNSUPPORTED: the extension predates remote reload. The user reloads it once in chrome://extensions. EXTENSION_RELOAD_TIMEOUT: it did not come back within 15 s; check chrome://extensions for errors."
+                ],
+                examples: ["usemac browser reload-extension", "usemac browser reload-extension --profile Work"],
+                json: "[BrowserProfileStatus] of the reloaded profiles, as 'browser status' prints them"
             )
         case "browser tabs":
             return CommandHelp(
                 usage: ["usemac browser tabs [--profile <name>] [--query <text>]"],
-                summary: "List open Chrome tabs with tabId, title, URL and active state.",
+                summary: "List open Chrome tabs with tabId, title, URL and active state. Tabs on sites the user's app and site rules block are left out; any browser command on one, or opening such a site, fails with TARGET_BLOCKED (exit 4).",
                 flags: [
                     ("--profile <name>", "Chrome profile from 'browser status' (only needed with several profiles)"),
                     ("--query <text>", "Case-insensitive filter on title or URL")
@@ -2286,7 +2439,7 @@ struct UseMacCLI {
         case "browser extract":
             return CommandHelp(
                 usage: ["usemac browser extract [auto|tables|text|kpis|eval|downloads] [--profile <name>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]"],
-                summary: "Extract structured data from a tab. auto, tables, text and kpis only read; downloads lists files downloaded during the UseMac session; eval runs JavaScript in the page (autonomous mode only, logged).",
+                summary: "Extract structured data from a tab. auto, tables, text and kpis only read; downloads lists files downloaded during the UseMac session; eval runs JavaScript in the page (autonomous mode, or Ask mode once the user allows it; logged).",
                 flags: [
                     ("--tab <id>", "Tab to read"),
                     ("--selector <css>", "Scope extraction to one container"),
@@ -2322,7 +2475,8 @@ struct UseMacCLI {
                 ],
                 notes: [
                     "JSON keys: profile, tabId, steps, stopOnError, returnObservation, returnDiffOnly, readOnly, verify, returnImageContent.",
-                    restrictedPageNote
+                    restrictedPageNote,
+                    "In Ask mode a step with an upload or a cmd/ctrl shortcut waits (up to 45 s) for the user to allow it in UseMac; APPROVAL_DENIED or APPROVAL_TIMEOUT (exit 4) means nothing ran."
                 ],
                 examples: ["usemac browser act '[{\"action\":\"setValue\",\"elementId\":\"@b2\",\"text\":\"UseMac\"},{\"action\":\"click\",\"elementId\":\"@b3\"}]' --tab 123"],
                 json: batchResultJSON
@@ -2374,15 +2528,28 @@ struct UseMacCLI {
             )
         case "start":
             return CommandHelp(
-                usage: ["usemac start [--summary \"<text>\"] [--app <name>] [--profile <name>] [--tab <id>] [--task <taskId>]"],
-                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps. Prints a taskId: pass it as --task to 'browser open' and 'done', so that when several agents work at once, finishing this task only closes the tabs it opened.",
-                examples: ["usemac start --summary \"Reviewing dashboard\""]
+                usage: ["usemac start [--summary \"<text>\"] [--agent <name>] [--app <name>] [--profile <name>] [--tab <id>] [--task <taskId>]"],
+                summary: "Call once at the start of a multi-step task so the floating live preview opens once and stays open between steps. Prints a taskId: pass it as --task to every later command (or export USEMAC_TASK=<taskId>). When several agents work at once, a browser command without --tab then goes to this task's own last tab, not another agent's, and finishing this task only closes the tabs it opened. While the task runs, the windows and tabs it acts in are its own: another task's act there fails with TARGET_BUSY (exit 6) until this one is done. --agent names the agent on its preview cards.",
+                examples: ["usemac start --summary \"Reviewing dashboard\" --agent \"Claude Code\""]
             )
         case "stop", "done", "complete":
             return CommandHelp(
                 usage: ["usemac done [--summary \"<text>\"] [--task <taskId>] [--app <name>] [--profile <name>] [--tab <id>] [--keep-tab <id,id>] [--keep-tabs]   (aliases: stop, complete)"],
-                summary: "Call once when the whole task is finished: shows the completion state and closes the live preview. About 2 s later UseMac closes the Chrome tabs it opened (never your own tabs, the tab you are looking at, or tabs with a running download). --keep-tab keeps the page with the result; --keep-tabs keeps them all. With --task, only that task's tabs close: tabs other running tasks opened are never closed.",
+                summary: "Call once when the whole task is finished: shows the completion state and closes the live preview. About 2 s later UseMac closes the Chrome tabs it opened (never your own tabs, the tab you are looking at, or tabs with a running download). --keep-tab keeps the page with the result; --keep-tabs keeps them all. With --task, only that task's tabs close: tabs other running tasks opened are never closed. Prints what the task did (with --json: taskSummary with requests, actions, failedActions, blocked, tabsOpened, tabsClosed, tabsClosing, durationMs).",
                 examples: ["usemac done --summary \"Report exported\"", "usemac done --summary \"Invoice ready\" --keep-tab 123"]
+            )
+        case "audit":
+            return CommandHelp(
+                usage: ["usemac audit [--limit <n>] [--since <30m|2h|7d|date|ms>] [--task <taskId>]"],
+                summary: "Print the audit log, newest first: every observation and action, with its app, result and task. Without flags, the 50 most recent entries. UseMac keeps it on disk (one file per day, 30 days by default), and typed text and page scripts appear only as their length.",
+                flags: [
+                    ("--limit <n>", "How many entries (default 50, at most 1000)"),
+                    ("--since <time>", "Only newer entries: a duration (30m, 2h, 7d), a date (2026-11-25, ISO 8601) or ms since 1970"),
+                    ("--task <taskId>", "Only the entries of this task (the taskId 'start' printed)")
+                ],
+                notes: ["Filters read the log on disk, so they reach back past the last restart; with the app closed, only the files in ~/Library/Application Support/UseMac/audit/ have it."],
+                examples: ["usemac audit", "usemac audit --task task-1a2b3c4d", "usemac audit --since 2h --limit 200 --json"],
+                json: "[AuditEntry {id, timestampMs, method, targetApp, summary, latencyMs, success, taskId}]"
             )
         case "serve":
             return CommandHelp(

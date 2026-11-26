@@ -9,6 +9,15 @@ Contract between the Chrome extension (`Extension/`) and the daemon bridge
 - The extension is the client and connects to `ws://127.0.0.1:49222/usemac-bridge`.
 - The daemon binds `127.0.0.1` only and accepts the WebSocket upgrade only when the `Origin` header starts with
   `chrome-extension://`. Authentication below, not the port, is what proves each side to the other.
+- Builds that know the Chrome Web Store ID (Info.plist `UseMacChromeExtensionID`, or `USEMAC_CHROME_EXTENSION_ID`)
+  also check the ID in that `Origin`. They accept the store ID, the ID Chrome gives the app's own
+  `UseMac.app/Contents/Resources/chrome-extension` folder when it is loaded unpacked, the comma-separated IDs in
+  `USEMAC_ALLOWED_EXTENSION_IDS`, and the IDs in the app's `usemac.bridge.allowedExtensionIds` default (an array,
+  set only by the user with `defaults write app.usemac`). Any other extension, such as a copy loaded unpacked from
+  a repo checkout, is refused at the upgrade, and its popup shows the app as not running. Builds without a store ID
+  accept any extension ID unless `USEMAC_ALLOWED_EXTENSION_IDS` is set; the default only adds IDs and never turns
+  the check on. Everything after the upgrade, pairing included, is the same for a store install and an unpacked
+  one. Each install keeps its own copy of the pairing key, so a new install needs the key pasted once.
 
 ## Pairing key
 
@@ -28,8 +37,14 @@ as 64 lowercase hex characters. Proofs are compared in constant time. `|` below 
 1. Extension → daemon, first frame after the socket opens:
 
    ```json
-   {"type":"hello","protocol":2,"extensionVersion":"0.5.0","profileName":"Work","clientNonce":"<64 hex>","hasKey":true}
+   {"type":"hello","protocol":2,"extensionVersion":"0.6.0 beta 3","extensionId":"<32 letters a-p>","profileName":"Work","clientNonce":"<64 hex>","hasKey":true}
    ```
+
+   `extensionVersion` is the manifest's `version_name`, else its `version`. `extensionId` (optional) is
+   `chrome.runtime.id`; an extension that sends it also accepts `reload_extension` (below). The daemon ignores an
+   `extensionId` that is not a string. For extensions that predate the field, the daemon takes the ID from the
+   upgrade's `Origin` header (`chrome-extension://<id>`) when every upgrade since that connection was accepted came
+   from the same ID.
 
    `hello` carries no e-mail, no window titles and no tab count. A `hello` whose `protocol` is not `2`, or whose
    `clientNonce` is not 64 hex characters, gets `{"type":"auth_failed","reason":"bad_hello"}` and the socket is closed.
@@ -57,7 +72,8 @@ as 64 lowercase hex characters. Proofs are compared in constant time. `|` below 
 
    `clientProof = HMAC-SHA256(K, utf8("usemac-bridge-v2|client|" + clientNonce + "|" + serverNonce))`
 
-   The daemon verifies it. On success it answers `{"type":"ready"}`. On failure it answers
+   The daemon verifies it. On success it answers `{"type":"ready"}`, optionally with `extensionStatus` (see
+   "Outdated or wrong-source extension" below). On failure it answers
    `{"type":"auth_failed","reason":"bad_proof"}` and closes the socket. Each `challenge` is valid for one `auth`.
 
 5. After `ready`, the extension sends `{"type":"profile_info","profileName":"Work","tabCount":12}` and repeats it
@@ -84,7 +100,8 @@ clientProof  = c98c470a7e7cf4f566d842b2a2fcdd46e9894e13bcfe448ad0c180cb17fa4f35
 ## Commands after `ready`
 
 Daemon → extension requests keep the existing shape: `{"type":"request","id":"<uuid>","command":"…", …}` with
-`command` one of `tabs`, `open`, `observe`, `extract`, `screenshot`, `act`, `focus_tab`, `stop_stream`.
+`command` one of `tabs`, `open`, `observe`, `extract`, `screenshot`, `act`, `focus_tab`, `stop_stream`,
+`close_owned_tabs`, `reload_extension`.
 Extension → daemon frames keep the existing shapes: `response`, `frame`, `cursor`, `stream_stopped`, `ping`.
 
 ### `cancel` (new, daemon → extension)
@@ -180,11 +197,14 @@ The extension remembers the tabs it created itself (`open` with a new tab or `ne
 2 s after `task_complete` unless the agent passed `keepTabs: true`.
 
 ```json
-{"type":"request","id":"…","command":"close_owned_tabs","keepTabIds":[123]}
+{"type":"request","id":"…","command":"close_owned_tabs","keepTabIds":[123],"closeTabIds":[123,124]}
 ```
 
 The extension closes every owned tab except tabs in `keepTabIds`, the active tab of the focused window (the user
-is looking at it) and tabs whose origin has a download still in progress. Tabs the user opened are never in the
+is looking at it) and tabs whose origin has a download still in progress. With `closeTabIds` (the tabs of the task
+that finished; extensions 0.6+), it only considers those owned tabs and leaves every other one alone, so a tab
+another agent's task opened stays open. Older extensions ignore `closeTabIds`; for them the daemon builds
+`keepTabIds` from the tabs running tasks own right before it sends the command. Tabs the user opened are never in the
 list, even if a command used them through `tabId`. The response carries `closedTabs` and `keptTabs`
 (`[{tabId, title, reason}]`).
 
@@ -194,3 +214,105 @@ Tab listings mark tabs that belong to UseMac (in its "UseMac" tab group, or open
 The UseMac app only streams a Chrome window through the native (ScreenCaptureKit) preview when that window's
 active tab is one of these; otherwise the preview shows a placeholder, so the user's own tabs never appear in it.
 Extensions that predate the field send no `usemac`, which the app treats as "not a UseMac tab".
+
+## Outdated or wrong-source extension
+
+The daemon compares what `hello` reports with the extension copy inside the app
+(`UseMac.app/Contents/Resources/chrome-extension/manifest.json`):
+
+- **Outdated**: `extensionVersion` sorts before the bundled `version_name` (else `version`). Numbers compare
+  numerically; a release sorts after its pre-releases (`alpha` < `beta` < `rc`), so `0.5.0` < `0.6.0 beta 2` <
+  `0.6.0 beta 3` < `0.6.0`.
+- **Source**: `app` when the ID is the one Chrome gives the bundled folder loaded unpacked, `web_store` when it is
+  the Chrome Web Store ID (`UseMacChromeExtensionID` in Info.plist, or `USEMAC_CHROME_EXTENSION_ID`),
+  `other_folder` for any other ID (loaded unpacked from another folder, such as a repo checkout: app updates never
+  reach it), and `unknown` without an ID or a bundled copy.
+- **Unpacked IDs**: Chrome makes the folder path absolute with `realpath(3)` (symlinks resolved, `/tmp` →
+  `/private/tmp`, no trailing slash, on-disk case), hashes its UTF-8 bytes with SHA-256, keeps the first 16 bytes
+  and writes each hex digit `0`–`f` as `a`–`p`. A manifest with `key` hashes the decoded key instead. Example:
+  `/Applications/UseMac.app/Contents/Resources/chrome-extension` → `cjmjpbjmbbokoknjmnppdcifkeaaapca`.
+
+`ready` carries the verdict for the extension popup. Older extensions ignore the field.
+
+```json
+{"type":"ready","extensionStatus":{"source":"other_folder","bundledVersion":"0.6.0 beta 3","outdated":true,"reloadable":true,"note":"Loaded from another folder, app updates won't reach it. …"}}
+```
+
+`browser_status` reports the same per profile: `extensionId`, `extensionSource`, `bundledExtensionVersion`,
+`extensionOutdated`, `extensionReloadable` and `extensionNote`.
+
+## Reloading the extension (`reload_extension`)
+
+```json
+{"type":"request","id":"…","command":"reload_extension"}
+```
+
+The extension handles it at once, outside the tab queues. It answers `{"type":"response","id":"…","ok":true,
+"extensionVersion":"…"}`, waits until the answer has left the socket (at most 1 s), then calls
+`chrome.runtime.reload()`. Chrome restarts the service worker with the code now in the extension's folder, which
+connects and pairs again on its own (the key is in `chrome.storage.local`). Debugger sessions end, and the list of
+tabs UseMac opened (`chrome.storage.session`) is lost, so `close_owned_tabs` no longer closes tabs opened before the
+reload.
+
+The daemon (`browser_reload_extension`, CLI `usemac browser reload-extension`, Settings → Chrome Extension →
+Reload):
+
+- sends the command only to sessions whose `hello` carried `extensionId`. Others get `EXTENSION_RELOAD_UNSUPPORTED`
+  (reload once in `chrome://extensions`) without any frame, so an old extension never sees an unknown command. An
+  `UNKNOWN_COMMAND` answer maps to the same error;
+- refuses with `BROWSER_BUSY` while that session still has commands waiting for an answer, unless `force` is set;
+- treats the socket closing before the answer as a reload in progress;
+- waits up to 15 s for a new ready session with the same profile name, accepted after the command was sent, and
+  returns its status, or fails with `EXTENSION_RELOAD_TIMEOUT`.
+
+## Tab indicator (`tab_control`, `stop_requested`)
+
+While an agent controls a tab and the user can see it (the active tab of a window that is not minimized), the
+extension draws a blue border around the viewport and a pill at the top center: "UseMac is controlling this tab",
+the current step when there is one ("Clicking Save"), and a **Stop** button. It draws through the debugger it is
+already attached with, in the `usemac` isolated world of the top document, so it needs no extra permission:
+
+- one `<usemac-tab-indicator>` host under `<html>` (not `<body>`), `aria-hidden`, with a **closed** shadow root,
+  `position: fixed`, the highest z-index (and the top layer through a manual popover where Chrome supports it).
+  Only the pill takes pointer events. The host is put back if the page removes it, and drawn again after every
+  top-level navigation.
+- A tab counts as controlled from the first agent command on it (`open`, `observe`, `extract`, `screenshot`, `act`)
+  until its control ends (below), its debugger detaches (idle timeout, eviction, `stop_stream`, release from the
+  popup) or the tab closes. Nothing is drawn into a controlled tab until the user looks at it.
+- The page holds a lease of 12 s that the extension renews every 4 s while the indicator is on screen. Without a
+  renewal (the debugger went away) the page hides and removes it by itself.
+- Agents never see it: the DOM walk of `observe` cannot enter the closed shadow root, `Page.captureScreenshot` for
+  `observe`, `act` and `screenshot` runs with the indicator hidden, and the pill stops taking pointer events while the
+  agent's own mouse events land on it, so they reach the page below.
+
+### `tab_control` (daemon → extension)
+
+```json
+{"type":"tab_control","state":"stopped"}
+{"type":"tab_control","state":"ended","keepTabIds":[123]}
+```
+
+No `id`, no response. Ignored before `ready`, like `cancel`.
+
+| `state` | Sent when | Effect |
+| --- | --- | --- |
+| `stopped` | The kill switch trips (sent right before `cancel`), or the policy becomes `paused`. | Every controlled tab's pill says "Stopped" (no Stop button, gray border) for 4 s, then the indicator goes away. A tab `cancel` detaches keeps its "Stopped" pill for those 4 s. |
+| `ended` | `task_complete`, with or without `keepTabs`. | The indicator goes away on every controlled tab except `keepTabIds`: the tabs other running tasks still own (`TaskTabRegistry`). A tab kept open with `keepTabIds` loses it too. The next agent command on a tab brings it back. |
+
+### `stop_requested` (extension → daemon)
+
+```json
+{"type":"stop_requested","tabId":123}
+```
+
+Sent when the user clicks Stop in the pill. The click must be trusted (`event.isTrusted`), come from a pointer
+(`detail >= 1`, so not a keyboard or accessibility press) and reach the extension through a CDP binding
+(`Runtime.addBinding` with `executionContextName: "usemac"`) that the page's own scripts cannot call; the binding
+carries a per-tab token. The daemon drops it from a session that is not `ready`. The app handles it like Stop in the
+HUD: it trips the kill switch, unless the agent is already stopped or paused.
+
+### `frame.indicator`
+
+`frame` messages carry `"indicator": true` while the indicator is on screen in that frame (screencast frames of a
+visible tab show what Chrome paints). The daemon does not reuse such frames as an agent's screenshot (`vision_query`
+takes a fresh capture instead). Frames without the field (older extensions) count as plain.

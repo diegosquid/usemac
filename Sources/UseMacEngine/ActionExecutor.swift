@@ -100,8 +100,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 bundleId: currentApp?.bundleId,
                 windowTitle: currentApp?.windowTitle,
                 windowBounds: currentApp?.windowBounds,
-                title: "Did not run",
-                subtitle: refusal.message,
+                title: ActivityCaption.refusedBatchTitle(stepCount: request.steps.count),
+                subtitle: ActivityCaption.reason(errorCode: refusal.errorCode, message: refusal.message) ?? refusal.message,
                 mechanism: refusal.mechanism,
                 latencyMs: 0,
                 success: false,
@@ -166,8 +166,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     bundleId: currentApp?.bundleId,
                     windowTitle: currentApp?.windowTitle,
                     windowBounds: currentApp?.windowBounds,
-                    title: "Blocked \(step.action.rawValue)",
-                    subtitle: blockReason,
+                    title: ActivityCaption.failedStepTitle(step: step, position: (index + 1, request.steps.count)),
+                    subtitle: ActivityCaption.reason(errorCode: "POLICY_BLOCKED"),
                     elementId: step.elementId,
                     mechanism: "blocked",
                     latencyMs: 0,
@@ -217,10 +217,15 @@ public final class ActionExecutor: @unchecked Sendable {
             )
             stepResults.append(result)
 
-            let stepTitle = formatStepTitle(step: step, node: outcome.node, app: currentApp)
+            // A failed step says what UseMac couldn't do and why, in plain words (ActivityCaption).
+            let stepTitle = outcome.success
+                ? formatStepTitle(step: step, node: outcome.node, app: currentApp)
+                : ActivityCaption.failedStepTitle(step: step, targetName: outcome.node?.title, position: (index + 1, request.steps.count))
             let baseSubtitle = "\(outcome.mechanism) · \(String(format: "%.1f ms", stepLatencyMs))"
             let stepSubtitle: String
-            if !outcome.success, let msg = outcome.message, !msg.isEmpty {
+            if !outcome.success, let reason = ActivityCaption.reason(errorCode: outcome.errorCode, message: outcome.message) {
+                stepSubtitle = reason
+            } else if !outcome.success, let msg = outcome.message, !msg.isEmpty {
                 stepSubtitle = "\(baseSubtitle) · \(msg)"
             } else if outcome.effect == ActionEffect.none {
                 stepSubtitle = "\(baseSubtitle) · no visible effect"
@@ -446,20 +451,20 @@ public final class ActionExecutor: @unchecked Sendable {
         if step.action == .axAction, step.actionName?.lowercased() == "axopen" {
             return true
         }
-        guard step.action == .pressKey, let modifiers = step.modifiers else {
+        guard step.action == .pressKey else {
             return false
         }
-        let lower = Set(modifiers.map { $0.lowercased() })
-        return lower.contains("cmd")
-            || lower.contains("command")
-            || lower.contains("ctrl")
-            || lower.contains("control")
+        return ModifierAliases.isSensitive(step.modifiers)
     }
 
     // MARK: - Preconditions
 
     /// Stale-snapshot and expected-title checks. Returns a refusal when the batch must not run.
     private func preflightRefusal(_ request: BatchActionRequest, targetApp: AppDescriptor?) -> Refusal? {
+        // The app the batch resolved to, named or not (the app in front), may be one the user's rules block.
+        if let blocked = TargetRulesStore.shared.blockedMessage(for: targetApp) {
+            return Refusal(mechanism: "target-rules", errorCode: TargetRules.errorCode, message: blocked)
+        }
         guard let pid = targetApp?.pid, pid > 0 else { return nil }
         if let pinned = WindowResolver.pinnedTitle(pid: pid), WindowResolver.window(pid: pid, titleContains: pinned) == nil {
             return Refusal(
@@ -588,6 +593,9 @@ public final class ActionExecutor: @unchecked Sendable {
     /// Real (HID) input goes to whatever app is in front. Refuse unless that is the target.
     /// `point` is where a mouse event would land, for the check that it is not a UseMac window.
     private func frontmostGuard(_ targetApp: AppDescriptor?, input: String, at point: CGPoint? = nil) -> StepOutcome? {
+        if let point, let refusal = killSwitch.approvalPromptRefusal(at: point) {
+            return StepOutcome(success: false, mechanism: "self-target", message: refusal, errorCode: "SELF_TARGET_BLOCKED")
+        }
         if let pid = targetApp?.pid, pid > 0, !WindowResolver.isFrontmost(pid: pid) {
             return notFrontmostOutcome(targetApp: targetApp, input: input)
         }
@@ -606,6 +614,14 @@ public final class ActionExecutor: @unchecked Sendable {
         if (targetApp?.pid ?? 0) <= 0, let front = WindowResolver.frontmostPid() {
             receivers.append(front)
         }
+        if receivers.contains(where: { !workspaceMonitor.isUseMacProcess(pid: $0) && TargetRulesStore.shared.blocksProcess(pid: $0) }) {
+            return StepOutcome(
+                success: false,
+                mechanism: "target-rules",
+                message: "This input would land in a window of an app the user's UseMac rules block, so nothing was sent. \(TargetRules.stopHint)",
+                errorCode: TargetRules.errorCode
+            )
+        }
         guard receivers.contains(where: { workspaceMonitor.isUseMacProcess(pid: $0) }) else { return nil }
         return StepOutcome(
             success: false,
@@ -621,6 +637,81 @@ public final class ActionExecutor: @unchecked Sendable {
             success: false,
             mechanism: "hid-guard",
             message: "\(targetApp?.name ?? "The target app") is not in front (\(front) is), so UseMac did not send real \(input): it would have landed in the wrong app. Use background steps, or run the batch with \"foreground\": true.",
+            errorCode: "TARGET_NOT_FRONTMOST"
+        )
+    }
+
+    /// The window a step must reach when the batch names one (`window`, which pins it): UseMac works in that
+    /// window even when another window of the app is in front. Without a pin the target is whichever window
+    /// of the app is in front, which can change during the batch (⌘N opens one), so no id is enforced.
+    private func pinnedWindowId(_ targetApp: AppDescriptor?) -> CGWindowID? {
+        guard let pid = targetApp?.pid, pid > 0, WindowResolver.pinnedTitle(pid: pid) != nil else { return nil }
+        return targetApp?.windowId.map { CGWindowID($0) }
+    }
+
+    /// Real mouse input lands in the window on top at the point. With the target app in front, that can still be
+    /// another window: the user's own Chrome window over the one UseMac works in, or another app's window.
+    /// Decides how a step that would post real input sends it. `backgroundAllowed`: the event has a background
+    /// route without side effects (wheel and mouse-moved events, not clicks).
+    private func pointerRoute(_ targetApp: AppDescriptor?, at point: CGPoint?, backgroundAllowed: Bool) -> InputRouting.PointerRoute {
+        guard let pid = targetApp?.pid, pid > 0 else { return .foreground }
+        var documentIds: Set<CGWindowID>?
+        return InputRouting.pointerRoute(
+            point: point,
+            targetPid: pid,
+            targetWindowId: pinnedWindowId(targetApp),
+            windows: InputRouting.pointerWindows(),
+            isDocumentWindow: { id in
+                if documentIds == nil { documentIds = InputRouting.documentWindowIds(pid: pid) }
+                return documentIds?.contains(id) == true
+            },
+            backgroundAllowed: backgroundAllowed
+        )
+    }
+
+    /// Refuses real mouse input (clicks) that would land in another window than the target.
+    private func pointerRefusal(_ targetApp: AppDescriptor?, at point: CGPoint?, input: String) -> StepOutcome? {
+        switch pointerRoute(targetApp, at: point, backgroundAllowed: false) {
+        case .foreground:
+            return nil
+        case .background(let covering), .refuse(let covering):
+            return coveredWindowOutcome(targetApp: targetApp, covering: covering, input: input)
+        }
+    }
+
+    private func coveredWindowOutcome(targetApp: AppDescriptor?, covering: WindowResolver.WindowInfo?, input: String) -> StepOutcome {
+        let app = targetApp?.name ?? "the target app"
+        let place: String
+        if let covering {
+            place = covering.pid == targetApp?.pid
+                ? "another \(app) window is on top of it there"
+                : "a \(NSRunningApplication(processIdentifier: covering.pid)?.localizedName ?? "another app") window is on top of it there"
+        } else {
+            place = "it is not on screen there"
+        }
+        return StepOutcome(
+            success: false,
+            mechanism: "hid-guard",
+            message: "The \(app) window UseMac works in would not get real \(input): \(place). Nothing was sent. Use a background step (setValue, axAction, scrollIntoView, or click an element with AXPress), or wait until that window is in front.",
+            errorCode: "TARGET_NOT_FRONTMOST"
+        )
+    }
+
+    /// Real keys go to the focused (key) window of the app in front. Refuses when that is not the window UseMac
+    /// works in, e.g. a window it opened that sits behind the user's own window of the same app.
+    private func keyWindowGuard(_ targetApp: AppDescriptor?, input: String) -> StepOutcome? {
+        guard let pid = targetApp?.pid, pid > 0, let target = pinnedWindowId(targetApp) else { return nil }
+        let keysReach = InputRouting.keysReachTarget(
+            appIsFrontmost: WindowResolver.isFrontmost(pid: pid),
+            targetWindowId: target,
+            focusedWindowId: InputRouting.focusedWindowId(pid: pid)
+        )
+        if keysReach { return nil }
+        let app = targetApp?.name ?? "the target app"
+        return StepOutcome(
+            success: false,
+            mechanism: "hid-guard",
+            message: "The \(app) window UseMac works in is not \(app)'s focused window, so real \(input) would go to the window in front (probably the user's). Nothing was sent. Use setValue or axAction, which work without focus.",
             errorCode: "TARGET_NOT_FRONTMOST"
         )
     }
@@ -683,7 +774,7 @@ public final class ActionExecutor: @unchecked Sendable {
         case .hover:
             outcome = performHover(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .setValue:
-            outcome = performSetValue(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+            outcome = await performSetValue(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .type:
             outcome = performType(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .pressKey:
@@ -797,6 +888,7 @@ public final class ActionExecutor: @unchecked Sendable {
             if let pid = targetApp?.pid, pid > 0, let live = axIndexer.liveNode(for: id, pid: pid) {
                 resolved = ResolvedElement(pid: pid, element: live.element, node: live.node)
             } else if let other = axIndexer.node(for: id), !workspaceMonitor.isUseMacProcess(pid: other.pid),
+                      !TargetRulesStore.shared.blocksProcess(pid: other.pid),
                       let live = axIndexer.liveNode(for: id, pid: other.pid) {
                 resolved = ResolvedElement(pid: other.pid, element: live.element, node: live.node)
             } else {
@@ -830,14 +922,31 @@ public final class ActionExecutor: @unchecked Sendable {
         return parts.isEmpty ? "(empty match)" : parts.joined(separator: ", ")
     }
 
-    private func resolvePoint(step: ActionStep, node: ElementNode?) -> CGPoint? {
+    /// Where a pointer event for the step goes: the given coordinates, or the middle of the part of the element
+    /// inside its window. The middle of a tall text area or list can lie below the window, over another app.
+    private func resolvePoint(step: ActionStep, node: ElementNode?, targetApp: AppDescriptor?) -> CGPoint? {
         if let x = step.x, let y = step.y {
             return CGPoint(x: x, y: y)
         }
-        if let node, node.offscreen != true, node.frame.width > 0, node.frame.height > 0 {
-            return CGPoint(x: node.frame.centerX, y: node.frame.centerY)
+        guard let node, node.offscreen != true, node.frame.width > 0, node.frame.height > 0 else {
+            return nil
         }
-        return nil
+        let rect = CGRect(x: node.frame.x, y: node.frame.y, width: node.frame.width, height: node.frame.height)
+        if let window = targetWindowFrame(targetApp) {
+            let visible = rect.intersection(window)
+            if !visible.isNull, visible.width > 1, visible.height > 1 {
+                return CGPoint(x: visible.midX, y: visible.midY)
+            }
+        }
+        return CGPoint(x: rect.midX, y: rect.midY)
+    }
+
+    /// The target window's frame now (falls back to the bounds seen when the batch started).
+    private func targetWindowFrame(_ targetApp: AppDescriptor?) -> CGRect? {
+        if let windowId = targetApp?.windowId, let info = WindowResolver.info(windowId: CGWindowID(windowId)) {
+            return info.frame
+        }
+        return targetApp?.windowBounds.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
     }
 
     private func highlight(_ node: ElementNode?, targetApp: AppDescriptor?, onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?) {
@@ -1007,7 +1116,7 @@ public final class ActionExecutor: @unchecked Sendable {
             }
         }
 
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-click" : "cgevent-hid",
@@ -1019,7 +1128,8 @@ public final class ActionExecutor: @unchecked Sendable {
             )
         }
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point)
+            ?? pointerRefusal(targetApp, at: point, input: "clicks") {
             var refusedWithNode = refused
             refusedWithNode.node = resolved.node
             return refusedWithNode
@@ -1049,8 +1159,8 @@ public final class ActionExecutor: @unchecked Sendable {
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) -> StepOutcome {
-        let bgPid = backgroundPid(for: step, targetApp: targetApp)
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        var bgPid = backgroundPid(for: step, targetApp: targetApp)
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-hover" : "cgevent-hover",
@@ -1059,8 +1169,18 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "mouse movement", at: point) {
-            return refused
+        if bgPid == nil {
+            if let refused = frontmostGuard(targetApp, input: "mouse movement", at: point) {
+                return refused
+            }
+            switch pointerRoute(targetApp, at: point, backgroundAllowed: step.preferBackground != false) {
+            case .foreground:
+                break
+            case .background:
+                bgPid = targetApp?.pid
+            case .refuse(let covering):
+                return coveredWindowOutcome(targetApp: targetApp, covering: covering, input: "mouse movement")
+            }
         }
 
         if resolved.node != nil {
@@ -1106,7 +1226,7 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-click" : "cgevent-hid",
@@ -1115,7 +1235,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point)
+            ?? pointerRefusal(targetApp, at: point, input: "clicks") {
             return refused
         }
 
@@ -1154,7 +1275,7 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
-        guard let point = resolvePoint(step: step, node: resolved.node) else {
+        guard let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp) else {
             return StepOutcome(
                 success: false,
                 mechanism: bgPid != nil ? "cgevent-pid-click" : "cgevent-hid",
@@ -1163,7 +1284,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point)
+            ?? pointerRefusal(targetApp, at: point, input: "clicks") {
             return refused
         }
 
@@ -1190,7 +1312,7 @@ public final class ActionExecutor: @unchecked Sendable {
         resolved: ResolvedElement,
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
-    ) -> StepOutcome {
+    ) async -> StepOutcome {
         let text = step.text ?? ""
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
         let omniboxWarning = isChromiumApp(targetApp) && Self.isAddressBar(resolved.node)
@@ -1201,13 +1323,24 @@ public final class ActionExecutor: @unchecked Sendable {
             highlight(resolved.node, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
             // IMPORTANT: Never set kAXFocusedAttribute while app is in background!
             // In Chromium/Electron, kAXFocusedAttribute calls Widget::Activate() and steals focus/Spaces.
-            if bgPid == nil {
+            // The same goes for a window of the app in front that is not its focused window (one UseMac opened
+            // behind the user's): focusing it would bring it over the user's window and take their keys.
+            if bgPid == nil, keyWindowGuard(targetApp, input: "typing") == nil {
                 _ = AXUIElementSetAttributeValue(axEl, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             }
             if AXUIElementSetAttributeValue(axEl, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
-                let readBack = Self.axString(axEl, kAXValueAttribute)
+                var readBack = Self.axString(axEl, kAXValueAttribute)
                 let isToggle = ["AXCheckBox", "AXRadioButton", "AXSwitch"].contains(resolved.node?.role ?? "")
                 let isSecure = Self.axString(axEl, kAXSubroleAttribute) == "AXSecureTextField"
+                // Chromium sets the value in the page and updates its accessibility tree a moment later: wait for
+                // that before calling the value rejected.
+                var waitedMs = 0
+                while !isToggle, !isSecure, let current = readBack,
+                      ElementMatcher.normalize(current) != ElementMatcher.normalize(text), waitedMs < 300 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    waitedMs += 50
+                    readBack = Self.axString(axEl, kAXValueAttribute)
+                }
                 if !isToggle, !isSecure, let readBack, ElementMatcher.normalize(readBack) != ElementMatcher.normalize(text) {
                     return StepOutcome(
                         success: true,
@@ -1222,10 +1355,13 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         if bgPid == nil {
-            if let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node)) {
+            let point = resolvePoint(step: step, node: resolved.node, targetApp: targetApp)
+            if let refused = frontmostGuard(targetApp, input: "typing", at: point)
+                ?? keyWindowGuard(targetApp, input: "typing")
+                ?? point.flatMap({ pointerRefusal(targetApp, at: $0, input: "clicks") }) {
                 return refused
             }
-            if let point = resolvePoint(step: step, node: resolved.node) {
+            if let point {
                 pulse(point, label: resolved.node?.id ?? "setValue", targetApp: targetApp, onOverlayEvent: onOverlayEvent)
                 _ = postMouseClick(at: point, button: .left, clickCount: 1, restoreCursor: step.restoreCursor != false, targetPid: nil)
             }
@@ -1257,7 +1393,13 @@ public final class ActionExecutor: @unchecked Sendable {
         let text = step.text ?? ""
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node)) {
+        // Where a real click places the caret first (an element or explicit coordinates).
+        let clickPoint: CGPoint? = bgPid == nil && (resolved.node != nil || (step.x != nil && step.y != nil))
+            ? resolvePoint(step: step, node: resolved.node, targetApp: targetApp)
+            : nil
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node, targetApp: targetApp))
+            ?? keyWindowGuard(targetApp, input: "typing")
+            ?? clickPoint.flatMap({ pointerRefusal(targetApp, at: $0, input: "clicks") }) {
             return refused
         }
 
@@ -1268,9 +1410,7 @@ public final class ActionExecutor: @unchecked Sendable {
                 _ = AXUIElementSetAttributeValue(axEl, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             }
         }
-        if bgPid == nil,
-           let point = resolvePoint(step: step, node: resolved.node),
-           resolved.node != nil || (step.x != nil && step.y != nil) {
+        if let point = clickPoint {
             pulse(point, label: resolved.node?.id ?? "type", targetApp: targetApp, onOverlayEvent: onOverlayEvent)
             _ = postMouseClick(at: point, button: .left, clickCount: 1, restoreCursor: step.restoreCursor != false, targetPid: nil)
         }
@@ -1287,11 +1427,11 @@ public final class ActionExecutor: @unchecked Sendable {
 
     private func performPressKey(step: ActionStep, resolved: ResolvedElement, targetApp: AppDescriptor?) -> StepOutcome {
         guard let keyName = step.key?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let keyCode = Self.keyCodeMap[keyName.lowercased()] else {
+              let keyCode = NativeKeyMap.keyCode(for: step.key) else {
             return StepOutcome(
                 success: false,
                 mechanism: "cgevent-key",
-                message: "Unsupported or missing key: \(step.key ?? "<nil>")",
+                message: NativeKeyMap.unsupportedKeyMessage(for: step.key),
                 errorCode: "INVALID_REQUEST"
             )
         }
@@ -1308,7 +1448,7 @@ public final class ActionExecutor: @unchecked Sendable {
             warning = "AXConfirm failed on \(resolved.node?.id ?? "the element"); sent a key event instead."
         }
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "key presses") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "key presses") ?? keyWindowGuard(targetApp, input: "key presses") {
             return refused
         }
 
@@ -1338,7 +1478,7 @@ public final class ActionExecutor: @unchecked Sendable {
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) async -> StepOutcome {
-        let bgPid = backgroundPid(for: step, targetApp: targetApp)
+        var bgPid = backgroundPid(for: step, targetApp: targetApp)
         let dy = Int32(step.deltaY ?? 0)
         let dx = Int32(step.deltaX ?? 0)
 
@@ -1375,6 +1515,25 @@ public final class ActionExecutor: @unchecked Sendable {
 
         let probes = scrollProbes(pid: pid, near: point)
 
+        // The app is in front, but a real wheel event goes to the window on top at the point, which may not be
+        // the target window (the user's own window of the same app, or another app's): scroll it in the
+        // background then.
+        if bgPid == nil {
+            if let refused = frontmostGuard(targetApp, input: "scrolling", at: point) {
+                return refused
+            }
+            switch pointerRoute(targetApp, at: point, backgroundAllowed: step.preferBackground != false) {
+            case .foreground:
+                break
+            case .background:
+                bgPid = targetApp?.pid
+            case .refuse(let covering):
+                var refused = coveredWindowOutcome(targetApp: targetApp, covering: covering, input: "scrolling")
+                refused.node = resolved.node
+                return refused
+            }
+        }
+
         if let bgPid {
             if let point {
                 scrollEvent.location = point
@@ -1383,14 +1542,17 @@ public final class ActionExecutor: @unchecked Sendable {
             scrollEvent.postToPid(bgPid)
             let moved = await measureScroll(probes: probes)
             if moved.map({ abs($0) >= 1 }) != true, dy != 0,
-               let fallback = await scrollToNextOffscreen(pid: pid, down: dy < 0, targetApp: targetApp, onOverlayEvent: onOverlayEvent) {
+               let fallback = await scrollToNextOffscreen(
+                   pid: pid,
+                   down: dy < 0,
+                   point: point,
+                   elementId: resolved.node?.id,
+                   targetApp: targetApp,
+                   onOverlayEvent: onOverlayEvent
+               ) {
                 return fallback
             }
             return StepOutcome(success: true, mechanism: "cgevent-pid-scroll", node: resolved.node, scrollDeltaY: moved)
-        }
-
-        if let refused = frontmostGuard(targetApp, input: "scrolling", at: point) {
-            return refused
         }
 
         let savedCursor = CGEvent(source: nil)?.location
@@ -1414,12 +1576,7 @@ public final class ActionExecutor: @unchecked Sendable {
         if let x = step.x, let y = step.y {
             return CGPoint(x: x, y: y)
         }
-        let window: CGRect? = {
-            if let windowId = targetApp?.windowId, let info = WindowResolver.info(windowId: CGWindowID(windowId)) {
-                return info.frame
-            }
-            return targetApp?.windowBounds.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
-        }()
+        let window = targetWindowFrame(targetApp)
         if let node, node.offscreen != true, node.frame.width > 0, node.frame.height > 0 {
             let rect = CGRect(x: node.frame.x, y: node.frame.y, width: node.frame.width, height: node.frame.height)
             if let window {
@@ -1481,20 +1638,28 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     /// Web content exposes no scroll bars and may ignore background wheel events. Scrolling the next element
-    /// that is out of view into view (AXScrollToVisible) pages through it without any events.
+    /// that is out of view into view (AXScrollToVisible) pages through it without any events. The candidate is
+    /// taken from the web area or scroll area under `point` (or holding `elementId`), never from the rest of the
+    /// window: Chrome lists its infobar and tab strip after the page.
     private func scrollToNextOffscreen(
         pid: Int32,
         down: Bool,
+        point: CGPoint?,
+        elementId: String?,
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) async -> StepOutcome? {
-        let nodes = axIndexer.latestNodes(pid: pid)
-        guard let firstVisible = nodes.firstIndex(where: { $0.offscreen != true && $0.role != "AXWindow" }),
-              let lastVisible = nodes.lastIndex(where: { $0.offscreen != true && $0.role != "AXWindow" }) else { return nil }
-        let candidate: ElementNode? = down
-            ? nodes[(lastVisible + 1)...].first(where: { $0.offscreen == true })
-            : nodes[..<firstVisible].last(where: { $0.offscreen == true })
-        guard let candidate, let element = axIndexer.element(for: candidate.id, pid: pid) else { return nil }
+        let layout = axIndexer.latestScrollLayout(pid: pid)
+        let elementIndex = elementId.flatMap { id in layout.nodes.firstIndex(where: { $0.id == id }) }
+        guard let index = ScrollFallback.nextOffscreenIndex(
+            nodes: layout.nodes,
+            containers: layout.containers,
+            at: point,
+            down: down,
+            elementIndex: elementIndex
+        ) else { return nil }
+        let candidate = layout.nodes[index]
+        guard let element = axIndexer.element(for: candidate.id, pid: pid) else { return nil }
         guard AXUIElementPerformAction(element, "AXScrollToVisible" as CFString) == .success else { return nil }
         try? await Task.sleep(nanoseconds: 180_000_000)
         let refreshed = axIndexer.liveNode(for: candidate.id, pid: pid)?.node
@@ -1687,7 +1852,8 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Picks a file in an open panel without Finder navigation or focus: type the file name in the panel's
     /// search field, select the result row with exactly that path and press the panel's Open button (AXOpen
-    /// as a fallback). Falls back to ⌘⇧G only when the app is already in front.
+    /// as a fallback). Falls back to ⌘⇧G only when the app is already in front. A file the search can never list
+    /// (/tmp, $TMPDIR, hidden folders) goes straight to ⌘⇧G in front, and fails fast in the background.
     private func performNativeUploadFile(
         step: ActionStep,
         resolved: ResolvedElement,
@@ -1741,8 +1907,20 @@ public final class ActionExecutor: @unchecked Sendable {
             return StepOutcome(success: true, mechanism: "nsopenpanel-navigate", message: "Selected \(fileName).\(extra)", effect: .changed)
         }
 
+        // Spotlight never lists files in /tmp, $TMPDIR or hidden folders, and Go to Folder takes no keys in the
+        // background (see OpenPanelReach). Say so now instead of searching; with the app in front, go to ⌘⇧G.
+        let searchBlocker = OpenPanelReach.searchBlocker(for: file)
+        if let searchBlocker, !WindowResolver.isFrontmost(pid: pid) {
+            return StepOutcome(
+                success: false,
+                mechanism: "nsopenpanel-unreachable",
+                message: OpenPanelReach.backgroundMessage(fileName: fileName, reason: searchBlocker, appName: targetApp?.name ?? "the app"),
+                errorCode: "TARGET_NOT_FRONTMOST"
+            )
+        }
+
         // 2. Search by name (Spotlight) when the file's folders are not reachable from the sidebar.
-        if let search = panel.searchField {
+        if searchBlocker == nil, let search = panel.searchField {
             // The picker search is Spotlight: index the file now so a file created seconds ago is found.
             await Self.indexForSpotlight(file)
             _ = AXUIElementSetAttributeValue(search, kAXValueAttribute as CFString, fileName as CFTypeRef)
@@ -1812,7 +1990,7 @@ public final class ActionExecutor: @unchecked Sendable {
                     mechanism: "nsopenpanel-search",
                     message: ambiguous
                         ? "Several files named \(fileName) showed up in the picker search. Give the file a unique name, or rerun this step in a batch with \"foreground\": true."
-                        : "The picker could not be driven in the background: browsing its folders did not enable Open, and its search (Spotlight) did not list \(fileName) yet. Rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back), or retry once Spotlight has indexed the file (not /tmp or hidden folders).",
+                        : "The picker could not be driven in the background: browsing its folders did not enable Open, and its search (Spotlight) did not list \(fileName) yet. Rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back), or retry once Spotlight has indexed the file.",
                     errorCode: "ELEMENT_NOT_FOUND"
                 )
             }
@@ -1834,8 +2012,7 @@ public final class ActionExecutor: @unchecked Sendable {
         _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
         try? await Task.sleep(nanoseconds: 300_000_000)
         _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        let closed = findOpenPanel(pid: pid) == nil
+        let closed = await waitForPanelToClose(pid: pid)
         return StepOutcome(
             success: closed,
             mechanism: "nsopenpanel-goto",
@@ -2280,14 +2457,7 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private func formatKeyChord(key: String?, modifiers: [String]?) -> String {
-        var modPrefix = ""
-        if let modifiers {
-            let lower = Set(modifiers.map { $0.lowercased() })
-            if lower.contains("ctrl") || lower.contains("control") { modPrefix += "⌃" }
-            if lower.contains("alt") || lower.contains("opt") || lower.contains("option") { modPrefix += "⌥" }
-            if lower.contains("shift") { modPrefix += "⇧" }
-            if lower.contains("cmd") || lower.contains("command") { modPrefix += "⌘" }
-        }
+        let modPrefix = ModifierAliases.symbols(modifiers)
         let rawKey = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let formattedKey = rawKey.count == 1 ? rawKey.uppercased() : rawKey.capitalized
         return modPrefix + (formattedKey.isEmpty ? "Key" : formattedKey)
@@ -2383,73 +2553,6 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private func modifierFlags(from modifiers: [String]?) -> CGEventFlags {
-        guard let modifiers else { return [] }
-        var flags: CGEventFlags = []
-        for mod in modifiers {
-            switch mod.lowercased() {
-            case "cmd", "command":
-                flags.insert(.maskCommand)
-            case "shift":
-                flags.insert(.maskShift)
-            case "alt", "opt", "option":
-                flags.insert(.maskAlternate)
-            case "ctrl", "control":
-                flags.insert(.maskControl)
-            default:
-                break
-            }
-        }
-        return flags
+        ModifierAliases.eventFlags(modifiers)
     }
-
-    private static let keyCodeMap: [String: CGKeyCode] = [
-        "return": 0x24,
-        "enter": 0x24,
-        "tab": 0x30,
-        "space": 0x31,
-        "delete": 0x33,
-        "backspace": 0x33,
-        "escape": 0x35,
-        "esc": 0x35,
-        "left": 0x7B,
-        "right": 0x7C,
-        "down": 0x7D,
-        "up": 0x7E,
-        "a": 0x00,
-        "s": 0x01,
-        "d": 0x02,
-        "f": 0x03,
-        "h": 0x04,
-        "g": 0x05,
-        "z": 0x06,
-        "x": 0x07,
-        "c": 0x08,
-        "v": 0x09,
-        "b": 0x0B,
-        "q": 0x0C,
-        "w": 0x0D,
-        "e": 0x0E,
-        "r": 0x0F,
-        "y": 0x10,
-        "t": 0x11,
-        "1": 0x12,
-        "2": 0x13,
-        "3": 0x14,
-        "4": 0x15,
-        "6": 0x16,
-        "5": 0x17,
-        "9": 0x19,
-        "7": 0x1A,
-        "8": 0x1C,
-        "0": 0x1D,
-        "o": 0x1F,
-        "u": 0x20,
-        "i": 0x22,
-        "p": 0x23,
-        "l": 0x25,
-        "j": 0x26,
-        "k": 0x28,
-        "n": 0x2D,
-        "m": 0x2E
-    ]
 }

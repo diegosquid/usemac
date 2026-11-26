@@ -156,6 +156,11 @@ public final class ActivityHUDController {
         panel.isVisible
     }
 
+    /// Where the HUD panel is on screen (the Ask-mode prompt docks next to it).
+    public var panelFrame: NSRect {
+        panel.frame
+    }
+
     public init(appState: AppState) {
         self.appState = appState
 

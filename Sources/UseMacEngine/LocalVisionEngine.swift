@@ -133,12 +133,21 @@ public final class LocalVisionEngine: @unchecked Sendable {
     }
 
     public static func isRuntimeInstalled() -> Bool {
-        let py = venvPythonURL.path
-        guard FileManager.default.isExecutableFile(atPath: py) else { return false }
-        let sitePackages = venvDir.appendingPathComponent("lib").path
-        guard let enumerator = FileManager.default.enumerator(atPath: sitePackages) else { return false }
-        while let item = enumerator.nextObject() as? String {
-            if item.hasSuffix("mlx_vlm") || item.contains("mlx_vlm/") {
+        guard FileManager.default.isExecutableFile(atPath: venvPythonURL.path) else { return false }
+        return sitePackagesContainMLXVLM(libDir: venvDir.appendingPathComponent("lib", isDirectory: true))
+    }
+
+    /// Looks for `lib/python*/site-packages/mlx_vlm` directly. Walking the whole venv (about 15,000 files)
+    /// made every status call slow, and under load the walk failed with EINVAL in tests that start engines.
+    static func sitePackagesContainMLXVLM(libDir: URL) -> Bool {
+        let fileManager = FileManager.default
+        guard let pythons = try? fileManager.contentsOfDirectory(atPath: libDir.path) else { return false }
+        for name in pythons where name.hasPrefix("python") {
+            let package = libDir
+                .appendingPathComponent(name, isDirectory: true)
+                .appendingPathComponent("site-packages/mlx_vlm", isDirectory: true)
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: package.path, isDirectory: &isDirectory), isDirectory.boolValue {
                 return true
             }
         }

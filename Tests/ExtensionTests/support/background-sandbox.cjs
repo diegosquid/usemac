@@ -57,6 +57,10 @@ class FakeWebSocket {
  * @param {(tabId:number, tab:object) => string|null} [options.attachError]  Message chrome.debugger.attach rejects with.
  * @param {(tabId:number, method:string, params:object) => any} [options.cdp]  CDP command results (default {}).
  * @param {string} [options.userAgent]
+ * @param {Array<object>} [options.groups]  Initial tab groups: { id, windowId, title?, color? } (tabs join with groupId).
+ * @param {object} [options.session]  Initial chrome.storage.session contents, as a restarted service worker finds them.
+ * @param {number|((api:string) => number)} [options.apiDelayMs]  Real latency (ms) for tabs.get, tabs.group and the
+ *   tabGroups calls, so concurrent callers interleave the way they do against Chrome. Default 0.
  */
 function createBackgroundSandbox(options = {}) {
   const calls = [];
@@ -86,6 +90,9 @@ function createBackgroundSandbox(options = {}) {
       ...(t.pendingUrl ? { pendingUrl: t.pendingUrl } : {})
     });
   }
+  for (const g of options.groups || []) {
+    groups.set(g.id, { id: g.id, windowId: g.windowId ?? 1, title: g.title ?? "", color: g.color || "grey", collapsed: false });
+  }
   for (const w of options.windows || []) {
     windows.set(w.id, { id: w.id, focused: Boolean(w.focused), type: "normal", state: w.state || "normal" });
   }
@@ -101,7 +108,19 @@ function createBackgroundSandbox(options = {}) {
   const windowsFocusChanged = makeEvent();
   const windowsBoundsChanged = makeEvent();
   const debuggerDetached = makeEvent();
-  const sessionStore = {};
+  const sessionStore = clone(options.session || {});
+
+  async function apiDelay(api) {
+    const ms = typeof options.apiDelayMs === "function" ? options.apiDelayMs(api) : options.apiDelayMs || 0;
+    if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Like Chrome, a group that loses its last tab is gone.
+  function dropEmptyGroups() {
+    for (const id of Array.from(groups.keys())) {
+      if (!Array.from(tabs.values()).some((t) => t.groupId === id)) groups.delete(id);
+    }
+  }
 
   function getTabOrThrow(id) {
     const tab = tabs.get(id);
@@ -177,7 +196,10 @@ function createBackgroundSandbox(options = {}) {
       onUpdated: tabsUpdated,
       onRemoved: tabsRemoved,
       onActivated: tabsActivated,
-      get: async (id) => clone(getTabOrThrow(id)),
+      get: async (id) => {
+        await apiDelay("tabs.get");
+        return clone(getTabOrThrow(id));
+      },
       getZoom: async (id) => {
         getTabOrThrow(id);
         return options.zoom ? options.zoom(id) : 1;
@@ -186,6 +208,7 @@ function createBackgroundSandbox(options = {}) {
         record("tabs.remove", id);
         getTabOrThrow(id);
         tabs.delete(id);
+        dropEmptyGroups();
         tabsRemoved.emit(id, {});
       },
       query: async (query = {}) => {
@@ -207,25 +230,44 @@ function createBackgroundSandbox(options = {}) {
       },
       group: async ({ groupId, tabIds, createProperties }) => {
         record("tabs.group", { groupId, tabIds, createProperties });
+        await apiDelay("tabs.group");
         let id = groupId;
         if (id == null) {
           id = nextGroupId++;
-          groups.set(id, { id, windowId: createProperties?.windowId, title: "" });
+          const windowId = createProperties?.windowId ?? getTabOrThrow(tabIds[0]).windowId;
+          groups.set(id, { id, windowId, title: "", color: "grey", collapsed: false });
+        } else if (!groups.has(id)) {
+          throw new Error(`No group with id: ${id}.`);
         }
-        for (const tabId of tabIds) getTabOrThrow(tabId).groupId = id;
+        // A tab grouped into a group of another window moves to that window, as in Chrome.
+        for (const tabId of tabIds) {
+          const tab = getTabOrThrow(tabId);
+          tab.groupId = id;
+          tab.windowId = groups.get(id).windowId;
+        }
+        dropEmptyGroups();
         return id;
       }
     },
     tabGroups: {
       TAB_GROUP_ID_NONE: -1,
       query: async (query = {}) => {
+        record("tabGroups.query", query);
+        await apiDelay("tabGroups.query");
         return Array.from(groups.values())
           .filter((g) => query.windowId == null || g.windowId === query.windowId)
           .filter((g) => query.title == null || g.title === query.title)
           .map(clone);
       },
+      get: async (id) => {
+        await apiDelay("tabGroups.get");
+        if (!groups.has(id)) throw new Error(`No group with id: ${id}.`);
+        return clone(groups.get(id));
+      },
       update: async (id, props) => {
         record("tabGroups.update", id, props);
+        await apiDelay("tabGroups.update");
+        if (!groups.has(id)) throw new Error(`No group with id: ${id}.`);
         Object.assign(groups.get(id), props);
         return clone(groups.get(id));
       }
@@ -352,6 +394,15 @@ function createBackgroundSandbox(options = {}) {
       activateInWindow(getTabOrThrow(tabId));
     },
 
+    /** Session storage as the extension last wrote it. */
+    session: sessionStore,
+
+    /** The user drags a tab out of its group (or Chrome ungroups it). */
+    ungroupTab(tabId) {
+      getTabOrThrow(tabId).groupId = -1;
+      dropEmptyGroups();
+    },
+
     /** The user minimizes or restores a window ("minimized" | "normal" | ...); focus leaves or returns to it. */
     setWindowState(windowId, windowState) {
       const win = windows.get(windowId);
@@ -363,13 +414,31 @@ function createBackgroundSandbox(options = {}) {
     /** Marks the bridge authenticated so the extension sends responses (captured in `sent`). */
     markReady() {
       vm.runInContext(
-        `state.ws = state.ws || new WebSocket("ws://test"); state.ws.readyState = WebSocket.OPEN; state.authState = "ready";`,
+        // The real connectWS installs the socket handlers (deliver() uses them); the fake socket never opens.
+        `if (!state.ws) connectWS(true); state.ws.readyState = WebSocket.OPEN; state.authState = "ready";`,
         context
       );
     },
 
     get sent() {
       return vm.runInContext("state.ws ? state.ws.sentFrames : []", context);
+    },
+
+    /** Delivers a daemon -> extension frame (e.g. `cancel`, `tab_control`) through the real socket handler. */
+    async deliver(message, timeoutMs = 2000) {
+      const startedAt = Date.now();
+      while (!vm.runInContext("typeof state.ws?.onmessage === 'function'", context)) {
+        if (Date.now() - startedAt > timeoutMs) throw new Error("The extension never set up its socket handler");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      this.markReady();
+      context.__deliverText = JSON.stringify(message);
+      vm.runInContext("state.ws.onmessage({ data: __deliverText })", context);
+    },
+
+    /** A CDP event from the debugger, as Chrome sends it for the tab's top-level target. */
+    debuggerEvent(tabId, method, params = {}) {
+      chrome.debugger.onEvent.emit({ tabId }, method, params);
     },
 
     /** Sends a daemon request through the real dispatcher and resolves with the extension's response frame. */

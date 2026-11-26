@@ -132,6 +132,8 @@ public struct SetupGuideView: View {
     @State private var visionChoice: SetupVisionChoice
     @State private var agentChoice: SetupAgentChoice = .claudeCode
     @State private var copiedKey: String?
+    /// Chrome step on a build with a store ID: the user chose the bundled folder over the Chrome Web Store.
+    @State private var chromeLoadUnpacked = false
 
     public init(
         appState: AppState,
@@ -443,7 +445,12 @@ public struct SetupGuideView: View {
     // 4. Chrome
 
     private var chromeStep: some View {
-        VStack(spacing: 26) {
+        // Release builds that know the Chrome Web Store ID offer the store first, no Developer mode needed.
+        // Beta builds (no ID) and anyone who picks "Load it unpacked instead" get the bundled folder.
+        let hasStoreListing = UseMacDefaults.chromeWebStoreListingURL != nil
+        let useStore = hasStoreListing && !chromeLoadUnpacked
+
+        return VStack(spacing: 26) {
             stepHeader(
                 symbol: "globe",
                 title: "Connect Chrome",
@@ -451,14 +458,13 @@ public struct SetupGuideView: View {
             )
 
             VStack(spacing: 0) {
-                if appState.chromeWebStoreExtensionId != nil {
-                    // Release builds that know the Chrome Web Store ID: one click, no Developer mode.
+                if useStore {
                     SetupRow(
                         leading: { SetupNumberBadge(number: 1) },
-                        title: "Add UseMac to Chrome",
-                        detail: "Opens the Chrome Web Store. Click Add to Chrome."
+                        title: "Add from Chrome Web Store",
+                        detail: "Opens UseMac Browser Bridge in the Chrome Web Store. Click Add to Chrome."
                     ) {
-                        Button("Add to Chrome") { appState.installPublishedChromeExtension() }
+                        Button("Open Web Store") { appState.installPublishedChromeExtension() }
                             .buttonStyle(SubtleOutlineButtonStyle())
                     }
                 } else {
@@ -486,7 +492,7 @@ public struct SetupGuideView: View {
                 }
                 InsetDivider(leading: 64)
                 SetupRow(
-                    leading: { SetupNumberBadge(number: appState.chromeWebStoreExtensionId != nil ? 2 : 3) },
+                    leading: { SetupNumberBadge(number: useStore ? 2 : 3) },
                     title: "Pair it with this Mac",
                     detail: "Open the extension popup and paste the pairing key."
                 ) {
@@ -500,6 +506,16 @@ public struct SetupGuideView: View {
             }
             .codexCardElevation(colorScheme, cornerRadius: 16)
             .frame(width: 540)
+
+            if hasStoreListing {
+                Button(chromeLoadUnpacked ? "Add from Chrome Web Store instead" : "Load it unpacked instead") {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                        chromeLoadUnpacked.toggle()
+                    }
+                }
+                .buttonStyle(SetupLinkButtonStyle())
+                .padding(.top, -14)
+            }
 
             chromeStatusLine
         }
@@ -661,6 +677,7 @@ public struct SetupGuideView: View {
     private var executionModeDetail: String {
         switch appState.status.policy {
         case .autonomous: return "Agents can read and act without asking."
+        case .ask: return "Uploads, page scripts and ⌘/⌃ shortcuts wait for your OK."
         case .confirmSensitive: return "Uploads, page scripts and ⌘/⌃ shortcuts are blocked."
         case .readOnly: return "Agents can look and scroll. Clicks and typing are blocked."
         case .paused: return "Agents are paused until you resume."
