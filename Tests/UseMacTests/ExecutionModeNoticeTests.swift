@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import UseMacEngine
@@ -217,6 +218,50 @@ final class ExecutionModeNoticeTests: XCTestCase {
         // A reply from an older daemon, without the field, still decodes.
         let old = try JSONDecoder().decode(RPCResponse.self, from: Data(#"{"id":"3","ok":false,"serverLatencyMs":0,"error":{"code":"POLICY_BLOCKED","message":"m"}}"#.utf8))
         XCTAssertNil(old.error?.hint)
+    }
+
+    /// The real engine behind the real socket server: the raw NDJSON line carries `error.hint`.
+    func testTheSocketLineCarriesTheHint() throws {
+        let service = makeService()
+        service.setGovernancePolicy(.readOnly)
+        let socketPath = "/tmp/usemac-notice-sock-\(UUID().uuidString.prefix(8)).sock"
+        let server = UnixSocketServer(socketPath: socketPath, service: service)
+        try server.start()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { Darwin.close(fd) }
+        var tv = timeval(tv_sec: 10, tv_usec: 0)
+        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_un()
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &addr.sun_path) { buffer in
+            buffer.initializeMemory(as: UInt8.self, repeating: 0)
+            for (index, byte) in socketPath.utf8.enumerated() { buffer[index] = byte }
+        }
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        XCTAssertEqual(connected, 0)
+
+        let line = #"{"id":"s1","method":"act","act":{"app":"no-such-app","steps":[{"action":"click","elementId":"e1"}],"returnObservation":false}}"# + "\n"
+        _ = line.utf8CString.withUnsafeBufferPointer { Darwin.write(fd, $0.baseAddress!, line.utf8.count) }
+        var received = Data()
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        while !received.contains(0x0A) {
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count <= 0 { break }
+            received.append(contentsOf: buffer[..<count])
+        }
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: received) as? [String: Any])
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "POLICY_BLOCKED")
+        XCTAssertEqual(error["hint"] as? String, ExecutionModeNotice.agentHint(policy: .readOnly, killSwitchTripped: false))
     }
 
     func testMCPShowsTheDaemonsHintAsTheNextStep() async throws {

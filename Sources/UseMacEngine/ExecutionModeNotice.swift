@@ -80,7 +80,7 @@ public enum ExecutionModeNotice {
     /// change it. Nil when nothing blocks agents (Autonomous, or Ask without the Emergency stop).
     public static func agentHint(policy: GovernancePolicy, killSwitchTripped: Bool) -> String? {
         if killSwitchTripped {
-            return "The emergency stop is on in UseMac (⇧⌘⎋), so agents can't read the screen or act. Stop and ask the user to resume (UseMac menu bar icon → Resume Agents); agents can't turn it off. Don't look for another route."
+            return "The emergency stop (Kill Switch, ⇧⌘⎋) is on in UseMac, so agents can't read the screen or act. Stop and ask the user to resume (UseMac menu bar icon → Resume Agents); agents can't turn it off. Don't look for another route."
         }
         switch policy {
         case .autonomous, .ask:
