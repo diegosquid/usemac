@@ -156,7 +156,10 @@ public final class WorkspaceMonitor: @unchecked Sendable {
     }
 
     public func isGuessedTarget(requestApp: String?, stepApps: [String?] = []) -> Bool {
-        Self.isGuessedTarget(requestApp: requestApp, stepApps: stepApps, hasPairedApp: getPairedApp() != nil)
+        lock.lock()
+        let hasPaired = pairedApp.map { !isUseMacApp($0) } ?? false
+        lock.unlock()
+        return Self.isGuessedTarget(requestApp: requestApp, stepApps: stepApps, hasPairedApp: hasPaired)
     }
 
     /// The running app `query` names (name, bundle ID or PID), matched like `resolveTarget` but without window
@@ -230,10 +233,17 @@ public final class WorkspaceMonitor: @unchecked Sendable {
         lock.unlock()
 
         guard let currentPaired, !isUseMacApp(currentPaired) else { return nil }
-        let apps = listRunningApps()
-        if let fresh = apps.first(where: { $0.pid == currentPaired.pid }) {
+        if let running = NSRunningApplication(processIdentifier: currentPaired.pid), !running.isTerminated {
+            var fresh = currentPaired
+            fresh.isActive = running.isActive
+            fresh.isHidden = running.isHidden
+            if let name = running.localizedName, !name.isEmpty {
+                fresh.name = name
+            }
             lock.lock()
-            pairedApp = fresh
+            if pairedApp?.pid == currentPaired.pid {
+                pairedApp = fresh
+            }
             lock.unlock()
             return fresh
         }

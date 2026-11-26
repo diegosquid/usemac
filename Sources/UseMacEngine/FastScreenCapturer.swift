@@ -27,25 +27,59 @@ public final class FastScreenCapturer: @unchecked Sendable {
 
     public init() {}
 
+    /// Captures the target app window (or primary display when no app is named).
+    /// When `streamer` already has a live frame for the target window, reuses it in <5 ms without
+    /// hitting `SCShareableContent`. When `writeToDisk` is `false`, skips creating/writing a temp file.
     public func capture(
         _ request: ScreenshotRequest,
-        targetApp: AppDescriptor? = nil
+        targetApp: AppDescriptor? = nil,
+        streamer: LiveScreenStreamer? = nil,
+        writeToDisk: Bool = true
+    ) async throws -> ScreenshotResult {
+        try await captureWindow(request, targetApp: targetApp, streamer: streamer, writeToDisk: writeToDisk)
+    }
+
+    /// Captures a window screenshot, reusing `streamer.latestFrame(forWindowID:)` when available
+    /// and optionally skipping disk writes (`writeToDisk: false`).
+    public func captureWindow(
+        _ request: ScreenshotRequest,
+        targetApp: AppDescriptor? = nil,
+        streamer: LiveScreenStreamer? = nil,
+        writeToDisk: Bool = true
     ) async throws -> ScreenshotResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
 
-        // A capture for a named app must show that app. Falling back to the whole display would hand the
-        // agent the user's screen labeled as the app.
-        let namedApp = !(request.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        let prepared = try await prepareCapture(
-            targetApp: targetApp,
-            maxDimension: request.maxDimension,
-            allowDisplayFallback: !namedApp
-        )
+        if let targetApp, TargetRulesStore.shared.blocksProcess(pid: targetApp.pid) {
+            throw CaptureError.targetBlocked(appName: targetApp.name)
+        }
 
-        let cgImage = try await SCScreenshotManager.captureImage(
-            contentFilter: prepared.filter,
-            configuration: prepared.config
-        )
+        let capturedImage: CGImage
+        if let liveImage = liveStreamImage(for: targetApp, streamer: streamer) {
+            capturedImage = Self.applyRegionAndScale(
+                liveImage,
+                region: request.region,
+                maxDimension: request.maxDimension
+            )
+        } else {
+            // A capture for a named app must show that app. Falling back to the whole display would hand the
+            // agent the user's screen labeled as the app.
+            let namedApp = !(request.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let prepared = try await prepareCapture(
+                targetApp: targetApp,
+                maxDimension: request.maxDimension,
+                allowDisplayFallback: !namedApp
+            )
+
+            let rawImage = try await SCScreenshotManager.captureImage(
+                contentFilter: prepared.filter,
+                configuration: prepared.config
+            )
+            capturedImage = Self.applyRegionAndScale(
+                rawImage,
+                region: request.region,
+                maxDimension: request.maxDimension
+            )
+        }
 
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
@@ -54,21 +88,26 @@ public final class FastScreenCapturer: @unchecked Sendable {
 
         let clampedQuality = min(max(request.quality, 0.1), 1.0)
         let options = [kCGImageDestinationLossyCompressionQuality: clampedQuality] as CFDictionary
-        CGImageDestinationAddImage(destination, cgImage, options)
+        CGImageDestinationAddImage(destination, capturedImage, options)
 
         guard CGImageDestinationFinalize(destination) else {
             throw CaptureError.jpegEncodingFailed
         }
 
-        try FileManager.default.createDirectory(
-            atPath: UseMacDefaults.captureDirectory,
-            withIntermediateDirectories: true
-        )
-
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let path = "\(UseMacDefaults.captureDirectory)/capture-\(nowMs).jpg"
         let jpegData = data as Data
-        try jpegData.write(to: URL(fileURLWithPath: path))
+        let path: String
+        if writeToDisk {
+            try FileManager.default.createDirectory(
+                atPath: UseMacDefaults.captureDirectory,
+                withIntermediateDirectories: true
+            )
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let filePath = "\(UseMacDefaults.captureDirectory)/capture-\(nowMs).jpg"
+            try jpegData.write(to: URL(fileURLWithPath: filePath))
+            path = filePath
+        } else {
+            path = ""
+        }
 
         let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
         let base64 = request.includeBase64 ? jpegData.base64EncodedString() : nil
@@ -76,8 +115,8 @@ public final class FastScreenCapturer: @unchecked Sendable {
         return ScreenshotResult(
             path: path,
             mimeType: "image/jpeg",
-            width: cgImage.width,
-            height: cgImage.height,
+            width: capturedImage.width,
+            height: capturedImage.height,
             byteCount: jpegData.count,
             latencyMs: latencyMs,
             base64Data: base64
@@ -88,8 +127,19 @@ public final class FastScreenCapturer: @unchecked Sendable {
     /// given) without writing to disk. Returns nil when the app has no capturable window.
     public func capturePreviewCGImage(
         targetApp: AppDescriptor?,
-        maxDimension: Int = 560
+        maxDimension: Int = 560,
+        streamer: LiveScreenStreamer? = nil
     ) async -> (image: CGImage, windowBounds: ScreenRect?)? {
+        if let targetApp, TargetRulesStore.shared.blocksProcess(pid: targetApp.pid) {
+            return nil
+        }
+        if let targetApp,
+           let streamer,
+           let windowId = targetWindowIDForLiveLookup(targetApp: targetApp, streamer: streamer),
+           let live = streamer.latestFrameWithBounds(forWindowID: windowId) {
+            let scaled = Self.applyRegionAndScale(live.image, region: nil, maxDimension: maxDimension)
+            return (scaled, live.windowBounds ?? targetApp.windowBounds)
+        }
         do {
             let prepared = try await prepareCapture(
                 targetApp: targetApp,
@@ -104,6 +154,63 @@ public final class FastScreenCapturer: @unchecked Sendable {
         } catch {
             return nil
         }
+    }
+
+    private func targetWindowIDForLiveLookup(targetApp: AppDescriptor, streamer: LiveScreenStreamer) -> CGWindowID? {
+        guard streamer.streamedWindowID != nil else { return nil }
+        if let known = targetApp.windowId, known != 0 {
+            return CGWindowID(known)
+        }
+        if targetApp.pid > 0, let resolved = WindowResolver.targetWindowID(pid: targetApp.pid) {
+            return resolved
+        }
+        return nil
+    }
+
+    private func liveStreamImage(for targetApp: AppDescriptor?, streamer: LiveScreenStreamer?) -> CGImage? {
+        guard let targetApp, let streamer,
+              let windowId = targetWindowIDForLiveLookup(targetApp: targetApp, streamer: streamer) else {
+            return nil
+        }
+        return streamer.latestFrame(forWindowID: windowId)
+    }
+
+    private static func applyRegionAndScale(_ image: CGImage, region: ScreenRect?, maxDimension: Int) -> CGImage {
+        var working = image
+        if let region, region.width >= 2, region.height >= 2 {
+            let imageBounds = CGRect(x: 0, y: 0, width: working.width, height: working.height)
+            let cropRect = CGRect(x: region.x, y: region.y, width: region.width, height: region.height)
+                .integral
+                .intersection(imageBounds)
+            if !cropRect.isNull, cropRect.width >= 2, cropRect.height >= 2,
+               let cropped = working.cropping(to: cropRect) {
+                working = cropped
+            }
+        }
+
+        let maxDim = max(1, maxDimension)
+        let currentMax = max(working.width, working.height)
+        guard currentMax > maxDim else {
+            return working
+        }
+
+        let scale = Double(maxDim) / Double(currentMax)
+        let targetW = max(1, Int((Double(working.width) * scale).rounded()))
+        let targetH = max(1, Int((Double(working.height) * scale).rounded()))
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else {
+            return working
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(working, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        return ctx.makeImage() ?? working
     }
 
     private func prepareCapture(

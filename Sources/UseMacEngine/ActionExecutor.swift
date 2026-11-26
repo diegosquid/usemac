@@ -28,13 +28,38 @@ public final class ActionExecutor: @unchecked Sendable {
         self.killSwitch = killSwitch
     }
 
+    /// Error codes that represent hard safety/policy blocks and must never be bypassed by `optional: true`.
+    private static let nonSkippableErrorCodes: Set<String> = [
+        "POLICY_BLOCKED",
+        "SELF_TARGET_BLOCKED",
+        "TARGET_BLOCKED",
+        "UPLOAD_BLOCKED",
+        "URL_BLOCKED"
+    ]
+
     public func executeBatch(
         _ request: BatchActionRequest,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)? = nil,
-        onLiveActivity: (@Sendable (LiveActivityItem) -> Void)? = nil
+        onLiveActivity: (@Sendable (LiveActivityItem) -> Void)? = nil,
+        preResolvedTarget: AppDescriptor? = nil
     ) async -> (result: BatchActionResult, resolvedApp: AppDescriptor?) {
         let batchStartNs = DispatchTime.now().uptimeNanoseconds
-        let requestTarget = workspaceMonitor.resolveTarget(query: request.app)
+        let requestTarget: AppQueryMatch
+        if let preResolvedTarget {
+            if workspaceMonitor.isUseMacProcess(pid: preResolvedTarget.pid)
+                || WorkspaceMonitor.isUseMac(
+                    pid: preResolvedTarget.pid,
+                    bundleId: preResolvedTarget.bundleId,
+                    selfPid: ProcessInfo.processInfo.processIdentifier
+                )
+                || workspaceMonitor.namesUseMac(request.app) {
+                requestTarget = .useMac
+            } else {
+                requestTarget = .app(preResolvedTarget)
+            }
+        } else {
+            requestTarget = workspaceMonitor.resolveTarget(query: request.app)
+        }
         var currentApp: AppDescriptor?
         if case .app(let app) = requestTarget {
             currentApp = app
@@ -112,7 +137,7 @@ public final class ActionExecutor: @unchecked Sendable {
 
         var burst: ForegroundBurst?
         if request.foreground == true {
-            switch await beginForegroundBurst(targetApp: currentApp) {
+            switch await beginForegroundBurst(targetApp: currentApp, waitForIdleMs: request.waitForIdleMs) {
             case .success(let started):
                 burst = started
                 onLiveActivity?(LiveActivityItem(
@@ -142,7 +167,9 @@ public final class ActionExecutor: @unchecked Sendable {
             }
         }
 
+        let lastEffectIndex = request.steps.lastIndex(where: { Self.checksEffect($0.action) })
         var allSucceeded = true
+        var hadMutatingSuccess = false
 
         for (index, step) in request.steps.enumerated() {
             if let blockReason = killSwitch.isBlocked(
@@ -190,22 +217,105 @@ public final class ActionExecutor: @unchecked Sendable {
                 currentApp = workspaceMonitor.resolveApp(query: stepAppQuery)
             }
 
+            // Skip redundant measureEffect waits on non-gating intermediate steps in multi-step batches.
+            let nextStep = (index + 1 < request.steps.count) ? request.steps[index + 1] : nil
+            let nextIsGating = nextStep.map { next in
+                next.action == .waitFor || next.action == .assert || next.action == .uploadFile
+                    || !(next.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            } ?? false
+            let shouldMeasureEffect = request.steps.count == 1
+                || index == lastEffectIndex
+                || nextIsGating
+                || request.foregroundFallback == true
+
             let stepStartNs = DispatchTime.now().uptimeNanoseconds
             var outcome: StepOutcome
             if let burst, let pid = currentApp?.pid, pid == burst.targetPid, !WindowResolver.isFrontmost(pid: pid) {
                 // The user (or another app) took the front during the burst: stop sending real input.
                 outcome = notFrontmostOutcome(targetApp: currentApp, input: "input")
             } else {
-                outcome = await executeStep(step, targetApp: currentApp, onOverlayEvent: onOverlayEvent)
+                outcome = await executeStep(
+                    step,
+                    targetApp: currentApp,
+                    measureEffect: shouldMeasureEffect,
+                    onOverlayEvent: onOverlayEvent
+                )
             }
+
+            // Opt-in foregroundFallback: escalate inside the same batch if a background attempt failed with
+            // TARGET_NOT_FRONTMOST or produced effect == .none on a non-responsive window, provided user is idle.
+            if request.foregroundFallback == true,
+               request.foreground != true,
+               burst == nil,
+               let target = currentApp,
+               target.pid > 0,
+               Self.shouldEscalateToForeground(step: step, outcome: outcome, targetPid: target.pid) {
+                switch await beginForegroundBurst(targetApp: target, waitForIdleMs: request.waitForIdleMs) {
+                case .success(let started):
+                    burst = started
+                    onLiveActivity?(LiveActivityItem(
+                        kind: .actionStep,
+                        appName: target.name,
+                        appPid: target.pid,
+                        bundleId: target.bundleId,
+                        windowTitle: target.windowTitle,
+                        windowBounds: target.windowBounds,
+                        title: "Borrowing the screen",
+                        subtitle: "\(target.name) needed focus for this step",
+                        mechanism: "foreground-fallback",
+                        success: true,
+                        isInProgress: true
+                    ))
+                    var fgStep = step
+                    fgStep.preferBackground = false
+                    outcome = await executeStep(
+                        fgStep,
+                        targetApp: currentApp,
+                        measureEffect: true,
+                        onOverlayEvent: onOverlayEvent
+                    )
+                case .failure(let refusal):
+                    if !outcome.success {
+                        outcome.message = "\(outcome.message ?? "Background action failed.") Foreground fallback unavailable: \(refusal.message)"
+                    } else {
+                        let baseWarn = outcome.warning ?? "No visible effect in background."
+                        outcome.warning = "\(baseWarn) Foreground fallback skipped: \(refusal.message)"
+                    }
+                }
+            }
+
+            // Resilient `optional: true`: convert non-safety failures into skipped successes so batch continues.
+            if step.optional == true, !outcome.success {
+                let isSafetyBlock = outcome.errorCode.map { Self.nonSkippableErrorCodes.contains($0) } ?? false
+                if !isSafetyBlock {
+                    let reason = outcome.message ?? outcome.errorCode ?? "target unavailable"
+                    outcome = StepOutcome(
+                        success: true,
+                        mechanism: outcome.mechanism,
+                        message: "Optional step skipped: \(reason)",
+                        node: outcome.node,
+                        resolvedApp: outcome.resolvedApp,
+                        errorCode: nil,
+                        effect: .unverified,
+                        warning: nil,
+                        scrollDeltaY: outcome.scrollDeltaY,
+                        skipped: true
+                    )
+                }
+            }
+
             let stepLatencyMs = Double(DispatchTime.now().uptimeNanoseconds - stepStartNs) / 1_000_000.0
 
             if let resolvedApp = outcome.resolvedApp {
                 currentApp = resolvedApp
             }
 
-            if step.action != .wait && step.action != .target && step.action != .hover && step.action != .waitFor {
+            if !outcome.skipped,
+               step.action != .wait && step.action != .target && step.action != .hover && step.action != .waitFor && step.action != .assert {
                 axIndexer.invalidate(pid: currentApp?.pid)
+                if outcome.success && isMutatingStep(step) {
+                    hadMutatingSuccess = true
+                }
             }
 
             let result = ActionStepResult(
@@ -219,7 +329,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: outcome.errorCode,
                 effect: outcome.effect,
                 warning: outcome.warning,
-                resolvedElementId: outcome.node?.id
+                resolvedElementId: outcome.node?.id,
+                skipped: outcome.skipped ? true : nil
             )
             stepResults.append(result)
 
@@ -229,7 +340,9 @@ public final class ActionExecutor: @unchecked Sendable {
                 : ActivityCaption.failedStepTitle(step: step, targetName: outcome.node?.title, position: (index + 1, request.steps.count))
             let baseSubtitle = "\(outcome.mechanism) · \(String(format: "%.1f ms", stepLatencyMs))"
             let stepSubtitle: String
-            if !outcome.success, let reason = ActivityCaption.reason(errorCode: outcome.errorCode, message: outcome.message) {
+            if outcome.skipped {
+                stepSubtitle = "skipped (optional)"
+            } else if !outcome.success, let reason = ActivityCaption.reason(errorCode: outcome.errorCode, message: outcome.message) {
                 stepSubtitle = reason
             } else if !outcome.success, let msg = outcome.message, !msg.isEmpty {
                 stepSubtitle = "\(baseSubtitle) · \(msg)"
@@ -264,11 +377,58 @@ public final class ActionExecutor: @unchecked Sendable {
             }
         }
 
+        // Post-batch quiescence settle (80 ms quiet window, 300 ms cap) before post-action observation.
+        if hadMutatingSuccess,
+           request.returnObservation,
+           let pid = currentApp?.pid,
+           pid > 0,
+           axIndexer.hasObserver(for: pid) {
+            await settleQuiescence(pid: pid, quietWindowMs: 80, maxWaitMs: 300)
+        }
+
         if let burst {
             await endForegroundBurst(burst)
         }
 
         return finish(allSucceeded)
+    }
+
+    private func settleQuiescence(pid: pid_t, quietWindowMs: Int = 80, maxWaitMs: Int = 300) async {
+        let deadlineNs = DispatchTime.now().uptimeNanoseconds + UInt64(max(1, maxWaitMs)) * 1_000_000
+        while true {
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            if nowNs >= deadlineNs { break }
+            let remainingMs = Int((deadlineNs - nowNs) / 1_000_000)
+            let windowMs = min(quietWindowMs, remainingMs)
+            guard windowMs > 0 else { break }
+            let gen = axIndexer.currentGeneration(pid: pid)
+            let changed = await axIndexer.waitForChange(pid: pid, sinceGeneration: gen, timeoutMs: windowMs)
+            if !changed {
+                break
+            }
+        }
+    }
+
+    private static func shouldEscalateToForeground(step: ActionStep, outcome: StepOutcome, targetPid: pid_t) -> Bool {
+        if !outcome.success && outcome.errorCode == "TARGET_NOT_FRONTMOST" {
+            return true
+        }
+        guard outcome.success && outcome.effect == ActionEffect.none else {
+            return false
+        }
+        // Do not steal focus just because a scrollbar is already at the top/bottom edge.
+        if outcome.mechanism == "ax-scrollbar" {
+            return false
+        }
+        switch step.action {
+        case .click, .doubleClick, .rightClick, .type, .pressKey, .setValue, .scroll, .axAction, .uploadFile:
+            let wasBackground = outcome.mechanism.contains("pid")
+                || outcome.mechanism.hasPrefix("ax-")
+                || !WindowResolver.isFrontmost(pid: targetPid)
+            return wasBackground
+        default:
+            return false
+        }
     }
 
     private struct StepOutcome {
@@ -281,6 +441,7 @@ public final class ActionExecutor: @unchecked Sendable {
         var effect: ActionEffect?
         var warning: String?
         var scrollDeltaY: Double?
+        var skipped: Bool
 
         init(
             success: Bool,
@@ -291,7 +452,8 @@ public final class ActionExecutor: @unchecked Sendable {
             errorCode: String? = nil,
             effect: ActionEffect? = nil,
             warning: String? = nil,
-            scrollDeltaY: Double? = nil
+            scrollDeltaY: Double? = nil,
+            skipped: Bool = false
         ) {
             self.success = success
             self.mechanism = mechanism
@@ -302,6 +464,7 @@ public final class ActionExecutor: @unchecked Sendable {
             self.effect = effect
             self.warning = warning
             self.scrollDeltaY = scrollDeltaY
+            self.skipped = skipped
         }
     }
 
@@ -486,7 +649,10 @@ public final class ActionExecutor: @unchecked Sendable {
         if stepsSwitchApps { return nil }
 
         let usesSnapshotIds = request.allowStaleSnapshot != true && request.steps.contains { step in
-            (step.elementId?.isEmpty == false) && (step.match == nil || step.match?.isEmpty == true)
+            guard step.optional != true else { return false }
+            let stepHasId = (step.elementId?.isEmpty == false) && (step.match == nil || step.match?.isEmpty == true)
+            let formHasId = step.fields?.contains(where: { ($0.elementId?.isEmpty == false) && ($0.match == nil || $0.match?.isEmpty == true) }) == true
+            return stepHasId || formHasId
         }
         let expected = request.expectWindowTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard usesSnapshotIds || (expected?.isEmpty == false) else { return nil }
@@ -494,19 +660,23 @@ public final class ActionExecutor: @unchecked Sendable {
         let current = axIndexer.currentContext(pid: pid)
 
         if usesSnapshotIds, let snapshot = axIndexer.snapshotContext(pid: pid), let current {
-            if let before = snapshot.windowId, let now = current.windowId, before != now {
+            let decision = Self.evaluateStaleSnapshot(
+                snapshot: snapshot,
+                current: current,
+                elementsAlive: { self.allReferencedElementsAlive(in: request.steps, pid: pid) }
+            )
+            if decision.shouldRefuse {
+                if decision.windowChanged {
+                    return Refusal(
+                        mechanism: "stale-check",
+                        errorCode: "STALE_SNAPSHOT",
+                        message: "The \(targetApp?.name ?? "app") window changed since the last observe (now \"\(current.windowTitle ?? "untitled")\"). Element ids would hit the wrong place: observe again, or use `match`."
+                    )
+                }
                 return Refusal(
                     mechanism: "stale-check",
                     errorCode: "STALE_SNAPSHOT",
-                    message: "The \(targetApp?.name ?? "app") window changed since the last observe (now \"\(current.windowTitle ?? "untitled")\"). Element ids would hit the wrong place: observe again, or use `match`."
-                )
-            }
-            if let before = snapshot.windowTitle, let now = current.windowTitle,
-               Self.comparableTitle(before) != Self.comparableTitle(now) {
-                return Refusal(
-                    mechanism: "stale-check",
-                    errorCode: "STALE_SNAPSHOT",
-                    message: "The window now shows \"\(now)\" but the last observe saw \"\(before)\". Observe again, or use `match`, or pass allowStaleSnapshot if this is expected."
+                    message: "The window now shows \"\(current.windowTitle ?? "")\" but the last observe saw \"\(snapshot.windowTitle ?? "")\". Observe again, or use `match`, or pass allowStaleSnapshot if this is expected."
                 )
             }
         }
@@ -524,6 +694,55 @@ public final class ActionExecutor: @unchecked Sendable {
         return nil
     }
 
+    /// Evaluates whether snapshot ids are stale. Always refuses when `windowId` changed; when `windowId` is
+    /// unchanged and only `comparableTitle` drifted, verifies per-element liveness instead of aborting blindly.
+    static func evaluateStaleSnapshot(
+        snapshot: AXIndexer.SnapshotContext,
+        current: AXIndexer.SnapshotContext,
+        elementsAlive: () -> Bool
+    ) -> (shouldRefuse: Bool, windowChanged: Bool) {
+        if let before = snapshot.windowId, let now = current.windowId, before != now {
+            return (true, true)
+        }
+        if let before = snapshot.windowTitle, let now = current.windowTitle,
+           comparableTitle(before) != comparableTitle(now) {
+            let sameWindow = (snapshot.windowId != nil && snapshot.windowId == current.windowId)
+            if sameWindow && elementsAlive() {
+                return (false, false)
+            }
+            return (true, false)
+        }
+        return (false, false)
+    }
+
+    private func allReferencedElementsAlive(in steps: [ActionStep], pid: pid_t) -> Bool {
+        var ids: [String] = []
+        for step in steps where step.optional != true {
+            if let id = step.elementId, !id.isEmpty, (step.match == nil || step.match?.isEmpty == true) {
+                ids.append(id)
+            }
+            if let fields = step.fields {
+                for field in fields {
+                    if let id = field.elementId, !id.isEmpty, (field.match == nil || field.match?.isEmpty == true) {
+                        ids.append(id)
+                    }
+                }
+            }
+        }
+        guard !ids.isEmpty else { return true }
+        for id in ids {
+            let cachedRole = axIndexer.node(for: id, pid: pid)?.role
+            guard let live = axIndexer.liveNode(for: id, pid: pid) else {
+                return false
+            }
+            if let cachedRole,
+               ElementMatcher.normalizeRole(live.node.role) != ElementMatcher.normalizeRole(cachedRole) {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Letters only, folded: unread counters, emoji and punctuation do not make a window "different".
     static func comparableTitle(_ title: String) -> String {
         let letters = title.unicodeScalars.map { CharacterSet.letters.contains($0) ? Character($0) : " " }
@@ -532,12 +751,26 @@ public final class ActionExecutor: @unchecked Sendable {
 
     // MARK: - Foreground burst
 
-    private func beginForegroundBurst(targetApp: AppDescriptor?) async -> Result<ForegroundBurst, Refusal> {
+    private func beginForegroundBurst(targetApp: AppDescriptor?, waitForIdleMs: Int? = nil) async -> Result<ForegroundBurst, Refusal> {
         guard let app = targetApp, app.pid > 0,
               let running = NSRunningApplication(processIdentifier: app.pid), !running.isTerminated else {
             return .failure(Refusal(mechanism: "foreground-burst", errorCode: "APP_NOT_FOUND", message: "A foreground burst needs a running target app."))
         }
-        let idle = WindowResolver.secondsSinceUserInput()
+        let idleWaitBudgetMs = max(0, waitForIdleMs ?? 2000)
+        var idle = WindowResolver.secondsSinceUserInput()
+        if idle < Self.userIdleRequiredSeconds && !idleIsFromOwnInput(idle) && idleWaitBudgetMs > 0 {
+            let deadlineNs = DispatchTime.now().uptimeNanoseconds + UInt64(idleWaitBudgetMs) * 1_000_000
+            while DispatchTime.now().uptimeNanoseconds < deadlineNs {
+                let toIdleMs = Int(max(40, (Self.userIdleRequiredSeconds - idle) * 1000.0))
+                let remainingMs = Int((deadlineNs - DispatchTime.now().uptimeNanoseconds) / 1_000_000)
+                let sliceMs = min(150, min(toIdleMs, max(1, remainingMs)))
+                try? await Task.sleep(nanoseconds: UInt64(sliceMs) * 1_000_000)
+                idle = WindowResolver.secondsSinceUserInput()
+                if idle >= Self.userIdleRequiredSeconds || idleIsFromOwnInput(idle) {
+                    break
+                }
+            }
+        }
         if idle < Self.userIdleRequiredSeconds && !idleIsFromOwnInput(idle) {
             return .failure(Refusal(
                 mechanism: "foreground-burst",
@@ -549,26 +782,107 @@ public final class ActionExecutor: @unchecked Sendable {
         let previous = NSWorkspace.shared.frontmostApplication
         let cursor = CGEvent(source: nil)?.location
         if !WindowResolver.isFrontmost(pid: app.pid) {
-            _ = running.activate(options: [])
-            var waitedMs = 0
-            while !WindowResolver.isFrontmost(pid: app.pid) && waitedMs < 1500 {
-                try? await Task.sleep(nanoseconds: 50_000_000)
-                waitedMs += 50
+            let activated = await waitForApplicationActivation(pid: app.pid, timeoutMs: 1500) {
+                _ = running.activate(options: [])
             }
-            guard WindowResolver.isFrontmost(pid: app.pid) else {
+            guard activated && WindowResolver.isFrontmost(pid: app.pid) else {
                 return .failure(Refusal(
                     mechanism: "foreground-burst",
                     errorCode: "TARGET_NOT_FRONTMOST",
                     message: "\(app.name) did not come to the front, so nothing was sent."
                 ))
             }
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            try? await Task.sleep(nanoseconds: 25_000_000)
         }
         return .success(ForegroundBurst(
             targetPid: app.pid,
             previousApp: previous?.processIdentifier == app.pid ? nil : previous,
             savedCursor: cursor
         ))
+    }
+
+    private final class ActivationWaitState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resumed = false
+        private var observer: NSObjectProtocol?
+        private var timeoutItem: DispatchWorkItem?
+        private let continuation: CheckedContinuation<Bool, Never>
+
+        init(continuation: CheckedContinuation<Bool, Never>) {
+            self.continuation = continuation
+        }
+
+        func attach(observer: NSObjectProtocol, timeoutItem: DispatchWorkItem) {
+            var alreadyDone = false
+            lock.lock()
+            if resumed {
+                alreadyDone = true
+            } else {
+                self.observer = observer
+                self.timeoutItem = timeoutItem
+            }
+            lock.unlock()
+            if alreadyDone {
+                timeoutItem.cancel()
+                NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            }
+        }
+
+        func complete(_ ok: Bool) {
+            lock.lock()
+            guard !resumed else {
+                lock.unlock()
+                return
+            }
+            resumed = true
+            let obs = observer
+            observer = nil
+            let item = timeoutItem
+            timeoutItem = nil
+            lock.unlock()
+            item?.cancel()
+            if let obs {
+                NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            }
+            continuation.resume(returning: ok)
+        }
+    }
+
+    private func waitForApplicationActivation(
+        pid: pid_t,
+        timeoutMs: Int,
+        activate: @escaping () -> Void
+    ) async -> Bool {
+        if WindowResolver.isFrontmost(pid: pid) { return true }
+        return await withCheckedContinuation { continuation in
+            let state = ActivationWaitState(continuation: continuation)
+            let obs = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: nil
+            ) { note in
+                if let activated = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                   activated.processIdentifier == pid {
+                    state.complete(true)
+                }
+            }
+            let item = DispatchWorkItem {
+                state.complete(WindowResolver.isFrontmost(pid: pid))
+            }
+            state.attach(observer: obs, timeoutItem: item)
+
+            activate()
+
+            if WindowResolver.isFrontmost(pid: pid) {
+                state.complete(true)
+                return
+            }
+
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(
+                deadline: .now() + .milliseconds(max(1, timeoutMs)),
+                execute: item
+            )
+        }
     }
 
     private func endForegroundBurst(_ burst: ForegroundBurst) async {
@@ -727,6 +1041,7 @@ public final class ActionExecutor: @unchecked Sendable {
     private func executeStep(
         _ step: ActionStep,
         targetApp: AppDescriptor?,
+        measureEffect shouldMeasureEffect: Bool = true,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) async -> StepOutcome {
         switch step.action {
@@ -750,6 +1065,18 @@ public final class ActionExecutor: @unchecked Sendable {
         case .openURL, .navigate:
             return await performOpenURL(step: step)
 
+        case .assert:
+            return performAssert(step: step, targetApp: targetApp)
+
+        case .scrollUntil:
+            return await performScrollUntil(step: step, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+
+        case .fillForm:
+            return await performFillForm(step: step, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+
+        case .menuAction:
+            return performMenuAction(step: step, targetApp: targetApp)
+
         default:
             break
         }
@@ -765,7 +1092,8 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         let pid = resolved.pid > 0 ? resolved.pid : (targetApp?.pid ?? 0)
-        let baseline = pid > 0 ? captureBaseline(pid: pid, resolved: resolved) : nil
+        let willCheckEffect = shouldMeasureEffect && Self.checksEffect(step.action)
+        let baseline = (willCheckEffect && pid > 0) ? captureBaseline(pid: pid, resolved: resolved) : nil
 
         var outcome: StepOutcome
         switch step.action {
@@ -793,14 +1121,12 @@ public final class ActionExecutor: @unchecked Sendable {
             outcome = performAXAction(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
         case .uploadFile:
             outcome = await performNativeUploadFile(step: step, resolved: resolved, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
-        case .assert, .scrollUntil, .fillForm, .menuAction:
-            outcome = StepOutcome(success: false, mechanism: "dispatch", message: "Step '\(step.action.rawValue)' is not implemented yet", errorCode: "NOT_IMPLEMENTED")
-        case .target, .wait, .waitFor, .openURL, .navigate:
+        case .target, .wait, .waitFor, .openURL, .navigate, .assert, .scrollUntil, .fillForm, .menuAction:
             outcome = StepOutcome(success: false, mechanism: "dispatch", message: "Unreachable step type")
         }
 
         if outcome.success, outcome.effect == nil {
-            if let baseline, Self.checksEffect(step.action) {
+            if let baseline, willCheckEffect {
                 outcome.effect = await measureEffect(baseline: baseline, outcome: outcome)
                 if outcome.effect == ActionEffect.none, outcome.warning == nil {
                     outcome.warning = Self.noEffectWarning(step: step, mechanism: outcome.mechanism)
@@ -992,11 +1318,27 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private func captureBaseline(pid: Int32, resolved: ResolvedElement) -> EffectBaseline {
+        let gen = axIndexer.currentGeneration(pid: pid)
+        // Reuse attributes already read by `liveNode`/`resolve` (avoiding 4-5 redundant AX IPCs per step).
+        if let node = resolved.node {
+            let frame = (node.frame.width > 0 || node.frame.height > 0)
+                ? CGRect(x: node.frame.x, y: node.frame.y, width: node.frame.width, height: node.frame.height)
+                : nil
+            return EffectBaseline(
+                pid: pid,
+                changeCount: gen,
+                element: resolved.element,
+                value: node.value,
+                focused: node.focused,
+                frame: frame,
+                focusedElement: nil
+            )
+        }
         let axApp = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(axApp, 0.35)
+        AXUIElementSetMessagingTimeout(axApp, 0.25)
         return EffectBaseline(
             pid: pid,
-            changeCount: axIndexer.changeCount(pid: pid),
+            changeCount: gen,
             element: resolved.element,
             value: resolved.element.flatMap { Self.axString($0, kAXValueAttribute) },
             focused: resolved.element.flatMap { Self.axBool($0, kAXFocusedAttribute) },
@@ -1005,36 +1347,66 @@ public final class ActionExecutor: @unchecked Sendable {
         )
     }
 
-    /// Watches for AX notifications or attribute changes after an action. `none` only when nothing at all
-    /// changed in the window, so it is a conservative signal.
+    /// Event-driven effect detection: wakes immediately (2–5 ms) on `AXObserver` notifications via
+    /// `axIndexer.waitForChange`, falling back to attribute diffs only if no AX notification fired.
     private func measureEffect(baseline: EffectBaseline, outcome: StepOutcome) async -> ActionEffect {
         if outcome.scrollDeltaY.map({ abs($0) >= 1 }) == true {
             return .changed
         }
-        let deadline = DispatchTime.now().uptimeNanoseconds + Self.effectWindowMs * 1_000_000
-        repeat {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            if axIndexer.changeCount(pid: baseline.pid) != baseline.changeCount {
-                return .changed
+        if axIndexer.currentGeneration(pid: baseline.pid) != baseline.changeCount {
+            return .changed
+        }
+
+        let deadlineNs = DispatchTime.now().uptimeNanoseconds + Self.effectWindowMs * 1_000_000
+        let firstSliceMs = min(120, Int(Self.effectWindowMs))
+        if await axIndexer.waitForChange(
+            pid: baseline.pid,
+            sinceGeneration: baseline.changeCount,
+            timeoutMs: firstSliceMs
+        ) {
+            return .changed
+        }
+
+        if hasAttributeChanged(baseline: baseline) {
+            return .changed
+        }
+
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if nowNs < deadlineNs {
+            let remainingMs = Int((deadlineNs - nowNs) / 1_000_000)
+            if remainingMs > 0 {
+                if await axIndexer.waitForChange(
+                    pid: baseline.pid,
+                    sinceGeneration: baseline.changeCount,
+                    timeoutMs: remainingMs
+                ) {
+                    return .changed
+                }
+                if hasAttributeChanged(baseline: baseline) {
+                    return .changed
+                }
             }
-            if let element = baseline.element {
-                if Self.axString(element, kAXValueAttribute) != baseline.value { return .changed }
-                if Self.axBool(element, kAXFocusedAttribute) != baseline.focused { return .changed }
-                if let before = baseline.frame, let now = Self.axFrame(element), before != now { return .changed }
-            }
+        }
+        return .none
+    }
+
+    private func hasAttributeChanged(baseline: EffectBaseline) -> Bool {
+        if let element = baseline.element {
+            if Self.axString(element, kAXValueAttribute) != baseline.value { return true }
+            if Self.axBool(element, kAXFocusedAttribute) != baseline.focused { return true }
+            if let before = baseline.frame, let now = Self.axFrame(element), before != now { return true }
+        }
+        if let beforeFocused = baseline.focusedElement {
             let axApp = AXUIElementCreateApplication(baseline.pid)
             AXUIElementSetMessagingTimeout(axApp, 0.2)
             let focusedNow = Self.axElement(axApp, kAXFocusedUIElementAttribute)
-            switch (baseline.focusedElement, focusedNow) {
-            case (nil, nil):
-                break
-            case let (before?, now?):
-                if !CFEqual(before, now) { return .changed }
-            default:
-                return .changed
+            if let focusedNow {
+                if !CFEqual(beforeFocused, focusedNow) { return true }
+            } else {
+                return true
             }
-        } while DispatchTime.now().uptimeNanoseconds < deadline
-        return .none
+        }
+        return false
     }
 
     // MARK: - Actions
@@ -1336,29 +1708,49 @@ public final class ActionExecutor: @unchecked Sendable {
             if bgPid == nil, keyWindowGuard(targetApp, input: "typing") == nil {
                 _ = AXUIElementSetAttributeValue(axEl, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             }
+            let beforeValue = resolved.node?.value ?? Self.axString(axEl, kAXValueAttribute)
+            let genBefore = resolved.pid > 0 ? axIndexer.currentGeneration(pid: resolved.pid) : 0
             if AXUIElementSetAttributeValue(axEl, kAXValueAttribute as CFString, text as CFTypeRef) == .success {
                 var readBack = Self.axString(axEl, kAXValueAttribute)
                 let isToggle = ["AXCheckBox", "AXRadioButton", "AXSwitch"].contains(resolved.node?.role ?? "")
                 let isSecure = Self.axString(axEl, kAXSubroleAttribute) == "AXSecureTextField"
-                // Chromium sets the value in the page and updates its accessibility tree a moment later: wait for
-                // that before calling the value rejected.
-                var waitedMs = 0
-                while !isToggle, !isSecure, let current = readBack,
-                      ElementMatcher.normalize(current) != ElementMatcher.normalize(text), waitedMs < 300 {
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                    waitedMs += 50
-                    readBack = Self.axString(axEl, kAXValueAttribute)
+                // Chromium sets the value in the page and updates its accessibility tree a moment later: wait
+                // briefly via AXObserver before inspecting readback.
+                if !isToggle, !isSecure, let current = readBack,
+                   ElementMatcher.normalize(current) != ElementMatcher.normalize(text) {
+                    var waitedMs = 0
+                    var lastGen = genBefore
+                    while waitedMs < 300 {
+                        if resolved.pid > 0 {
+                            _ = await axIndexer.waitForChange(pid: resolved.pid, sinceGeneration: lastGen, timeoutMs: 50)
+                            lastGen = axIndexer.currentGeneration(pid: resolved.pid)
+                        } else {
+                            try? await Task.sleep(nanoseconds: 50_000_000)
+                        }
+                        waitedMs += 50
+                        readBack = Self.axString(axEl, kAXValueAttribute)
+                        if let rb = readBack,
+                           ElementMatcher.normalize(rb) == ElementMatcher.normalize(text)
+                           || ElementMatcher.normalize(rb) != ElementMatcher.normalize(beforeValue ?? "") {
+                            break
+                        }
+                    }
                 }
-                if !isToggle, !isSecure, let readBack, ElementMatcher.normalize(readBack) != ElementMatcher.normalize(text) {
-                    return StepOutcome(
-                        success: true,
-                        mechanism: "ax-set-value",
-                        node: resolved.node,
-                        effect: ActionEffect.none,
-                        warning: "The field reads back \"\(readBack.prefix(60))\" instead of the text you set: the app may have rejected or reformatted it."
-                    )
-                }
-                return StepOutcome(success: true, mechanism: "ax-set-value", node: resolved.node, effect: .changed, warning: omniboxWarning)
+                let eval = Self.evaluateSetValueReadBack(
+                    requested: text,
+                    before: beforeValue,
+                    readBack: readBack,
+                    isToggle: isToggle,
+                    isSecure: isSecure
+                )
+                return StepOutcome(
+                    success: true,
+                    mechanism: "ax-set-value",
+                    message: eval.message,
+                    node: resolved.node,
+                    effect: eval.effect,
+                    warning: eval.warning ?? omniboxWarning
+                )
             }
         }
 
@@ -1383,6 +1775,41 @@ public final class ActionExecutor: @unchecked Sendable {
             message: ok ? nil : "Failed to type text",
             node: resolved.node,
             warning: omniboxWarning ?? (resolved.element != nil ? "AXValue could not be set; typed the text instead." : nil)
+        )
+    }
+
+    /// Evaluates `AXValue` readback after `setValue`: if the app reformatted the text (so `readBack != before`),
+    /// reports `effect: .changed` with an informational message instead of a false `effect: .none` warning.
+    static func evaluateSetValueReadBack(
+        requested: String,
+        before: String?,
+        readBack: String?,
+        isToggle: Bool,
+        isSecure: Bool
+    ) -> (effect: ActionEffect, message: String?, warning: String?) {
+        if isToggle || isSecure {
+            return (.changed, nil, nil)
+        }
+        guard let readBack else {
+            return (.changed, nil, nil)
+        }
+        let normReq = ElementMatcher.normalize(requested)
+        let normRead = ElementMatcher.normalize(readBack)
+        if normRead == normReq {
+            return (.changed, nil, nil)
+        }
+        let normBefore = ElementMatcher.normalize(before ?? "")
+        if normRead != normBefore {
+            return (
+                .changed,
+                "Field value updated and formatted as \"\(readBack.prefix(80))\".",
+                nil
+            )
+        }
+        return (
+            ActionEffect.none,
+            nil,
+            "The field still reads back \"\(readBack.prefix(60))\" instead of the text you set: the app may have rejected it."
         )
     }
 
@@ -1831,6 +2258,7 @@ public final class ActionExecutor: @unchecked Sendable {
         let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(timeoutMs) * 1_000_000
 
         while true {
+            let genBeforeCheck = axIndexer.currentGeneration(pid: pid)
             var found: ElementNode?
             if hasMatch, let match = step.match {
                 let index = max(0, match.index ?? 0)
@@ -1842,7 +2270,8 @@ public final class ActionExecutor: @unchecked Sendable {
             if wantGone ? (found == nil) : (found != nil) {
                 return StepOutcome(success: true, mechanism: "wait-for", node: found, effect: .unverified)
             }
-            if DispatchTime.now().uptimeNanoseconds >= deadline {
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            if nowNs >= deadline {
                 let what = hasMatch ? Self.describe(step.match!) : (step.elementId ?? "element")
                 return StepOutcome(
                     success: false,
@@ -1852,8 +2281,475 @@ public final class ActionExecutor: @unchecked Sendable {
                     errorCode: "WAIT_TIMEOUT"
                 )
             }
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            let remainingMs = Int((deadline - nowNs) / 1_000_000)
+            let sliceMs = min(500, max(1, remainingMs))
+            let woke = await axIndexer.waitForChange(pid: pid, sinceGeneration: genBeforeCheck, timeoutMs: sliceMs)
+            if !woke {
+                axIndexer.invalidate(pid: pid)
+            }
         }
+    }
+
+    // MARK: - Resilient SOTA Steps (assert, scrollUntil, fillForm, menuAction)
+
+    private func performAssert(step: ActionStep, targetApp: AppDescriptor?) -> StepOutcome {
+        let hasExpectTitle = !(step.expectTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasExpectText = !(step.expectText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasExpectNotText = !(step.expectNotText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasMatch = step.match?.isEmpty == false
+        let hasElementId = !(step.elementId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        guard hasExpectTitle || hasExpectText || hasExpectNotText || hasMatch || hasElementId else {
+            return StepOutcome(
+                success: false,
+                mechanism: "assert",
+                message: "assert requires at least one of expectTitle, expectText, expectNotText, match, or elementId.",
+                errorCode: "INVALID_REQUEST"
+            )
+        }
+        guard let targetApp, targetApp.pid > 0 else {
+            return StepOutcome(
+                success: false,
+                mechanism: "assert",
+                message: "assert needs a target app.",
+                errorCode: "APP_NOT_FOUND"
+            )
+        }
+        let pid = targetApp.pid
+        let windowTitle = axIndexer.currentContext(pid: pid)?.windowTitle ?? targetApp.windowTitle ?? ""
+
+        let eval = Self.evaluateAssert(
+            step: step,
+            appName: targetApp.name,
+            windowTitle: windowTitle,
+            findMatch: { match in
+                let idx = max(0, match.index ?? 0)
+                let hits = self.axIndexer.find(pid: pid, match: match, limit: idx + 1)
+                return hits.count > idx ? hits[idx].node : nil
+            },
+            findElementById: { id in
+                self.axIndexer.liveNode(for: id, pid: pid)?.node
+            }
+        )
+        return StepOutcome(
+            success: eval.passed,
+            mechanism: "assert",
+            message: eval.message,
+            node: eval.node,
+            errorCode: eval.passed ? nil : "ASSERTION_FAILED",
+            effect: .unverified
+        )
+    }
+
+    internal static func evaluateAssert(
+        step: ActionStep,
+        appName: String,
+        windowTitle: String,
+        findMatch: (ElementMatch) -> ElementNode?,
+        findElementById: (String) -> ElementNode?
+    ) -> (passed: Bool, message: String, node: ElementNode?) {
+        var matchedNode: ElementNode?
+
+        if let expectedTitle = step.expectTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !expectedTitle.isEmpty {
+            let normHave = ElementMatcher.normalize(windowTitle)
+            let normWant = ElementMatcher.normalize(expectedTitle)
+            if !normHave.contains(normWant) {
+                return (false, "Expected window title to contain \"\(expectedTitle)\", but got \"\(windowTitle)\".", nil)
+            }
+        }
+
+        if let expectText = step.expectText?.trimmingCharacters(in: .whitespacesAndNewlines), !expectText.isEmpty {
+            let found = findMatch(ElementMatch(text: expectText))
+            let titleContains = ElementMatcher.normalize(windowTitle).contains(ElementMatcher.normalize(expectText))
+            if found == nil && !titleContains {
+                return (false, "Expected text \"\(expectText)\" was not found in \(appName).", nil)
+            }
+            matchedNode = matchedNode ?? found
+        }
+
+        if let expectNotText = step.expectNotText?.trimmingCharacters(in: .whitespacesAndNewlines), !expectNotText.isEmpty {
+            let found = findMatch(ElementMatch(text: expectNotText))
+            let titleContains = ElementMatcher.normalize(windowTitle).contains(ElementMatcher.normalize(expectNotText))
+            if found != nil || titleContains {
+                return (false, "Text \"\(expectNotText)\" was unexpectedly present in \(appName).", found)
+            }
+        }
+
+        let wantGone = step.gone == true
+        if let match = step.match, !match.isEmpty {
+            let found = findMatch(match)
+            if wantGone {
+                if found != nil {
+                    return (false, "Expected element matching \(describe(match)) to be gone, but it is still present.", found)
+                }
+            } else {
+                guard let found else {
+                    return (false, "Expected element matching \(describe(match)) was not found in \(appName).", nil)
+                }
+                matchedNode = matchedNode ?? found
+            }
+        } else if let id = step.elementId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+            let found = findElementById(id)
+            if wantGone {
+                if found != nil {
+                    return (false, "Expected element \(id) to be gone, but it is still present.", found)
+                }
+            } else {
+                guard let found else {
+                    return (false, "Expected element \(id) was not found in \(appName).", nil)
+                }
+                matchedNode = matchedNode ?? found
+            }
+        }
+
+        return (true, "Assertion passed", matchedNode)
+    }
+
+    private func performScrollUntil(
+        step: ActionStep,
+        targetApp: AppDescriptor?,
+        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
+    ) async -> StepOutcome {
+        guard let targetApp, targetApp.pid > 0 else {
+            return StepOutcome(success: false, mechanism: "scroll-until", message: "scrollUntil needs a target app.", errorCode: "APP_NOT_FOUND")
+        }
+        let effectiveMatch: ElementMatch? = {
+            if let m = step.match, !m.isEmpty { return m }
+            if let txt = step.expectText?.trimmingCharacters(in: .whitespacesAndNewlines), !txt.isEmpty {
+                return ElementMatch(text: txt)
+            }
+            return nil
+        }()
+        let hasElementId = !(step.elementId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        guard effectiveMatch != nil || hasElementId else {
+            return StepOutcome(
+                success: false,
+                mechanism: "scroll-until",
+                message: "scrollUntil requires match, expectText, or elementId.",
+                errorCode: "INVALID_REQUEST"
+            )
+        }
+
+        let pid = targetApp.pid
+        let maxScrolls = min(30, max(1, step.maxScrolls ?? 8))
+        let deltaY = step.deltaY ?? -360
+        let deltaX = step.deltaX ?? 0
+
+        func lookupTarget() -> (element: AXUIElement, node: ElementNode)? {
+            if let match = effectiveMatch {
+                let idx = max(0, match.index ?? 0)
+                let hits = axIndexer.find(pid: pid, match: match, limit: idx + 1)
+                guard hits.count > idx else { return nil }
+                return (hits[idx].element, hits[idx].node)
+            }
+            if let id = step.elementId {
+                return axIndexer.liveNode(for: id, pid: pid)
+            }
+            return nil
+        }
+
+        for attempt in 0...maxScrolls {
+            if let found = lookupTarget() {
+                if found.node.offscreen != true {
+                    highlight(found.node, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+                    return StepOutcome(
+                        success: true,
+                        mechanism: "scroll-until",
+                        message: attempt == 0 ? "Target already visible" : "Found after \(attempt) scroll\(attempt == 1 ? "" : "s")",
+                        node: found.node,
+                        effect: attempt == 0 ? .unverified : .changed
+                    )
+                }
+                // Found offscreen: try direct AXScrollToVisible before scrolling manually.
+                if AXUIElementPerformAction(found.element, "AXScrollToVisible" as CFString) == .success {
+                    let gen = axIndexer.currentGeneration(pid: pid)
+                    _ = await axIndexer.waitForChange(pid: pid, sinceGeneration: gen, timeoutMs: 150)
+                    if let refreshed = axIndexer.liveNode(for: found.node.id, pid: pid), refreshed.node.offscreen != true {
+                        highlight(refreshed.node, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+                        return StepOutcome(
+                            success: true,
+                            mechanism: "scroll-until",
+                            message: "Scrolled target into view",
+                            node: refreshed.node,
+                            effect: .changed
+                        )
+                    }
+                }
+            }
+
+            if attempt == maxScrolls { break }
+
+            let genBeforeScroll = axIndexer.currentGeneration(pid: pid)
+            let scrollStep = ActionStep(
+                action: .scroll,
+                x: step.x,
+                y: step.y,
+                deltaX: deltaX,
+                deltaY: deltaY,
+                preferBackground: step.preferBackground,
+                restoreCursor: step.restoreCursor
+            )
+            let scrollOutcome = await performScroll(
+                step: scrollStep,
+                resolved: ResolvedElement(pid: pid),
+                targetApp: targetApp,
+                onOverlayEvent: onOverlayEvent
+            )
+            if !scrollOutcome.success {
+                return scrollOutcome
+            }
+            axIndexer.invalidate(pid: pid)
+            if scrollOutcome.warning == "Already at the end of the scroll view." {
+                break
+            }
+            _ = await axIndexer.waitForChange(pid: pid, sinceGeneration: genBeforeScroll, timeoutMs: 120)
+        }
+
+        let targetDesc = effectiveMatch.map(Self.describe) ?? (step.elementId ?? "target")
+        return StepOutcome(
+            success: false,
+            mechanism: "scroll-until",
+            message: "Could not find visible \(targetDesc) after \(maxScrolls) scroll\(maxScrolls == 1 ? "" : "s").",
+            errorCode: "ELEMENT_NOT_FOUND"
+        )
+    }
+
+    private func performFillForm(
+        step: ActionStep,
+        targetApp: AppDescriptor?,
+        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
+    ) async -> StepOutcome {
+        guard let targetApp, targetApp.pid > 0 else {
+            return StepOutcome(success: false, mechanism: "fill-form", message: "fillForm needs a target app.", errorCode: "APP_NOT_FOUND")
+        }
+        guard let fields = step.fields, !fields.isEmpty else {
+            return StepOutcome(success: false, mechanism: "fill-form", message: "fillForm requires a non-empty fields array.", errorCode: "INVALID_REQUEST")
+        }
+
+        var filledCount = 0
+        var lastNode: ElementNode?
+
+        for (fieldIdx, field) in fields.enumerated() {
+            let fieldDesc = field.label ?? field.elementId ?? field.match.map(Self.describe) ?? "field #\(fieldIdx + 1)"
+            let fieldMatch: ElementMatch? = {
+                if let m = field.match, !m.isEmpty { return m }
+                if field.elementId?.isEmpty != false,
+                   let label = field.label?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !label.isEmpty {
+                    return ElementMatch(title: label)
+                }
+                return nil
+            }()
+            var probeStep = ActionStep(
+                action: .setValue,
+                elementId: field.elementId,
+                preferBackground: step.preferBackground,
+                restoreCursor: step.restoreCursor,
+                match: fieldMatch
+            )
+
+            var fieldResolved: ResolvedElement?
+            switch await resolve(step: probeStep, targetApp: targetApp, scrollOffscreenIntoView: true) {
+            case .success(let found):
+                fieldResolved = found
+            case .failure:
+                // Fallback for label matching against text (value/title/description) if title-only missed.
+                if field.match == nil, field.elementId == nil,
+                   let label = field.label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
+                    probeStep.match = ElementMatch(text: label)
+                    if case .success(let fallbackFound) = await resolve(step: probeStep, targetApp: targetApp, scrollOffscreenIntoView: true) {
+                        fieldResolved = fallbackFound
+                    }
+                }
+            }
+
+            guard let resolved = fieldResolved, let axEl = resolved.element else {
+                return StepOutcome(
+                    success: false,
+                    mechanism: "fill-form",
+                    message: "Could not locate form field \(fieldDesc).",
+                    errorCode: "FORM_FILL_FAILED"
+                )
+            }
+
+            let role = resolved.node?.role ?? ""
+            let isToggleRole = ["AXCheckBox", "AXRadioButton", "AXSwitch", "AXToggle"].contains(role)
+
+            if field.checked != nil || isToggleRole {
+                let wantChecked = field.checked ?? {
+                    let v = (field.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    return v == "true" || v == "1" || v == "yes" || v == "on"
+                }()
+                let currentChecked = Self.axBool(axEl, kAXValueAttribute)
+                    ?? (resolved.node?.value == "1" || resolved.node?.value?.lowercased() == "true")
+                if currentChecked != wantChecked {
+                    let toggleRes = performClick(
+                        step: ActionStep(action: .click, preferBackground: step.preferBackground, restoreCursor: step.restoreCursor),
+                        resolved: resolved,
+                        targetApp: targetApp,
+                        onOverlayEvent: onOverlayEvent
+                    )
+                    if !toggleRes.success {
+                        return StepOutcome(
+                            success: false,
+                            mechanism: "fill-form",
+                            message: "Failed to toggle \(fieldDesc): \(toggleRes.message ?? toggleRes.errorCode ?? "unknown error")",
+                            node: resolved.node,
+                            errorCode: "FORM_FILL_FAILED"
+                        )
+                    }
+                }
+            } else if role == "AXPopUpButton", let desired = field.value {
+                let selected = await selectPopUpOption(
+                    element: axEl,
+                    desired: desired,
+                    pid: resolved.pid,
+                    node: resolved.node,
+                    targetApp: targetApp,
+                    onOverlayEvent: onOverlayEvent
+                )
+                if !selected {
+                    return StepOutcome(
+                        success: false,
+                        mechanism: "fill-form",
+                        message: "Failed to select \"\(desired)\" in \(fieldDesc).",
+                        node: resolved.node,
+                        errorCode: "FORM_FILL_FAILED"
+                    )
+                }
+            } else if let textValue = field.value {
+                let setRes = await performSetValue(
+                    step: ActionStep(action: .setValue, text: textValue, preferBackground: step.preferBackground, restoreCursor: step.restoreCursor),
+                    resolved: resolved,
+                    targetApp: targetApp,
+                    onOverlayEvent: onOverlayEvent
+                )
+                if !setRes.success {
+                    return StepOutcome(
+                        success: false,
+                        mechanism: "fill-form",
+                        message: "Failed to set \(fieldDesc): \(setRes.message ?? setRes.errorCode ?? "unknown error")",
+                        node: resolved.node,
+                        errorCode: "FORM_FILL_FAILED"
+                    )
+                }
+            }
+
+            filledCount += 1
+            lastNode = resolved.node
+            axIndexer.invalidate(pid: targetApp.pid)
+        }
+
+        if let submitMatch = step.submitMatch, !submitMatch.isEmpty {
+            let submitStep = ActionStep(
+                action: .click,
+                preferBackground: step.preferBackground,
+                restoreCursor: step.restoreCursor,
+                match: submitMatch
+            )
+            switch await resolve(step: submitStep, targetApp: targetApp, scrollOffscreenIntoView: true) {
+            case .success(let submitResolved):
+                let clickRes = performClick(
+                    step: submitStep,
+                    resolved: submitResolved,
+                    targetApp: targetApp,
+                    onOverlayEvent: onOverlayEvent
+                )
+                if !clickRes.success {
+                    return StepOutcome(
+                        success: false,
+                        mechanism: "fill-form",
+                        message: "Filled \(filledCount) field(s), but submit failed: \(clickRes.message ?? clickRes.errorCode ?? "click failed")",
+                        node: submitResolved.node,
+                        errorCode: "FORM_FILL_FAILED"
+                    )
+                }
+                lastNode = submitResolved.node
+            case .failure(let refusal):
+                return StepOutcome(
+                    success: false,
+                    mechanism: "fill-form",
+                    message: "Filled \(filledCount) field(s), but submit button was not found: \(refusal.message)",
+                    errorCode: "FORM_FILL_FAILED"
+                )
+            }
+        }
+
+        let submitNote = (step.submitMatch?.isEmpty == false) ? " and submitted" : ""
+        return StepOutcome(
+            success: true,
+            mechanism: "fill-form",
+            message: "Filled \(filledCount) field\(filledCount == 1 ? "" : "s")\(submitNote)",
+            node: lastNode,
+            effect: .changed
+        )
+    }
+
+    private func selectPopUpOption(
+        element: AXUIElement,
+        desired: String,
+        pid: pid_t,
+        node: ElementNode?,
+        targetApp: AppDescriptor?,
+        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
+    ) async -> Bool {
+        highlight(node, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
+        // First try direct AXValue assignment if the popup supports it.
+        if AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, desired as CFTypeRef) == .success {
+            if let rb = Self.axString(element, kAXValueAttribute),
+               ElementMatcher.normalize(rb).contains(ElementMatcher.normalize(desired)) {
+                return true
+            }
+        }
+        // Otherwise open its AXMenu via AXPress, locate matching AXMenuItem, and press it.
+        let gen = axIndexer.currentGeneration(pid: pid)
+        guard AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
+            return false
+        }
+        _ = await axIndexer.waitForChange(pid: pid, sinceGeneration: gen, timeoutMs: 250)
+        let wantNorm = ElementMatcher.normalize(desired)
+        let children = Self.axChildren(element)
+        let menus = children.filter { Self.axString($0, kAXRoleAttribute) == "AXMenu" }
+        for menu in menus {
+            let items = Self.axChildren(menu)
+            if let exact = items.first(where: {
+                guard let title = Self.axString($0, kAXTitleAttribute) else { return false }
+                return ElementMatcher.normalize(title) == wantNorm
+            }) ?? items.first(where: {
+                guard let title = Self.axString($0, kAXTitleAttribute) else { return false }
+                return ElementMatcher.normalize(title).contains(wantNorm)
+            }) {
+                return AXUIElementPerformAction(exact, kAXPressAction as CFString) == .success
+            }
+        }
+        return false
+    }
+
+    private func performMenuAction(step: ActionStep, targetApp: AppDescriptor?) -> StepOutcome {
+        guard let targetApp, targetApp.pid > 0 else {
+            return StepOutcome(
+                success: false,
+                mechanism: "ax-menu-action",
+                message: "menuAction needs a target app.",
+                errorCode: "APP_NOT_FOUND"
+            )
+        }
+        guard let menuPath = step.menuPath, !menuPath.isEmpty else {
+            return StepOutcome(
+                success: false,
+                mechanism: "ax-menu-action",
+                message: "menuAction requires a non-empty menuPath (e.g. [\"File\", \"Save\"]).",
+                errorCode: "INVALID_REQUEST"
+            )
+        }
+        let inv = MenuBarController.invoke(pid: targetApp.pid, appName: targetApp.name, path: menuPath)
+        return StepOutcome(
+            success: inv.success,
+            mechanism: "ax-menu-action",
+            message: inv.message ?? inv.result.message,
+            errorCode: inv.errorCode,
+            effect: inv.success ? .changed : nil
+        )
     }
 
     // MARK: - Native file picker
