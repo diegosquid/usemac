@@ -348,6 +348,7 @@ public struct ControlCenterView: View {
                 localVisionGroup
                 permissionsGroup
                 safetyGroup
+                TargetRulesGroupView()
                 SoftwareUpdatesGroupView(updater: appState.updater)
             }
             .frame(maxWidth: 640, alignment: .leading)
