@@ -122,7 +122,8 @@ struct UseMacCLI {
         .setPolicy,
         .pairApp,
         .browserReloadExtension,
-        .reportPrepare
+        .reportPrepare,
+        .debugCapture
     ]
 
     /// Exit code 4: a safety rule blocked the request. Stop and tell the user.
@@ -134,7 +135,8 @@ struct UseMacCLI {
         "URL_BLOCKED",
         "UPLOAD_BLOCKED",
         "SELF_TARGET_BLOCKED",
-        "TARGET_BLOCKED"
+        "TARGET_BLOCKED",
+        "DEBUG_CAPTURE_OFF"
     ]
 
     /// Exit code 5: the screen is not what the caller expected. Observe again, then retry.
@@ -228,7 +230,7 @@ struct UseMacCLI {
             }
             if options.help {
                 // Only group commands take a subcommand word; for the others the next word is data (JSON, text).
-                let isGroup = command == "browser" || command == "vision"
+                let isGroup = command == "browser" || command == "vision" || command == "debug"
                 let path = isGroup && !(rest.first?.hasPrefix("-") ?? true) ? [command, rest[0]] : [command]
                 return try printHelp(for: path)
             }
@@ -271,6 +273,8 @@ struct UseMacCLI {
                 return try await handleAudit(args: rest, options: options)
             case "report":
                 return try await handleReport(args: rest, options: options)
+            case "debug":
+                return try await handleDebug(args: rest, options: options)
             case "serve":
                 return try await handleServe(options: options)
             case "mcp":
@@ -1714,6 +1718,78 @@ struct UseMacCLI {
         return 0
     }
 
+    private static func handleDebug(args: [String], options: GlobalOptions) async throws -> Int32 {
+        switch args.first {
+        case "capture":
+            return try await handleDebugCapture(args: Array(args.dropFirst()), options: options)
+        case "help":
+            return try printHelp(for: ["debug"] + args.dropFirst().prefix(1))
+        case nil:
+            throw CLIError.usage("Usage: usemac debug capture [--window <kinds>] [--frames <n>] [--interval <ms>] [--context] [--out <dir>]")
+        case let other?:
+            throw CLIError.usage("Unknown debug subcommand: '\(other)'. Use: capture.")
+        }
+    }
+
+    /// `debug capture`: PNGs of UseMac's own windows, for developing UseMac. Needs the user to turn on Debug capture.
+    private static func handleDebugCapture(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(
+            args: args,
+            valueFlags: ["--window", "--frames", "--interval", "--margin", "--out"],
+            boolFlags: ["--context"]
+        )
+        if let extra = parsed.positionals.first {
+            throw CLIError.usage("Unexpected argument '\(extra)'. Run 'usemac help debug capture'.")
+        }
+        let params = DebugCaptureParams(
+            window: parsed.values["--window"],
+            frames: try parseOptionalInt(parsed.values, flag: "--frames", positive: true),
+            intervalMs: try parseOptionalInt(parsed.values, flag: "--interval", positive: true),
+            context: parsed.flags.contains("--context") ? true : nil,
+            contextMargin: try parseOptionalInt(parsed.values, flag: "--margin")
+        )
+        let resolved: DebugCaptureOptions
+        do {
+            resolved = try params.resolved()
+        } catch let invalid as DebugCaptureParams.InvalidWindow {
+            throw CLIError.usage(invalid.message)
+        }
+
+        let req = RPCRequest(method: .debugCapture, debugCapture: params)
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: resolved.clientTimeoutMs)
+        try ensureOK(res)
+        guard var result = res.debugCapture else {
+            throw CLIError.rpcFailure(code: "INTERNAL", message: "Response missing debugCapture.")
+        }
+        if let out = parsed.values["--out"] {
+            do {
+                result = try result.copied(to: out)
+            } catch {
+                throw CLIError.rpcFailure(code: "INTERNAL", message: "Couldn't copy the PNGs to \(out): \(error.localizedDescription). They are still in \(result.directory).")
+            }
+        }
+
+        if options.json {
+            printEncodableJSON(result)
+            return 0
+        }
+        let frames = result.frames == 1 ? "1 frame" : "\(result.frames) frames, \(result.intervalMs) ms apart"
+        print(String(format: "[%@] Debug capture: %d PNG(s) of %@ (%@) in %@ | %.0f ms | rtt: %.2f ms", mode.rawValue, result.images.count, result.window, frames, result.directory, result.latencyMs, rttMs))
+        for image in result.images {
+            let f = image.frame
+            let title = image.title.map { $0.isEmpty ? "" : " \"\($0)\"" } ?? ""
+            let window = image.windowId.map { " window \($0)\(title)" } ?? ""
+            print(String(
+                format: "  #%d +%.0f ms  %@%@  frame (%.0f, %.0f, %.0f×%.0f)  %d×%d px  %@",
+                image.frameIndex, image.offsetMs, image.kind, window, f.x, f.y, f.width, f.height, image.width, image.height, image.path
+            ))
+        }
+        if !result.notes.isEmpty {
+            print("Notes: \(result.notes.joined(separator: "; "))")
+        }
+        return 0
+    }
+
     private static func handleScreenshot(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
@@ -2168,6 +2244,8 @@ struct UseMacCLI {
                                                      Print the audit log (kept on disk, typed text redacted), newest first
           report --summary "<text>" [--title "<text>"] [--task <taskId>]
                                                      Prepare a problem report the user reviews in UseMac before anything is sent
+          debug capture [--window <kinds>] [--frames <n>] [--interval <ms>] [--context] [--margin <pt>] [--out <dir>]
+                                                     For developing UseMac: PNGs of UseMac's own windows (the user must turn on Debug capture)
           serve                                      Start the Unix socket RPC daemon
           mcp                                        Start the stdio MCP server
           install-skill [--workspace] [--dir <path>] [--force] [--dry-run]
@@ -2179,7 +2257,7 @@ struct UseMacCLI {
           1  Command or RPC failure (find: nothing matched)
           2  Invalid usage, unknown flag or key, or invalid JSON
           3  Daemon required (DAEMON_REQUIRED): ask the user to open UseMac
-          4  Blocked by a safety rule or the user (POLICY_BLOCKED, POLICY_LOCKED, APPROVAL_DENIED, APPROVAL_TIMEOUT, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED, TARGET_BLOCKED): stop and tell the user
+          4  Blocked by a safety rule or the user (POLICY_BLOCKED, POLICY_LOCKED, APPROVAL_DENIED, APPROVAL_TIMEOUT, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED, TARGET_BLOCKED, DEBUG_CAPTURE_OFF): stop and tell the user
           5  The screen is not what you expected (STALE_SNAPSHOT, ELEMENT_NOT_FOUND, WAIT_TIMEOUT): observe again, then retry
           6  Needs the app (and its window) in front, or the user or another task is busy there (TARGET_NOT_FRONTMOST, USER_ACTIVE, TARGET_BUSY): use a background step, or wait and retry
           7  This route cannot reach it (RESTRICTED_PAGE, CAPTURE_TOO_SMALL): switch route (see 'usemac help browser')
@@ -2604,6 +2682,38 @@ struct UseMacCLI {
                 examples: ["usemac report --task task-1a2b3c4d --summary \"Clicked Save in TextEdit with match; expected the sheet to open; got ELEMENT_NOT_FOUND twice although the button was visible.\""],
                 json: "ProblemReportReceipt {reportId, status (awaiting_user_review), taskId, entryCount, errorCodes, message}"
             )
+        case "debug":
+            return CommandHelp(
+                usage: ["usemac debug <subcommand> [arguments]"],
+                summary: "Tools for developing UseMac itself. They work only after the user turns on Debug capture in UseMac → Settings → Developer.",
+                flags: [("capture", "Save PNGs of UseMac's own windows (live preview, Settings, …), read-only")],
+                notes: ["Run 'usemac help debug capture' for its flags."],
+                examples: ["usemac debug capture --window preview"]
+            )
+        case "debug capture":
+            return CommandHelp(
+                usage: ["usemac debug capture [--window <kinds>] [--frames <n>] [--interval <ms>] [--context] [--margin <pt>] [--out <dir>]"],
+                summary: "For developing UseMac: save PNGs of UseMac's own windows so you can check its UI (the live preview, Settings, the setup guide, …). Read-only: it never clicks or types in them, and observe, act and screenshot still refuse UseMac's windows (SELF_TARGET_BLOCKED). Each window is captured on its own with its transparency and shadow. Prints each PNG's path, window kind, title and frame in screen points (origin at the top-left of the main display).",
+                flags: [
+                    ("--window <kinds>", "Comma-separated: preview, prompt (the Ask prompt), settings, setup, report, other, all, context (default all)"),
+                    ("--frames <n>", "Take a burst of n captures to see an animation (default 1, at most 40)"),
+                    ("--interval <ms>", "Time between frames (default 250, from 100 to 1000)"),
+                    ("--context", "Also capture the screen around the live preview, so it shows over what is behind it (same as adding 'context' to --window)"),
+                    ("--margin <pt>", "Points around the preview in a context capture (default 48, at most 400)"),
+                    ("--out <dir>", "Copy the PNGs into this folder (default: they stay in the private temp folder 'screenshot' uses, pruned after 30 minutes)")
+                ],
+                notes: [
+                    "Needs the user: Debug capture is off by default and only they can turn it on, in UseMac → Settings → Developer. While it is off this fails with DEBUG_CAPTURE_OFF (exit 4): ask the user, don't look for another route. No command, method or MCP tool turns it on.",
+                    "Values out of range are brought into range; 'Notes:' (notes in JSON) says so. A context capture leaves out apps the user's rules block. The Kill Switch and Paused block it (POLICY_BLOCKED); without the app it fails with DAEMON_REQUIRED.",
+                    "When none of the windows asked for is on screen it fails with CAPTURE_FAILED. The live preview shows while a task runs ('usemac start'); only the user opens Settings."
+                ],
+                examples: [
+                    "usemac debug capture --window preview --context",
+                    "usemac debug capture --window preview --frames 12 --interval 100 --out ./hud-frames",
+                    "usemac debug capture --window settings --json"
+                ],
+                json: "DebugCaptureResult {window, frames, intervalMs, directory, latencyMs, notes, images: [{path, kind, title, windowId, frame {x, y, width, height}, width, height, byteCount, frameIndex, offsetMs}]}"
+            )
         case "serve":
             return CommandHelp(
                 usage: ["usemac serve [--socket <path>]"],
@@ -2672,7 +2782,7 @@ struct UseMacCLI {
         var lines: [String] = ["usemac \(key) — \(help.summary)", "", "Usage:"]
         lines.append(contentsOf: help.usage.map { "  \($0)" })
         if !help.flags.isEmpty {
-            let isGroup = key == "browser" || key == "vision"
+            let isGroup = key == "browser" || key == "vision" || key == "debug"
             lines.append("")
             lines.append(isGroup ? "Subcommands:" : "Flags:")
             let width = min(28, help.flags.map(\.0.count).max() ?? 0)
