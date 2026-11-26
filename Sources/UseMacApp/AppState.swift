@@ -572,7 +572,10 @@ public final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let profile = event.profileName ?? self.hudDeck.first(where: { $0.isBrowser })?.browserProfile ?? self.connectedBrowserProfiles.first?.profileName ?? "Chrome"
-                let cardId = Self.browserCardId(profile: profile, tabId: event.tabId)
+                // A cursor only moves on a tab that already has a card; the card itself comes with the tab's first frame.
+                let profileCardId = Self.browserCardId(profile: profile, tabId: event.tabId)
+                guard let cardId = self.browserCardIdForTab(event.tabId)
+                    ?? (self.hudDeck.contains(where: { $0.id == profileCardId }) ? profileCardId : nil) else { return }
                 let label: String?
                 switch event.phase {
                 case "click":
@@ -1755,11 +1758,14 @@ public final class AppState: ObservableObject {
     // MARK: - Live Activity Stream Handling
 
     private func handleLiveActivity(_ item: LiveActivityItem) {
-        updatePreviewResizeHold(for: item)
         liveActivities.append(item)
         if liveActivities.count > 80 {
             liveActivities.removeFirst(liveActivities.count - 80)
         }
+        // Golden rule: the preview only shows UseMac's tabs and apps an agent named. Work on a guessed target (no app
+        // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
+        guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
+        updatePreviewResizeHold(for: item)
 
         // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
         // cursor or stream target on the large preview of the card the user is watching.
@@ -1976,6 +1982,16 @@ public final class AppState: ObservableObject {
                 }
                 return sub
             }()
+            // A step on a tab with no card yet adds nothing: the tab's card comes with its first real frame. Otherwise
+            // a step on a closed tab (or one that is not UseMac's) left an empty globe card and reopened the preview.
+            let cardExists = hudDeck.contains(where: { $0.id == cardId })
+            guard cardExists || PreviewDeckFocus.activityAddsCard(
+                isBrowser: isChromeBridgeActivity,
+                namesTab: item.browserTabId != nil,
+                success: item.success
+            ) else {
+                return
+            }
             upsertHUDCard(
                 id: cardId,
                 isBrowser: isChromeBridgeActivity,

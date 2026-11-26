@@ -1543,6 +1543,9 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     public var isInProgress: Bool
     public var browserTabId: Int?
     public var browserProfile: String?
+    /// True when the request named no app and UseMac fell back to the app in front (usually the user's own). The
+    /// live preview never shows such work: only UseMac tabs and apps an agent named are shown.
+    public var targetGuessed: Bool?
 
     public init(
         id: String = UUID().uuidString,
@@ -1562,7 +1565,8 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         success: Bool = true,
         isInProgress: Bool = false,
         browserTabId: Int? = nil,
-        browserProfile: String? = nil
+        browserProfile: String? = nil,
+        targetGuessed: Bool? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1582,6 +1586,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.isInProgress = isInProgress
         self.browserTabId = browserTabId
         self.browserProfile = browserProfile
+        self.targetGuessed = targetGuessed
     }
 }
 

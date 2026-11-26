@@ -43,6 +43,21 @@ public enum PreviewDeckFocus {
         return front.isCompleted && !front.isBusy
     }
 
+    /// Whether the live preview reacts to an activity at all. Work on a guessed target (the request named no app, so
+    /// UseMac fell back to the app in front, usually the user's own) is never shown: only UseMac tabs and apps an
+    /// agent named are.
+    public static func previewShows(targetGuessed: Bool) -> Bool {
+        !targetGuessed
+    }
+
+    /// Whether an activity may add a card the deck does not have yet. A Chrome tab's card only comes from a real
+    /// frame of that tab, never from a step: a step can name a tab that is closed or not UseMac's, and its card would
+    /// stay empty. A browser activity that names no tab (a task that has not opened one yet) may add the placeholder.
+    public static func activityAddsCard(isBrowser: Bool, namesTab: Bool, success: Bool) -> Bool {
+        guard isBrowser else { return true }
+        return !namesTab && success
+    }
+
     /// True when an activity is another card's work, so it must not drive the large preview (its caption, cursor,
     /// click pulse or stream target). Activity that names neither a tab nor an app, and native work in a Chromium
     /// browser (which can be the front tab's own page), counts as the front card's.

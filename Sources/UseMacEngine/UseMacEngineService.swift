@@ -222,7 +222,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 mechanism: cacheTag,
                 latencyMs: snapshot.latencyMs,
                 success: true,
-                isInProgress: false
+                isInProgress: false,
+                targetGuessed: workspaceMonitor.isGuessedTarget(requestApp: params.app) ? true : nil
             ))
             response = .success(id: request.id, latencyMs: latencyMs, snapshot: snapshot)
 
@@ -253,7 +254,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }
 
             let overlay = onOverlayEvent
-            let liveActivity = onLiveActivity
+            // Work on a guessed target (no app named, none paired: the app in front) is marked so the live preview
+            // never shows the user's own app.
+            let targetGuessed = workspaceMonitor.isGuessedTarget(requestApp: actReq.app, stepApps: actReq.steps.map(\.app))
+            let liveActivity: (@Sendable (LiveActivityItem) -> Void)?
+            if targetGuessed, let forward = onLiveActivity {
+                liveActivity = { item in
+                    var marked = item
+                    marked.targetGuessed = true
+                    forward(marked)
+                }
+            } else {
+                liveActivity = onLiveActivity
+            }
             let (actResult, resolvedApp) = await actionExecutor.executeBatch(
                 actReq,
                 onOverlayEvent: overlay,
@@ -312,7 +325,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 subtitle: completeSubtitle,
                 latencyMs: actResult.totalLatencyMs,
                 success: actResult.success,
-                isInProgress: false
+                isInProgress: false,
+                targetGuessed: targetGuessed ? true : nil
             ))
             response = .success(id: request.id, latencyMs: latencyMs, snapshot: observation, actionResult: finalResult)
 
@@ -371,7 +385,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     subtitle: "\(max(1, result.byteCount / 1024)) KB · JPEG",
                     latencyMs: result.latencyMs,
                     success: true,
-                    isInProgress: false
+                    isInProgress: false,
+                    targetGuessed: workspaceMonitor.isGuessedTarget(requestApp: req.app) ? true : nil
                 ))
                 response = .success(id: request.id, latencyMs: latencyMs, screenshot: result)
             } catch {

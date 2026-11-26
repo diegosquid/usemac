@@ -74,4 +74,30 @@ final class PreviewDeckFocusTests: XCTestCase {
         let finished = PreviewDeckFocus.Front(isBrowser: true, browserTabId: 11, hasPreview: true, isBusy: false, isCompleted: true)
         XCTAssertFalse(PreviewDeckFocus.isBackgroundActivity(front: finished, tabId: 22, appPid: nil, isChromiumApp: false))
     }
+
+    // MARK: Golden rule: only UseMac tabs and apps an agent named
+
+    func testGuessedTargetNeverReachesThePreview() {
+        XCTAssertFalse(PreviewDeckFocus.previewShows(targetGuessed: true))
+        XCTAssertTrue(PreviewDeckFocus.previewShows(targetGuessed: false))
+    }
+
+    func testATabsCardComesFromItsFrameNotFromASteps() {
+        // Steps on a tab (even successful ones, like "starting") never add its card: a closed tab would leave an empty one.
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: true, success: true))
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: true, success: false))
+        // A browser task that has not opened a tab yet may show the placeholder.
+        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: false, success: true))
+        XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: false, success: false))
+        // Native apps an agent named keep their cards.
+        XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: false, namesTab: false, success: false))
+    }
+
+    func testTargetIsGuessedOnlyWhenNothingNamesAnApp() {
+        XCTAssertTrue(WorkspaceMonitor.isGuessedTarget(requestApp: nil, hasPairedApp: false))
+        XCTAssertTrue(WorkspaceMonitor.isGuessedTarget(requestApp: "  ", stepApps: [nil, ""], hasPairedApp: false))
+        XCTAssertFalse(WorkspaceMonitor.isGuessedTarget(requestApp: "TextEdit", hasPairedApp: false))
+        XCTAssertFalse(WorkspaceMonitor.isGuessedTarget(requestApp: nil, stepApps: [nil, "Notes"], hasPairedApp: false))
+        XCTAssertFalse(WorkspaceMonitor.isGuessedTarget(requestApp: nil, hasPairedApp: true), "pair_app names the target")
+    }
 }

@@ -17,6 +17,9 @@ All notable changes to UseMac are documented here. The format follows
 
 ### Security
 
+- The live preview only shows UseMac's own Chrome tabs and apps an agent named. A screenshot, observe or action
+  that names no app (so it falls back to the app in front, usually your own) no longer makes the preview show that
+  app, and a failed step on a closed tab no longer leaves an empty card.
 - Agents can no longer observe or act on UseMac's own windows, such as Settings. Requests that name UseMac
   return `SELF_TARGET_BLOCKED`, and `list_apps` no longer lists it.
 
