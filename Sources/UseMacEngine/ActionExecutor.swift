@@ -34,7 +34,11 @@ public final class ActionExecutor: @unchecked Sendable {
         onLiveActivity: (@Sendable (LiveActivityItem) -> Void)? = nil
     ) async -> (result: BatchActionResult, resolvedApp: AppDescriptor?) {
         let batchStartNs = DispatchTime.now().uptimeNanoseconds
-        var currentApp = workspaceMonitor.resolveApp(query: request.app)
+        let requestTarget = workspaceMonitor.resolveTarget(query: request.app)
+        var currentApp: AppDescriptor?
+        if case .app(let app) = requestTarget {
+            currentApp = app
+        }
         if let window = request.window, let app = currentApp {
             WindowResolver.pin(pid: app.pid, title: window)
             currentApp = WorkspaceMonitor.withTargetWindow(app)
@@ -73,7 +77,13 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         // Preconditions run before anything is sent, so a refused batch never half-runs.
-        if let refusal = preflightRefusal(request, targetApp: currentApp) {
+        // UseMac's own windows are never a target: a batch or step that names UseMac does not run at all.
+        let batchNamesUseMac = requestTarget == .useMac
+            || request.steps.contains(where: { workspaceMonitor.namesUseMac($0.app) })
+        let selfTargetRefusal: Refusal? = batchNamesUseMac
+            ? Refusal(mechanism: "self-target", errorCode: "SELF_TARGET_BLOCKED", message: WorkspaceMonitor.selfTargetMessage)
+            : nil
+        if let refusal = selfTargetRefusal ?? preflightRefusal(request, targetApp: currentApp) {
             stepResults.append(ActionStepResult(
                 index: 0,
                 action: request.steps.first?.action ?? .wait,
@@ -576,10 +586,33 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     /// Real (HID) input goes to whatever app is in front. Refuse unless that is the target.
-    private func frontmostGuard(_ targetApp: AppDescriptor?, input: String) -> StepOutcome? {
-        guard let pid = targetApp?.pid, pid > 0 else { return nil }
-        if WindowResolver.isFrontmost(pid: pid) { return nil }
-        return notFrontmostOutcome(targetApp: targetApp, input: input)
+    /// `point` is where a mouse event would land, for the check that it is not a UseMac window.
+    private func frontmostGuard(_ targetApp: AppDescriptor?, input: String, at point: CGPoint? = nil) -> StepOutcome? {
+        if let pid = targetApp?.pid, pid > 0, !WindowResolver.isFrontmost(pid: pid) {
+            return notFrontmostOutcome(targetApp: targetApp, input: input)
+        }
+        return ownWindowGuard(targetApp, at: point)
+    }
+
+    /// Real input lands in whichever window the window server picks, which can be a UseMac window (Settings)
+    /// even when the target is another app. Refuse before sending anything when it would.
+    private func ownWindowGuard(_ targetApp: AppDescriptor?, at point: CGPoint?) -> StepOutcome? {
+        var receivers: [pid_t] = []
+        // Topmost normal window at the point. UseMac's overlays sit above layer 0 and let clicks through.
+        if let point, let top = WindowResolver.onScreenWindows().first(where: { $0.frame.contains(point) }) {
+            receivers.append(top.pid)
+        }
+        // Without a target app, keys and clicks go to whatever app is in front.
+        if (targetApp?.pid ?? 0) <= 0, let front = WindowResolver.frontmostPid() {
+            receivers.append(front)
+        }
+        guard receivers.contains(where: { workspaceMonitor.isUseMacProcess(pid: $0) }) else { return nil }
+        return StepOutcome(
+            success: false,
+            mechanism: "self-target",
+            message: "This input would land in a UseMac window, so nothing was sent. \(WorkspaceMonitor.selfTargetMessage)",
+            errorCode: "SELF_TARGET_BLOCKED"
+        )
     }
 
     private func notFrontmostOutcome(targetApp: AppDescriptor?, input: String) -> StepOutcome {
@@ -763,7 +796,8 @@ public final class ActionExecutor: @unchecked Sendable {
         } else if let id = step.elementId, !id.isEmpty {
             if let pid = targetApp?.pid, pid > 0, let live = axIndexer.liveNode(for: id, pid: pid) {
                 resolved = ResolvedElement(pid: pid, element: live.element, node: live.node)
-            } else if let other = axIndexer.node(for: id), let live = axIndexer.liveNode(for: id, pid: other.pid) {
+            } else if let other = axIndexer.node(for: id), !workspaceMonitor.isUseMacProcess(pid: other.pid),
+                      let live = axIndexer.liveNode(for: id, pid: other.pid) {
                 resolved = ResolvedElement(pid: other.pid, element: live.element, node: live.node)
             } else {
                 return .failure(Refusal(
@@ -985,7 +1019,7 @@ public final class ActionExecutor: @unchecked Sendable {
             )
         }
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
             var refusedWithNode = refused
             refusedWithNode.node = resolved.node
             return refusedWithNode
@@ -1025,7 +1059,7 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "mouse movement") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "mouse movement", at: point) {
             return refused
         }
 
@@ -1081,7 +1115,7 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
             return refused
         }
 
@@ -1129,7 +1163,7 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "ELEMENT_NOT_FOUND"
             )
         }
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "clicks", at: point) {
             return refused
         }
 
@@ -1188,7 +1222,7 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         if bgPid == nil {
-            if let refused = frontmostGuard(targetApp, input: "typing") {
+            if let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node)) {
                 return refused
             }
             if let point = resolvePoint(step: step, node: resolved.node) {
@@ -1223,7 +1257,7 @@ public final class ActionExecutor: @unchecked Sendable {
         let text = step.text ?? ""
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node)) {
             return refused
         }
 
@@ -1355,7 +1389,7 @@ public final class ActionExecutor: @unchecked Sendable {
             return StepOutcome(success: true, mechanism: "cgevent-pid-scroll", node: resolved.node, scrollDeltaY: moved)
         }
 
-        if let refused = frontmostGuard(targetApp, input: "scrolling") {
+        if let refused = frontmostGuard(targetApp, input: "scrolling", at: point) {
             return refused
         }
 
