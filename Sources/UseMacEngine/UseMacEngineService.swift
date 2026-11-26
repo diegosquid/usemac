@@ -138,7 +138,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
-            guard let resolvedObserveApp = workspaceMonitor.resolveApp(query: params.app) else {
+            let observeTarget = workspaceMonitor.resolveTarget(query: params.app)
+            if observeTarget == .useMac {
+                response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Observe blocked")
+                break
+            }
+            guard case .app(let resolvedObserveApp) = observeTarget else {
                 let latencyMs = elapsedMs(since: startNs)
                 appendAudit(method: request.method.rawValue, targetApp: params.app, summary: "App not found", latencyMs: latencyMs, success: false)
                 emitLiveActivity(LiveActivityItem(
@@ -242,6 +247,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
+            if workspaceMonitor.namesUseMac(actReq.app) || actReq.steps.contains(where: { workspaceMonitor.namesUseMac($0.app) }) {
+                response = selfTargetResponse(request: request, startNs: startNs, targetApp: actReq.app, activityTitle: "Action blocked")
+                break
+            }
+
             let overlay = onOverlayEvent
             let liveActivity = onLiveActivity
             let (actResult, resolvedApp) = await actionExecutor.executeBatch(
@@ -318,6 +328,12 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
+            // A whole-display capture (no app) is a read and may show UseMac; a capture of UseMac itself is not.
+            let screenshotTarget = workspaceMonitor.resolveTarget(query: req.app)
+            if screenshotTarget == .useMac {
+                response = selfTargetResponse(request: request, startNs: startNs, targetApp: req.app, activityTitle: "Screenshot blocked")
+                break
+            }
             guard permissionManager.isScreenRecordingGranted() else {
                 let latencyMs = elapsedMs(since: startNs)
                 appendAudit(method: request.method.rawValue, targetApp: req.app, summary: "Screen Recording permission denied", latencyMs: latencyMs, success: false)
@@ -330,7 +346,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
-            let targetApp = workspaceMonitor.resolveApp(query: req.app)
+            var targetApp: AppDescriptor?
+            if case .app(let app) = screenshotTarget {
+                targetApp = app
+            }
             do {
                 let result = try await screenCapturer.capture(req, targetApp: targetApp)
                 let latencyMs = elapsedMs(since: startNs)
@@ -413,6 +432,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     activityTitle: "Pair app blocked",
                     reason: blockReason
                 )
+                break
+            }
+            if workspaceMonitor.namesUseMac(query) {
+                response = selfTargetResponse(request: request, startNs: startNs, targetApp: query, activityTitle: "Pair app blocked")
                 break
             }
             let paired = setPairedApp(query)
@@ -1214,6 +1237,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
+            if workspaceMonitor.namesUseMac(params.app) {
+                response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Vision query blocked")
+                break
+            }
             if let rawImagePath = params.imagePath?.trimmingCharacters(in: .whitespacesAndNewlines), !rawImagePath.isEmpty {
                 guard isAllowedVisionImagePath(rawImagePath) else {
                     let latencyMs = elapsedMs(since: startNs)
@@ -1827,6 +1854,33 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             isInProgress: false
         ))
         return .failure(id: request.id, code: "POLICY_BLOCKED", message: reason, latencyMs: latencyMs)
+    }
+
+    /// Refusal for a request that names UseMac itself: agents never observe or act on its own windows.
+    private func selfTargetResponse(
+        request: RPCRequest,
+        startNs: UInt64,
+        targetApp: String?,
+        activityTitle: String
+    ) -> RPCResponse {
+        let latencyMs = elapsedMs(since: startNs)
+        let message = WorkspaceMonitor.selfTargetMessage
+        appendAudit(
+            method: request.method.rawValue,
+            targetApp: targetApp,
+            summary: "Blocked: request named UseMac itself",
+            latencyMs: latencyMs,
+            success: false
+        )
+        emitLiveActivity(LiveActivityItem(
+            kind: .policyOrSafety,
+            title: activityTitle,
+            subtitle: message,
+            latencyMs: latencyMs,
+            success: false,
+            isInProgress: false
+        ))
+        return .failure(id: request.id, code: "SELF_TARGET_BLOCKED", message: message, latencyMs: latencyMs)
     }
 
     private func normalizedDirectoryPrefix(_ path: String) -> String {

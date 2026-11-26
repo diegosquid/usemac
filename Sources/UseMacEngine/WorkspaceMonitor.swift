@@ -3,7 +3,23 @@ import CoreGraphics
 import Foundation
 import UseMacProtocol
 
+/// What an app query (name, bundle ID or PID) names among the running apps.
+public enum AppQueryMatch: Equatable, Sendable {
+    case app(AppDescriptor)
+    /// The query names UseMac itself, which is never a target.
+    case useMac
+    case notFound
+}
+
 public final class WorkspaceMonitor: @unchecked Sendable {
+    /// UseMac's bundle ID. Matching it, not only this process's PID, also covers a `--standalone` CLI,
+    /// whose own PID is not the app's.
+    public static let useMacBundleId = "app.usemac"
+    public static let useMacAppName = "UseMac"
+    /// Agents never observe or act on UseMac's own windows (Settings, the setup guide): only the user changes
+    /// UseMac's settings.
+    public static let selfTargetMessage = "UseMac does not automate its own windows. Stop and ask the user to change UseMac settings themselves."
+
     private struct WindowMetadata {
         let title: String?
         let bounds: ScreenRect?
@@ -17,8 +33,17 @@ public final class WorkspaceMonitor: @unchecked Sendable {
 
     public init() {}
 
+    /// Running GUI apps an agent may target. UseMac itself is never listed.
     public func listRunningApps() -> [AppDescriptor] {
-        let windowMap = collectWindowMetadataByPid()
+        let apps = Self.excludingUseMac(regularApps(), selfPid: selfPid)
+        rememberExternalFrontmost(in: apps)
+        return apps
+    }
+
+    /// Every running GUI app, UseMac included. Only target resolution reads it, to tell "names UseMac" apart
+    /// from "not found"; everything an agent gets back goes through `listRunningApps()` or `resolveTarget`.
+    private func regularApps(withWindowMetadata: Bool = true) -> [AppDescriptor] {
+        let windowMap: [Int32: WindowMetadata] = withWindowMetadata ? collectWindowMetadataByPid() : [:]
         let running = NSWorkspace.shared.runningApplications
 
         var descriptors: [AppDescriptor] = []
@@ -52,13 +77,86 @@ public final class WorkspaceMonitor: @unchecked Sendable {
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
 
-        if let activeExternal = descriptors.first(where: { $0.isActive && $0.pid != selfPid }) {
+        return descriptors
+    }
+
+    private func rememberExternalFrontmost(in apps: [AppDescriptor]) {
+        if let activeExternal = apps.first(where: { $0.isActive && !isUseMacApp($0) }) {
             lock.lock()
             lastExternalFrontmostApp = activeExternal
             lock.unlock()
         }
+    }
 
-        return descriptors
+    // MARK: - UseMac is never a target
+
+    /// True for this process, and for any app with UseMac's bundle ID (the app, seen from a `--standalone` CLI).
+    public static func isUseMac(
+        pid: Int32,
+        bundleId: String?,
+        selfPid: Int32,
+        selfBundleId: String = WorkspaceMonitor.useMacBundleId
+    ) -> Bool {
+        if pid == selfPid { return true }
+        guard let bundleId else { return false }
+        return bundleId.lowercased() == selfBundleId.lowercased()
+    }
+
+    public static func excludingUseMac(
+        _ apps: [AppDescriptor],
+        selfPid: Int32,
+        selfBundleId: String = WorkspaceMonitor.useMacBundleId
+    ) -> [AppDescriptor] {
+        apps.filter { !isUseMac(pid: $0.pid, bundleId: $0.bundleId, selfPid: selfPid, selfBundleId: selfBundleId) }
+    }
+
+    /// Resolves `query` against `apps` (which may include UseMac). A query that names UseMac, directly or
+    /// because UseMac is the app it matches, is `.useMac` and never falls through to another app.
+    public static func matchQuery(
+        _ query: String,
+        in apps: [AppDescriptor],
+        selfPid: Int32,
+        selfBundleId: String = WorkspaceMonitor.useMacBundleId
+    ) -> AppQueryMatch {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .notFound }
+        let isSelf: (AppDescriptor) -> Bool = {
+            isUseMac(pid: $0.pid, bundleId: $0.bundleId, selfPid: selfPid, selfBundleId: selfBundleId)
+        }
+
+        if let pid = Int32(trimmed) {
+            if pid == selfPid { return .useMac }
+            guard let app = apps.first(where: { $0.pid == pid }) else { return .notFound }
+            return isSelf(app) ? .useMac : .app(app)
+        }
+
+        // UseMac is not in `apps` while its windows are closed (it then runs as an accessory app).
+        let needle = trimmed.lowercased()
+        if needle == selfBundleId.lowercased() || needle == useMacAppName.lowercased() {
+            return .useMac
+        }
+
+        guard let match = matchApp(query: trimmed, in: apps) else { return .notFound }
+        return isSelf(match) ? .useMac : .app(match)
+    }
+
+    /// True when `query` names UseMac itself. Cheap: it skips window metadata.
+    public func namesUseMac(_ query: String?) -> Bool {
+        guard let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return Self.matchQuery(query, in: regularApps(withWindowMetadata: false), selfPid: selfPid) == .useMac
+    }
+
+    /// True when `pid` is UseMac (this process, or the app seen from a `--standalone` CLI).
+    public func isUseMacProcess(pid: Int32) -> Bool {
+        Self.isUseMac(
+            pid: pid,
+            bundleId: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+            selfPid: selfPid
+        )
+    }
+
+    private func isUseMacApp(_ app: AppDescriptor) -> Bool {
+        Self.isUseMac(pid: app.pid, bundleId: app.bundleId, selfPid: selfPid)
     }
 
     public func currentExternalFrontmostApp() -> AppDescriptor? {
@@ -93,7 +191,10 @@ public final class WorkspaceMonitor: @unchecked Sendable {
             return nil
         }
 
-        let resolved = matchApp(query: query, in: listRunningApps())
+        var resolved: AppDescriptor?
+        if case .app(let app) = Self.matchQuery(query, in: regularApps(), selfPid: selfPid) {
+            resolved = app
+        }
         lock.lock()
         pairedApp = resolved
         lock.unlock()
@@ -105,7 +206,7 @@ public final class WorkspaceMonitor: @unchecked Sendable {
         let currentPaired = pairedApp
         lock.unlock()
 
-        guard let currentPaired else { return nil }
+        guard let currentPaired, !isUseMacApp(currentPaired) else { return nil }
         let apps = listRunningApps()
         if let fresh = apps.first(where: { $0.pid == currentPaired.pid }) {
             lock.lock()
@@ -118,9 +219,19 @@ public final class WorkspaceMonitor: @unchecked Sendable {
 
     /// Resolves the app an action targets and pins the exact window (AX focused window → CGWindowID), so
     /// previews, screenshots and overlay checks never guess by title.
+    /// Never returns UseMac itself; use `resolveTarget(query:)` to tell that case apart from "not found".
     public func resolveApp(query: String?) -> AppDescriptor? {
-        guard let app = resolveAppWithoutWindow(query: query) else { return nil }
-        return Self.withTargetWindow(app)
+        guard case .app(let app) = resolveTarget(query: query) else { return nil }
+        return app
+    }
+
+    /// Like `resolveApp(query:)`, but reports `.useMac` when the query names UseMac itself.
+    public func resolveTarget(query: String?) -> AppQueryMatch {
+        let match = resolveTargetWithoutWindow(query: query)
+        guard case .app(let app) = match else { return match }
+        // Belt and braces: whatever path produced it, UseMac is never handed out as a target.
+        if isUseMacApp(app) { return .useMac }
+        return .app(Self.withTargetWindow(app))
     }
 
     public static func withTargetWindow(_ app: AppDescriptor) -> AppDescriptor {
@@ -143,22 +254,30 @@ public final class WorkspaceMonitor: @unchecked Sendable {
         return resolved
     }
 
-    private func resolveAppWithoutWindow(query: String?) -> AppDescriptor? {
-        let apps = listRunningApps()
-
+    private func resolveTargetWithoutWindow(query: String?) -> AppQueryMatch {
         if let query {
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                return matchApp(query: trimmed, in: apps)
+                let apps = regularApps()
+                rememberExternalFrontmost(in: apps)
+                return Self.matchQuery(trimmed, in: apps, selfPid: selfPid)
             }
         }
+        guard let app = fallbackApp() else { return .notFound }
+        return .app(app)
+    }
+
+    /// The target when the agent names no app: the paired app, else the last external frontmost app, else
+    /// the frontmost app. Only ever picks from `listRunningApps()`, which leaves UseMac out.
+    private func fallbackApp() -> AppDescriptor? {
+        let apps = listRunningApps()
 
         lock.lock()
         let currentPaired = pairedApp
         let lastExternal = lastExternalFrontmostApp
         lock.unlock()
 
-        if let currentPaired {
+        if let currentPaired, !isUseMacApp(currentPaired) {
             if let fresh = apps.first(where: { $0.pid == currentPaired.pid }) {
                 return fresh
             }
@@ -167,7 +286,7 @@ public final class WorkspaceMonitor: @unchecked Sendable {
             }
         }
 
-        if let lastExternal {
+        if let lastExternal, !isUseMacApp(lastExternal) {
             if let fresh = apps.first(where: { $0.pid == lastExternal.pid }) {
                 return fresh
             }
@@ -176,12 +295,10 @@ public final class WorkspaceMonitor: @unchecked Sendable {
             }
         }
 
-        return apps.first(where: { $0.isActive && $0.pid != selfPid })
-            ?? apps.first(where: { $0.pid != selfPid })
-            ?? apps.first
+        return apps.first(where: { $0.isActive }) ?? apps.first
     }
 
-    private func matchApp(query: String, in apps: [AppDescriptor]) -> AppDescriptor? {
+    private static func matchApp(query: String, in apps: [AppDescriptor]) -> AppDescriptor? {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
