@@ -3072,6 +3072,12 @@ async function resolveStepTarget(tabId, step) {
   return null;
 }
 
+// True when a step says where to act: a non-blank elementId or selector, or a point.
+function stepNamesTarget(step) {
+  const named = (value) => typeof value === "string" && value.trim() !== "";
+  return named(step?.elementId) || named(step?.selector) || (Number.isFinite(step?.x) && Number.isFinite(step?.y));
+}
+
 function buildKeyDescriptor(keyName) {
   const raw = String(keyName || "");
   const lower = raw.toLowerCase();
@@ -3247,6 +3253,14 @@ async function executeActionStep(tabId, step, cancelToken = null) {
   }
 
   if (action === "setValue" || action === "type") {
+    // setValue replaces a field's text, so it must name the field: without one it used to select-all and type into
+    // whatever had focus. Typing into the focused element is what "type" is for.
+    if (action === "setValue" && !stepNamesTarget(step)) {
+      throw {
+        code: "INVALID_REQUEST",
+        message: "setValue names no field: pass elementId (an @bN id from browser_observe) or selector. Nothing was typed. To type into the focused field, use type."
+      };
+    }
     const session = getOrCreateTabSession(tabId);
     const text = step.text ?? "";
     const target = await resolveStepTarget(tabId, step);

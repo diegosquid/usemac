@@ -867,6 +867,13 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = .failure(id: request.id, code: "INVALID_REQUEST", message: "Missing browserAct payload", latencyMs: latencyMs)
                 break
             }
+            // A setValue with no field would type into whatever has focus in the page: refuse it before anything else.
+            if let invalid = BrowserStepValidation.targetlessSetValueMessage(in: params.steps) {
+                let latencyMs = elapsedMs(since: startNs)
+                appendAudit(method: request.method.rawValue, targetApp: params.profile ?? "Chrome", summary: invalid, latencyMs: latencyMs, success: false)
+                response = .failure(id: request.id, code: "INVALID_REQUEST", message: invalid, latencyMs: latencyMs)
+                break
+            }
 
             var urlValidationError: String?
             for idx in params.steps.indices where params.steps[idx].action == .openURL || params.steps[idx].action == .navigate {
