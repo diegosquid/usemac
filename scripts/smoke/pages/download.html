@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UseMac smoke download</title>
+<script>
+  const params = new URLSearchParams(location.search);
+  if (params.get("t")) document.title = params.get("t");
+</script>
+</head>
+<body>
+<h1>UseMac smoke: a download runs while the task finishes</h1>
+<p><a id="dl" href="#">Download the slow file</a></p>
+<script>
+  // ?name=<file>&seconds=<n>&size=<bytes> point the link at the server's slow /download endpoint.
+  const name = params.get("name") || "usemac-smoke.bin";
+  const q = new URLSearchParams({ seconds: params.get("seconds") || "10", size: params.get("size") || "524288" });
+  document.getElementById("dl").href = "/download/" + encodeURIComponent(name) + "?" + q.toString();
+</script>
+</body>
+</html>
