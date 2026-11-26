@@ -234,6 +234,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if params.includeScreenshot == true, perms.screenRecordingGranted {
                 let axIndexer = self.axIndexer
                 let screenCapturer = self.screenCapturer
+                let liveStreamer = self.liveStreamer
                 let shotReq = ScreenshotRequest(
                     app: params.app,
                     includeBase64: params.returnImageContent ?? false
@@ -249,7 +250,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                         includeOffscreen: includeOffscreen
                     )
                 }.value
-                async let shotTask: ScreenshotResult? = try? screenCapturer.capture(shotReq, targetApp: app)
+                async let shotTask: ScreenshotResult? = try? screenCapturer.capture(shotReq, targetApp: app, streamer: liveStreamer)
                 snapshot = await axTask
                 capturedShot = await shotTask
                 if let shot = capturedShot {
@@ -267,29 +268,33 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
             }
 
-            // Automatic AX + OCR `@vN` fusion for AX-blind Electron/Canvas/PDF windows.
-            if snapshot.elements.count < 5,
+            // Automatic AX + OCR `@vN` fusion for AX-blind Electron/Canvas/PDF windows
+            // (runs on the unfiltered AX tree before applying any caller `ElementFilter`).
+            // On hot-cache hits, reuse cached OCR nodes instead of re-capturing ScreenCaptureKit + Vision.
+            if perms.accessibilityGranted,
+               snapshot.elements.count < 5,
                perms.screenRecordingGranted,
                let bounds = snapshot.app.windowBounds,
                bounds.width > 300,
                bounds.height > 200 {
-                let ocrNodes = await fuseOCRElements(
-                    app: app,
-                    windowBounds: bounds,
-                    existingScreenshotPath: capturedShot?.path
-                )
+                let ocrNodes: [ElementNode]
+                if snapshot.fromHotCache {
+                    ocrNodes = cachedOCRNodes(forPid: app.pid)
+                } else {
+                    ocrNodes = await fuseOCRElements(
+                        app: app,
+                        windowBounds: bounds,
+                        existingScreenshotPath: capturedShot?.path
+                    )
+                    storeOCRNodes(ocrNodes, pid: app.pid)
+                }
                 if !ocrNodes.isEmpty {
                     snapshot.elements.append(contentsOf: ocrNodes)
-                    storeOCRNodes(ocrNodes, pid: app.pid)
                 }
             }
 
             if let filter = params.filter {
-                snapshot.elements = Self.filterElements(
-                    snapshot.elements,
-                    filter: filter,
-                    viewport: snapshot.app.windowBounds
-                )
+                snapshot = AXIndexer.filteringSnapshot(snapshot, with: filter)
             }
 
             recordObserveMetrics(latencyMs: snapshot.latencyMs, fromHotCache: snapshot.fromHotCache)
@@ -381,7 +386,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }()
             var capturedBeforeCG = beforeNativeCG
             if actReq.diffCrop == true, actPerms.screenRecordingGranted, let preApp = preResolvedApp {
-                capturedBeforeCG = await screenCapturer.capturePreviewCGImage(targetApp: preApp, maxDimension: 1280)?.image
+                capturedBeforeCG = await screenCapturer.capturePreviewCGImage(
+                    targetApp: preApp,
+                    maxDimension: 1280,
+                    streamer: liveStreamer
+                )?.image
             }
 
             let (actResult, resolvedApp) = await actionExecutor.executeBatch(
@@ -431,6 +440,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     app: actReq.app,
                     includeBase64: actReq.returnImageContent ?? false
                 )
+                // Always capture fresh post-action pixels (do not reuse `liveStreamer`, which may lag behind the just-completed action).
                 if let shot = try? await screenCapturer.capture(shotReq, targetApp: targetApp) {
                     var finalShot = shot
                     let fullData = try? Data(contentsOf: URL(fileURLWithPath: shot.path))
@@ -586,15 +596,17 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 targetApp = app
             }
             do {
-                let rawResult = try await screenCapturer.capture(req, targetApp: targetApp)
+                let rawResult = try await screenCapturer.capture(req, targetApp: targetApp, streamer: liveStreamer)
                 let targetKey = targetApp.map { "native:\($0.pid)" } ?? "native:display"
                 var result = rawResult
-                if let rawData = try? Data(contentsOf: URL(fileURLWithPath: rawResult.path)) {
+                // `FastScreenCapturer.capture` already applies explicit `req.region` on the full-resolution CGImage.
+                // Only update the full-frame baseline / compute `diffCrop` when no explicit `region` was requested.
+                if req.region == nil, let rawData = try? Data(contentsOf: URL(fileURLWithPath: rawResult.path)) {
                     let cropped = applyRegionOrDiffCrop(
                         jpegData: rawData,
                         original: rawResult,
                         targetKey: targetKey,
-                        region: req.region,
+                        region: nil,
                         diffCrop: req.diffCrop == true,
                         maxDimension: req.maxDimension,
                         quality: req.quality,
@@ -1930,7 +1942,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             quality: 0.82,
             includeBase64: false
         )
-        if let shot = try? await screenCapturer.capture(shotReq, targetApp: targetApp) {
+        if let shot = try? await screenCapturer.capture(shotReq, targetApp: targetApp, streamer: liveStreamer) {
             let w = targetApp?.windowBounds?.width ?? Double(shot.width)
             let h = targetApp?.windowBounds?.height ?? Double(shot.height)
             return (shot.path, w, h, nil, nil, targetApp?.windowTitle ?? targetApp?.name)
@@ -2054,7 +2066,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         guard permissionManager.isScreenRecordingGranted() else {
             return nil
         }
-        return await screenCapturer.capturePreviewCGImage(targetApp: app, maxDimension: maxDimension)
+        return await screenCapturer.capturePreviewCGImage(targetApp: app, maxDimension: maxDimension, streamer: liveStreamer)
     }
 
     public func recentAuditEntries(limit: Int = 50) -> [AuditEntry] {
@@ -2583,11 +2595,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
         if isInvoke {
             let invokeRes = await Task.detached(priority: .userInitiated) {
-                NativeAppMenuHelper.invoke(pid: app.pid, path: cleanedPath)
+                MenuBarController.invoke(pid: app.pid, appName: app.name, path: cleanedPath)
             }.value
             let latencyMs = elapsedMs(since: startNs)
-            switch invokeRes {
-            case .success(let resolvedPath):
+            if invokeRes.success {
+                let resolvedPath = invokeRes.result.invokedPath ?? cleanedPath
                 let joined = resolvedPath.joined(separator: " > ")
                 incrementActionCount(by: 1)
                 appendAudit(method: request.method.rawValue, targetApp: app.name, summary: "Invoked menu \(joined)", latencyMs: latencyMs, success: true)
@@ -2607,23 +2619,26 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 return .success(
                     id: request.id,
                     latencyMs: latencyMs,
-                    appMenuResult: AppMenuResult(app: app.name, invokedPath: resolvedPath, message: "Invoked \(joined)")
+                    appMenuResult: invokeRes.result
                 )
-            case .failure(let err):
-                appendAudit(method: request.method.rawValue, targetApp: app.name, summary: err.message, latencyMs: latencyMs, success: false)
-                return .failure(id: request.id, code: err.code, message: err.message, latencyMs: latencyMs)
+            } else {
+                let code = invokeRes.errorCode ?? "ELEMENT_NOT_FOUND"
+                let message = invokeRes.message ?? invokeRes.result.message ?? "Failed to invoke menu item."
+                appendAudit(method: request.method.rawValue, targetApp: app.name, summary: message, latencyMs: latencyMs, success: false)
+                return .failure(id: request.id, code: code, message: message, latencyMs: latencyMs)
             }
         } else {
             let query = params.query
-            let items = await Task.detached(priority: .userInitiated) {
-                NativeAppMenuHelper.search(pid: app.pid, query: query, maxItems: 200)
+            let menuResult = await Task.detached(priority: .userInitiated) {
+                MenuBarController.search(pid: app.pid, appName: app.name, query: query, maxItems: 200)
             }.value
             let latencyMs = elapsedMs(since: startNs)
-            appendAudit(method: request.method.rawValue, targetApp: app.name, summary: "Found \(items.count) menu item(s)", latencyMs: latencyMs, success: true)
+            let count = menuResult.items?.count ?? 0
+            appendAudit(method: request.method.rawValue, targetApp: app.name, summary: "Found \(count) menu item(s)", latencyMs: latencyMs, success: true)
             return .success(
                 id: request.id,
                 latencyMs: latencyMs,
-                appMenuResult: AppMenuResult(app: app.name, items: items)
+                appMenuResult: menuResult
             )
         }
     }
@@ -3198,7 +3213,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 LocalVisionEngine.ocrElementNodes(fromJPEG: data, windowBounds: windowBounds)
             }.value
         }
-        guard let preview = await screenCapturer.capturePreviewCGImage(targetApp: app, maxDimension: 1280) else {
+        guard let preview = await screenCapturer.capturePreviewCGImage(
+            targetApp: app,
+            maxDimension: 1280,
+            streamer: liveStreamer
+        ) else {
             return []
         }
         let effectiveBounds = preview.windowBounds ?? windowBounds
@@ -3214,8 +3233,23 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             map[node.id] = node
         }
         stateLock.lock()
-        ocrNodesByPid[pid] = map
+        if map.isEmpty {
+            ocrNodesByPid.removeValue(forKey: pid)
+        } else {
+            ocrNodesByPid[pid] = map
+        }
         stateLock.unlock()
+    }
+
+    private func cachedOCRNodes(forPid pid: Int32) -> [ElementNode] {
+        stateLock.lock()
+        let values = ocrNodesByPid[pid].map { Array($0.values) } ?? []
+        stateLock.unlock()
+        return values.sorted { lhs, rhs in
+            let lNum = Int(lhs.id.dropFirst(2)) ?? Int.max
+            let rNum = Int(rhs.id.dropFirst(2)) ?? Int.max
+            return lNum < rNum
+        }
     }
 
     private func lookupOCRNode(_ id: String, pid: Int32) -> ElementNode? {
@@ -3253,27 +3287,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }
         }
         return copy
-    }
-
-    static func filterElements(_ elements: [ElementNode], filter: ElementFilter, viewport: ScreenRect?) -> [ElementNode] {
-        elements.filter { node in
-            if filter.viewportOnly == true, node.offscreen == true {
-                return false
-            }
-            if let role = filter.role?.trimmingCharacters(in: .whitespacesAndNewlines), !role.isEmpty {
-                if ElementMatcher.normalizeRole(node.role) != ElementMatcher.normalizeRole(role) {
-                    return false
-                }
-            }
-            if let text = filter.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
-                let needle = ElementMatcher.normalize(text)
-                let haystacks = [node.title, node.value, node.roleDescription].compactMap { $0 }
-                if !haystacks.contains(where: { ElementMatcher.normalize($0).contains(needle) }) {
-                    return false
-                }
-            }
-            return true
-        }
     }
 
     private func cachedScreenshotJPEG(forKey key: String) -> Data? {
@@ -3378,166 +3391,5 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             latencyMs: latencyMs,
             base64Data: includeBase64 ? croppedData.base64EncodedString() : nil
         )
-    }
-}
-
-// MARK: - Native Menu Bar AX Helper (zero focus steal)
-
-private enum NativeAppMenuHelper {
-    struct MenuError: Error {
-        let code: String
-        let message: String
-    }
-
-    static func search(pid: Int32, query: String?, maxItems: Int = 200) -> [AppMenuItemInfo] {
-        let axApp = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(axApp, 0.5)
-        guard let menuBar = copyElement(axApp, attribute: kAXMenuBarAttribute) else {
-            return []
-        }
-
-        let needle = query.map { ElementMatcher.normalize($0) }
-        let hasQuery = !(needle?.isEmpty ?? true)
-        var results: [AppMenuItemInfo] = []
-
-        func walkMenu(_ menuElement: AXUIElement, pathPrefix: [String], depth: Int) {
-            guard depth <= 4, results.count < maxItems else { return }
-            let children = copyChildren(menuElement)
-            for child in children {
-                guard results.count < maxItems else { break }
-                let title = (copyString(child, attribute: kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !title.isEmpty else { continue }
-                if depth == 0 && title == "Apple" { continue }
-
-                let currentPath = pathPrefix + [title]
-                let subChildren = copyChildren(child)
-                if let submenu = subChildren.first(where: { copyString($0, attribute: kAXRoleAttribute) == kAXMenuRole as String }) {
-                    walkMenu(submenu, pathPrefix: currentPath, depth: depth + 1)
-                } else if depth > 0 {
-                    let enabled = copyBool(child, attribute: kAXEnabledAttribute) ?? true
-                    let shortcut = formatShortcut(for: child)
-                    if !hasQuery || matchesQuery(needle!, title: title, path: currentPath) {
-                        results.append(AppMenuItemInfo(path: currentPath, title: title, shortcut: shortcut, enabled: enabled))
-                    }
-                }
-            }
-        }
-
-        walkMenu(menuBar, pathPrefix: [], depth: 0)
-        return results
-    }
-
-    static func invoke(pid: Int32, path: [String]) -> Result<[String], MenuError> {
-        guard !path.isEmpty else {
-            return .failure(MenuError(code: "INVALID_REQUEST", message: "menuPath must not be empty."))
-        }
-        let axApp = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(axApp, 0.5)
-        guard let menuBar = copyElement(axApp, attribute: kAXMenuBarAttribute) else {
-            return .failure(MenuError(code: "ELEMENT_NOT_FOUND", message: "Application menu bar is not accessible."))
-        }
-
-        var currentContainer = menuBar
-        var resolvedPath: [String] = []
-
-        for (index, segment) in path.enumerated() {
-            let children = copyChildren(currentContainer)
-            guard let matched = matchMenuItem(segment: segment, in: children) else {
-                let joined = path.joined(separator: " > ")
-                return .failure(MenuError(code: "ELEMENT_NOT_FOUND", message: "Menu item '\(joined)' not found (stopped at '\(segment)')."))
-            }
-            let title = copyString(matched, attribute: kAXTitleAttribute) ?? segment
-            resolvedPath.append(title)
-
-            if index < path.count - 1 {
-                let subChildren = copyChildren(matched)
-                guard let submenu = subChildren.first(where: { copyString($0, attribute: kAXRoleAttribute) == kAXMenuRole as String }) else {
-                    return .failure(MenuError(code: "ELEMENT_NOT_FOUND", message: "Menu '\(title)' has no submenu for '\(path[index + 1])'."))
-                }
-                currentContainer = submenu
-            } else {
-                let enabled = copyBool(matched, attribute: kAXEnabledAttribute) ?? true
-                guard enabled else {
-                    let joined = resolvedPath.joined(separator: " > ")
-                    return .failure(MenuError(code: "APP_MENU_FAILED", message: "Menu item '\(joined)' is disabled."))
-                }
-                let status = AXUIElementPerformAction(matched, kAXPressAction as CFString)
-                guard status == .success else {
-                    let joined = resolvedPath.joined(separator: " > ")
-                    return .failure(MenuError(code: "APP_MENU_FAILED", message: "Failed to press menu item '\(joined)' (AXError \(status.rawValue))."))
-                }
-                return .success(resolvedPath)
-            }
-        }
-        return .failure(MenuError(code: "ELEMENT_NOT_FOUND", message: "Menu item not found."))
-    }
-
-    private static func matchMenuItem(segment: String, in children: [AXUIElement]) -> AXUIElement? {
-        let want = ElementMatcher.normalize(segment)
-        guard !want.isEmpty else { return nil }
-        var prefixMatch: AXUIElement?
-        var containsMatch: AXUIElement?
-        for child in children {
-            guard let title = copyString(child, attribute: kAXTitleAttribute), !title.isEmpty else { continue }
-            let have = ElementMatcher.normalize(title)
-            if have == want { return child }
-            if prefixMatch == nil && have.hasPrefix(want) { prefixMatch = child }
-            if containsMatch == nil && have.contains(want) { containsMatch = child }
-        }
-        return prefixMatch ?? containsMatch
-    }
-
-    private static func matchesQuery(_ normalizedNeedle: String, title: String, path: [String]) -> Bool {
-        if ElementMatcher.normalize(title).contains(normalizedNeedle) { return true }
-        return ElementMatcher.normalize(path.joined(separator: " ")).contains(normalizedNeedle)
-    }
-
-    private static func formatShortcut(for item: AXUIElement) -> String? {
-        guard let cmdChar = copyString(item, attribute: kAXMenuItemCmdCharAttribute), !cmdChar.isEmpty else {
-            return nil
-        }
-        let mods = copyInt(item, attribute: kAXMenuItemCmdModifiersAttribute) ?? 0
-        var prefix = ""
-        if (mods & (1 << 2)) != 0 { prefix += "⌃" }
-        if (mods & (1 << 1)) != 0 { prefix += "⌥" }
-        if (mods & (1 << 0)) != 0 { prefix += "⇧" }
-        if (mods & (1 << 3)) == 0 { prefix += "⌘" }
-        return prefix + cmdChar.uppercased()
-    }
-
-    private static func copyElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success, let raw else {
-            return nil
-        }
-        guard CFGetTypeID(raw) == AXUIElementGetTypeID() else { return nil }
-        return (raw as! AXUIElement)
-    }
-
-    private static func copyChildren(_ element: AXUIElement) -> [AXUIElement] {
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw) == .success,
-              let list = raw as? [AXUIElement] else {
-            return []
-        }
-        return list
-    }
-
-    private static func copyString(_ element: AXUIElement, attribute: String) -> String? {
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
-        return raw as? String
-    }
-
-    private static func copyBool(_ element: AXUIElement, attribute: String) -> Bool? {
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
-        return (raw as? NSNumber)?.boolValue
-    }
-
-    private static func copyInt(_ element: AXUIElement, attribute: String) -> Int? {
-        var raw: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success else { return nil }
-        return (raw as? NSNumber)?.intValue
     }
 }

@@ -990,9 +990,52 @@ COMPARE_ROWS: list[tuple[str, tuple[str, ...], str]] = [
 ]
 
 
+def normalize_report_for_compare(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize pre-SOTA legacy baseline JSONs (`schema`/`ipc`/`nativeFinder`/`browserExpenseForm`) into bench-sota format."""
+    if isinstance(data.get("static"), dict) and isinstance(data.get("native"), dict):
+        return data
+
+    schema = data.get("schema") or {}
+    ipc = data.get("ipc") or {}
+    finder = data.get("nativeFinder") or {}
+    browser_form = data.get("browserExpenseForm") or {}
+
+    static = {
+        "mcpToolCount": schema.get("mcpToolCount"),
+        "mcpToolsCompactBytes": schema.get("mcpToolsCompactBytes"),
+        "mcpToolsPrettyBytes": schema.get("mcpToolsPrettyBytes"),
+        "mcpInstructionsChars": schema.get("mcpInstructionsChars"),
+        "skillMdBytes": schema.get("skillMdBytes"),
+        "agentsMdBytes": schema.get("agentsMdBytes"),
+        "staticTokensEst35": schema.get("staticTokensEst35"),
+    }
+    native = {
+        "pingP50Ms": (ipc.get("ping") or {}).get("p50Ms"),
+        "pingP95Ms": (ipc.get("ping") or {}).get("p95Ms"),
+        "listAppsP50Ms": (ipc.get("listApps") or {}).get("p50Ms"),
+        "observeColdMs": (ipc.get("observe") or {}).get("coldMs"),
+        "observeWarmP50Ms": (ipc.get("observe") or {}).get("warmP50Ms"),
+        "nativeObserveCliChars": finder.get("observeChars"),
+        "nativeObserveElements": finder.get("observeElements"),
+        "nativeObserveTokensEst": finder.get("observeTokensEst25"),
+    }
+    browser = {
+        "spaOpenMs": browser_form.get("openMs"),
+        "observeVisibleChars": browser_form.get("observeChars"),
+        "fillFormActMs": browser_form.get("actLatencyMs"),
+    }
+    amdahl = compute_amdahl_model(static, native, browser)
+    return {
+        "static": static,
+        "native": native,
+        "browser": browser,
+        "amdahl": amdahl,
+    }
+
+
 def render_comparison(before_path: Path, after_path: Path) -> str:
-    before = json.loads(before_path.read_text(encoding="utf-8"))
-    after = json.loads(after_path.read_text(encoding="utf-8"))
+    before = normalize_report_for_compare(json.loads(before_path.read_text(encoding="utf-8")))
+    after = normalize_report_for_compare(json.loads(after_path.read_text(encoding="utf-8")))
 
     lines = [
         "# UseMac SOTA Benchmark Comparison",
@@ -1046,7 +1089,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Print JSON instead of Markdown")
     args = parser.parse_args(argv)
 
-    if args.compare:
+    if args.compare and not args.save:
         before_p, after_p = Path(args.compare[0]), Path(args.compare[1])
         if not before_p.exists() or not after_p.exists():
             print(f"bench-sota: comparison file missing ({before_p}, {after_p})", file=sys.stderr)
@@ -1072,6 +1115,19 @@ def main(argv: list[str] | None = None) -> int:
         save_path = Path(args.save)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    if args.compare:
+        before_p, after_p = Path(args.compare[0]), Path(args.compare[1])
+        if not before_p.exists() or not after_p.exists():
+            print(f"bench-sota: comparison file missing ({before_p}, {after_p})", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(render_markdown_report(report))
+            print("")
+            print(render_comparison(before_p, after_p))
+        return 0
 
     if args.json:
         print(json.dumps(report, indent=2))

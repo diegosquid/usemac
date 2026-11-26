@@ -615,7 +615,7 @@ public final class AXIndexer: @unchecked Sendable {
         }
     }
 
-    private static func filteringSnapshot(_ snapshot: WindowSnapshot, with filter: ElementFilter) -> WindowSnapshot {
+    internal static func filteringSnapshot(_ snapshot: WindowSnapshot, with filter: ElementFilter) -> WindowSnapshot {
         var filtered = snapshot
         filtered.elements = applyFilter(snapshot.elements, filter: filter)
         if var diff = snapshot.diff {
