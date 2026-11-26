@@ -26,7 +26,7 @@ UseMac is a native macOS app and background daemon (written in Swift) that lets 
 printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
-Methods (24): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`, `report_prepare`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one.
+Methods (25): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`, `report_prepare`, `debug_capture`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one. `debug_capture` is only for developing UseMac itself and works only after you turn on **Debug capture** in Settings ([Agent Guide, section 9](.agents/AGENTS.md#9-debug-capture-developing-usemac)).
 
 ### MCP (`stdio`)
 
@@ -73,6 +73,7 @@ USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 "$USEMAC" browser status
 "$USEMAC" audit --since 2h
 "$USEMAC" install-skill
+"$USEMAC" debug capture --window preview --context   # developing UseMac only, once you turn on Debug capture
 ```
 
 When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and action requests return `DAEMON_REQUIRED`. Passing `--standalone` runs in-process without the app and without its safety controls.
@@ -81,7 +82,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 
 Failed requests carry an error `code` and `message`, and an optional `hint` when UseMac knows what the agent should do next (for `POLICY_BLOCKED`, which execution mode, pause or Kill Switch refused it). The [Agent Guide](.agents/AGENTS.md#error-codes) explains each code and what the agent should do next.
 
-- **Stop and tell the user** (a safety rule blocked it, or UseMac isn't running): `POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DAEMON_REQUIRED`.
+- **Stop and tell the user** (a safety rule blocked it, or UseMac isn't running): `POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DEBUG_CAPTURE_OFF`, `DAEMON_REQUIRED`.
 - **The screen changed** (observe again): `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`.
 - **Needs the app in front, or the user is busy**: `TARGET_NOT_FRONTMOST`, `USER_ACTIVE`.
 - **Wrong route** (switch to native observe or the hybrid Chrome flow): `RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`.
@@ -112,6 +113,7 @@ UseMac starts in **Autonomous** until you pick another mode in **Settings → Ge
   - **URLs**: `browser_open` and `openURL`/`navigate` accept only `http://`, `https://`, and `about:blank` (scheme-less URLs get `https://`; everything else returns `URL_BLOCKED`).
   - **File uploads**: `uploadFile` blocks `~/.ssh`, `~/.aws`, `~/.gnupg`, Keychains, `.env` files, browser and password-manager directories in `~/Library`, shell histories, and secret/key extensions (`.pem`, `.pfx`, `.p8`, `.kdbx`, `.ovpn`, `.jks`, `.keystore`, `.tfstate`), returning `UPLOAD_BLOCKED`.
   - **UseMac's own windows**: agents can't observe or act on UseMac itself (Settings, the setup guide). Requests that name it return `SELF_TARGET_BLOCKED`, and `list_apps` leaves it out.
+  - **Debug capture** (**Settings → General → Developer**, off by default): for developing UseMac. While it is on, agents can take screenshots of UseMac's own windows, including the live preview and Settings, and of the screen around the preview (`debug_capture`, CLI `usemac debug capture`); they still can't click or type in them. Only you can turn it on: a confirmation explains it and only your own click on **Turn On** counts. No method, MCP tool or CLI command changes it, and the menu bar menu shows "Debug Capture: On" with **Turn Off Debug Capture** while it is on. While it is off, `debug_capture` returns `DEBUG_CAPTURE_OFF`.
   - **Local vision paths & models**: `vision_query.imagePath` only accepts files inside your user temporary directory or `/tmp`; `vision_install` only accepts the three built-in model presets (`INVALID_MODEL`).
   - **Temporary captures**: Screenshots are written to a private folder inside your user temporary directory and deleted after 30 minutes.
 - **Audit log**: Every observation and action is appended to one JSONL file per day in `~/Library/Application Support/UseMac/audit/` (readable only by you), kept for 30 days by default (**Settings → General → History**). Typed text, `setValue` values and `eval` sources are stored only as their length unless you turn on **Record typed text**, and URLs always lose their credentials and secret-looking query values. **Settings → History** filters it by task, app and result and exports it as JSON Lines or CSV; agents read it with `audit_log` (`limit`, `sinceMs`, `taskId`) or `usemac audit`.
