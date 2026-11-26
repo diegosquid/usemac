@@ -298,8 +298,9 @@ public final class AppState: ObservableObject {
         if FileManager.default.isExecutableFile(atPath: helper.path) {
             return helper.path
         }
-        let sibling = executableURL.deletingLastPathComponent().appendingPathComponent("usemac")
-        if FileManager.default.isExecutableFile(atPath: sibling.path) && sibling.lastPathComponent == "usemac" && sibling.path != executableURL.path {
+        // A SwiftPM build folder (.build/<config>/) holds the CLI product next to the app as usemac-cli.
+        let sibling = executableURL.deletingLastPathComponent().appendingPathComponent("usemac-cli")
+        if FileManager.default.isExecutableFile(atPath: sibling.path) {
             return sibling.path
         }
         if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/usemac") {
