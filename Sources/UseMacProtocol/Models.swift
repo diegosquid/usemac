@@ -1412,6 +1412,8 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
     public var summary: String
     public var latencyMs: Double
     public var success: Bool
+    /// The task the request belonged to (from `task_start`), when UseMac could tell.
+    public var taskId: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -1420,7 +1422,8 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
         targetApp: String? = nil,
         summary: String,
         latencyMs: Double,
-        success: Bool
+        success: Bool,
+        taskId: String? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1429,6 +1432,7 @@ public struct AuditEntry: Codable, Equatable, Identifiable, Sendable {
         self.summary = summary
         self.latencyMs = latencyMs
         self.success = success
+        self.taskId = taskId
     }
 }
 

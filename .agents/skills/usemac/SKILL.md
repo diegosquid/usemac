@@ -84,7 +84,7 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   ```json
   {"id":"b3e","method":"browser_extract","browserExtract":{"tabId":123,"mode":"tables","scanHorizontal":true}}
   ```
-  Modes: `"auto"`, `"tables"` (supports `scanHorizontal: true`), `"kpis"`, `"text"` (all read-only), `"downloads"` (lists only downloads started during the UseMac session), and `"eval"` (`"expression": "..."`). Note: `"eval"` runs arbitrary JavaScript in the page, is only allowed in `autonomous` mode (blocked under `confirmSensitive`, `readOnly`, and `paused`), and every expression is recorded in the audit history.
+  Modes: `"auto"`, `"tables"` (supports `scanHorizontal: true`), `"kpis"`, `"text"` (all read-only), `"downloads"` (lists only downloads started during the UseMac session), and `"eval"` (`"expression": "..."`). Note: `"eval"` runs arbitrary JavaScript in the page, is only allowed in `autonomous` mode (blocked under `confirmSensitive`, `readOnly`, and `paused`), and the audit history records each expression's length, not its source.
 - **Capture browser tab or cropped chart/element screenshot (inline image block in MCP)**:
   ```json
   {"id":"b3s","method":"browser_screenshot","browserScreenshot":{"tabId":123,"viewportWidth":1440,"viewportHeight":900,"deviceScaleFactor":2,"returnImageContent":true}}
@@ -106,6 +106,7 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   {"id":"d1","method":"task_complete","taskComplete":{"taskId":"<taskId from task_start>","summary":"Analysis complete"}}
   ```
   `task_start` returns a `taskId`. Pass it to every `browser_open` and to `task_complete`: other agents may be working at the same time, and the `taskId` is how UseMac closes only your tabs and marks only your preview cards done.
+  To check what your task did (it survives a UseMac restart), read its audit entries, newest first: `{"id":"a1","method":"audit_log","auditLog":{"taskId":"<taskId>","limit":200}}` (`sinceMs` also filters). Typed text and `eval` sources appear only as their length.
 
 Quick one-liner via `nc` or persistent Python `AF_UNIX` socket:
 ```bash
@@ -136,6 +137,7 @@ USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" vision ocr
 "$USEMAC" start --summary "Analyzing page"
 "$USEMAC" done --summary "Finished reading article"
+"$USEMAC" audit --task <taskId> [--since 2h] [--limit 200]
 "$USEMAC" observe --app "Notes" [--role button] [--text "new"] [--no-offscreen]
 "$USEMAC" find --app "Notes" --role button --title "New Note" [--first]
 "$USEMAC" act '{"app":"Notes","returnDiffOnly":true,"steps":[{"action":"click","match":{"role":"button","title":"New Note"}}]}' [--expect-title "Notes"] [--foreground] [--allow-stale]

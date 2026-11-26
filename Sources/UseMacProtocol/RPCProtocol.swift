@@ -80,6 +80,7 @@ public struct RPCRequest: Codable, Sendable {
     public var visionQuery: VisionQueryParams?
     public var taskStart: TaskStartParams?
     public var taskComplete: TaskCompleteParams?
+    public var auditLog: AuditLogParams?
 
     public init(
         id: String = UUID().uuidString,
@@ -100,7 +101,8 @@ public struct RPCRequest: Codable, Sendable {
         visionInstall: VisionInstallParams? = nil,
         visionQuery: VisionQueryParams? = nil,
         taskStart: TaskStartParams? = nil,
-        taskComplete: TaskCompleteParams? = nil
+        taskComplete: TaskCompleteParams? = nil,
+        auditLog: AuditLogParams? = nil
     ) {
         self.id = id
         self.method = method
@@ -121,6 +123,7 @@ public struct RPCRequest: Codable, Sendable {
         self.visionQuery = visionQuery
         self.taskStart = taskStart
         self.taskComplete = taskComplete
+        self.auditLog = auditLog
     }
 
     public init(from decoder: Decoder) throws {
@@ -144,6 +147,7 @@ public struct RPCRequest: Codable, Sendable {
         self.visionQuery = try c.decodeIfPresent(VisionQueryParams.self, forKey: .visionQuery)
         self.taskStart = try c.decodeIfPresent(TaskStartParams.self, forKey: .taskStart)
         self.taskComplete = try c.decodeIfPresent(TaskCompleteParams.self, forKey: .taskComplete)
+        self.auditLog = try c.decodeIfPresent(AuditLogParams.self, forKey: .auditLog)
     }
 }
 

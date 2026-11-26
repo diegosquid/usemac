@@ -253,6 +253,8 @@ struct UseMacCLI {
                 return try await handleTaskStart(args: rest, options: options)
             case "done", "complete", "stop":
                 return try await handleTaskComplete(args: rest, options: options)
+            case "audit":
+                return try await handleAudit(args: rest, options: options)
             case "serve":
                 return try await handleServe(options: options)
             case "mcp":
@@ -1560,6 +1562,45 @@ struct UseMacCLI {
         return 0
     }
 
+    private static func handleAudit(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--limit", "--since", "--task"])
+        if let extra = parsed.positionals.first {
+            throw CLIError.usage("Unexpected argument '\(extra)'. Run 'usemac help audit'.")
+        }
+        let limit = try parseOptionalInt(parsed.values, flag: "--limit", positive: true)
+        var sinceMs: Int64?
+        if let rawSince = parsed.values["--since"] {
+            guard let parsedSince = AuditLogParams.parseSince(rawSince) else {
+                throw CLIError.usage("--since expects a duration (30m, 2h, 7d), a date (2026-11-25 or ISO 8601) or milliseconds since 1970.")
+            }
+            sinceMs = parsedSince
+        }
+        let taskId = parsed.values["--task"]
+        let filtered = limit != nil || sinceMs != nil || taskId != nil
+        let req = RPCRequest(
+            method: .auditLog,
+            auditLog: filtered ? AuditLogParams(limit: limit, sinceMs: sinceMs, taskId: taskId) : nil
+        )
+        let (res, rttMs, mode) = try await executeRPC(req, options: options)
+        try ensureOK(res)
+        let entries = res.auditEntries ?? []
+        if options.json {
+            printEncodableJSON(entries)
+            return 0
+        }
+        print(String(format: "[%@] %d audit entr%@, newest first (%.2f ms):", mode.rawValue, entries.count, entries.count == 1 ? "y" : "ies", rttMs))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        for entry in entries {
+            let time = formatter.string(from: Date(timeIntervalSince1970: Double(entry.timestampMs) / 1000))
+            let result = entry.success ? "ok    " : "FAILED"
+            let task = entry.taskId.map { " [\($0)]" } ?? ""
+            print("  \(time)  \(result)  \(entry.method)  \(entry.targetApp ?? "-")\(task)  \(entry.summary)")
+        }
+        return 0
+    }
+
     private static func handleScreenshot(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
@@ -1612,7 +1653,7 @@ struct UseMacCLI {
     }
 
     private static func handleServe(options: GlobalOptions) async throws -> Int32 {
-        let service = UseMacEngineService(socketPath: options.socketPath)
+        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore())
         let server = UnixSocketServer(socketPath: options.socketPath, service: service, onClientCountChange: nil)
         try server.start()
 
@@ -2007,6 +2048,8 @@ struct UseMacCLI {
                                                      Start a continuous session keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
                                                      Finish the task with a completion overlay and smoothly close the preview
+          audit [--limit <n>] [--since <time>] [--task <taskId>]
+                                                     Print the audit log (kept on disk, typed text redacted), newest first
           serve                                      Start the Unix socket RPC daemon
           mcp                                        Start the stdio MCP server
           install-skill [--workspace] [--dir <path>] [--force] [--dry-run]
@@ -2383,6 +2426,19 @@ struct UseMacCLI {
                 usage: ["usemac done [--summary \"<text>\"] [--task <taskId>] [--app <name>] [--profile <name>] [--tab <id>] [--keep-tab <id,id>] [--keep-tabs]   (aliases: stop, complete)"],
                 summary: "Call once when the whole task is finished: shows the completion state and closes the live preview. About 2 s later UseMac closes the Chrome tabs it opened (never your own tabs, the tab you are looking at, or tabs with a running download). --keep-tab keeps the page with the result; --keep-tabs keeps them all. With --task, only that task's tabs close: tabs other running tasks opened are never closed.",
                 examples: ["usemac done --summary \"Report exported\"", "usemac done --summary \"Invoice ready\" --keep-tab 123"]
+            )
+        case "audit":
+            return CommandHelp(
+                usage: ["usemac audit [--limit <n>] [--since <30m|2h|7d|date|ms>] [--task <taskId>]"],
+                summary: "Print the audit log, newest first: every observation and action, with its app, result and task. Without flags, the 50 most recent entries. UseMac keeps it on disk (one file per day, 30 days by default), and typed text and page scripts appear only as their length.",
+                flags: [
+                    ("--limit <n>", "How many entries (default 50, at most 1000)"),
+                    ("--since <time>", "Only newer entries: a duration (30m, 2h, 7d), a date (2026-11-25, ISO 8601) or ms since 1970"),
+                    ("--task <taskId>", "Only the entries of this task (the taskId 'start' printed)")
+                ],
+                notes: ["Filters read the log on disk, so they reach back past the last restart; with the app closed, only the files in ~/Library/Application Support/UseMac/audit/ have it."],
+                examples: ["usemac audit", "usemac audit --task task-1a2b3c4d", "usemac audit --since 2h --limit 200 --json"],
+                json: "[AuditEntry {id, timestampMs, method, targetApp, summary, latencyMs, success, taskId}]"
             )
         case "serve":
             return CommandHelp(
