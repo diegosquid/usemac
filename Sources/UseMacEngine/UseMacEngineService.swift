@@ -7,7 +7,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let socketPath: String
     private let permissionManager = PermissionManager()
     private let killSwitch = KillSwitch()
-    private let workspaceMonitor = WorkspaceMonitor()
+    let workspaceMonitor = WorkspaceMonitor()
     /// Which running task owns which Chrome tabs UseMac opened (see TaskTabRegistry).
     let taskTabs = TaskTabRegistry()
     private let axIndexer = AXIndexer()
@@ -55,7 +55,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         get {
             stateLock.lock()
             defer { stateLock.unlock() }
-            return _onLiveActivity
+            return _onLiveActivity.map(TaskActivityContext.labeling)
         }
         set {
             stateLock.lock()
@@ -1454,7 +1454,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let summaryText = (params.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? params.summary!.trimmingCharacters(in: .whitespacesAndNewlines)
                 : "Working…"
-            let taskId = taskTabs.start(taskId: params.taskId)
+            let taskId = taskTabs.start(taskId: params.taskId, agent: params.agent)
             appendAudit(
                 method: request.method.rawValue,
                 targetApp: targetName,
@@ -2011,6 +2011,22 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             isInProgress: false
         ))
         return .failure(id: request.id, code: "SELF_TARGET_BLOCKED", message: message, latencyMs: latencyMs)
+    }
+
+    /// Refusal for an acting request on a window or tab another running task holds (TaskTabRegistry.claim).
+    func targetBusyResponse(request: RPCRequest, busy: TaskTabRegistry.Busy) -> RPCResponse {
+        let holder = busy.agent.map { "\($0) (\(busy.taskId))" } ?? busy.taskId
+        let message = "\(busy.target) is in use by another task, \(holder), active \(busy.idleSeconds) s ago. "
+            + "Wait until it finishes (task_complete), then retry; observe and screenshot still work."
+        appendAudit(method: request.method.rawValue, targetApp: busy.target, summary: "Busy: held by \(holder)", latencyMs: 0, success: false)
+        emitLiveActivity(LiveActivityItem(
+            kind: .policyOrSafety,
+            title: "\(busy.target) is busy",
+            subtitle: message,
+            success: false,
+            isInProgress: false
+        ))
+        return .failure(id: request.id, code: "TARGET_BUSY", message: message)
     }
 
     private func normalizedDirectoryPrefix(_ path: String) -> String {

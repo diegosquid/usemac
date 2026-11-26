@@ -3,7 +3,8 @@ import UseMacProtocol
 
 /// Which running task owns which Chrome tabs UseMac opened, so one agent finishing never closes another agent's tabs.
 /// It also remembers each task's last tab (a request without `tabId` goes there, not to the last tab any agent
-/// touched) and counts what the task did for the `task_complete` summary.
+/// touched), counts what the task did for the `task_complete` summary, and holds the task's leases: the windows and
+/// tabs it acts in, which another running task's actions can't touch until it finishes (`TARGET_BUSY`).
 ///
 /// A request is tied to a task by, in order: its explicit `taskId`, the task that owns the `tabId` it names, or the
 /// only running task. An explicit `taskId` that names no running task ties the request to no task. When none of
@@ -27,6 +28,39 @@ public final class TaskTabRegistry: @unchecked Sendable {
         var actions = 0
         var failedActions = 0
         var blocked = 0
+        /// Shown on the task's preview cards (`task_start` `agent`, or the MCP client's name).
+        var agent: String?
+        /// Windows the task acted in, and tabs it acted in that it did not open (it owns those already).
+        var windowLeases: [WindowLease] = []
+        var leasedTabIds: Set<Int> = []
+    }
+
+    /// A window a task acts in. Without `windowId` (UseMac could not tell the window) it covers every window of the app.
+    public struct WindowLease: Equatable, Sendable {
+        public var pid: Int32
+        public var windowId: UInt32?
+        /// For messages, e.g. `TextEdit window "Untitled"`.
+        public var label: String
+
+        public init(pid: Int32, windowId: UInt32?, label: String) {
+            self.pid = pid
+            self.windowId = windowId
+            self.label = label
+        }
+
+        func overlaps(_ other: WindowLease) -> Bool {
+            pid == other.pid && (windowId == nil || other.windowId == nil || windowId == other.windowId)
+        }
+    }
+
+    /// Another running task holds a window or tab the request wants to act in.
+    public struct Busy: Equatable, Sendable {
+        public var taskId: String
+        public var agent: String?
+        /// What is busy, e.g. `TextEdit window "Untitled"` or `Chrome tab 123`.
+        public var target: String
+        /// Seconds since the holding task last did anything.
+        public var idleSeconds: Int
     }
 
     struct TabRef: Equatable {
@@ -64,7 +98,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
 
     /// Opens a task and returns its id (the caller's, or a new one).
     @discardableResult
-    public func start(taskId: String? = nil, now: Date = Date()) -> String {
+    public func start(taskId: String? = nil, agent: String? = nil, now: Date = Date()) -> String {
         lock.lock(); defer { lock.unlock() }
         expire(now: now)
         let id = Self.clean(taskId) ?? Self.newId()
@@ -73,7 +107,51 @@ public final class TaskTabRegistry: @unchecked Sendable {
         } else {
             tasks[id]?.lastActivityAt = now
         }
+        if let agent = Self.cleanAgent(agent) {
+            tasks[id]?.agent = agent
+        }
         return id
+    }
+
+    /// The name shown on the task's preview cards, if it has one.
+    public func agent(of taskId: String?) -> String? {
+        guard let taskId else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return tasks[taskId]?.agent
+    }
+
+    /// Leases the windows and tabs an acting request works in for its task, or names the running task that holds one
+    /// of them. A request of no task (no `taskId`, and UseMac can't tell its task) is never refused, so callers that
+    /// don't use tasks work as before. One with a `taskId` that names no running task is refused but leases nothing.
+    public func claim(_ scope: Scope, windows: [WindowLease], tabs: [Int], now: Date = Date()) -> Busy? {
+        lock.lock(); defer { lock.unlock() }
+        expire(now: now)
+        let requester = scope.taskId.flatMap { tasks[$0] != nil ? $0 : nil }
+        guard requester != nil || Self.clean(scope.request.namedTaskId) != nil else { return nil }
+        for (id, task) in tasks where id != requester {
+            let idle = max(0, Int(now.timeIntervalSince(task.lastActivityAt)))
+            if let window = windows.first(where: { wanted in task.windowLeases.contains { $0.overlaps(wanted) } }) {
+                return Busy(taskId: id, agent: task.agent, target: window.label, idleSeconds: idle)
+            }
+            if let tab = tabs.first(where: { task.tabIds.contains($0) || task.leasedTabIds.contains($0) }) {
+                return Busy(taskId: id, agent: task.agent, target: "Chrome tab \(tab)", idleSeconds: idle)
+            }
+        }
+        guard let requester else { return nil }
+        for window in windows where !(tasks[requester]?.windowLeases.contains { $0.pid == window.pid && $0.windowId == window.windowId } ?? true) {
+            tasks[requester]?.windowLeases.append(window)
+        }
+        for tab in tabs where tasks[requester]?.tabIds.contains(tab) == false {
+            tasks[requester]?.leasedTabIds.insert(tab)
+        }
+        tasks[requester]?.lastActivityAt = now
+        return nil
+    }
+
+    /// True when a running task holds a lease or owns a tab, so an acting request may have to wait.
+    public var hasRunningTasks: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !tasks.isEmpty
     }
 
     /// The running task a request belongs to, if UseMac can tell.
@@ -155,6 +233,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
             let closing = keepTabs ? [] : task.openedTabIds.filter { task.tabIds.contains($0) && !keepTabIds.contains($0) }
             let summary = TaskSummary(
                 taskId: finished,
+                agent: task.agent,
                 requests: task.requests,
                 actions: task.actions,
                 failedActions: task.failedActions,
@@ -180,6 +259,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
             if tasks[key]?.tabIds.remove(tabId) != nil {
                 tasks[key]?.closedTabIds.append(tabId)
             }
+            tasks[key]?.leasedTabIds.remove(tabId)
             tasks[key]?.recentTabs.removeAll { $0.tabId == tabId }
         }
     }
@@ -208,10 +288,15 @@ public final class TaskTabRegistry: @unchecked Sendable {
         return tasks.count
     }
 
+    /// An agent name as the preview shows it: trimmed, at most 40 characters, nil when empty.
+    public static func cleanAgent(_ name: String?) -> String? {
+        clean(name).map { String($0.prefix(40)) }
+    }
+
     /// A refusal for a safety reason, counted as blocked in the summary.
     static func isBlockedCode(_ code: String?) -> Bool {
         guard let code else { return false }
-        return code.hasSuffix("_BLOCKED") || code == "POLICY_LOCKED"
+        return code.hasSuffix("_BLOCKED") || code == "POLICY_LOCKED" || code == "TARGET_BUSY"
     }
 
     // MARK: - Private (call with the lock held)
@@ -239,8 +324,9 @@ public final class TaskTabRegistry: @unchecked Sendable {
         tasks[owner]?.recentTabs = recent
     }
 
+    /// Tabs running tasks opened or act in: another task's cleanup leaves them open.
     private func allTabsLocked() -> Set<Int> {
-        tasks.values.reduce(into: Set<Int>()) { $0.formUnion($1.tabIds) }
+        tasks.values.reduce(into: Set<Int>()) { $0.formUnion($1.tabIds); $0.formUnion($1.leasedTabIds) }
     }
 
     private func expire(now: Date) {

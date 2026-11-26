@@ -87,6 +87,8 @@ public enum UseMacErrorGuide {
             return "UseMac never observes or acts on its own windows. Stop and tell the user; never try to change UseMac's settings through its UI."
         case "TARGET_BLOCKED":
             return "The user's app and site rules block this app or site. Stop and tell the user; only they can change the rules, in UseMac Settings. Do not reach it another way. Only when the message says UseMac couldn't confirm the tab's site, retry once first."
+        case "TARGET_BUSY":
+            return "Another agent's task is working in this window or tab, so nothing ran. Wait and retry once it finishes, or work in your own window or tab (browser_open for a new tab). Observe and screenshot still work. Never close or take over the other task's window."
         case "DAEMON_REQUIRED":
             return "Ask the user to open UseMac.app; do not bypass it with --standalone."
         default:
