@@ -27,6 +27,12 @@ All notable changes to UseMac are documented here. The format follows
 - **The preview has no Stop or Resume.** It only shows what is happening. Stop and resume from the UseMac menu or
   with ⌘⇧⎋. A stopped preview keeps its red border, and the collapsed pill says "Stopped".
 - **A softer shadow.** The preview draws its own light shadow instead of the macOS window shadow.
+- **Agents no longer resize Chrome tabs.** A tab used to be laid out at 1280×800 while UseMac thought it was in the
+  background, or when an agent asked for a viewport size, so a tab you were watching could show the page in a
+  1280×800 area inside a wider window. Now every tab keeps the size Chrome gives it, and the preview shows the page
+  at that real size. `browser_observe` ignores `viewportWidth`, `viewportHeight` and `deviceScaleFactor`;
+  `browser_screenshot` scales its image down to fit `viewportWidth` × `viewportHeight` (CLI `--width`/`--height`)
+  and ignores `deviceScaleFactor` (`--scale`).
 
 ## [0.6.0-beta.3] - 2026-11-26
 
