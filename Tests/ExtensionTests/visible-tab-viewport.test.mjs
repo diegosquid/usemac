@@ -8,8 +8,7 @@ const { fakeJpeg, base64Size } = require("./support/fake-jpeg.cjs");
 
 // UseMac never changes a tab's size. Every tab lays out at the size Chrome gives it and reports that size. A tab the
 // user is looking at gets its preview from the screencast; a hidden tab gets the capture pump (CAPTURE_INTERVAL_MS =
-// 240 ms). The only metrics call is one clearDeviceMetricsOverride when attaching, for a tab an older version left
-// overridden.
+// 240 ms). Zero Emulation.*DeviceMetricsOverride calls are sent.
 const PUMP_WINDOW_MS = 650; // at least two pump ticks
 const SET = "Emulation.setDeviceMetricsOverride";
 const CLEAR = "Emulation.clearDeviceMetricsOverride";
@@ -98,7 +97,7 @@ test("a hidden tab is never resized and still gets the screenshot pump", async (
   const sb = withSandbox(t, { cdp: retinaCdp() });
   await observe(sb, HIDDEN);
 
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [CLEAR], "only the clear sent when attaching");
+  assert.deepEqual(metricsCalls(sb, HIDDEN), [], "no device metrics override calls sent");
   assert.deepEqual(viewportOf(sb, HIDDEN), { ...RETINA, zoom: 1 }, "it reports the size Chrome gave it");
   await assertPumpPolls(sb, HIDDEN);
   const frame = sb.sent.filter((f) => f.type === "frame" && f.tabId === HIDDEN).at(-1);
@@ -110,7 +109,7 @@ test("the active tab of a normal window is never resized and is not polled for s
   const sb = withSandbox(t);
   await observe(sb, VISIBLE);
 
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), []);
   assert.ok(cdpMethods(sb, VISIBLE).includes("Page.startScreencast"), "frames come from the screencast");
   assert.ok(cdpMethods(sb, VISIBLE).includes("Emulation.setFocusEmulationEnabled"), "focus emulation stays");
   assert.ok(screenshotCount(sb, VISIBLE) <= 1, "at most the one frame sent when streaming starts");
@@ -122,7 +121,7 @@ test("the active tab of a minimized window counts as hidden", async (t) => {
   const sb = withSandbox(t, { windows: [{ id: 1, focused: false, state: "minimized" }] });
   await observe(sb, VISIBLE);
 
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), []);
   await assertPumpPolls(sb, VISIBLE);
   assertNeverResized(sb);
 });
@@ -143,8 +142,8 @@ test("switching tabs moves the pump to the tab the user left and resizes neither
   await queuesIdle(sb);
   await Promise.all([assertNoPolling(sb, VISIBLE), assertPumpPolls(sb, HIDDEN)]);
 
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR], "one clear when attaching, nothing after");
-  assert.deepEqual(metricsCalls(sb, HIDDEN), [CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [], "no device metrics calls");
+  assert.deepEqual(metricsCalls(sb, HIDDEN), []);
   assertNeverResized(sb);
 });
 
@@ -159,7 +158,7 @@ test("minimizing and restoring the window switches its active tab's pump", async
   sb.setWindowState(1, "normal");
   await queuesIdle(sb);
   await assertNoPolling(sb, VISIBLE);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), []);
   assertNeverResized(sb);
 });
 
@@ -207,7 +206,7 @@ for (const [name, tabId] of [["visible", VISIBLE], ["hidden", HIDDEN]]) {
 
     assert.equal(observed.snapshot.app.windowBounds.width, 1728, "observed at the tab's real size");
     assert.equal(observed.snapshot.app.windowBounds.height, 1004);
-    assert.deepEqual(metricsCalls(sb, tabId), [CLEAR]);
+    assert.deepEqual(metricsCalls(sb, tabId), []);
     assertNeverResized(sb);
   });
 
@@ -221,7 +220,7 @@ for (const [name, tabId] of [["visible", VISIBLE], ["hidden", HIDDEN]]) {
     assert.deepEqual(base64Size(shot.screenshotBase64), { width: 1024, height: 595 }, "the image itself is that size");
     assert.ok(shot.screenshotWidth <= 1024 && shot.screenshotHeight <= 768);
     assert.deepEqual(sb.canvasDraws, [[1024, 595]]);
-    assert.deepEqual(metricsCalls(sb, tabId), [CLEAR]);
+    assert.deepEqual(metricsCalls(sb, tabId), []);
     assertNeverResized(sb);
   });
 }
@@ -249,12 +248,18 @@ test("a screenshot that already fits the box is returned as captured, never scal
   assertNeverResized(sb);
 });
 
-test("a screenshot without a box reports the size of the image it returns", async (t) => {
+test("a screenshot without a box defaults to VLM-optimal 1280x800 cap, and fullResolution keeps raw size", async (t) => {
   const sb = withSandbox(t, { cdp: retinaCdp() });
   await observe(sb, HIDDEN);
 
   const shot = await screenshot(sb, HIDDEN);
-  assert.deepEqual([shot.screenshotWidth, shot.screenshotHeight], [3456, 2008]);
+  assert.deepEqual([shot.screenshotWidth, shot.screenshotHeight], [1280, 744]);
+  assert.deepEqual(base64Size(shot.screenshotBase64), { width: 1280, height: 744 });
+  assert.deepEqual(sb.canvasDraws, [[1280, 744]]);
+
+  sb.canvasDraws.length = 0;
+  const full = await screenshot(sb, HIDDEN, { fullResolution: true });
+  assert.deepEqual([full.screenshotWidth, full.screenshotHeight], [3456, 2008]);
   assert.deepEqual(sb.canvasDraws, []);
   assertNeverResized(sb);
 });
@@ -314,7 +319,7 @@ test("a zoomed tab keeps its CSS size when it goes to the background and back", 
   sb.activateTab(VISIBLE);
   await queuesIdle(sb);
   await assertNoPolling(sb, VISIBLE);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), []);
   assertNeverResized(sb);
 });
 

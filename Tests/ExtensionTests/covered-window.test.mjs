@@ -8,7 +8,7 @@ const { createBackgroundSandbox } = require("./support/background-sandbox.cjs");
 // The active tab of a window covered by other windows counts as visible (isTabVisibleToUser), but Chrome stops
 // painting it, so its screencast goes quiet. When that happens and the page reports document.visibilityState
 // "hidden", the tab goes back to screenshot polling at its real size, until the page is visible again. No tab is
-// ever resized: the only metrics call is the clearDeviceMetricsOverride sent when attaching.
+// ever resized: zero device metrics override calls are sent.
 const SET = "Emulation.setDeviceMetricsOverride";
 const CLEAR = "Emulation.clearDeviceMetricsOverride";
 const VISIBLE = 21;
@@ -83,8 +83,8 @@ test("a visible tab whose window is covered goes back to screenshot polling at i
 
   await waitFor(() => covered(sb, VISIBLE), "the covered window to be detected");
   await assertPolls(sb, VISIBLE);
-  // No metrics override (only the clear sent when attaching): the page keeps its layout.
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  // No metrics override calls: the page keeps its layout and cold attach stays fast.
+  assert.deepEqual(metricsCalls(sb, VISIBLE), []);
   const frames = sb.sent.filter((f) => f.type === "frame" && f.tabId === VISIBLE);
   assert.ok(frames.length >= 2, "the preview keeps getting frames");
 });
@@ -100,7 +100,7 @@ test("polling stops when the covered window comes back on top", async (t) => {
   screencastFrame(sb, VISIBLE);
   await waitFor(() => !covered(sb, VISIBLE), "the window to count as uncovered");
   await assertNoPolling(sb, VISIBLE);
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR]);
+  assert.deepEqual(metricsCalls(sb, VISIBLE), []);
 });
 
 test("a frame captured while covered does not end polling while the page is still hidden", async (t) => {
@@ -174,7 +174,7 @@ test("a covered tab the user switches away from keeps polling as a hidden tab, a
   sb.activateTab(VISIBLE);
   await waitFor(() => sb.eval(`state.tabQueues.size === 0`), "the visibility sync");
   await waitFor(() => !pumpRunning(sb, VISIBLE), "the pump to stop");
-  assert.deepEqual(metricsCalls(sb, VISIBLE), [CLEAR], "never resized, hidden or shown");
+  assert.deepEqual(metricsCalls(sb, VISIBLE), [], "never resized, hidden or shown");
   await assertNoPolling(sb, VISIBLE);
 });
 
