@@ -3102,7 +3102,21 @@ function buildKeyDescriptor(keyName) {
     home: { key: "Home", code: "Home", keyCode: 36 },
     end: { key: "End", code: "End", keyCode: 35 },
     pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
-    pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 }
+    pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+    // Same names as native pressKey (Sources/UseMacEngine/NativeKeyMap.swift); NativeKeyMapTests checks both tables.
+    forwarddelete: { key: "Delete", code: "Delete", keyCode: 46 },
+    f1: { key: "F1", code: "F1", keyCode: 112 },
+    f2: { key: "F2", code: "F2", keyCode: 113 },
+    f3: { key: "F3", code: "F3", keyCode: 114 },
+    f4: { key: "F4", code: "F4", keyCode: 115 },
+    f5: { key: "F5", code: "F5", keyCode: 116 },
+    f6: { key: "F6", code: "F6", keyCode: 117 },
+    f7: { key: "F7", code: "F7", keyCode: 118 },
+    f8: { key: "F8", code: "F8", keyCode: 119 },
+    f9: { key: "F9", code: "F9", keyCode: 120 },
+    f10: { key: "F10", code: "F10", keyCode: 121 },
+    f11: { key: "F11", code: "F11", keyCode: 122 },
+    f12: { key: "F12", code: "F12", keyCode: 123 }
   };
 
   if (special[lower]) {
@@ -3124,12 +3138,14 @@ function buildKeyDescriptor(keyName) {
   return { key: raw, code: raw, keyCode: 0 };
 }
 
+// The same names as native pressKey and the daemon's sensitive-shortcut check (ModifierAliases.swift);
+// ModifierAliasesTests fails when the two lists differ, so a ⌘/⌃ spelling can't skip the check.
 function buildModifierMask(modifiers) {
   if (!Array.isArray(modifiers)) return 0;
   let mask = 0;
   for (const mod of modifiers) {
-    const m = String(mod).toLowerCase();
-    if (m === "alt" || m === "option") mask |= 1;
+    const m = String(mod).trim().toLowerCase();
+    if (m === "alt" || m === "opt" || m === "option") mask |= 1;
     else if (m === "control" || m === "ctrl") mask |= 2;
     else if (m === "meta" || m === "command" || m === "cmd") mask |= 4;
     else if (m === "shift") mask |= 8;

@@ -446,14 +446,10 @@ public final class ActionExecutor: @unchecked Sendable {
         if step.action == .axAction, step.actionName?.lowercased() == "axopen" {
             return true
         }
-        guard step.action == .pressKey, let modifiers = step.modifiers else {
+        guard step.action == .pressKey else {
             return false
         }
-        let lower = Set(modifiers.map { $0.lowercased() })
-        return lower.contains("cmd")
-            || lower.contains("command")
-            || lower.contains("ctrl")
-            || lower.contains("control")
+        return ModifierAliases.isSensitive(step.modifiers)
     }
 
     // MARK: - Preconditions
@@ -1287,11 +1283,11 @@ public final class ActionExecutor: @unchecked Sendable {
 
     private func performPressKey(step: ActionStep, resolved: ResolvedElement, targetApp: AppDescriptor?) -> StepOutcome {
         guard let keyName = step.key?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let keyCode = Self.keyCodeMap[keyName.lowercased()] else {
+              let keyCode = NativeKeyMap.keyCode(for: step.key) else {
             return StepOutcome(
                 success: false,
                 mechanism: "cgevent-key",
-                message: "Unsupported or missing key: \(step.key ?? "<nil>")",
+                message: NativeKeyMap.unsupportedKeyMessage(for: step.key),
                 errorCode: "INVALID_REQUEST"
             )
         }
@@ -2280,14 +2276,7 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private func formatKeyChord(key: String?, modifiers: [String]?) -> String {
-        var modPrefix = ""
-        if let modifiers {
-            let lower = Set(modifiers.map { $0.lowercased() })
-            if lower.contains("ctrl") || lower.contains("control") { modPrefix += "⌃" }
-            if lower.contains("alt") || lower.contains("opt") || lower.contains("option") { modPrefix += "⌥" }
-            if lower.contains("shift") { modPrefix += "⇧" }
-            if lower.contains("cmd") || lower.contains("command") { modPrefix += "⌘" }
-        }
+        let modPrefix = ModifierAliases.symbols(modifiers)
         let rawKey = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let formattedKey = rawKey.count == 1 ? rawKey.uppercased() : rawKey.capitalized
         return modPrefix + (formattedKey.isEmpty ? "Key" : formattedKey)
@@ -2383,73 +2372,6 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private func modifierFlags(from modifiers: [String]?) -> CGEventFlags {
-        guard let modifiers else { return [] }
-        var flags: CGEventFlags = []
-        for mod in modifiers {
-            switch mod.lowercased() {
-            case "cmd", "command":
-                flags.insert(.maskCommand)
-            case "shift":
-                flags.insert(.maskShift)
-            case "alt", "opt", "option":
-                flags.insert(.maskAlternate)
-            case "ctrl", "control":
-                flags.insert(.maskControl)
-            default:
-                break
-            }
-        }
-        return flags
+        ModifierAliases.eventFlags(modifiers)
     }
-
-    private static let keyCodeMap: [String: CGKeyCode] = [
-        "return": 0x24,
-        "enter": 0x24,
-        "tab": 0x30,
-        "space": 0x31,
-        "delete": 0x33,
-        "backspace": 0x33,
-        "escape": 0x35,
-        "esc": 0x35,
-        "left": 0x7B,
-        "right": 0x7C,
-        "down": 0x7D,
-        "up": 0x7E,
-        "a": 0x00,
-        "s": 0x01,
-        "d": 0x02,
-        "f": 0x03,
-        "h": 0x04,
-        "g": 0x05,
-        "z": 0x06,
-        "x": 0x07,
-        "c": 0x08,
-        "v": 0x09,
-        "b": 0x0B,
-        "q": 0x0C,
-        "w": 0x0D,
-        "e": 0x0E,
-        "r": 0x0F,
-        "y": 0x10,
-        "t": 0x11,
-        "1": 0x12,
-        "2": 0x13,
-        "3": 0x14,
-        "4": 0x15,
-        "6": 0x16,
-        "5": 0x17,
-        "9": 0x19,
-        "7": 0x1A,
-        "8": 0x1C,
-        "0": 0x1D,
-        "o": 0x1F,
-        "u": 0x20,
-        "i": 0x22,
-        "p": 0x23,
-        "l": 0x25,
-        "j": 0x26,
-        "k": 0x28,
-        "n": 0x2D,
-        "m": 0x2E
-    ]
 }

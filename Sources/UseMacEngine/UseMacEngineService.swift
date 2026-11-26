@@ -1962,14 +1962,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         if step.action == .axAction, step.actionName?.lowercased() == "axopen" {
             return true
         }
-        guard step.action == .pressKey, let modifiers = step.modifiers else {
+        guard step.action == .pressKey else {
             return false
         }
-        let lower = Set(modifiers.map { $0.lowercased() })
-        return lower.contains("cmd")
-            || lower.contains("command")
-            || lower.contains("ctrl")
-            || lower.contains("control")
+        // Any spelling either path presses as ⌘ or ⌃, "meta" included (ModifierAliases).
+        return ModifierAliases.isSensitive(step.modifiers)
     }
 
     private func incrementRequestCount() {
