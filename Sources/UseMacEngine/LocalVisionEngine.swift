@@ -30,6 +30,10 @@ public final class LocalVisionEngine: @unchecked Sendable {
 
     private let lock = NSLock()
     private let workerQueue = DispatchQueue(label: "app.usemac.vision-worker-io", qos: .userInitiated)
+    /// Whether this engine may start the MLX worker. Only the app's engine (and `usemac serve`) may: the CLI's
+    /// standalone and read-only fallback engines run once per agent process, and each would load its own ~3 GB copy.
+    /// Those answer with Apple Vision OCR.
+    private let allowsModel: Bool
 
     private var _enabled: Bool
     private var _modelId: String
@@ -46,7 +50,8 @@ public final class LocalVisionEngine: @unchecked Sendable {
 
     public var onStatusChanged: (@Sendable (VisionStatus) -> Void)?
 
-    public init() {
+    public init(allowsModel: Bool = false) {
+        self.allowsModel = allowsModel
         let savedModel = UserDefaults.standard.string(forKey: DefaultsKeys.modelId)
         if let savedModel, !savedModel.isEmpty {
             self._modelId = savedModel
@@ -55,13 +60,8 @@ public final class LocalVisionEngine: @unchecked Sendable {
         } else {
             self._modelId = LocalVisionModelPreset.qwen25VL3B.rawValue
         }
-        let runtimeReady = Self.isRuntimeInstalled()
-        let modelReady = Self.isModelCached(self._modelId)
-        if UserDefaults.standard.object(forKey: DefaultsKeys.enabled) != nil {
-            self._enabled = UserDefaults.standard.bool(forKey: DefaultsKeys.enabled)
-        } else {
-            self._enabled = runtimeReady && modelReady
-        }
+        // Off until the user turns it on (installing turns it on). A model found in the Hugging Face cache doesn't.
+        self._enabled = UserDefaults.standard.bool(forKey: DefaultsKeys.enabled)
     }
 
     deinit {
@@ -227,7 +227,8 @@ public final class LocalVisionEngine: @unchecked Sendable {
             state = "ready"
         }
 
-        let backend = (enabled && runtimeInstalled && modelDownloaded) ? "mlx-vlm" : "apple-vision-ocr"
+        // The backend that would answer a query now; `state` still reports the user's setup.
+        let backend = (allowsModel && enabled && runtimeInstalled && modelDownloaded) ? "mlx-vlm" : "apple-vision-ocr"
         return VisionStatus(
             enabled: enabled,
             state: state,
@@ -611,9 +612,10 @@ public final class LocalVisionEngine: @unchecked Sendable {
             )
         }
 
-        // Try Local MLX VLM if enabled, installed, and cached
+        // Try Local MLX VLM if this engine may load it and it is enabled, installed, and cached.
+        // The worker starts and loads the model here, on the first query that needs it.
         let status = currentStatus()
-        if status.enabled && status.runtimeInstalled && status.modelDownloaded {
+        if status.backend == "mlx-vlm" {
             // Hybrid boost: attach ~25ms Apple Vision OCR text for exact literal fidelity on hostnames, codes, errors & numbers
             let needsOCRContext = (effectiveMode == "ask" || effectiveMode == "verify" || effectiveMode == "describe" || effectiveMode == "diagnose")
             let ocrContext = needsOCRContext
@@ -790,51 +792,6 @@ public final class LocalVisionEngine: @unchecked Sendable {
     }
 
     // MARK: - Persistent MLX Worker Process
-
-    /// Silently pre-warms the local MLX-VLM worker and loads model weights in the background
-    /// (called on `task_start` so the very first visual query has zero cold-start delay).
-    public func warmupIfReady() {
-        // Avoid spawning a real MLX Python worker during XCTest runs
-        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
-        let status = currentStatus()
-        guard status.enabled && status.runtimeInstalled && status.modelDownloaded else { return }
-        let targetModel = status.modelId
-
-        workerQueue.async { [weak self] in
-            guard let self else { return }
-            if let proc = self.workerProcess, proc.isRunning, self.workerLoadedModel == targetModel {
-                self.scheduleIdleUnload()
-                return
-            }
-            guard self.ensureWorkerRunningLocked(),
-                  let stdin = self.workerStdin,
-                  let stdout = self.workerStdout else {
-                return
-            }
-            let payload: [String: Any] = [
-                "id": UUID().uuidString,
-                "cmd": "load",
-                "model": targetModel
-            ]
-            guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else { return }
-            var lineData = jsonData
-            lineData.append(0x0A)
-            do {
-                try stdin.write(contentsOf: lineData)
-            } catch {
-                self.stopWorker()
-                return
-            }
-            self.scheduleIdleUnload()
-            if let respLine = self.readNextLine(from: stdout),
-               let respData = respLine.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
-               (json["ok"] as? Bool) == true {
-                self.workerLoadedModel = targetModel
-                self.notifyStatusChanged()
-            }
-        }
-    }
 
     private func queryMLXWorker(
         modelId: String,

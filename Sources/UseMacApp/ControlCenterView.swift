@@ -755,8 +755,8 @@ public struct ControlCenterView: View {
                 subtitle: vision.installProgress
                     ?? vision.lastError
                     ?? (isReady
-                        ? "Offline Apple Silicon MLX grounding for popups, icons, and cross-origin overlays."
-                        : "Optional local MLX model (\(selectedPreset.sizeHint)) on top of built-in Apple Vision OCR.")
+                        ? "Checks icons, colors and greyed-out buttons on your Mac. Loads when an agent needs it, unloads after 5 idle minutes."
+                        : "Optional (\(selectedPreset.sizeHint)). Apple OCR covers most tasks; the model adds icons and colors.")
             ) {
                 if isInstalling {
                     ProgressView()

@@ -251,7 +251,7 @@ public final class AppState: ObservableObject {
     private var policyBeforePause: GovernancePolicy?
 
     public init(socketPath: String = UseMacDefaults.defaultSocketPath) {
-        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore())
+        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore(), allowsLocalVisionModel: true)
         let defaults = UserDefaults.standard
 
         // Nothing saved, or an unknown mode, starts in Autonomous with the Emergency stop off (StartupSafetyStateTests).
