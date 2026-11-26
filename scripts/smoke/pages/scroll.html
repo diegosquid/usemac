@@ -11,6 +11,9 @@
 <script>
   const params = new URLSearchParams(location.search);
   if (params.get("t")) document.title = params.get("t");
+  // Counts the wheel events the page receives, so a window that must not be touched can prove no input reached it.
+  window.__smokeWheels = 0;
+  window.addEventListener("wheel", () => { window.__smokeWheels += 1; }, { passive: true });
   // ?lock=1: the page swallows wheel events, so a background wheel scroll cannot move it and UseMac has to
   // fall back to scrolling the next offscreen element into view.
   if (params.get("lock") === "1") {
