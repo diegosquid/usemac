@@ -210,7 +210,9 @@ public final class AppState: ObservableObject {
     /// which cancels auto-hide, never keeps a finished card in the filmstrip.
     private var completionCleanupTask: Task<Void, Never>?
     private var taskIdleSettleTask: Task<Void, Never>?
-    private var isHUDManuallyPinned: Bool = false
+    /// Ghost-card cleanup and background card stills (AppState+DeckHygiene.swift).
+    var deckHygiene = DeckHygieneState()
+    var isHUDManuallyPinned: Bool = false
     private var isHUDShowingStoppedPill: Bool = false
     private var wasHUDCollapsedBeforeKillSwitch: Bool = false
     private var showingFrozenBrowserFrame: Bool = false
@@ -526,6 +528,7 @@ public final class AppState: ObservableObject {
                 self.streamStatus = status
                 if case .idle = status, !self.isBrowserStreamActive && !self.showingFrozenBrowserFrame {
                     self.videoSink.reset()
+                    self.showFrontCardStillIfStreamIdle()
                     if self.hudStreamMode == .autoWindow && !self.isHUDManuallyPinned && !self.isAgentBusy && self.isHUDVisible && !self.hasCompletedHUDAction && self.hudDeck.isEmpty && !self.status.killSwitchTripped {
                         self.hideHUD(userInitiated: false)
                     }
@@ -1465,7 +1468,7 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func syncFrontCardToUI() {
+    func syncFrontCardToUI() {
         guard let front = hudDeck.first else {
             showingFrozenBrowserFrame = false
             isBrowserStreamActive = false
@@ -1917,9 +1920,14 @@ public final class AppState: ObservableObject {
             // other agents' running tasks stay as they are.
             for idx in hudDeck.indices {
                 let card = hudDeck[idx]
-                let isFinishedTasks: Bool = card.isBrowser
-                    ? card.browserTabId.map { finishedTabs.contains($0) || $0 == item.browserTabId } ?? false
-                    : item.appPid != nil && card.appDescriptor?.pid == item.appPid
+                let isFinishedTasks = PreviewCardLifecycle.taskCompleteFinishes(
+                    isBrowser: card.isBrowser,
+                    browserTabId: card.browserTabId,
+                    appPid: card.appDescriptor?.pid,
+                    finishedTabIds: finishedTabs,
+                    finishedTabId: item.browserTabId,
+                    finishedAppPid: item.appPid
+                )
                 if isFinishedTasks {
                     hudDeck[idx].isBusy = false
                     hudDeck[idx].isCompleted = item.success && !engine.isKillSwitchTripped()
@@ -2027,6 +2035,7 @@ public final class AppState: ObservableObject {
             if hudDeck.first?.id == cardId {
                 syncFrontCardToUI()
             }
+            deckCardDidRecordActivity(cardId: cardId)
         }
 
         let hasStreamTarget = (pairedApp != nil || activeTargetApp != nil || hudStreamMode == .fullDisplay || isBrowserStreamActive || showingFrozenBrowserFrame || !hudDeck.isEmpty)
