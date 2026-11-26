@@ -229,7 +229,6 @@ public final class AppState: ObservableObject {
     private var captionClearTask: Task<Void, Never>?
     private var virtualAgentFadeTask: Task<Void, Never>?
     private var virtualAgentMoveTask: Task<Void, Never>?
-    private var previewResizeHoldTask: Task<Void, Never>?
     private var activityIndicatorHoldTask: Task<Void, Never>?
     private var hudAutoHideTask: Task<Void, Never>?
     /// Removes finished cards after the completion check. Separate from hudAutoHideTask so another agent's activity,
@@ -1770,28 +1769,6 @@ public final class AppState: ObservableObject {
         return cached?.allowed
     }
 
-    /// Keeps the HUD size steady while an action batch runs; an aspect change that persists applies once
-    /// the batch ends.
-    private func updatePreviewResizeHold(for item: LiveActivityItem) {
-        switch item.kind {
-        case .actionStart, .actionStep:
-            videoSink.setAspectRatioHold(true)
-            previewResizeHoldTask?.cancel()
-            previewResizeHoldTask = Task { @MainActor [weak self] in
-                // Safety release in case the batch never reports completion.
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-                guard !Task.isCancelled else { return }
-                self?.videoSink.setAspectRatioHold(false)
-            }
-        case .actionComplete, .taskComplete, .policyOrSafety:
-            previewResizeHoldTask?.cancel()
-            previewResizeHoldTask = nil
-            videoSink.setAspectRatioHold(false)
-        case .taskStart, .observe, .screenshot, .highlight:
-            break
-        }
-    }
-
     // MARK: - Live Activity Stream Handling
 
     private func handleLiveActivity(_ item: LiveActivityItem) {
@@ -1802,7 +1779,6 @@ public final class AppState: ObservableObject {
         // Golden rule: the preview only shows UseMac's tabs and apps an agent named. Work on a guessed target (no app
         // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
         guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
-        updatePreviewResizeHold(for: item)
 
         // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
         // cursor or stream target on the large preview of the card the user is watching.

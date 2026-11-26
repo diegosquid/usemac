@@ -122,55 +122,6 @@ final class LivePreviewGeometryTests: XCTestCase {
         ))
     }
 
-    // MARK: Aspect ratio debounce
-
-    func testFirstRatioAppliesAtOnceAndSmallChangesAreIgnored() {
-        var stabilizer = PreviewAspectRatioStabilizer()
-        XCTAssertEqual(stabilizer.observe(1.6, at: 0, hold: false), 1.6)
-        XCTAssertNil(stabilizer.observe(1.65, at: 5, hold: false))
-        XCTAssertNil(stabilizer.observe(1.55, at: 10, hold: false))
-        XCTAssertFalse(stabilizer.hasPending)
-        XCTAssertEqual(stabilizer.current, 1.6)
-    }
-
-    func testRealChangeMustPersistBeforeItApplies() {
-        var stabilizer = PreviewAspectRatioStabilizer(threshold: 0.08, settleSeconds: 0.6)
-        _ = stabilizer.observe(1.6, at: 0, hold: false)
-        XCTAssertNil(stabilizer.observe(2.0, at: 1.0, hold: false))
-        XCTAssertNil(stabilizer.observe(2.0, at: 1.3, hold: false))
-        XCTAssertEqual(stabilizer.observe(2.0, at: 1.61, hold: false), 2.0)
-        XCTAssertEqual(stabilizer.current, 2.0)
-    }
-
-    func testSourceThatFlipsBackDoesNotResize() {
-        var stabilizer = PreviewAspectRatioStabilizer(threshold: 0.08, settleSeconds: 0.6)
-        _ = stabilizer.observe(1.6, at: 0, hold: false)
-        XCTAssertNil(stabilizer.observe(2.0, at: 1.0, hold: false))
-        XCTAssertNil(stabilizer.observe(1.6, at: 1.2, hold: false))
-        XCTAssertFalse(stabilizer.hasPending)
-        // A later flip starts its own wait instead of inheriting the old one.
-        XCTAssertNil(stabilizer.observe(2.0, at: 2.0, hold: false))
-        XCTAssertNil(stabilizer.settle(at: 2.3, hold: false))
-        XCTAssertEqual(stabilizer.settle(at: 2.7, hold: false), 2.0)
-    }
-
-    func testHoldDefersTheChangeUntilReleased() {
-        var stabilizer = PreviewAspectRatioStabilizer(threshold: 0.08, settleSeconds: 0.6)
-        _ = stabilizer.observe(1.6, at: 0, hold: false)
-        XCTAssertNil(stabilizer.observe(1.0, at: 1.0, hold: true))
-        XCTAssertNil(stabilizer.observe(1.0, at: 3.0, hold: true))
-        XCTAssertNil(stabilizer.settle(at: 4.0, hold: true))
-        XCTAssertEqual(stabilizer.settle(at: 4.1, hold: false), 1.0)
-    }
-
-    func testResetAppliesTheNextRatioAtOnce() {
-        var stabilizer = PreviewAspectRatioStabilizer()
-        _ = stabilizer.observe(1.6, at: 0, hold: false)
-        stabilizer.reset()
-        XCTAssertNil(stabilizer.current)
-        XCTAssertEqual(stabilizer.observe(0.8, at: 0.1, hold: true), 0.8)
-    }
-
     // MARK: Local vision size guard
 
     func testVisionRefusesTinyCaptures() throws {

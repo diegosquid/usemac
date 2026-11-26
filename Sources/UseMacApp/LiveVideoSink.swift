@@ -6,12 +6,7 @@ import UseMacProtocol
 
 @MainActor
 public final class LiveVideoSink: ObservableObject {
-    public static let defaultAspectRatio: CGFloat = 268.0 / 172.0
-
     @Published public private(set) var hasReceivedFrame: Bool = false
-    /// Aspect ratio the HUD sizes itself to. Follows the frames only through `aspectStabilizer`, so it does
-    /// not jump on every small change, on a source that flips for a moment, or while an action batch runs.
-    @Published public private(set) var frameAspectRatio: CGFloat = LiveVideoSink.defaultAspectRatio
     @Published public private(set) var sourceBounds: ScreenRect?
     @Published public private(set) var sourceName: String = "Agent"
     @Published public private(set) var isWindowCapture: Bool = false
@@ -22,9 +17,6 @@ public final class LiveVideoSink: ObservableObject {
 
     private weak var targetLayer: CALayer?
     private var latestSurface: AnyObject?
-    private var aspectStabilizer = PreviewAspectRatioStabilizer()
-    private var holdsAspectRatio = false
-    private var aspectSettleTask: Task<Void, Never>?
 
     public init() {}
 
@@ -83,16 +75,6 @@ public final class LiveVideoSink: ObservableObject {
         )
     }
 
-    /// While held, the HUD keeps its size; a pending aspect change applies when the hold ends.
-    public func setAspectRatioHold(_ hold: Bool) {
-        guard hold != holdsAspectRatio else { return }
-        holdsAspectRatio = hold
-        if !hold {
-            settlePendingAspectRatio()
-            scheduleAspectSettleIfNeeded()
-        }
-    }
-
     private func applyFrame(
         contents: AnyObject,
         width: Int,
@@ -111,13 +93,6 @@ public final class LiveVideoSink: ObservableObject {
             targetLayer.contents = contents
             CATransaction.commit()
         }
-        if width > 0 && height > 0 {
-            let clamped = min(max(CGFloat(width) / CGFloat(height), 0.62), 2.15)
-            if let applied = aspectStabilizer.observe(Double(clamped), at: Self.now(), hold: holdsAspectRatio) {
-                setAspectRatio(CGFloat(applied))
-            }
-            scheduleAspectSettleIfNeeded()
-        }
         if !hasReceivedFrame { hasReceivedFrame = true }
         if self.sourceBounds != sourceBounds { self.sourceBounds = sourceBounds }
         if self.sourceName != sourceName { self.sourceName = sourceName }
@@ -130,10 +105,6 @@ public final class LiveVideoSink: ObservableObject {
     public func reset() {
         latestSurface = nil
         hasReceivedFrame = false
-        aspectSettleTask?.cancel()
-        aspectSettleTask = nil
-        aspectStabilizer.reset()
-        frameAspectRatio = Self.defaultAspectRatio
         sourceBounds = nil
         sourceName = "Agent"
         isWindowCapture = false
@@ -146,35 +117,5 @@ public final class LiveVideoSink: ObservableObject {
             targetLayer.contents = nil
             CATransaction.commit()
         }
-    }
-
-    private func setAspectRatio(_ ratio: CGFloat) {
-        if abs(ratio - frameAspectRatio) > 0.001 {
-            frameAspectRatio = ratio
-        }
-    }
-
-    private func settlePendingAspectRatio() {
-        if let applied = aspectStabilizer.settle(at: Self.now(), hold: holdsAspectRatio) {
-            setAspectRatio(CGFloat(applied))
-        }
-    }
-
-    /// A static window stops sending frames, so a pending change is re-checked on a timer instead of
-    /// waiting for the next frame.
-    private func scheduleAspectSettleIfNeeded() {
-        guard aspectStabilizer.hasPending, !holdsAspectRatio, aspectSettleTask == nil else { return }
-        let delay = UInt64((aspectStabilizer.settleSeconds + 0.05) * 1_000_000_000)
-        aspectSettleTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled, let self else { return }
-            self.aspectSettleTask = nil
-            self.settlePendingAspectRatio()
-            self.scheduleAspectSettleIfNeeded()
-        }
-    }
-
-    private static func now() -> Double {
-        ProcessInfo.processInfo.systemUptime
     }
 }
