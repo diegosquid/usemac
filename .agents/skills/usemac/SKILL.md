@@ -91,6 +91,7 @@ Whenever controlling **Google Chrome**, use `browser_status`, `browser_tabs`, `b
   {"id":"b3s","method":"browser_screenshot","browserScreenshot":{"tabId":123,"viewportWidth":1280,"viewportHeight":800,"returnImageContent":true}}
   ```
   UseMac never resizes a tab: pages are observed and captured at the size Chrome gives them. On `browser_screenshot`, `viewportWidth`/`viewportHeight` are the largest image size (a bigger capture is scaled down to fit, keeping its aspect ratio). `browser_observe` ignores them, and `deviceScaleFactor` is ignored everywhere.
+  Element (`elementId`/`selector`) and `fullPage` shots only capture what is on screen: the page scrolls while they are taken and goes back afterwards. An element is scrolled into view only if needed; one bigger than the viewport comes back as its top-left part with `truncated: true`. `fullPage` stitches viewport captures at the tab's width up to 16384 CSS px (40 captures, 12 s), with `truncated: true` past that; fixed or sticky headers repeat in each viewport.
 - **Act on `@b1..@bN` DOM refs or CSS selectors (works across OOPIF iframes & Shadow DOM; supports `navigate`/`openURL`, `"readOnly": true`, `"verify": "..."` for on-device visual verification, or `"returnImageContent": true` for an inline post-action screenshot)**:
   ```json
   {"id":"b4","method":"browser_act","browserAct":{"tabId":123,"readOnly":false,"verify":"Record values appeared with no errors","steps":[{"action":"hover","elementId":"@b8"},{"action":"wait","selector":"[role='gridcell']","durationMs":6000},{"action":"click","elementId":"@b3"}]}}
@@ -130,7 +131,7 @@ USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" browser observe [--tab <id>] [--screenshot]
 "$USEMAC" browser extract tables --tab <id> --scan-horizontal
 "$USEMAC" browser extract downloads
-"$USEMAC" browser screenshot --tab <id> [--selector "<css>"] [--width 1280 --height 800]
+"$USEMAC" browser screenshot --tab <id> [--selector "<css>" | --full-page] [--width 1280 --height 800]
 "$USEMAC" browser act '[{"action":"hover","elementId":"@b1"}]' [--tab <id>] [--read-only] [--verify "Expected state"] [--screenshot]
 "$USEMAC" browser reload-extension [--profile <name>]   # only when the user asks: stops all browser work
 "$USEMAC" vision status

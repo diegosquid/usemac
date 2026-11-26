@@ -6,6 +6,15 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Element and full-page screenshots no longer make Chrome enlarge the page.** They only capture what is on screen,
+  so the page scrolls while they are taken and goes back to where it was afterwards, also when the capture fails. An
+  element is scrolled into view only if it isn't fully visible; one bigger than the tab comes back as the part on
+  screen, from its top-left corner. A full page is stitched from one capture per viewport at the tab's width, up to
+  16384 CSS px (it was 6000); fixed or sticky headers show in every viewport. When the image doesn't show everything,
+  the result has `truncated: true` and MCP and the CLI print a `Truncated:` line.
+
 ## [0.7.0-beta.1] - 2026-11-26
 
 ### Added
