@@ -380,12 +380,16 @@ private struct DeckCardView: View {
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
         let isFront = position == 0
 
+        // A card swaps faces at once when it reaches or leaves the front (it still slides into place): a cross-fade
+        // drew both faces at the same time, with the caption twice and the card washed in its tag color.
         ZStack {
             if isFront {
                 FramelessLivePiPCard(appState: appState, videoSink: videoSink, accent: accent, tag: accent)
                     .opacity(frontFade)
+                    .transition(.identity)
             } else {
                 backFace(shape: shape, depth: min(position, hudDeckMaxBehind))
+                    .transition(.identity)
             }
         }
         .hudSoftShadow(shape, ambient: isFront)
