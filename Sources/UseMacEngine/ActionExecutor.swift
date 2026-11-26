@@ -460,6 +460,10 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Stale-snapshot and expected-title checks. Returns a refusal when the batch must not run.
     private func preflightRefusal(_ request: BatchActionRequest, targetApp: AppDescriptor?) -> Refusal? {
+        // The app the batch resolved to, named or not (the app in front), may be one the user's rules block.
+        if let blocked = TargetRulesStore.shared.blockedMessage(for: targetApp) {
+            return Refusal(mechanism: "target-rules", errorCode: TargetRules.errorCode, message: blocked)
+        }
         guard let pid = targetApp?.pid, pid > 0 else { return nil }
         if let pinned = WindowResolver.pinnedTitle(pid: pid), WindowResolver.window(pid: pid, titleContains: pinned) == nil {
             return Refusal(
@@ -605,6 +609,14 @@ public final class ActionExecutor: @unchecked Sendable {
         // Without a target app, keys and clicks go to whatever app is in front.
         if (targetApp?.pid ?? 0) <= 0, let front = WindowResolver.frontmostPid() {
             receivers.append(front)
+        }
+        if receivers.contains(where: { !workspaceMonitor.isUseMacProcess(pid: $0) && TargetRulesStore.shared.blocksProcess(pid: $0) }) {
+            return StepOutcome(
+                success: false,
+                mechanism: "target-rules",
+                message: "This input would land in a window of an app the user's UseMac rules block, so nothing was sent. \(TargetRules.stopHint)",
+                errorCode: TargetRules.errorCode
+            )
         }
         guard receivers.contains(where: { workspaceMonitor.isUseMacProcess(pid: $0) }) else { return nil }
         return StepOutcome(
@@ -797,6 +809,7 @@ public final class ActionExecutor: @unchecked Sendable {
             if let pid = targetApp?.pid, pid > 0, let live = axIndexer.liveNode(for: id, pid: pid) {
                 resolved = ResolvedElement(pid: pid, element: live.element, node: live.node)
             } else if let other = axIndexer.node(for: id), !workspaceMonitor.isUseMacProcess(pid: other.pid),
+                      !TargetRulesStore.shared.blocksProcess(pid: other.pid),
                       let live = axIndexer.liveNode(for: id, pid: other.pid) {
                 resolved = ResolvedElement(pid: other.pid, element: live.element, node: live.node)
             } else {

@@ -124,7 +124,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
-            let apps = listRunningApps()
+            let apps = TargetRulesStore.shared.rules.visibleApps(listRunningApps())
             let latencyMs = elapsedMs(since: startNs)
             response = .success(id: request.id, latencyMs: latencyMs, apps: apps)
 
@@ -143,6 +143,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let observeTarget = workspaceMonitor.resolveTarget(query: params.app)
             if observeTarget == .useMac {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Observe blocked")
+                break
+            }
+            if case .app(let app) = observeTarget, let blocked = TargetRulesStore.shared.blockedMessage(for: app) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Observe blocked", message: blocked)
                 break
             }
             guard case .app(let resolvedObserveApp) = observeTarget else {
@@ -254,6 +258,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: actReq.app, activityTitle: "Action blocked")
                 break
             }
+            if let blocked = TargetRulesStore.shared.blockedMessage(forQueries: [actReq.app] + actReq.steps.map(\.app), in: workspaceMonitor) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: actReq.app, activityTitle: "Action blocked", message: blocked)
+                break
+            }
 
             let overlay = onOverlayEvent
             // Work on a guessed target (no app named, none paired: the app in front) is marked so the live preview
@@ -348,6 +356,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let screenshotTarget = workspaceMonitor.resolveTarget(query: req.app)
             if screenshotTarget == .useMac {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: req.app, activityTitle: "Screenshot blocked")
+                break
+            }
+            if case .app(let app) = screenshotTarget, let blocked = TargetRulesStore.shared.blockedMessage(for: app) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Screenshot blocked", message: blocked)
                 break
             }
             guard permissionManager.isScreenRecordingGranted() else {
@@ -453,6 +465,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }
             if workspaceMonitor.namesUseMac(query) {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: query, activityTitle: "Pair app blocked")
+                break
+            }
+            if let blocked = TargetRulesStore.shared.blockedMessage(forQueries: [query], in: workspaceMonitor) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: query, activityTitle: "Pair app blocked", message: blocked)
                 break
             }
             let paired = setPairedApp(query)
@@ -1262,6 +1278,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Vision query blocked")
                 break
             }
+            if let blocked = TargetRulesStore.shared.blockedMessage(forQueries: [params.app], in: workspaceMonitor) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Vision query blocked", message: blocked)
+                break
+            }
             if let rawImagePath = params.imagePath?.trimmingCharacters(in: .whitespacesAndNewlines), !rawImagePath.isEmpty {
                 guard isAllowedVisionImagePath(rawImagePath) else {
                     let latencyMs = elapsedMs(since: startNs)
@@ -1748,8 +1768,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
     public func currentStatus() -> DaemonStatus {
         let permissions = permissionManager.currentStatus(promptAccessibility: false)
-        let paired = workspaceMonitor.getPairedApp()
-        let frontmost = workspaceMonitor.currentExternalFrontmostApp()
+        // Apps the user's rules block are left out, like UseMac itself.
+        let rules = TargetRulesStore.shared.rules
+        let paired = workspaceMonitor.getPairedApp().flatMap { rules.blocksApp(bundleId: $0.bundleId) ? nil : $0 }
+        let frontmost = workspaceMonitor.currentExternalFrontmostApp().flatMap { rules.blocksApp(bundleId: $0.bundleId) ? nil : $0 }
         let policy = killSwitch.getPolicy()
         let tripped = killSwitch.isTripped
 
@@ -1880,6 +1902,33 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             isInProgress: false
         ))
         return .failure(id: request.id, code: "POLICY_BLOCKED", message: reason, latencyMs: latencyMs)
+    }
+
+    /// Refusal for a request whose target the user's app and site rules block (TargetRules).
+    private func targetBlockedResponse(
+        request: RPCRequest,
+        startNs: UInt64,
+        targetApp: String?,
+        activityTitle: String,
+        message: String
+    ) -> RPCResponse {
+        let latencyMs = elapsedMs(since: startNs)
+        appendAudit(
+            method: request.method.rawValue,
+            targetApp: targetApp,
+            summary: "Blocked by the app and site rules",
+            latencyMs: latencyMs,
+            success: false
+        )
+        emitLiveActivity(LiveActivityItem(
+            kind: .policyOrSafety,
+            title: activityTitle,
+            subtitle: message,
+            latencyMs: latencyMs,
+            success: false,
+            isInProgress: false
+        ))
+        return .failure(id: request.id, code: TargetRules.errorCode, message: message, latencyMs: latencyMs)
     }
 
     /// Refusal for a request that names UseMac itself: agents never observe or act on its own windows.

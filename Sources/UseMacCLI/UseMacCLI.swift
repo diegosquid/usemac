@@ -122,7 +122,8 @@ struct UseMacCLI {
         "POLICY_LOCKED",
         "URL_BLOCKED",
         "UPLOAD_BLOCKED",
-        "SELF_TARGET_BLOCKED"
+        "SELF_TARGET_BLOCKED",
+        "TARGET_BLOCKED"
     ]
 
     /// Exit code 5: the screen is not what the caller expected. Observe again, then retry.
@@ -2018,7 +2019,7 @@ struct UseMacCLI {
           1  Command or RPC failure (find: nothing matched)
           2  Invalid usage, unknown flag or key, or invalid JSON
           3  Daemon required (DAEMON_REQUIRED): ask the user to open UseMac
-          4  Blocked by a safety rule (POLICY_BLOCKED, POLICY_LOCKED, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED): stop and tell the user
+          4  Blocked by a safety rule (POLICY_BLOCKED, POLICY_LOCKED, URL_BLOCKED, UPLOAD_BLOCKED, SELF_TARGET_BLOCKED, TARGET_BLOCKED): stop and tell the user
           5  The screen is not what you expected (STALE_SNAPSHOT, ELEMENT_NOT_FOUND, WAIT_TIMEOUT): observe again, then retry
           6  Needs the app in front, or the user is busy (TARGET_NOT_FRONTMOST, USER_ACTIVE): use a background step, or wait and retry
           7  This route cannot reach it (RESTRICTED_PAGE, CAPTURE_TOO_SMALL): switch route (see 'usemac help browser')
@@ -2094,7 +2095,7 @@ struct UseMacCLI {
         case "apps":
             return CommandHelp(
                 usage: ["usemac apps"],
-                summary: "List running GUI apps with pid, bundle id, active state and front window title. UseMac itself is never listed or targeted.",
+                summary: "List running GUI apps with pid, bundle id, active state and front window title. UseMac itself, and apps the user's app and site rules block (TARGET_BLOCKED), are never listed or targeted.",
                 examples: ["usemac apps"],
                 json: "[AppDescriptor {pid, name, bundleId, isActive, isHidden, windowTitle, windowBounds, windowId}]"
             )
@@ -2232,7 +2233,7 @@ struct UseMacCLI {
         case "browser tabs":
             return CommandHelp(
                 usage: ["usemac browser tabs [--profile <name>] [--query <text>]"],
-                summary: "List open Chrome tabs with tabId, title, URL and active state.",
+                summary: "List open Chrome tabs with tabId, title, URL and active state. Tabs on sites the user's app and site rules block are left out; any browser command on one, or opening such a site, fails with TARGET_BLOCKED (exit 4).",
                 flags: [
                     ("--profile <name>", "Chrome profile from 'browser status' (only needed with several profiles)"),
                     ("--query <text>", "Case-insensitive filter on title or URL")

@@ -126,6 +126,34 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
 
     public override init() {
         super.init()
+        // New rules apply to a running stream right away: a display stream is rebuilt with the new exclusions
+        // and a window stream of an app that is now blocked stops.
+        rulesObserver = NotificationCenter.default.addObserver(
+            forName: TargetRulesStore.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.restartAfterRulesChange()
+        }
+    }
+
+    deinit {
+        if let rulesObserver {
+            NotificationCenter.default.removeObserver(rulesObserver)
+        }
+    }
+
+    private var rulesObserver: NSObjectProtocol?
+
+    private func restartAfterRulesChange() {
+        lock.lock()
+        let active = isActive
+        let mode = currentMode
+        let target = currentTargetApp
+        lock.unlock()
+        guard active else { return }
+        stop()
+        start(mode: mode, targetApp: target)
     }
 
     public func start(mode: HUDStreamMode, targetApp: AppDescriptor?) {
@@ -490,10 +518,14 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         pinnedWindowId: CGWindowID?
     ) -> Resolution {
         let selfPid = ProcessInfo.processInfo.processIdentifier
-        let excludedApps = shareable.applications.filter { $0.processID == selfPid }
+        // Apps the user's rules block are never streamed: no window of theirs, and not in a display stream.
+        let rules = TargetRulesStore.shared.rules
+        let excludedApps = shareable.applications.filter {
+            $0.processID == selfPid || rules.blocksApp(bundleId: $0.bundleIdentifier)
+        }
 
         if mode == .autoWindow {
-            guard let targetApp, targetApp.pid != selfPid else {
+            guard let targetApp, targetApp.pid != selfPid, !TargetRulesStore.shared.blocksProcess(pid: targetApp.pid) else {
                 return .none
             }
             guard let win = Self.selectWindow(for: targetApp, in: shareable.windows, pinnedWindowId: pinnedWindowId) else {

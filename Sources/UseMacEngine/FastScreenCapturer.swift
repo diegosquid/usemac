@@ -9,6 +9,7 @@ public final class FastScreenCapturer: @unchecked Sendable {
         case noDisplayAvailable
         case jpegEncodingFailed
         case noCapturableWindow(appName: String)
+        case targetBlocked(appName: String)
 
         public var errorDescription: String? {
             switch self {
@@ -18,6 +19,8 @@ public final class FastScreenCapturer: @unchecked Sendable {
                 return "Failed to encode captured image as JPEG"
             case .noCapturableWindow(let appName):
                 return "\(appName) has no window that can be captured (no open window, or only windows smaller than \(Int(WindowResolver.minimumContentSize.width))x\(Int(WindowResolver.minimumContentSize.height))). Open or restore its window and try again."
+            case .targetBlocked(let appName):
+                return TargetRules.blockedAppMessage(appName)
             }
         }
     }
@@ -108,6 +111,9 @@ public final class FastScreenCapturer: @unchecked Sendable {
         maxDimension: Int,
         allowDisplayFallback: Bool
     ) async throws -> (filter: SCContentFilter, config: SCStreamConfiguration, windowBounds: ScreenRect?) {
+        if let targetApp, TargetRulesStore.shared.blocksProcess(pid: targetApp.pid) {
+            throw CaptureError.targetBlocked(appName: targetApp.name)
+        }
         let shareable = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
         let filter: SCContentFilter
@@ -127,7 +133,10 @@ public final class FastScreenCapturer: @unchecked Sendable {
         } else if let targetApp, !allowDisplayFallback {
             throw CaptureError.noCapturableWindow(appName: targetApp.name)
         } else if let display = shareable.displays.first {
-            filter = SCContentFilter(display: display, excludingWindows: [])
+            // A whole-display capture leaves out the windows of apps the user's rules block.
+            let rules = TargetRulesStore.shared.rules
+            let blockedApps = shareable.applications.filter { rules.blocksApp(bundleId: $0.bundleIdentifier) }
+            filter = SCContentFilter(display: display, excludingApplications: blockedApps, exceptingWindows: [])
             sourceSize = CGSize(width: display.width, height: display.height)
             windowBounds = nil
         } else {

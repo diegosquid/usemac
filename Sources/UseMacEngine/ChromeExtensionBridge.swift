@@ -806,7 +806,11 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     public func open(_ params: BrowserOpenParams) async -> BridgeResponse {
-        await sendCommand(profileQuery: params.profile) { requestId in
+        let url = params.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId, url: url.isEmpty ? nil : url, checksTab: params.tabId != nil) {
+            return blocked
+        }
+        return await sendCommand(profileQuery: params.profile) { requestId in
             OpenWireCommand(
                 id: requestId,
                 url: params.url,
@@ -819,7 +823,14 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
     }
 
+    /// The freshest cached frame for the tab or profile, never one of a page the user's rules block.
     public func latestFrame(profileQuery: String? = nil, tabId: Int? = nil) -> CachedBrowserFrame? {
+        guard let frame = cachedFrame(profileQuery: profileQuery, tabId: tabId),
+              !Self.targetRulesBlockFrame(url: frame.url) else { return nil }
+        return frame
+    }
+
+    private func cachedFrame(profileQuery: String?, tabId: Int?) -> CachedBrowserFrame? {
         lock.lock()
         defer { lock.unlock() }
         if let tabId {
@@ -853,14 +864,26 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
     }
 
+    /// Every tab except those on sites the user's rules block.
     public func tabs(_ params: BrowserTabsParams) async -> BridgeResponse {
-        await sendCommand(profileQuery: params.profile) { requestId in
+        let response = await sendCommand(profileQuery: params.profile) { requestId in
             TabsWireCommand(id: requestId, query: params.query)
+        }
+        return Self.hidingBlockedTabs(response)
+    }
+
+    /// Every tab, blocked ones included: only the rules check reads it, to find the tab a command would run on.
+    func unfilteredTabs(profile: String?, timeoutSeconds: UInt64) async -> BridgeResponse {
+        await sendCommand(profileQuery: profile, timeoutSeconds: timeoutSeconds) { requestId in
+            TabsWireCommand(id: requestId, query: nil)
         }
     }
 
     public func observe(_ params: BrowserObserveParams) async -> BridgeResponse {
-        await sendCommand(profileQuery: params.profile) { requestId in
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
+            return blocked
+        }
+        return await sendCommand(profileQuery: params.profile) { requestId in
             ObserveWireCommand(
                 id: requestId,
                 tabId: params.tabId,
@@ -876,6 +899,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     public func extract(_ params: BrowserExtractParams) async -> BridgeResponse {
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
+            return blocked
+        }
         let timeoutSec: UInt64 = (params.scanHorizontal == true) ? 30 : 18
         return await sendCommand(profileQuery: params.profile, timeoutSeconds: timeoutSec) { requestId in
             ExtractWireCommand(
@@ -891,7 +917,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     public func screenshot(_ params: BrowserScreenshotParams) async -> BridgeResponse {
-        await sendCommand(profileQuery: params.profile, timeoutSeconds: 20) { requestId in
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
+            return blocked
+        }
+        return await sendCommand(profileQuery: params.profile, timeoutSeconds: 20) { requestId in
             ScreenshotWireCommand(
                 id: requestId,
                 tabId: params.tabId,
@@ -907,6 +936,15 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     public func act(_ params: BrowserActParams) async -> BridgeResponse {
+        // A batch that opens or navigates to a blocked site never runs, nor one on a tab that is on one.
+        for step in params.steps where step.action == .openURL || step.action == .navigate {
+            if let blocked = await targetRulesPreflight(profile: params.profile, tabId: nil, url: step.url ?? step.text, checksTab: false) {
+                return blocked
+            }
+        }
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
+            return blocked
+        }
         let totalWaitMs: UInt64 = params.steps.reduce(0) { partial, step in
             guard step.action == .wait, let ms = step.durationMs, ms > 0 else {
                 return partial
@@ -1327,6 +1365,16 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
               let jpegData = Data(base64Encoded: b64) else {
             return
         }
+        // A page the user's rules block is never cached or previewed, and its stream stops.
+        if Self.targetRulesBlockFrame(url: payload.url) {
+            lock.lock()
+            let profileName = sessions[sessionId]?.profileName
+            lock.unlock()
+            if let profileName {
+                stopStream(profileQuery: profileName, tabId: payload.tabId)
+            }
+            return
+        }
 
         lock.lock()
         guard let session = sessions[sessionId], session.isReady else {
@@ -1436,6 +1484,16 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             return
         }
         lock.unlock()
+
+        // A result from a page the user's rules block is dropped before its screenshot is written or cached.
+        if let blocked = Self.targetRulesResultRefusal(
+            url: payload.url ?? payload.extractResult?.url,
+            tabId: payload.tabId,
+            profileName: payload.profileName
+        ) {
+            completePendingRequest(id: payload.id, sessionId: sessionId, response: blocked)
+            return
+        }
 
         var resolvedSnapshot = payload.snapshot
         var resolvedScreenshot: ScreenshotResult?
