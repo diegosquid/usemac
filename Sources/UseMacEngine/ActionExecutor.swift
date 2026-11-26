@@ -1383,7 +1383,14 @@ public final class ActionExecutor: @unchecked Sendable {
             scrollEvent.postToPid(bgPid)
             let moved = await measureScroll(probes: probes)
             if moved.map({ abs($0) >= 1 }) != true, dy != 0,
-               let fallback = await scrollToNextOffscreen(pid: pid, down: dy < 0, targetApp: targetApp, onOverlayEvent: onOverlayEvent) {
+               let fallback = await scrollToNextOffscreen(
+                   pid: pid,
+                   down: dy < 0,
+                   point: point,
+                   elementId: resolved.node?.id,
+                   targetApp: targetApp,
+                   onOverlayEvent: onOverlayEvent
+               ) {
                 return fallback
             }
             return StepOutcome(success: true, mechanism: "cgevent-pid-scroll", node: resolved.node, scrollDeltaY: moved)
@@ -1481,20 +1488,28 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     /// Web content exposes no scroll bars and may ignore background wheel events. Scrolling the next element
-    /// that is out of view into view (AXScrollToVisible) pages through it without any events.
+    /// that is out of view into view (AXScrollToVisible) pages through it without any events. The candidate is
+    /// taken from the web area or scroll area under `point` (or holding `elementId`), never from the rest of the
+    /// window: Chrome lists its infobar and tab strip after the page.
     private func scrollToNextOffscreen(
         pid: Int32,
         down: Bool,
+        point: CGPoint?,
+        elementId: String?,
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) async -> StepOutcome? {
-        let nodes = axIndexer.latestNodes(pid: pid)
-        guard let firstVisible = nodes.firstIndex(where: { $0.offscreen != true && $0.role != "AXWindow" }),
-              let lastVisible = nodes.lastIndex(where: { $0.offscreen != true && $0.role != "AXWindow" }) else { return nil }
-        let candidate: ElementNode? = down
-            ? nodes[(lastVisible + 1)...].first(where: { $0.offscreen == true })
-            : nodes[..<firstVisible].last(where: { $0.offscreen == true })
-        guard let candidate, let element = axIndexer.element(for: candidate.id, pid: pid) else { return nil }
+        let layout = axIndexer.latestScrollLayout(pid: pid)
+        let elementIndex = elementId.flatMap { id in layout.nodes.firstIndex(where: { $0.id == id }) }
+        guard let index = ScrollFallback.nextOffscreenIndex(
+            nodes: layout.nodes,
+            containers: layout.containers,
+            at: point,
+            down: down,
+            elementIndex: elementIndex
+        ) else { return nil }
+        let candidate = layout.nodes[index]
+        guard let element = axIndexer.element(for: candidate.id, pid: pid) else { return nil }
         guard AXUIElementPerformAction(element, "AXScrollToVisible" as CFString) == .success else { return nil }
         try? await Task.sleep(nanoseconds: 180_000_000)
         let refreshed = axIndexer.liveNode(for: candidate.id, pid: pid)?.node
