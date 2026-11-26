@@ -94,6 +94,45 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 - **Chrome extension pairing & tab isolation**: Each Chrome profile must be paired once with the local `umk_…` key (unpaired requests return `EXTENSION_NOT_PAIRED`, and the key is never exposed via RPC, MCP, or CLI). Without an explicit `tabId`, browser methods only target the last UseMac tab or a tab in the `UseMac` tab group (`NO_USEMAC_TAB` otherwise).
 - **AI client data flow**: Everything an agent observes, extracts, or captures through UseMac is returned to the AI client you connected, which typically sends that data to its AI provider under that provider's terms.
 
+## Benchmarks
+
+The numbers on [usemac.app](https://usemac.app) come from `scripts/bench.sh`. To reproduce them, open UseMac.app and run:
+
+```bash
+python3 -m http.server --bind 127.0.0.1 8742 --directory scripts/bench &   # serves the fixture form page
+open -g -a Calculator
+scripts/bench.sh --app Calculator --url http://127.0.0.1:8742/expense-form.html \
+  --vision "The Submit expense button is visible"
+```
+
+It measures three things:
+
+- **Local IPC**: `usemac bench --iterations 1000 --app Calculator`. Each sample is a round trip from the CLI to the running daemon over the Unix socket: encode, send, handle, reply, decode. `ping` does no work, so it is the floor. A hot-cache `observe` returns the window's cached snapshot and diff.
+- **What the agent reads per look**: for a Chrome tab at a 1280×800 viewport, or a native window, the text that `usemac browser observe` or `usemac observe` prints (the same text the MCP tools return), next to a screenshot of the same view. Screenshot tokens use Anthropic's published estimate, width × height / 750, after the API's downscale (1568 px long edge, about 1,600 tokens). Text tokens are estimated at 2.5 characters per token, which is high on purpose for this dense text. `--count-tokens` replaces both with exact counts from Anthropic's `count_tokens` endpoint. It needs `ANTHROPIC_API_KEY` and sends the captures to the API.
+- **On-device visual check**: `usemac vision verify` answered by the local model (install it first with `usemac vision install`). The agent reads the text answer instead of an image.
+
+Results from 2026-11-26 on an Apple M4 Pro (12 cores, 24 GB), macOS 15.7 (24G222), with the installed UseMac 0.6.0-beta.2 and other builds running on the same machine:
+
+| Local IPC, p50 across 9 runs | Result |
+| :--- | ---: |
+| `ping` (1,000 per run) | 0.032–0.039 ms (p95 0.04–0.13 ms) |
+| `list_apps` | 0.44–0.69 ms |
+| `observe` Calculator, hot cache | 0.99–1.24 ms |
+| `observe` Calculator, cold | 19–69 ms |
+
+| What the agent reads per look (estimated) | Text | Screenshot | Text vs. screenshot |
+| :--- | ---: | ---: | ---: |
+| Fixture form page (`scripts/bench/expense-form.html`) | ≈904 tokens | 1,366 tokens (1280×800) | −34% |
+| This repository's landing page (`website/public`) | ≈1,674 tokens | 1,366 tokens (1280×800) | +23% |
+| Calculator window | ≈744 tokens | 93 tokens (198×350) | +700% |
+| Visual check of the fixture form, on-device (Qwen2.5-VL-3B-Instruct-4bit, 2.3–2.9 s inference) | ≈118 tokens | 1,366 tokens (1280×800) | −91% |
+
+What this shows:
+
+- A text snapshot is not always smaller than a screenshot. It is smaller for a form-like page. For a long page it lists every link and button plus the readable text, so it can cost more than one screenshot of the viewport. For a small native window, the screenshot is cheaper. What the snapshot gives the agent is element ids it can act on without guessing coordinates.
+- The large saving is the on-device visual check: the agent reads a one-line answer instead of an image. It costs a couple of seconds of local inference, and the answer is only as good as a 3B model.
+- Newer Claude models accept larger screenshots (up to 2576 px on the long edge) and can spend up to about 3× more tokens on a large capture. This comparison uses the smaller limit, so it does not count that.
+
 ## Build from source
 
 ```bash
@@ -121,7 +160,7 @@ node --test Tests/ExtensionTests/*.test.mjs
 - `Sources/` — Swift package sources for the protocol, automation engine, IPC/MCP layer, macOS app, and CLI.
 - `Tests/` — Swift unit/integration tests and Node.js extension tests.
 - `docs/` — Chrome bridge protocol specification and release notes.
-- `scripts/` — App bundling, DMG notarization/release, extension packaging, icon generation, and local vision worker scripts.
+- `scripts/` — App bundling, DMG notarization/release, extension packaging, icon generation, local vision worker, and benchmark (`bench.sh`) scripts.
 - `website/` — Static landing page, privacy policy, and Sparkle appcast deployed to Cloudflare Workers.
 
 ## Documentation
