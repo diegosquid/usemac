@@ -11,9 +11,12 @@ extension UseMacEngineService {
         let agent = request.method == .taskStart
             ? TaskTabRegistry.cleanAgent(request.taskStart?.agent)
             : taskTabs.agent(of: scope.taskId)
-        return await TaskActivityContext.$agentName.withValue(agent) {
+        let response = await TaskActivityContext.$agentName.withValue(agent) {
             await handleScoped(request, scope: scope)
         }
+        // Audit entries don't carry error codes; a problem report lists them from here.
+        problemReports.record(response, of: request, taskId: scope.taskId)
+        return response
     }
 
     private func handleScoped(_ request: RPCRequest, scope initialScope: TaskTabRegistry.Scope) async -> RPCResponse {

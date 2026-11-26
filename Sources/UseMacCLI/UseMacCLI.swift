@@ -121,7 +121,8 @@ struct UseMacCLI {
         .visionInstall,
         .setPolicy,
         .pairApp,
-        .browserReloadExtension
+        .browserReloadExtension,
+        .reportPrepare
     ]
 
     /// Exit code 4: a safety rule blocked the request. Stop and tell the user.
@@ -268,6 +269,8 @@ struct UseMacCLI {
                 return try await handleTaskComplete(args: rest, options: options)
             case "audit":
                 return try await handleAudit(args: rest, options: options)
+            case "report":
+                return try await handleReport(args: rest, options: options)
             case "serve":
                 return try await handleServe(options: options)
             case "mcp":
@@ -1684,6 +1687,32 @@ struct UseMacCLI {
         return 0
     }
 
+    private static func handleReport(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--summary", "--title"])
+        let summary = parsed.values["--summary"] ?? (parsed.positionals.isEmpty ? nil : parsed.positionals.joined(separator: " "))
+        guard let summary, !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError.usage("report needs --summary \"<what you tried, what you expected, what happened>\". Run 'usemac help report'.")
+        }
+        let req = RPCRequest(
+            method: .reportPrepare,
+            reportPrepare: ReportPrepareParams(summary: summary, title: parsed.values["--title"], taskId: options.taskId)
+        )
+        let (res, rttMs, mode) = try await executeRPC(req, options: options)
+        try ensureOK(res)
+        guard let receipt = res.problemReport else {
+            throw CLIError.rpcFailure(code: "INTERNAL", message: "Response missing problemReport.")
+        }
+        if options.json {
+            printEncodableJSON(receipt)
+            return 0
+        }
+        let scope = receipt.taskId.map { "task \($0)" } ?? "recent activity"
+        let codes = receipt.errorCodes.isEmpty ? "no error codes" : receipt.errorCodes.joined(separator: ", ")
+        print(String(format: "[%@] Report %@ (%@, %d audit entr%@, %@) | rtt: %.2f ms", mode.rawValue, receipt.status, scope, receipt.entryCount, receipt.entryCount == 1 ? "y" : "ies", codes, rttMs))
+        print(receipt.message)
+        return 0
+    }
+
     private static func handleScreenshot(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
@@ -2136,6 +2165,8 @@ struct UseMacCLI {
                                                      Finish the task with a completion overlay and smoothly close the preview
           audit [--limit <n>] [--since <time>] [--task <taskId>]
                                                      Print the audit log (kept on disk, typed text redacted), newest first
+          report --summary "<text>" [--title "<text>"] [--task <taskId>]
+                                                     Prepare a problem report the user reviews in UseMac before anything is sent
           serve                                      Start the Unix socket RPC daemon
           mcp                                        Start the stdio MCP server
           install-skill [--workspace] [--dir <path>] [--force] [--dry-run]
@@ -2555,6 +2586,22 @@ struct UseMacCLI {
                 notes: ["Filters read the log on disk, so they reach back past the last restart; with the app closed, only the files in ~/Library/Application Support/UseMac/audit/ have it."],
                 examples: ["usemac audit", "usemac audit --task task-1a2b3c4d", "usemac audit --since 2h --limit 200 --json"],
                 json: "[AuditEntry {id, timestampMs, method, targetApp, summary, latencyMs, success, taskId}]"
+            )
+        case "report":
+            return CommandHelp(
+                usage: ["usemac report --summary \"<what you tried, what you expected, what happened>\" [--title \"<text>\"] [--task <taskId>]"],
+                summary: "Prepare a problem report about a failure that looks like a UseMac bug (not a safety block or the user's choice), after the user agreed. UseMac builds it from your summary, the environment (app, extension and macOS versions, execution mode) and the task's audit entries and error codes, removes sensitive data (typed text, emails, tokens and keys, the home folder, URL query strings, long numbers; never screenshots), and opens it in its \"Review problem report\" window. It answers at once with awaiting_user_review. Only the user can open the report as a GitHub issue, from that window; you never see the text or the user's decision. Tell the user to review the window, and never paste the report anywhere else.",
+                flags: [
+                    ("--summary <text>", "Required: what you tried, what you expected and what happened (at most 4000 characters)"),
+                    ("--title <text>", "Issue title (default: the first line of the summary)"),
+                    ("--task <taskId>", "The task the report is about (default: $USEMAC_TASK, else the only running task, else the last 30 minutes of activity)")
+                ],
+                notes: [
+                    "Works in every execution mode, Read-only and Paused included; the Kill Switch blocks it (POLICY_BLOCKED). Without the app it fails with DAEMON_REQUIRED.",
+                    "One report shows at a time: while the user still has one open, report fails with REPORT_IN_REVIEW."
+                ],
+                examples: ["usemac report --task task-1a2b3c4d --summary \"Clicked Save in TextEdit with match; expected the sheet to open; got ELEMENT_NOT_FOUND twice although the button was visible.\""],
+                json: "ProblemReportReceipt {reportId, status (awaiting_user_review), taskId, entryCount, errorCodes, message}"
             )
         case "serve":
             return CommandHelp(

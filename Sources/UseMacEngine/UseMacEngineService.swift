@@ -18,6 +18,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let actionExecutor: ActionExecutor
     /// Ask mode: sensitive requests waiting for the user's answer in the HUD.
     public let approvals = ApprovalBroker()
+    /// `report_prepare` drafts waiting in the app's review window (UseMacEngineService+ProblemReport.swift).
+    public let problemReports = ProblemReportBroker()
     /// The audit log on disk; nil keeps it in memory only (tests, in-process CLI calls).
     public let auditStore: AuditLogStore?
 
@@ -1581,6 +1583,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             response = .success(
                 id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId, taskSummary: completion.summary
             )
+
+        case .reportPrepare:
+            // Only UseMac's own log and window are involved, so every mode allows it; the Kill Switch stops it.
+            if isKillSwitchTripped(), let reason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {
+                response = blockedPolicyResponse(request: request, startNs: startNs, targetApp: nil, activityTitle: "Problem report blocked", reason: reason)
+                break
+            }
+            response = prepareProblemReport(request, startNs: startNs)
         }
 
         notifyStateChanged()

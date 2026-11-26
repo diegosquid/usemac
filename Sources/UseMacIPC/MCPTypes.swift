@@ -99,6 +99,8 @@ public enum UseMacErrorGuide {
             return "Another agent's task is working in this window or tab, so nothing ran. Wait and retry once it finishes, or work in your own window or tab (browser_open for a new tab). Observe and screenshot still work. Never close or take over the other task's window."
         case "DAEMON_REQUIRED":
             return "Ask the user to open UseMac.app; do not bypass it with --standalone."
+        case "REPORT_IN_REVIEW":
+            return "A problem report is still open in UseMac's review window. Tell the user it is waiting for them; don't prepare another one until they close it."
         default:
             return nil
         }

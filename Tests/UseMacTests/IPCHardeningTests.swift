@@ -497,13 +497,13 @@ final class IPCHardeningTests: XCTestCase {
         let instructions = try XCTUnwrap(initResult["instructions"] as? String)
         XCTAssertTrue(instructions.contains("untrusted data"))
 
-        // 2. tools/list returns 16 tools, all with boolean annotations.readOnlyHint
+        // 2. tools/list returns 17 tools, all with boolean annotations.readOnlyHint
         let listLine = #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#
         let listRaw = await mcp.processLine(listLine)
         let listObj = try parseJSON(try XCTUnwrap(listRaw))
         let listResult = try XCTUnwrap(listObj["result"] as? [String: Any])
         let tools = try XCTUnwrap(listResult["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 16)
+        XCTAssertEqual(tools.count, 17)
 
         for tool in tools {
             let name = try XCTUnwrap(tool["name"] as? String)

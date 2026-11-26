@@ -22,7 +22,7 @@ Use **UseMac** to inspect and control macOS desktop applications and Google Chro
 ### Option A — Direct Unix Socket NDJSON (Default)
 Connect directly to `AF_UNIX` stream socket `{{USEMAC_SOCKET}}` (or `/tmp/usemac-$(id -u)/usemac.sock`). Send one UTF-8 JSON line (`\n`) per request and read one JSON line (`\n`) per response. Same-user connections only; requests larger than 16 MiB are rejected (`message_too_large`). A failure answers `"ok": false` with `error.code`, `error.message` and, when UseMac knows what you should do next, `error.hint`. `id` is optional, and `act` boolean flags default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, and `includeScreenshot: false` (`steps` is required).
 
-Methods: `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`.
+Methods: `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`, `report_prepare` (problem reports, section 6).
 
 - **Status**:
   ```json
@@ -142,13 +142,14 @@ USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" start --summary "Analyzing page"
 "$USEMAC" done --summary "Finished reading article"
 "$USEMAC" audit --task <taskId> [--since 2h] [--limit 200]
+"$USEMAC" report --task <taskId> --summary "<tried, expected, happened>"   # only after the user agreed (section 6)
 "$USEMAC" observe --app "Notes" [--role button] [--text "new"] [--no-offscreen]
 "$USEMAC" find --app "Notes" --role button --title "New Note" [--first]
 "$USEMAC" act '{"app":"Notes","returnDiffOnly":true,"steps":[{"action":"click","match":{"role":"button","title":"New Note"}}]}' [--expect-title "Notes"] [--foreground] [--allow-stale]
 ```
 
 ### Option C — MCP Tools (if `usemac` MCP is configured in host)
-`usemac_status`, `usemac_list_apps`, `usemac_observe`, `usemac_act`, `usemac_screenshot`, `usemac_highlight`, `usemac_browser_tabs`, `usemac_browser_open`, `usemac_browser_observe`, `usemac_browser_extract`, `usemac_browser_screenshot`, `usemac_browser_act`, `usemac_vision_status`, `usemac_vision_query`, `usemac_task_start`, `usemac_task_complete`.
+`usemac_status`, `usemac_list_apps`, `usemac_observe`, `usemac_act`, `usemac_screenshot`, `usemac_highlight`, `usemac_browser_tabs`, `usemac_browser_open`, `usemac_browser_observe`, `usemac_browser_extract`, `usemac_browser_screenshot`, `usemac_browser_act`, `usemac_vision_status`, `usemac_vision_query`, `usemac_task_start`, `usemac_task_complete`, `usemac_report_prepare`.
 
 Each tool exposes MCP `annotations` (`readOnlyHint`, `destructiveHint`). On timeout, the MCP server returns an error without retrying the action; call `usemac_status` or observe again before deciding whether to retry. `usemac_act` takes the same `match`, `scrollIntoView`/`axAction`/`waitFor` steps and `expectWindowTitle`/`allowStaleSnapshot`/`foreground` fields as the socket; `usemac_observe` takes `includeOffscreen`, `maxDepth`, `maxElements`; `usemac_browser_open` takes `activate` and `newWindow`. Errors end with a `Next:` line telling you what to do.
 
@@ -255,6 +256,7 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 | `NO_USEMAC_TAB` | No `tabId` was passed and there is no tracked UseMac tab or tab in the `UseMac` tab group, or your task's last tab was closed before an action. | Call `browser_open` to open a new background tab, or call `browser_tabs` and pass an explicit `tabId`. |
 | `CANCELLED` | The running or queued Chrome batch was cancelled (for example by the Kill Switch or a timeout). | Stop the current batch, check `status` if needed, and inform the user before taking further actions. |
 | `DAEMON_REQUIRED` | `UseMac.app` is not running, so actions are disabled in the CLI and MCP server. | Stop and ask the user to open `UseMac.app`; do not bypass it with `--standalone`. |
+| `REPORT_IN_REVIEW` | `report_prepare`: another problem report is still open in UseMac's review window. Nothing new opened. | Tell the user a report is waiting for them; don't prepare another until they close it. |
 | `STALE_SNAPSHOT` | The window changed since your last observe (or `expectWindowTitle` didn't match). Nothing ran. | Observe again and use the new ids, or use `match`. |
 | `ELEMENT_NOT_FOUND` | No element matched `match` (or the id is gone). | Observe again (raise `maxDepth`/`maxElements`, scroll the list), loosen the match, or check `index`. |
 | `WAIT_TIMEOUT` | `waitFor` ran out of time. | Observe to see the current state before retrying. |
@@ -287,3 +289,21 @@ Native steps accept `"match": {"role", "title", "value", "text", "exact", "index
 - The user's app and site rules (by default: password managers, Keychain Access and password-manager web vaults) are off limits. `list_apps` and `browser_tabs` leave those apps and tabs out, and anything that would reach them returns TARGET_BLOCKED. Don't reach them another way (another app, a screenshot, a different URL); only the user changes the rules.
 - Never take focus while the user is typing: no foreground burst after `USER_ACTIVE`, no `open -a` without `-g`.
 - Never try to change the execution mode, read the pairing key, or work around the Kill Switch.
+
+---
+
+## 6. Reporting a problem
+
+When a failure looks like a bug in UseMac, offer to help the user report it. Nothing leaves the Mac until the user has read the report and sent it themselves.
+
+- **When**: after a failure that looks like UseMac's fault (an unexpected code such as `INTERNAL`, an element that is on screen but keeps returning `ELEMENT_NOT_FOUND`, an extension that stops answering, a step that reports `ok` but does nothing). Never after a safety block (`POLICY_BLOCKED`, `POLICY_LOCKED`, `APPROVAL_DENIED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `TARGET_BLOCKED`, `TARGET_BUSY`) or something the user chose.
+- **Ask the user first**: say what went wrong and ask whether they want to send a report to UseMac's GitHub. Go on only if they say yes.
+- **Call the method** with a short `summary` (what you tried, what you expected, what happened, the error codes; none of the user's own data) and your `taskId`:
+  ```json
+  {"id":"r1","method":"report_prepare","taskId":"<taskId>","reportPrepare":{"summary":"Clicked Save in TextEdit with match; expected the save sheet; got ELEMENT_NOT_FOUND twice although the button was visible."}}
+  ```
+  MCP: `usemac_report_prepare` (`summary`, optional `title`, `taskId`). CLI: `"$USEMAC" report --task <taskId> --summary "..."`. Without a `taskId`, UseMac uses the only running task, or the last 30 minutes of activity.
+- **Tell the user to review the "Review problem report" window**. UseMac built the report from your summary, the environment (app, extension and macOS versions, execution mode, permissions), the task's error codes and up to 40 audit entries, and removed typed text, emails, tokens and keys, the home folder, URL query strings, long numbers, window titles and the user's name. Screenshots are never included. The user can edit it, checks that it has no personal or sensitive data, and clicks **Open issue on GitHub**; they submit the issue in their browser.
+- The answer comes back at once with `problemReport.status` `awaiting_user_review`. You never get the report's text or the user's decision, so don't ask the user what they chose or push them to send it.
+- **Never paste the report anywhere else**, and never try to check the box, press the window's buttons or read the window (it ignores posted clicks and Accessibility actions, and UseMac's windows are off limits: `SELF_TARGET_BLOCKED`).
+- One report shows at a time (`REPORT_IN_REVIEW`). It works in every execution mode, Read-only and Paused included; the Kill Switch blocks it (`POLICY_BLOCKED`); without the app it fails with `DAEMON_REQUIRED`.
