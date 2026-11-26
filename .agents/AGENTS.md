@@ -8,7 +8,7 @@ There are three ways to talk to the running `UseMac.app`, all backed by the same
 - **MCP stdio server** — for hosts that prefer MCP tools. See [section 4](#4-mcp-server).
 - **CLI** — for agents with a shell. See [section 5](#5-cli).
 
-Whatever the transport, read [section 6](#6-acting-reliably) before acting on native apps: it covers `match`, step effects, error codes, foreground bursts, file pickers and restricted Chrome pages.
+Whatever the transport, read [section 6](#6-acting-reliably) before acting on native apps: it covers `match`, step effects, error codes, foreground bursts, file pickers and restricted Chrome pages. When something looks like a UseMac bug, [section 8](#8-reporting-a-problem) says how to help the user report it.
 
 The helper binary lives at `/Applications/UseMac.app/Contents/Helpers/usemac`.
 
@@ -63,8 +63,9 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 - One UTF-8 JSON object per line in each direction. Requests over 16 MiB are rejected with `message_too_large`.
 - `id` is optional. On `act` and `browser_act`, booleans default to `stopOnError: true`, `returnObservation: true`, `returnDiffOnly: false`, `includeScreenshot: false`; `steps` is required.
 - Keep one connection open across a multi-step task to reuse the Accessibility hot cache.
+- A failure answers `{"id": "…", "ok": false, "error": {"code": "…", "message": "…", "hint": "…"}}`. `hint` is optional: UseMac sends it when it knows what you should do next. On `POLICY_BLOCKED` it names the execution mode, pause or Kill Switch that refused the request; on `POLICY_LOCKED`, the current mode.
 
-### All 23 methods
+### All 24 methods
 
 | Method | Description |
 | :--- | :--- |
@@ -91,8 +92,12 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), t
 | `vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`); `imagePath` must be in the user's temp folder or `/tmp`. |
 | `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request; `agent` names you on the preview cards. |
 | `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. |
+| `report_prepare` | Prepare a problem report the user reviews in UseMac before anything is sent (`reportPrepare`: `summary` required, `title`, `taskId`). Answers at once with `problemReport.status` `awaiting_user_review`. See [section 8](#8-reporting-a-problem). |
 
 While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start` and `task_complete` answer; everything else returns `POLICY_BLOCKED`.
+`report_prepare` also works while **Paused** and in every other mode (it only reads UseMac's own log and opens UseMac's own window), but not with the Kill Switch on.
+
+UseMac starts in **Autonomous** unless the user picked another mode. Any other mode shows in UseMac's menu bar menu ("Mode: Read-only"), and only the user can relax it or resume.
 
 ### Ask mode
 
@@ -283,6 +288,7 @@ Every tool carries MCP `annotations` (`readOnlyHint`, `destructiveHint`). On a t
 | `usemac_vision_query` | On-device vision (`ask`, `verify`, `describe`, `locate`, `diagnose`, `ocr`). |
 | `usemac_task_start` | Hold the floating live preview open across a task; later calls on this connection belong to it. `agent` defaults to the MCP client's name. |
 | `usemac_task_complete` | Finish the task, close the preview and report what the task did. |
+| `usemac_report_prepare` | Prepare a problem report the user reviews in UseMac before anything is sent (`summary`, optional `title`, `taskId`). See [section 8](#8-reporting-a-problem). |
 
 Install the skill too (section 1): MCP gives the tools, the skill teaches how to use them well.
 
@@ -326,9 +332,10 @@ Chrome and on-device vision (`--profile` only when several profiles are connecte
 "$USEMAC" vision locate "X close button on notification popup"
 "$USEMAC" done --summary "Finished reading article"
 "$USEMAC" audit --task task-1a2b3c4d               # what this task did (--since 2h, --limit 200)
+"$USEMAC" report --task task-1a2b3c4d --summary "…" # only after the user agreed: see section 8
 ```
 
-When `UseMac.app` is closed, action commands (`act`, `click`, `set`, `type`, `key`, `browser open`, `browser act`, `vision install`) fail with `DAEMON_REQUIRED`. `--standalone` runs in-process without the app and **without** the Kill Switch or execution mode; use it only when the user asks.
+When `UseMac.app` is closed, action commands (`act`, `click`, `set`, `type`, `key`, `browser open`, `browser act`, `vision install`) and `report` fail with `DAEMON_REQUIRED`. `--standalone` runs in-process without the app and **without** the Kill Switch or execution mode; use it only when the user asks.
 
 | Exit code | Meaning |
 | :--- | :--- |
@@ -346,6 +353,8 @@ A failed batch exits with the code of its first failed step. With `--json`, succ
 ```json
 {"ok": false, "error": {"code": "POLICY_BLOCKED", "message": "...", "hint": "..."}}
 ```
+
+`hint` (`Next:` without `--json`) is the daemon's own advice when it sends one (for `POLICY_BLOCKED`: which mode, pause or Kill Switch refused it), else the CLI's advice for the code.
 
 ---
 
@@ -420,8 +429,8 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 
 | Code | Meaning | What the agent should do |
 | :--- | :--- | :--- |
-| `POLICY_BLOCKED` | The execution mode (`confirmSensitive`, `readOnly`, `paused`) or the Kill Switch blocked the request. | Stop and tell the user. Don't retry or look for another route. |
-| `POLICY_LOCKED` | `set_policy` tried to relax the execution mode. | Stop and tell the user; only they can relax it in UseMac Settings. |
+| `POLICY_BLOCKED` | The execution mode (`confirmSensitive`, `readOnly`, `paused`) or the Kill Switch blocked the request. The message and `hint` say which. (With `browser_act` `readOnly: true`, your own flag blocked it: the hint says so.) | Stop and tell the user which mode blocked you: only they can change it, in **UseMac → Settings → Safety** (or **Resume Agents** in UseMac's menu bar menu). Don't retry or look for another route. |
+| `POLICY_LOCKED` | `set_policy` tried to relax the execution mode. The `hint` names the current mode. | Stop and tell the user; only they can relax it, in **UseMac → Settings → Safety**. |
 | `APPROVAL_DENIED` | Ask mode: the user denied the sensitive step in UseMac's prompt. Nothing ran. | Stop and tell the user. Retry only if they ask you to. |
 | `APPROVAL_TIMEOUT` | Ask mode: nobody answered UseMac's prompt in time. Nothing ran. | Tell the user what needs their OK; retry once they say they are at the Mac. |
 | `URL_BLOCKED` | The URL scheme is not `http://`, `https://` or `about:blank`. | Stop and tell the user. |
@@ -429,6 +438,7 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 | `SELF_TARGET_BLOCKED` | The request named UseMac itself (by name, bundle ID or PID), or real input would have landed in a UseMac window. Nothing ran. | Stop and tell the user. Never try to change UseMac's settings through its UI. |
 | `TARGET_BLOCKED` | The user's app and site rules block the target: an app (named, or the app in front when none is named), real input that would land in its window, a Chrome tab on a blocked site, or a URL on one. Nothing ran, or the result was withheld. With site rules set, a tab command is also refused when UseMac couldn't confirm the tab's site (the message says so). | Stop and tell the user. Only they can change the rules, in **UseMac → Settings → General → App and site rules**. If the message says UseMac couldn't confirm the tab's site, retry once first. |
 | `DAEMON_REQUIRED` | `UseMac.app` is not running, so actions are disabled. | Ask the user to open UseMac; don't bypass it with `--standalone`. |
+| `REPORT_IN_REVIEW` | `report_prepare`: another problem report is still open in UseMac's review window. Nothing new opened. | Tell the user a report is waiting for them; don't prepare another until they close it. |
 | `STALE_SNAPSHOT` | The window changed since your last observe (or `expectWindowTitle` didn't match). Nothing ran. | Observe again and use the new ids, or use `match`. |
 | `ELEMENT_NOT_FOUND` | No element matched `match` (or the id is gone). | Observe again (raise `maxDepth`/`maxElements`, scroll the list), loosen the match, or check `index`. |
 | `WAIT_TIMEOUT` | `waitFor` ran out of time. | Observe to see the current state before retrying. |
@@ -468,3 +478,23 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 - The user's app and site rules (by default: password managers, Keychain Access and password-manager web vaults) are off limits. `list_apps` and `browser_tabs` leave those apps and tabs out, and anything that would reach them returns TARGET_BLOCKED. Don't reach them another way (another app, a screenshot, a different URL); only the user changes the rules.
 - Never take focus while the user is typing: no foreground burst after `USER_ACTIVE`, no `open -a` without `-g`.
 - Never try to change the execution mode, read the pairing key, or work around the Kill Switch.
+
+---
+
+## 8. Reporting a problem
+
+When a task fails in a way that looks like a bug in UseMac, you can help the user report it to UseMac's maintainers. Nothing leaves the Mac until the user has read the report and sent it themselves.
+
+**When to offer it.** After a failure that looks like UseMac's fault: a step that should have worked returns `INTERNAL` or another unexpected code, the same element keeps returning `ELEMENT_NOT_FOUND` although it is on screen, the Chrome extension stops answering, a step reports `ok` but nothing happens. Not after a safety block (`POLICY_BLOCKED`, `POLICY_LOCKED`, `APPROVAL_DENIED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `TARGET_BLOCKED`, `TARGET_BUSY`): those are UseMac working as the user set it up. Not when the user chose something (denied a prompt, closed a window, stopped you).
+
+1. **Ask the user first**, in one sentence: what went wrong, and whether they want to send a report to UseMac's GitHub. Only go on if they say yes.
+2. **Call the method** with a short `summary`: what you tried, what you expected and what happened, with the error codes. Leave out the user's own data (what they typed, document contents, names, addresses). Pass the task's `taskId`; without it UseMac uses the only running task, or the last 30 minutes of activity.
+   - Socket: `{"method":"report_prepare","taskId":"task-1a2b3c4d","reportPrepare":{"summary":"Clicked Save in TextEdit with match; expected the save sheet; got ELEMENT_NOT_FOUND twice although the button was visible."}}`
+   - MCP: `usemac_report_prepare` with `summary` (and `title`, `taskId` if needed).
+   - CLI: `usemac report --task <taskId> --summary "…"` (`--title` optional).
+3. **Tell the user to review the "Review problem report" window** that UseMac opened. They can edit the text, check that it has no personal or sensitive data, and click **Open issue on GitHub**, which opens a prefilled issue in their browser; they submit it there. A report too long for a link goes to their clipboard and they paste it.
+4. **Never paste the report anywhere else**, and never try to check the box, press the window's buttons or read the window: it ignores clicks some process posted and Accessibility actions, and UseMac blocks you from its own windows (`SELF_TARGET_BLOCKED`).
+
+What the report contains: your summary, the environment (UseMac version and build, macOS version, Chrome extension versions, execution mode, permissions), the error codes UseMac recorded for the task since it last started, and up to 40 of the task's audit entries (newest kept, listed oldest first). Audit entries already keep typed text, `setValue` values and `eval` sources only as their length. A second pass over the whole report, your summary included, removes emails, tokens and keys, passwords in `key=value` form, the home folder path (shown as `~`), URL credentials, query strings and fragments, long numbers, IP addresses, window titles, Chrome profile names and the user's name and computer name. Screenshots are never included.
+
+The answer comes back at once: `problemReport` with `status` `awaiting_user_review`, the `reportId`, `taskId`, `entryCount`, `errorCodes` and a `message` to relay. You never get the report's text or what the user decided. One report shows at a time (`REPORT_IN_REVIEW` while one is open). It works in every execution mode, Read-only and Paused included; the Kill Switch blocks it (`POLICY_BLOCKED`), and without the app it fails with `DAEMON_REQUIRED`.

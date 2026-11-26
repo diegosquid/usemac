@@ -18,6 +18,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let actionExecutor: ActionExecutor
     /// Ask mode: sensitive requests waiting for the user's answer in the HUD.
     public let approvals = ApprovalBroker()
+    /// `report_prepare` drafts waiting in the app's review window (UseMacEngineService+ProblemReport.swift).
+    public let problemReports = ProblemReportBroker()
     /// The audit log on disk; nil keeps it in memory only (tests, in-process CLI calls).
     public let auditStore: AuditLogStore?
 
@@ -469,7 +471,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     success: false,
                     isInProgress: false
                 ))
-                response = .failure(id: request.id, code: "POLICY_LOCKED", message: message, latencyMs: latencyMs)
+                response = .failure(id: request.id, code: "POLICY_LOCKED", message: message, latencyMs: latencyMs, hint: ExecutionModeNotice.relaxHint(current: currentPolicy))
                 break
             }
             emitLiveActivity(LiveActivityItem(
@@ -980,7 +982,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let hasSensitive = params.steps.contains { isSensitiveStepForPolicy($0) }
             let hasMutating = params.steps.contains { isMutatingStepForPolicy($0) }
             var blockReason = killSwitch.isBlocked(forSensitiveAction: hasSensitive, isMutatingAction: hasMutating)
-            if blockReason == nil, params.readOnly == true, hasMutating {
+            let readOnlyRequested = blockReason == nil && params.readOnly == true && hasMutating
+            if readOnlyRequested {
                 blockReason = "Mutating browser step blocked because readOnly=true was requested (only scroll, hover, wait, and target are permitted)."
             }
             if let blockReason {
@@ -990,7 +993,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     targetApp: params.profile ?? "Chrome",
                     activityAppName: "Chrome (\(params.profile ?? "Browser"))",
                     activityTitle: "Browser action blocked",
-                    reason: blockReason
+                    reason: blockReason,
+                    readOnlyRequested: readOnlyRequested
                 )
                 break
             }
@@ -1579,6 +1583,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             response = .success(
                 id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: completion.taskId, taskSummary: completion.summary
             )
+
+        case .reportPrepare:
+            // Only UseMac's own log and window are involved, so every mode allows it; the Kill Switch stops it.
+            if isKillSwitchTripped(), let reason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {
+                response = blockedPolicyResponse(request: request, startNs: startNs, targetApp: nil, activityTitle: "Problem report blocked", reason: reason)
+                break
+            }
+            response = prepareProblemReport(request, startNs: startNs)
         }
 
         notifyStateChanged()
@@ -1993,7 +2005,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         targetApp: String?,
         activityAppName: String? = nil,
         activityTitle: String,
-        reason: String
+        reason: String,
+        readOnlyRequested: Bool = false
     ) -> RPCResponse {
         let latencyMs = elapsedMs(since: startNs)
         appendAudit(
@@ -2003,16 +2016,24 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             latencyMs: latencyMs,
             success: false
         )
+        // The caption and the agent's hint name the mode, pause or Emergency stop that refused it (ExecutionModeNotice).
+        // browser_act's readOnly flag is the agent's own choice, not the user's.
+        let policy = killSwitch.getPolicy()
+        let tripped = killSwitch.isTripped
+        let caption = readOnlyRequested ? nil : ExecutionModeNotice.activityReason(policy: policy, killSwitchTripped: tripped)
+        let hint = readOnlyRequested
+            ? ExecutionModeNotice.readOnlyRequestedHint
+            : ExecutionModeNotice.agentHint(policy: policy, killSwitchTripped: tripped)
         emitLiveActivity(LiveActivityItem(
             kind: .policyOrSafety,
             appName: activityAppName ?? targetApp,
             title: activityTitle,
-            subtitle: reason,
+            subtitle: caption ?? reason,
             latencyMs: latencyMs,
             success: false,
             isInProgress: false
         ))
-        return .failure(id: request.id, code: "POLICY_BLOCKED", message: reason, latencyMs: latencyMs)
+        return .failure(id: request.id, code: "POLICY_BLOCKED", message: reason, latencyMs: latencyMs, hint: hint)
     }
 
     /// Refusal for a request whose target the user's app and site rules block (TargetRules).

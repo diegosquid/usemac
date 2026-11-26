@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import UseMacEngine
 import UseMacProtocol
 
 @main
@@ -139,20 +140,18 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
 
     private func updateStatusIcon() {
         guard let button = statusItem?.button else { return }
-        let paused = appState.status.killSwitchTripped || appState.status.policy == .paused
-        let active = !paused && appState.isActivityIndicatorLit
-        button.image = Self.makeMenuBarIcon(paused: paused, active: active)
+        let policy = appState.status.policy
+        let tripped = appState.status.killSwitchTripped
+        // Read-only, Paused and the Emergency stop badge the icon; the tooltip names any mode but Autonomous.
+        let badge = ExecutionModeNotice.badge(policy: policy, killSwitchTripped: tripped)
+        let acting = !tripped && policy != .paused && appState.isActivityIndicatorLit
+        let active = acting && badge == .none
+        button.image = Self.makeMenuBarIcon(badge: badge, active: active)
         button.imagePosition = .imageOnly
-        if paused {
-            button.toolTip = "UseMac (Paused / Kill Switch Active)"
-        } else if active {
-            button.toolTip = "UseMac (Agent Acting)"
-        } else {
-            button.toolTip = "UseMac (Running)"
-        }
+        button.toolTip = ExecutionModeNotice.tooltip(policy: policy, killSwitchTripped: tripped, agentActing: acting)
     }
 
-    private static func makeMenuBarIcon(paused: Bool, active: Bool) -> NSImage {
+    private static func makeMenuBarIcon(badge: ExecutionModeNotice.Badge, active: Bool) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { _ in
             guard let cg = NSGraphicsContext.current?.cgContext else { return false }
@@ -195,7 +194,7 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
             cg.setLineJoin(.round)
             cg.strokePath()
 
-            if paused {
+            if badge == .paused {
                 // Crisp negative-space badge with two-bar pause indicator at bottom-right
                 let badgeRect = CGRect(x: 10.4, y: 1.4, width: 6.4, height: 6.4)
                 cg.saveGState()
@@ -208,6 +207,26 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
                 let bar2 = CGPath(roundedRect: CGRect(x: 14.05, y: 2.6, width: 1.45, height: 4.0), cornerWidth: 0.55, cornerHeight: 0.55, transform: nil)
                 cg.addPath(bar1)
                 cg.addPath(bar2)
+                cg.fillPath()
+            } else if badge == .readOnly {
+                // Read-only: an eye (agents can look, not act) in the same negative-space badge
+                let badgeRect = CGRect(x: 10.4, y: 1.4, width: 6.4, height: 6.4)
+                cg.saveGState()
+                cg.setBlendMode(.clear)
+                cg.addEllipse(in: badgeRect.insetBy(dx: -0.9, dy: -0.9))
+                cg.fillPath()
+                cg.restoreGState()
+
+                let eyeCenter = CGPoint(x: badgeRect.midX, y: badgeRect.midY)
+                let eye = CGMutablePath()
+                eye.move(to: CGPoint(x: eyeCenter.x - 3.3, y: eyeCenter.y))
+                eye.addQuadCurve(to: CGPoint(x: eyeCenter.x + 3.3, y: eyeCenter.y), control: CGPoint(x: eyeCenter.x, y: eyeCenter.y + 2.75))
+                eye.addQuadCurve(to: CGPoint(x: eyeCenter.x - 3.3, y: eyeCenter.y), control: CGPoint(x: eyeCenter.x, y: eyeCenter.y - 2.75))
+                eye.closeSubpath()
+                cg.addPath(eye)
+                cg.setLineWidth(1.0)
+                cg.strokePath()
+                cg.addEllipse(in: CGRect(x: eyeCenter.x - 1.0, y: eyeCenter.y - 1.0, width: 2.0, height: 2.0))
                 cg.fillPath()
             } else if active {
                 // Crisp calm glacier-sky live activity dot with tight negative-space halo at bottom-right
@@ -295,6 +314,16 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
         headerItem.isEnabled = false
         statusHeaderItem = headerItem
         menu.addItem(headerItem)
+
+        // "Mode: Read-only" while the mode isn't Autonomous, so a mode the user didn't mean to keep can't hide.
+        let policy = appState.status.policy
+        if let modeTitle = ExecutionModeNotice.menuTitle(policy: policy) {
+            let modeItem = NSMenuItem(title: modeTitle, action: #selector(openSafetySettings), keyEquivalent: "")
+            modeItem.subtitle = ExecutionModeNotice.menuSubtitle(policy: policy)
+            modeItem.toolTip = "Change it in Settings → Safety"
+            modeItem.target = self
+            menu.addItem(modeItem)
+        }
 
         let perms = appState.status.permissions
         if !perms.accessibilityGranted || !perms.screenRecordingGranted {
@@ -461,6 +490,10 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
 
     @objc private func openControlCenter() {
         controlCenterController.show()
+    }
+
+    @objc private func openSafetySettings() {
+        controlCenterController.show(section: .overview, scrollTo: .safety)
     }
 
     @objc private func checkForUpdates() {

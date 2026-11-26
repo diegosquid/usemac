@@ -21,8 +21,15 @@ public enum ControlCenterSection: String, CaseIterable, Identifiable {
 @MainActor
 public final class ControlCenterRouter: ObservableObject {
     @Published public var selection: ControlCenterSection = .overview
+    /// A group in General to scroll to once it shows, then cleared (the menu bar's "Mode: …" line asks for Safety).
+    @Published public var scrollTarget: ControlCenterAnchor?
 
     public init() {}
+}
+
+/// Groups in General that other parts of the app can open Settings at.
+public enum ControlCenterAnchor: Hashable {
+    case safety
 }
 
 // MARK: - Window Drag Strip for Transparent Titlebar
@@ -61,9 +68,12 @@ public final class ControlCenterWindowController {
         }
     }
 
-    public func show(section: ControlCenterSection? = nil) {
+    public func show(section: ControlCenterSection? = nil, scrollTo anchor: ControlCenterAnchor? = nil) {
         if let section {
             router.selection = section
+        }
+        if let anchor {
+            router.scrollTarget = anchor
         }
 
         if window == nil {
@@ -284,7 +294,11 @@ public struct ControlCenterView: View {
         Group {
             switch router.selection {
             case .overview:
-                generalSection
+                ScrollViewReader { proxy in
+                    generalSection
+                        .onAppear { scrollToTarget(proxy) }
+                        .onChange(of: router.scrollTarget) { scrollToTarget(proxy) }
+                }
             case .connect:
                 connectSection
             case .audit:
@@ -293,6 +307,17 @@ public struct ControlCenterView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .codexSheetElevation(colorScheme, cornerRadius: 18)
+    }
+
+    /// Scrolls General to `router.scrollTarget`, once laid out, and clears it.
+    private func scrollToTarget(_ proxy: ScrollViewProxy) {
+        guard let target = router.scrollTarget else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(target, anchor: .top)
+            }
+            router.scrollTarget = nil
+        }
     }
 
     // MARK: - General Preferences Section (Pure Codex Style, Zero Dashboard)
@@ -324,6 +349,7 @@ public struct ControlCenterView: View {
                 localVisionGroup
                 permissionsGroup
                 safetyGroup
+                    .id(ControlCenterAnchor.safety)
                 AuditLogSettingsGroup(store: appState.engine.auditStore, onOpenHistory: { router.selection = .audit })
                 TargetRulesGroupView()
                 SoftwareUpdatesGroupView(updater: appState.updater)
@@ -856,44 +882,32 @@ public struct ControlCenterView: View {
         }
     }
 
-    private var executionModeSubtitle: String {
-        switch appState.status.policy {
-        case .autonomous:
-            return "Agents can read and act without asking."
-        case .ask:
-            return "Agents can act, but uploads, page scripts and ⌘/⌃ shortcuts wait for your OK in the live preview."
-        case .confirmSensitive:
-            return "Agents can act, but uploads, page scripts and ⌘/⌃ shortcuts are blocked."
-        case .readOnly:
-            return "Agents can look and scroll. Clicks, typing and uploads are blocked."
-        case .paused:
-            return "Agents can't read the screen or act until you resume."
-        }
-    }
-
     private var safetyGroup: some View {
         SettingsGroup(title: "Safety") {
             EmptyView()
         } content: {
-            codexRow(
-                title: "Execution mode",
-                subtitle: executionModeSubtitle,
-                subtitleLineLimit: nil
-            ) {
-                CodexSegmentedControl(
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2.5) {
+                    Text("Execution mode")
+                        .font(.system(size: 13.5, weight: .medium))
+                    Text("Choose what agents may do on this Mac. Agents can only make it stricter.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 18)
+
+                ExecutionModePicker(
                     selection: Binding(
                         get: { appState.status.policy },
                         set: { appState.setPolicy($0) }
                     ),
-                    options: [
-                        CodexSegmentOption(value: GovernancePolicy.autonomous, label: "Autonomous"),
-                        CodexSegmentOption(value: GovernancePolicy.ask, label: "Ask"),
-                        CodexSegmentOption(value: GovernancePolicy.confirmSensitive, label: "Block sensitive"),
-                        CodexSegmentOption(value: GovernancePolicy.readOnly, label: "Read-only"),
-                        CodexSegmentOption(value: GovernancePolicy.paused, label: "Paused")
-                    ]
+                    placement: .settings
                 )
+                .padding(.horizontal, 8)
             }
+            .padding(.top, 14)
+            .padding(.bottom, 8)
 
             InsetDivider(leading: 18)
 

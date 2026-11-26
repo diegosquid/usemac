@@ -214,7 +214,7 @@ final class MCPReliabilityContractTests: XCTestCase {
         let (mcp, _) = makeServer()
         defer { mcp.close() }
         let tools = try await toolList(mcp)
-        XCTAssertEqual(tools.count, 16)
+        XCTAssertEqual(tools.count, 17)
 
         let actProps = try properties(of: "usemac_act", in: tools)
         for key in ["expectWindowTitle", "allowStaleSnapshot", "foreground", "steps"] {

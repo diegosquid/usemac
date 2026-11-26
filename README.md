@@ -26,7 +26,7 @@ UseMac is a native macOS app and background daemon (written in Swift) that lets 
 printf '{"id":"1","method":"status"}\n' | nc -U "/tmp/usemac-$(id -u)/usemac.sock"
 ```
 
-Methods (23): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one.
+Methods (24): `ping`, `status`, `list_apps`, `observe`, `act`, `screenshot`, `set_policy`, `pair_app`, `audit_log`, `highlight`, `browser_status`, `browser_tabs`, `browser_open`, `browser_observe`, `browser_extract`, `browser_screenshot`, `browser_act`, `browser_reload_extension`, `vision_status`, `vision_install`, `vision_query`, `task_start`, `task_complete`, `report_prepare`. The [Agent Guide](.agents/AGENTS.md#3-unix-socket-ndjson) describes each one.
 
 ### MCP (`stdio`)
 
@@ -43,7 +43,7 @@ Add the bundled helper binary to your MCP client configuration under the `"usema
 }
 ```
 
-Every MCP tool includes `annotations` (`readOnlyHint`, `destructiveHint`), and the server does not automatically retry an action on timeout. Exposed tools (16):
+Every MCP tool includes `annotations` (`readOnlyHint`, `destructiveHint`), and the server does not automatically retry an action on timeout. Exposed tools (17):
 
 - `usemac_status`
 - `usemac_list_apps`
@@ -61,6 +61,7 @@ Every MCP tool includes `annotations` (`readOnlyHint`, `destructiveHint`), and t
 - `usemac_vision_query`
 - `usemac_task_start`
 - `usemac_task_complete`
+- `usemac_report_prepare`
 
 ### CLI (`usemac`)
 
@@ -78,7 +79,7 @@ When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and ac
 
 ### Error codes
 
-Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error-codes) explains each one and what the agent should do next.
+Failed requests carry an error `code` and `message`, and an optional `hint` when UseMac knows what the agent should do next (for `POLICY_BLOCKED`, which execution mode, pause or Kill Switch refused it). The [Agent Guide](.agents/AGENTS.md#error-codes) explains each code and what the agent should do next.
 
 - **Stop and tell the user** (a safety rule blocked it, or UseMac isn't running): `POLICY_BLOCKED`, `POLICY_LOCKED`, `URL_BLOCKED`, `UPLOAD_BLOCKED`, `SELF_TARGET_BLOCKED`, `IMAGE_PATH_BLOCKED`, `DAEMON_REQUIRED`.
 - **The screen changed** (observe again): `STALE_SNAPSHOT`, `ELEMENT_NOT_FOUND`, `WAIT_TIMEOUT`.
@@ -86,12 +87,15 @@ Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error
 - **Wrong route** (switch to native observe or the hybrid Chrome flow): `RESTRICTED_PAGE`, `CAPTURE_TOO_SMALL`.
 - **Chrome extension**: `EXTENSION_NOT_CONNECTED`, `EXTENSION_NOT_PAIRED`, `EXTENSION_TIMEOUT`, `EXTENSION_RELOAD_UNSUPPORTED`, `EXTENSION_RELOAD_TIMEOUT`, `BROWSER_BUSY`, `NO_USEMAC_TAB`, `CANCELLED`, `WINDOW_ERROR`, `EVAL_ERROR`.
 - **Apps, permissions and captures**: `APP_NOT_FOUND`, `PERMISSION_DENIED`, `CAPTURE_FAILED`, `UPLOAD_FAILED`, `NO_IMAGE_SOURCE`.
+- **Problem reports**: `REPORT_IN_REVIEW` (another report is still open for your review; see [How to contribute](#how-to-contribute)).
 - **Malformed requests**: `USAGE`, `INVALID_JSON`, `INVALID_REQUEST`, `INVALID_ARGUMENT`, `UNKNOWN_COMMAND`, `INVALID_MODEL`.
 - **Unexpected failures**: `INTERNAL`, `ENCODING_FAILED`, `EXTENSION_ERROR`, `BROWSER_TABS_FAILED`, `BROWSER_OPEN_FAILED`, `BROWSER_OBSERVE_FAILED`, `BROWSER_EXTRACT_FAILED`, `BROWSER_SCREENSHOT_FAILED`, `BROWSER_ACT_FAILED`.
 
 ## Safety model
 
 ### Execution modes
+
+UseMac starts in **Autonomous** until you pick another mode in **Settings → General → Safety**. Any other mode shows in the menu bar: Read-only badges the icon with an eye, Paused and the Kill Switch with pause bars, and the menu says "Mode: …" with a link back to Safety. Agents that a mode refuses get a `POLICY_BLOCKED` hint that names it and tells them to ask you.
 
 | Mode (`set_policy`) | App UI label | Behavior |
 | :--- | :--- | :--- |
@@ -101,7 +105,7 @@ Failed requests carry an error `code`. The [Agent Guide](.agents/AGENTS.md#error
 | `readOnly` | **Read-only** | Blocks mutating actions; `scroll`, `hover`, `wait`, `target`, observe, read-only extract (`auto`, `tables`, `text`, `kpis`, `downloads`), and screenshots remain allowed. |
 | `paused` | **Paused** | Blocks all automation, including reads. |
 
-- **Kill Switch (`⇧⌘⎋`)**: Immediately blocks all automation including reads and cancels any in-progress Chrome batch. While **Kill Switch** or **Paused** is active, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start`, and `task_complete` continue responding. Blocked requests return `POLICY_BLOCKED`.
+- **Kill Switch (`⇧⌘⎋`)**: Immediately blocks all automation including reads and cancels any in-progress Chrome batch. While **Kill Switch** or **Paused** is active, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start`, and `task_complete` continue responding. Blocked requests return `POLICY_BLOCKED`. `report_prepare` also works while **Paused** (it only opens UseMac's own review window), but not with the Kill Switch on.
 - **One-way socket policy changes**: `set_policy` over the socket can only keep or tighten the execution mode; attempting to relax it returns `POLICY_LOCKED` (only the app can relax the mode).
 - **Ask prompts answer only to you**: only a physical click with this Mac's mouse or trackpad answers an Ask prompt. It ignores clicks posted by any process (another agent, Screen Sharing, Universal Control, Voice Control) and Accessibility actions, there is no socket method or MCP tool for it, and UseMac refuses to post real input onto it. One prompt shows at a time; the others queue. Every answer, and every ignored click, goes to the audit log.
 - **Blocked by default**:
@@ -192,6 +196,45 @@ node --test Tests/ExtensionTests/*.test.mjs
 - [Chrome Extension Bridge Protocol](docs/BRIDGE-PROTOCOL.md)
 - [Live smoke run](docs/SMOKE.md): `scripts/smoke.sh`, run before every release
 - [Chrome Web Store release](docs/CHROME-WEB-STORE.md): the store ID (`USEMAC_CHROME_EXTENSION_ID`), packaging and submitting the extension
+
+## How to contribute
+
+### Report a problem
+
+**With your agent.** When a task fails in a way that looks like a UseMac bug, your agent can offer to report it (or ask it to). It calls `report_prepare` (MCP `usemac_report_prepare`, CLI `usemac report --summary "…"`), and UseMac opens a **Review problem report** window with exactly the text that would be sent:
+
+1. Read it. You can edit the title and the text to remove anything else.
+2. Check **I checked this report and it has no personal or sensitive data**. Any later edit clears the check.
+3. Click **Open issue on GitHub**. Your browser opens a prefilled issue on [diegosquid/usemac](https://github.com/diegosquid/usemac/issues), and you submit it there. A report too long for a link is copied to your clipboard instead, and you paste it into the issue.
+
+**Copy** puts the report on the clipboard, and **Cancel** discards it. Nothing leaves your Mac until you submit the issue on GitHub yourself. Only a click with your own mouse or trackpad checks the box or presses the buttons: the window ignores clicks some process posted and Accessibility actions, and agents can't observe or act on UseMac's windows. The agent only learns that the report is waiting for your review (`awaiting_user_review`), never its text or what you decided. One report shows at a time.
+
+**By hand.** [Open an issue](https://github.com/diegosquid/usemac/issues/new) with what you did, what you expected and what happened, your UseMac version (`usemac --version`) and macOS version, and the error code if there was one. `usemac audit --since 30m` prints recent activity; check it for personal data before you paste it.
+
+**What a report contains**: the agent's description of the problem; the environment (UseMac version and build, macOS version, architecture, Chrome extension version and where Chrome loads it from, execution mode, permissions); the error codes UseMac recorded for the task since it last started; and up to 40 of the task's audit entries (or the last 30 minutes of activity when no task is named), already redacted as described under **Audit log** above.
+
+**What is removed** before you see it, from the whole report including the agent's text: typed text, `setValue` values and page scripts (kept only as their length), emails, API keys and tokens, `password=`-style values, private keys, your home folder path (shown as `~`) and other users' folders, URL credentials, query strings and fragments, long numbers (card, phone and account numbers, codes), IP addresses, window titles, Chrome profile names, and your name, account name and computer name. Screenshots are never included. This is a safety net, not a guarantee: app names, page addresses and what the agent wrote stay in, so read the report before you send it.
+
+### Build and test
+
+You need macOS 15 on Apple Silicon, Xcode or the Swift 6 toolchain, and Node.js for the extension tests.
+
+```bash
+swift build                                  # .build/debug/UseMac (the app) and .build/debug/usemac-cli (the CLI)
+swift test                                   # Swift unit and integration tests
+node --test Tests/ExtensionTests/*.test.mjs  # Chrome extension tests
+./scripts/bundle-app.sh                      # signed dist/UseMac.app, with the CLI in Contents/Helpers/usemac
+```
+
+`swift test` includes a docs sync test: every method, MCP tool and error code in the code must appear in `.agents/AGENTS.md`, `.agents/skills/usemac/SKILL.md` and this README, and the counts above must match. Before a release, `scripts/smoke.sh` runs a live check against the installed app ([docs/SMOKE.md](docs/SMOKE.md)).
+
+### Open a pull request
+
+1. Fork the repository and create a branch from `main`.
+2. Keep commits small, with a subject in the imperative and a body that says why.
+3. Run `swift build`, `swift test` and the extension tests. CI runs the same three on every pull request.
+4. Document agent-facing changes (methods, parameters, MCP tools, error codes, defaults) in `.agents/AGENTS.md`, the skill, the MCP tool descriptions, the CLI help and this README.
+5. Open the pull request against `main`. Say what changed for users and agents, how you tested it, and what you couldn't test. Link the issue it fixes (`Closes #123`).
 
 ## License
 

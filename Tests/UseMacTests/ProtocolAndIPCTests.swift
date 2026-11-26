@@ -162,7 +162,8 @@ final class ProtocolAndIPCTests: XCTestCase {
             "usemac_vision_status",
             "usemac_vision_query",
             "usemac_task_start",
-            "usemac_task_complete"
+            "usemac_task_complete",
+            "usemac_report_prepare"
         ]
         for expected in expectedTools {
             XCTAssertTrue(toolNames.contains(expected), "Missing MCP tool: \(expected)")
