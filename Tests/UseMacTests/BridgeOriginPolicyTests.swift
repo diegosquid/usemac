@@ -185,13 +185,19 @@ final class BridgeOriginPolicyTests: XCTestCase {
         let port = await waitForListeningPort(of: bridge)
         XCTAssertNotEqual(port, 0)
 
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 0.5
-        config.timeoutIntervalForResource = 0.5
-        let session = URLSession(configuration: config)
-        defer { session.invalidateAndCancel() }
+        let shortConfig = URLSessionConfiguration.ephemeral
+        shortConfig.timeoutIntervalForRequest = 0.5
+        shortConfig.timeoutIntervalForResource = 0.5
+        let shortSession = URLSession(configuration: shortConfig)
+        defer { shortSession.invalidateAndCancel() }
 
-        func reachesTheHandshake() async -> Bool {
+        let allowConfig = URLSessionConfiguration.ephemeral
+        allowConfig.timeoutIntervalForRequest = 5
+        allowConfig.timeoutIntervalForResource = 5
+        let allowSession = URLSession(configuration: allowConfig)
+        defer { allowSession.invalidateAndCancel() }
+
+        func reachesTheHandshake(session: URLSession) async -> Bool {
             guard let ws = try? openMockExtensionSocket(port: port, origin: "chrome-extension://\(repoFolderId)", session: session) else {
                 return false
             }
@@ -209,12 +215,12 @@ final class BridgeOriginPolicyTests: XCTestCase {
             }
         }
 
-        let refusedByDefault = await reachesTheHandshake()
+        let refusedByDefault = await reachesTheHandshake(session: shortSession)
         XCTAssertFalse(refusedByDefault, "A repo copy is refused on a store build by default")
         var arguments = previousArguments
         arguments[BridgeOriginPolicy.allowedIdsDefaultsKey] = [repoFolderId]
         defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
-        let allowedByUser = await reachesTheHandshake()
+        let allowedByUser = await reachesTheHandshake(session: allowSession)
         XCTAssertTrue(allowedByUser, "usemac.bridge.allowedExtensionIds lets the user's repo copy pair")
     }
 

@@ -121,8 +121,8 @@ final class AskModeTests: XCTestCase {
         let service = makeService()
         service.setGovernancePolicy(.ask)
         let broker = service.approvals
-        broker.timeoutInterval = 0.25
-        broker.minimumVisibleInterval = 0.2
+        broker.timeoutInterval = 0.5
+        broker.minimumVisibleInterval = 0.45
 
         async let first = service.handle(evalRequest("1+1"))
         let shown = try await requirePrompt(broker)
@@ -131,13 +131,13 @@ final class AskModeTests: XCTestCase {
         XCTAssertEqual(both.id, shown.id, "The second request waits behind the first")
         XCTAssertEqual(both.waitingBehind, 1)
 
-        // Nobody answers the first: it times out, and the second reaches the screen with at least 0.2 s to go.
+        // Nobody answers the first: it times out, and the second reaches the screen with at least 0.45 s to go.
         let firstResponse = await first
         XCTAssertEqual(firstResponse.error?.code, "APPROVAL_TIMEOUT")
         let next = try XCTUnwrap(broker.currentPrompt)
         XCTAssertNotEqual(next.id, shown.id)
         XCTAssertEqual(next.waitingBehind, 0)
-        XCTAssertGreaterThan(next.deadline.timeIntervalSinceNow, 0.08)
+        XCTAssertGreaterThan(next.deadline.timeIntervalSinceNow, 0.2)
         XCTAssertTrue(broker.decide(promptId: next.id, decision: .deny, click: testClick))
         let secondResponse = await second
         XCTAssertEqual(secondResponse.error?.code, "APPROVAL_DENIED")
@@ -198,7 +198,7 @@ final class AskModeTests: XCTestCase {
 
     func testAllowForTaskCoversTheSameKindAndTargetOnly() async throws {
         let broker = ApprovalBroker(pollInterval: 0.01)
-        broker.timeoutInterval = 0.15
+        broker.timeoutInterval = 5.0
         let shortcutInTextEdit = ApprovalBroker.Request(
             method: "act", target: "TextEdit", steps: ["Press ⌘S"], kinds: [.shortcut], taskId: "task-a", grantTarget: "app:textedit"
         )
@@ -213,6 +213,9 @@ final class AskModeTests: XCTestCase {
         let again = await broker.requestApproval(shortcutInTextEdit)
         XCTAssertEqual(again, .allowedByTaskGrant(taskId: "task-a"))
         XCTAssertEqual(broker.pendingCount, 0)
+
+        // Tight timeout only for the calls expected to time out without an answer.
+        broker.timeoutInterval = 0.15
 
         var otherApp = shortcutInTextEdit
         otherApp.grantTarget = "app:finder"

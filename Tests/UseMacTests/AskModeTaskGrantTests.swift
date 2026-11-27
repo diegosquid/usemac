@@ -27,7 +27,7 @@ final class AskModeTaskGrantTests: XCTestCase {
         let service = UseMacEngineService(socketPath: "/tmp/usemac-ask-task-\(UUID().uuidString.prefix(8)).sock", extensionPort: 0)
         service.setGovernancePolicy(.ask)
         let broker = service.approvals
-        broker.timeoutInterval = 0.15
+        broker.timeoutInterval = 5.0
 
         let started = await service.handle(RPCRequest(method: .taskStart, taskStart: TaskStartParams(summary: "ask grant")))
         let taskId = try XCTUnwrap(started.taskId)
@@ -45,6 +45,9 @@ final class AskModeTaskGrantTests: XCTestCase {
         let second = await service.handle(eval(taskId: taskId))
         XCTAssertNotEqual(second.error?.code, "APPROVAL_TIMEOUT")
         XCTAssertTrue(service.recentAuditEntries(limit: 5).contains { $0.summary.hasPrefix("Approval: allowed by the grant for task \(taskId)") })
+
+        // Tight timeout only for the two calls expected to time out without an answer.
+        broker.timeoutInterval = 0.15
 
         // A request that doesn't name the task gets no grant, even with only this task running.
         let unnamed = await service.handle(eval(taskId: nil))
