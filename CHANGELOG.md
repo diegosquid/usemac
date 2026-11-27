@@ -6,6 +6,8 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0-beta.1] - 2026-11-26
+
 ### Added
 
 - **5 new SOTA RPC methods (29 methods total):**
@@ -33,6 +35,11 @@ All notable changes to UseMac are documented here. The format follows
 ### Removed
 
 - **Python / MLX sidecar and `vision_install`:** removed `vision_install`, `INVALID_MODEL`, and `scripts/usemac-vision-worker.py` in favor of instant, zero-setup on-device Apple Vision OCR (`VNRecognizeTextRequest`) and dirty-rect diff cropping.
+
+### Fixed
+
+- **Chrome downloads:** `browser_extract(mode: "downloads")` returns recent downloads for the selected profile without needing a tab. Downloads in progress keep their originating task tab open on completion, including downloads started in a popup or new tab; unrelated tabs still close. Profile-wide download reads no longer create an extra preview card.
+- **SPA network tracking:** captured XHR/Fetch responses survive same-document navigation, while full navigations clear the old document's responses. Downloads and captured network data remain filtered by app and site rules.
 
 ## [0.8.0-beta.1] - 2026-11-26
 
@@ -334,7 +341,8 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
-[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.8.0-beta.1...HEAD
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.9.0-beta.1...HEAD
+[0.9.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.8.0-beta.1...v0.9.0-beta.1
 [0.8.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.7.0-beta.1...v0.8.0-beta.1
 [0.7.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.3...v0.7.0-beta.1
 [0.6.0-beta.3]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.2...v0.6.0-beta.3
