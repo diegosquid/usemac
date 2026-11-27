@@ -137,7 +137,7 @@ final class AuditEntryKindTests: XCTestCase {
     }
 
     func testTasksSettingsAndUnknownMethodsAreOther() {
-        for method in ["task_start", "task_complete", "set_policy", "pair_app", "vision_install", "report_prepare", "approval", "something_new"] {
+        for method in ["task_start", "task_complete", "set_policy", "pair_app", "skill_save", "report_prepare", "approval", "something_new"] {
             XCTAssertEqual(AuditEntryKind(method: method), .other, method)
         }
     }

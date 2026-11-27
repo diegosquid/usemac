@@ -18,9 +18,13 @@ public enum RPCMethod: String, Codable, Sendable, CaseIterable {
     case browserExtract = "browser_extract"
     case browserScreenshot = "browser_screenshot"
     case browserAct = "browser_act"
+    case browserBatch = "browser_batch"
     case visionStatus = "vision_status"
-    case visionInstall = "vision_install"
     case visionQuery = "vision_query"
+    case appMenu = "app_menu"
+    case skillSave = "skill_save"
+    case skillRun = "skill_run"
+    case skillList = "skill_list"
     case taskStart = "task_start"
     case taskComplete = "task_complete"
     case browserReloadExtension = "browser_reload_extension"
@@ -41,6 +45,10 @@ public struct ObserveParams: Codable, Equatable, Sendable {
     /// window UseMac opened in the background). Later acts without `window` keep using it. Omit to observe
     /// the focused window again.
     public var window: String?
+    /// Optional server-side filter to keep only matching elements.
+    public var filter: ElementFilter?
+    /// When `includeScreenshot` is true, return the image inline in MCP responses.
+    public var returnImageContent: Bool?
 
     public init(
         app: String? = nil,
@@ -50,7 +58,9 @@ public struct ObserveParams: Codable, Equatable, Sendable {
         includeDiff: Bool? = true,
         includeScreenshot: Bool? = false,
         includeOffscreen: Bool? = nil,
-        window: String? = nil
+        window: String? = nil,
+        filter: ElementFilter? = nil,
+        returnImageContent: Bool? = nil
     ) {
         self.app = app
         self.maxDepth = maxDepth
@@ -60,6 +70,8 @@ public struct ObserveParams: Codable, Equatable, Sendable {
         self.includeScreenshot = includeScreenshot
         self.includeOffscreen = includeOffscreen
         self.window = window
+        self.filter = filter
+        self.returnImageContent = returnImageContent
     }
 }
 
@@ -79,9 +91,15 @@ public struct RPCRequest: Codable, Sendable {
     public var browserExtract: BrowserExtractParams?
     public var browserScreenshot: BrowserScreenshotParams?
     public var browserAct: BrowserActParams?
-    public var visionInstall: VisionInstallParams?
+    public var browserBatch: BrowserBatchParams?
     public var visionQuery: VisionQueryParams?
+    public var appMenu: AppMenuParams?
+    public var skillSave: SkillSaveParams?
+    public var skillRun: SkillRunParams?
+    public var skillList: SkillListParams?
+    /// Piggybacked or standalone task lifecycle start (accepted on any request).
     public var taskStart: TaskStartParams?
+    /// Piggybacked or standalone task lifecycle completion (accepted on any request).
     public var taskComplete: TaskCompleteParams?
     public var auditLog: AuditLogParams?
     /// The task this request belongs to (from `task_start`). Any method takes it; see `namedTaskId`.
@@ -106,8 +124,12 @@ public struct RPCRequest: Codable, Sendable {
         browserExtract: BrowserExtractParams? = nil,
         browserScreenshot: BrowserScreenshotParams? = nil,
         browserAct: BrowserActParams? = nil,
-        visionInstall: VisionInstallParams? = nil,
+        browserBatch: BrowserBatchParams? = nil,
         visionQuery: VisionQueryParams? = nil,
+        appMenu: AppMenuParams? = nil,
+        skillSave: SkillSaveParams? = nil,
+        skillRun: SkillRunParams? = nil,
+        skillList: SkillListParams? = nil,
         taskStart: TaskStartParams? = nil,
         taskComplete: TaskCompleteParams? = nil,
         auditLog: AuditLogParams? = nil,
@@ -131,8 +153,12 @@ public struct RPCRequest: Codable, Sendable {
         self.browserExtract = browserExtract
         self.browserScreenshot = browserScreenshot
         self.browserAct = browserAct
-        self.visionInstall = visionInstall
+        self.browserBatch = browserBatch
         self.visionQuery = visionQuery
+        self.appMenu = appMenu
+        self.skillSave = skillSave
+        self.skillRun = skillRun
+        self.skillList = skillList
         self.taskStart = taskStart
         self.taskComplete = taskComplete
         self.auditLog = auditLog
@@ -159,8 +185,12 @@ public struct RPCRequest: Codable, Sendable {
         self.browserExtract = try c.decodeIfPresent(BrowserExtractParams.self, forKey: .browserExtract)
         self.browserScreenshot = try c.decodeIfPresent(BrowserScreenshotParams.self, forKey: .browserScreenshot)
         self.browserAct = try c.decodeIfPresent(BrowserActParams.self, forKey: .browserAct)
-        self.visionInstall = try c.decodeIfPresent(VisionInstallParams.self, forKey: .visionInstall)
+        self.browserBatch = try c.decodeIfPresent(BrowserBatchParams.self, forKey: .browserBatch)
         self.visionQuery = try c.decodeIfPresent(VisionQueryParams.self, forKey: .visionQuery)
+        self.appMenu = try c.decodeIfPresent(AppMenuParams.self, forKey: .appMenu)
+        self.skillSave = try c.decodeIfPresent(SkillSaveParams.self, forKey: .skillSave)
+        self.skillRun = try c.decodeIfPresent(SkillRunParams.self, forKey: .skillRun)
+        self.skillList = try c.decodeIfPresent(SkillListParams.self, forKey: .skillList)
         self.taskStart = try c.decodeIfPresent(TaskStartParams.self, forKey: .taskStart)
         self.taskComplete = try c.decodeIfPresent(TaskCompleteParams.self, forKey: .taskComplete)
         self.auditLog = try c.decodeIfPresent(AuditLogParams.self, forKey: .auditLog)
@@ -199,11 +229,15 @@ public struct RPCResponse: Codable, Sendable {
     public var browserProfiles: [BrowserProfileStatus]?
     public var browserTabs: [BrowserTabInfo]?
     public var browserExtract: BrowserExtractResult?
+    public var browserBatchResult: BrowserBatchResult?
     public var browserTabId: Int?
     public var browserUrl: String?
     public var browserTitle: String?
     public var visionStatus: VisionStatus?
     public var visionResult: VisionQueryResult?
+    public var appMenuResult: AppMenuResult?
+    public var skillResult: SkillRunResult?
+    public var skills: SkillListResult?
     /// The task a `task_start` opened. Pass it to `browser_open` and `task_complete` so finishing this task only
     /// closes this task's tabs.
     public var taskId: String?
@@ -229,11 +263,15 @@ public struct RPCResponse: Codable, Sendable {
         browserProfiles: [BrowserProfileStatus]? = nil,
         browserTabs: [BrowserTabInfo]? = nil,
         browserExtract: BrowserExtractResult? = nil,
+        browserBatchResult: BrowserBatchResult? = nil,
         browserTabId: Int? = nil,
         browserUrl: String? = nil,
         browserTitle: String? = nil,
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
+        appMenuResult: AppMenuResult? = nil,
+        skillResult: SkillRunResult? = nil,
+        skills: SkillListResult? = nil,
         taskId: String? = nil,
         taskSummary: TaskSummary? = nil,
         error: RPCErrorPayload? = nil,
@@ -253,11 +291,15 @@ public struct RPCResponse: Codable, Sendable {
         self.browserProfiles = browserProfiles
         self.browserTabs = browserTabs
         self.browserExtract = browserExtract
+        self.browserBatchResult = browserBatchResult
         self.browserTabId = browserTabId
         self.browserUrl = browserUrl
         self.browserTitle = browserTitle
         self.visionStatus = visionStatus
         self.visionResult = visionResult
+        self.appMenuResult = appMenuResult
+        self.skillResult = skillResult
+        self.skills = skills
         self.taskId = taskId
         self.taskSummary = taskSummary
         self.error = error
@@ -278,11 +320,15 @@ public struct RPCResponse: Codable, Sendable {
         browserProfiles: [BrowserProfileStatus]? = nil,
         browserTabs: [BrowserTabInfo]? = nil,
         browserExtract: BrowserExtractResult? = nil,
+        browserBatchResult: BrowserBatchResult? = nil,
         browserTabId: Int? = nil,
         browserUrl: String? = nil,
         browserTitle: String? = nil,
         visionStatus: VisionStatus? = nil,
         visionResult: VisionQueryResult? = nil,
+        appMenuResult: AppMenuResult? = nil,
+        skillResult: SkillRunResult? = nil,
+        skills: SkillListResult? = nil,
         taskId: String? = nil,
         taskSummary: TaskSummary? = nil,
         problemReport: ProblemReportReceipt? = nil,
@@ -302,11 +348,15 @@ public struct RPCResponse: Codable, Sendable {
             browserProfiles: browserProfiles,
             browserTabs: browserTabs,
             browserExtract: browserExtract,
+            browserBatchResult: browserBatchResult,
             browserTabId: browserTabId,
             browserUrl: browserUrl,
             browserTitle: browserTitle,
             visionStatus: visionStatus,
             visionResult: visionResult,
+            appMenuResult: appMenuResult,
+            skillResult: skillResult,
+            skills: skills,
             taskId: taskId,
             taskSummary: taskSummary,
             error: nil,

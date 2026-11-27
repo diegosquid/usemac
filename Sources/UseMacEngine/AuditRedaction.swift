@@ -14,12 +14,21 @@ extension RPCRequest {
         (namedTaskId ?? taskStart?.taskId, namedTabId)
     }
 
-    /// Text this request carries that the audit log must not copy: typed and set values, and page scripts.
+    /// Text this request carries that the audit log must not copy: typed and set values, skill params, and page scripts.
     var auditSecrets: [String] {
-        let steps = (act?.steps ?? []) + (browserAct?.steps ?? [])
+        let steps = (act?.steps ?? [])
+            + (browserAct?.steps ?? [])
+            + (browserOpen?.steps ?? [])
+            + (skillSave?.steps ?? [])
         var secrets = steps
             .filter { $0.action == .type || $0.action == .setValue }
             .compactMap(\.text)
+        for step in steps where step.action == .fillForm {
+            secrets.append(contentsOf: (step.fields ?? []).compactMap(\.value))
+        }
+        if let skillParams = skillRun?.params {
+            secrets.append(contentsOf: skillParams.values)
+        }
         if let expression = browserExtract?.expression {
             secrets.append(expression)
         }
@@ -73,6 +82,14 @@ enum AuditRedactor {
             return "\(name) (\(count) file\(count == 1 ? "" : "s"))"
         case .axAction:
             return step.actionName.map { "\(name) \($0)" } ?? name
+        case .fillForm:
+            let count = step.fields?.count ?? 0
+            return "\(name) (\(count) field\(count == 1 ? "" : "s"))"
+        case .menuAction:
+            if let path = step.menuPath, !path.isEmpty {
+                return "\(name) \(path.joined(separator: " > "))"
+            }
+            return name
         default:
             return name
         }

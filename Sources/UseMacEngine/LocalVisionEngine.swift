@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreML
 import Darwin
 import Foundation
 import ImageIO
@@ -17,63 +18,58 @@ public enum LocalVisionError: Error, LocalizedError, Equatable {
     }
 }
 
+/// Result of a `16x10` tile-grid visual diff between two frames.
+///
+/// `dirtyRect` is expressed in **top-left pixel coordinates matching `after` image dimensions**
+/// (`0..<imageWidth`, `0..<imageHeight`), and `normalizedDirtyRect` holds the same bounding box
+/// in normalized `0...1` top-left coordinates. Both are `nil` when no tile exceeds the threshold.
+public struct DirtyRegionResult: Equatable, Sendable {
+    public var overallDiffPercent: Double
+    public var maxTileDiffPercent: Double
+    /// Bounding box of changed `16x10` tiles in pixel coordinates matching the `after` image (`0..<imageWidth`, `0..<imageHeight`, top-left origin).
+    public var dirtyRect: ScreenRect?
+    /// Bounding box of changed `16x10` tiles in normalized `0...1` top-left coordinates.
+    public var normalizedDirtyRect: ScreenRect?
+    public var imageWidth: Int
+    public var imageHeight: Int
+    public var changedTileCount: Int
+
+    public init(
+        overallDiffPercent: Double,
+        maxTileDiffPercent: Double,
+        dirtyRect: ScreenRect?,
+        normalizedDirtyRect: ScreenRect? = nil,
+        imageWidth: Int = 0,
+        imageHeight: Int = 0,
+        changedTileCount: Int = 0
+    ) {
+        self.overallDiffPercent = overallDiffPercent
+        self.maxTileDiffPercent = maxTileDiffPercent
+        self.dirtyRect = dirtyRect
+        self.normalizedDirtyRect = normalizedDirtyRect
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
+        self.changedTileCount = changedTileCount
+    }
+}
+
+/// On-device Apple Vision OCR and native Swift frame-diff engine (Neural Engine, zero Python/MLX sidecar).
 public final class LocalVisionEngine: @unchecked Sendable {
     /// Every refusal for a too-small image starts with this, so callers can map it to an error code.
     public static let captureTooSmallPrefix = "CAPTURE_TOO_SMALL:"
     /// Shorter side, in pixels, below which an image is refused.
     public static let minimumImageSide = 64
 
-    private enum DefaultsKeys {
-        static let enabled = "usemac.vision.enabled"
-        static let modelId = "usemac.vision.modelId"
-    }
-
-    private let lock = NSLock()
-    private let workerQueue = DispatchQueue(label: "app.usemac.vision-worker-io", qos: .userInitiated)
-    /// Whether this engine may start the MLX worker. Only the app's engine (and `usemac serve`) may: the CLI's
-    /// standalone and read-only fallback engines run once per agent process, and each would load its own ~3 GB copy.
-    /// Those answer with Apple Vision OCR.
-    private let allowsModel: Bool
-
-    private var _enabled: Bool
-    private var _modelId: String
-    private var _installing: Bool = false
-    private var _installProgress: String?
-    private var _lastError: String?
-
-    private var workerProcess: Process?
-    private var workerStdin: FileHandle?
-    private var workerStdout: FileHandle?
-    private var workerReadBuffer = Data()
-    private var workerLoadedModel: String?
-    private var idleUnloadWorkItem: DispatchWorkItem?
+    /// Tile grid dimensions used by `computeDirtyRegion` (4x4 grayscale samples per tile -> 64x40 total).
+    public static let dirtyGridColumns = 16
+    public static let dirtyGridRows = 10
+    private static let tileSampleSize = 4
 
     public var onStatusChanged: (@Sendable (VisionStatus) -> Void)?
 
-    public init(allowsModel: Bool = false) {
-        self.allowsModel = allowsModel
-        let savedModel = UserDefaults.standard.string(forKey: DefaultsKeys.modelId)
-        if let savedModel, !savedModel.isEmpty {
-            self._modelId = savedModel
-        } else if Self.isModelCached(LocalVisionModelPreset.qwen35_08B.rawValue) {
-            self._modelId = LocalVisionModelPreset.qwen35_08B.rawValue
-        } else {
-            self._modelId = LocalVisionModelPreset.qwen25VL3B.rawValue
-        }
-        // Off until the user turns it on (installing turns it on). A model found in the Hugging Face cache doesn't.
-        self._enabled = UserDefaults.standard.bool(forKey: DefaultsKeys.enabled)
-    }
+    public init() {}
 
-    deinit {
-        stopWorker()
-    }
-
-    // MARK: - Paths & Discovery
-
-    private static var applicationSupportBaseDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-    }
+    // MARK: - Legacy Directory Helper
 
     @discardableResult
     public static func migrateLegacyDirectory(from legacy: URL, to current: URL) -> Bool {
@@ -107,200 +103,169 @@ public final class LocalVisionEngine: @unchecked Sendable {
         }
     }
 
-    private static let performLegacyVisionMigrationOnce: Void = {
-        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
-        let base = applicationSupportBaseDir
-        let legacy = base
-            .appendingPathComponent("MacUse", isDirectory: true) // Legacy folder name, kept for one-time migration.
-            .appendingPathComponent("vision-venv", isDirectory: true)
-        let current = base
-            .appendingPathComponent(UseMacDefaults.applicationSupportFolderName, isDirectory: true)
-            .appendingPathComponent("vision-venv", isDirectory: true)
-        _ = migrateLegacyDirectory(from: legacy, to: current)
-    }()
-
-    public static var appSupportDir: URL {
-        _ = performLegacyVisionMigrationOnce
-        return applicationSupportBaseDir.appendingPathComponent(UseMacDefaults.applicationSupportFolderName, isDirectory: true)
-    }
-
-    public static var venvDir: URL {
-        appSupportDir.appendingPathComponent("vision-venv", isDirectory: true)
-    }
-
-    public static var venvPythonURL: URL {
-        venvDir.appendingPathComponent("bin/python")
-    }
-
-    public static func isRuntimeInstalled() -> Bool {
-        guard FileManager.default.isExecutableFile(atPath: venvPythonURL.path) else { return false }
-        return sitePackagesContainMLXVLM(libDir: venvDir.appendingPathComponent("lib", isDirectory: true))
-    }
-
-    /// Looks for `lib/python*/site-packages/mlx_vlm` directly. Walking the whole venv (about 15,000 files)
-    /// made every status call slow, and under load the walk failed with EINVAL in tests that start engines.
-    static func sitePackagesContainMLXVLM(libDir: URL) -> Bool {
-        let fileManager = FileManager.default
-        guard let pythons = try? fileManager.contentsOfDirectory(atPath: libDir.path) else { return false }
-        for name in pythons where name.hasPrefix("python") {
-            let package = libDir
-                .appendingPathComponent(name, isDirectory: true)
-                .appendingPathComponent("site-packages/mlx_vlm", isDirectory: true)
-            var isDirectory: ObjCBool = false
-            if fileManager.fileExists(atPath: package.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                return true
-            }
-        }
-        return false
-    }
-
-    public static func isModelCached(_ modelId: String) -> Bool {
-        let sanitized = "models--" + modelId.replacingOccurrences(of: "/", with: "--")
-        let hfCache = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".cache/huggingface/hub/\(sanitized)/snapshots", isDirectory: true)
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: hfCache.path),
-              let first = entries.first else {
-            return false
-        }
-        let snapshotDir = hfCache.appendingPathComponent(first, isDirectory: true)
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: snapshotDir.path) else {
-            return false
-        }
-        return files.contains(where: { $0.hasSuffix(".safetensors") })
-    }
-
-    public static func resolveWorkerScriptPath() -> String? {
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("vision/worker.py"),
-           FileManager.default.fileExists(atPath: bundled.path) {
-            return bundled.path
-        }
-        if let execURL = Bundle.main.executableURL {
-            let bundledFallback = execURL
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Resources/vision/worker.py")
-            if FileManager.default.fileExists(atPath: bundledFallback.path) {
-                return bundledFallback.path
-            }
-        }
-        return nil
-    }
-
-    /// True when the `uv` installer the optional MLX runtime needs is present on this Mac.
-    public static var isInstallerAvailable: Bool {
-        resolveUVPath() != nil
-    }
-
-    private static func resolveUVPath() -> String? {
-        let candidates = [
-            (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/uv"),
-            "/opt/homebrew/bin/uv",
-            "/usr/local/bin/uv",
-            "/usr/bin/uv"
-        ]
-        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-    }
-
-    // MARK: - Status & Configuration
+    // MARK: - Status
 
     public func currentStatus() -> VisionStatus {
-        lock.lock()
-        let enabled = _enabled
-        let modelId = _modelId
-        let installing = _installing
-        let progress = _installProgress
-        let lastError = _lastError
-        let running = workerProcess?.isRunning == true
-        lock.unlock()
-
-        let runtimeInstalled = Self.isRuntimeInstalled()
-        let modelDownloaded = Self.isModelCached(modelId)
-
-        let state: String
-        if installing {
-            state = "installing"
-        } else if !runtimeInstalled || !modelDownloaded {
-            state = "not_installed"
-        } else if !enabled {
-            state = "disabled"
-        } else {
-            state = "ready"
-        }
-
-        // The backend that would answer a query now; `state` still reports the user's setup.
-        let backend = (allowsModel && enabled && runtimeInstalled && modelDownloaded) ? "mlx-vlm" : "apple-vision-ocr"
-        return VisionStatus(
-            enabled: enabled,
-            state: state,
-            modelId: modelId,
-            backend: backend,
+        VisionStatus(
+            enabled: true,
+            state: "ready",
+            modelId: "apple-vision-ocr",
+            backend: "apple-vision-ocr",
             ocrAvailable: true,
-            runtimeInstalled: runtimeInstalled,
-            modelDownloaded: modelDownloaded,
-            workerRunning: running,
-            installProgress: progress,
-            lastError: lastError
+            runtimeInstalled: false,
+            modelDownloaded: false,
+            workerRunning: false,
+            installProgress: nil,
+            lastError: nil
         )
     }
 
-    public func setEnabled(_ enabled: Bool) {
-        lock.lock()
-        _enabled = enabled
-        UserDefaults.standard.set(enabled, forKey: DefaultsKeys.enabled)
-        lock.unlock()
-        if !enabled {
-            stopWorker()
+    // MARK: - Native Swift Tile Dirty-Region Diff (< 1.5 ms, 0 MB)
+
+    /// Computes a `16x10` tile-grid visual diff between two JPEG frames (`< 1.5 ms`).
+    ///
+    /// Returns `overallDiffPercent`, `maxTileDiffPercent`, and `dirtyRect` in pixel coordinates
+    /// matching the `afterJPEG` image dimensions (top-left origin), or `nil` when no tile exceeds
+    /// `tileThresholdPercent`.
+    public static func computeDirtyRegion(
+        beforeJPEG: Data,
+        afterJPEG: Data,
+        tileThresholdPercent: Double = 0.8
+    ) -> DirtyRegionResult {
+        guard let imgA = decodeCGImage(fromJPEG: beforeJPEG),
+              let imgB = decodeCGImage(fromJPEG: afterJPEG) else {
+            return DirtyRegionResult(
+                overallDiffPercent: 100.0,
+                maxTileDiffPercent: 100.0,
+                dirtyRect: nil,
+                normalizedDirtyRect: nil,
+                imageWidth: 0,
+                imageHeight: 0,
+                changedTileCount: 0
+            )
         }
-        notifyStatusChanged()
+        return computeDirtyRegion(before: imgA, after: imgB, tileThresholdPercent: tileThresholdPercent)
     }
 
-    public func setModelId(_ modelId: String) {
-        let trimmed = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        lock.lock()
-        let changed = _modelId != trimmed
-        _modelId = trimmed
-        UserDefaults.standard.set(trimmed, forKey: DefaultsKeys.modelId)
-        if Self.isRuntimeInstalled() && Self.isModelCached(trimmed) {
-            _enabled = true
-            UserDefaults.standard.set(true, forKey: DefaultsKeys.enabled)
-        }
-        lock.unlock()
-        if changed {
-            stopWorker()
-        }
-        notifyStatusChanged()
-    }
+    /// Computes a `16x10` tile-grid visual diff between two `CGImage` frames (`< 1.5 ms`).
+    ///
+    /// `dirtyRect` uses top-left pixel coordinates matching `after.width` x `after.height`.
+    public static func computeDirtyRegion(
+        before: CGImage,
+        after: CGImage,
+        tileThresholdPercent: Double = 0.8
+    ) -> DirtyRegionResult {
+        let cols = dirtyGridColumns
+        let rows = dirtyGridRows
+        let cell = tileSampleSize
+        let w = cols * cell // 64
+        let h = rows * cell // 40
+        let totalSamples = w * h
+        let afterW = max(1, after.width)
+        let afterH = max(1, after.height)
 
-    private func notifyStatusChanged() {
-        let status = currentStatus()
-        onStatusChanged?(status)
-    }
+        guard let bufA = downsampleGrayscale(before, width: w, height: h),
+              let bufB = downsampleGrayscale(after, width: w, height: h) else {
+            return DirtyRegionResult(
+                overallDiffPercent: 100.0,
+                maxTileDiffPercent: 100.0,
+                dirtyRect: ScreenRect(x: 0, y: 0, width: Double(afterW), height: Double(afterH)),
+                normalizedDirtyRect: ScreenRect(x: 0, y: 0, width: 1.0, height: 1.0),
+                imageWidth: afterW,
+                imageHeight: afterH,
+                changedTileCount: cols * rows
+            )
+        }
 
-    // MARK: - Phase 1: Native Swift Frame-Diff (< 2 ms, 0 MB)
+        let samplesPerTile = cell * cell
+        let tileDenom = Double(samplesPerTile * 255)
+        var totalDiff = 0
+        var maxTilePct = 0.0
+        var minCol = cols
+        var maxCol = -1
+        var minRow = rows
+        var maxRow = -1
+        var changedTiles = 0
+
+        for row in 0..<rows {
+            let baseY = row * cell
+            for col in 0..<cols {
+                let baseX = col * cell
+                var tileDiff = 0
+                for dy in 0..<cell {
+                    let rowOffset = (baseY + dy) * w + baseX
+                    for dx in 0..<cell {
+                        let idx = rowOffset + dx
+                        tileDiff += abs(Int(bufA[idx]) - Int(bufB[idx]))
+                    }
+                }
+                totalDiff += tileDiff
+                let tilePct = (Double(tileDiff) / tileDenom) * 100.0
+                if tilePct > maxTilePct {
+                    maxTilePct = tilePct
+                }
+                if tilePct >= tileThresholdPercent {
+                    changedTiles += 1
+                    if col < minCol { minCol = col }
+                    if col > maxCol { maxCol = col }
+                    if row < minRow { minRow = row }
+                    if row > maxRow { maxRow = row }
+                }
+            }
+        }
+
+        let overallPct = ((Double(totalDiff) / Double(totalSamples * 255)) * 100.0 * 100.0).rounded() / 100.0
+        let roundedMaxTile = (maxTilePct * 100.0).rounded() / 100.0
+
+        let dirtyRect: ScreenRect?
+        let normalizedDirtyRect: ScreenRect?
+        if changedTiles > 0, minCol <= maxCol, minRow <= maxRow {
+            let normX0 = Double(minCol) / Double(cols)
+            let normY0 = Double(minRow) / Double(rows)
+            let normX1 = Double(maxCol + 1) / Double(cols)
+            let normY1 = Double(maxRow + 1) / Double(rows)
+            normalizedDirtyRect = ScreenRect(
+                x: (normX0 * 10000).rounded() / 10000,
+                y: (normY0 * 10000).rounded() / 10000,
+                width: ((normX1 - normX0) * 10000).rounded() / 10000,
+                height: ((normY1 - normY0) * 10000).rounded() / 10000
+            )
+            let pxX0 = max(0.0, floor(normX0 * Double(afterW)))
+            let pxY0 = max(0.0, floor(normY0 * Double(afterH)))
+            let pxX1 = min(Double(afterW), ceil(normX1 * Double(afterW)))
+            let pxY1 = min(Double(afterH), ceil(normY1 * Double(afterH)))
+            dirtyRect = ScreenRect(
+                x: pxX0,
+                y: pxY0,
+                width: max(1.0, pxX1 - pxX0),
+                height: max(1.0, pxY1 - pxY0)
+            )
+        } else {
+            dirtyRect = nil
+            normalizedDirtyRect = nil
+        }
+
+        return DirtyRegionResult(
+            overallDiffPercent: overallPct,
+            maxTileDiffPercent: roundedMaxTile,
+            dirtyRect: dirtyRect,
+            normalizedDirtyRect: normalizedDirtyRect,
+            imageWidth: afterW,
+            imageHeight: afterH,
+            changedTileCount: changedTiles
+        )
+    }
 
     public static func computeFrameDiffPercent(beforeJPEG: Data, afterJPEG: Data) -> Double? {
         guard let imgA = decodeCGImage(fromJPEG: beforeJPEG),
               let imgB = decodeCGImage(fromJPEG: afterJPEG) else {
             return nil
         }
-        return computeFrameDiffPercent(before: imgA, after: imgB)
+        return computeDirtyRegion(before: imgA, after: imgB).overallDiffPercent
     }
 
     public static func computeFrameDiffPercent(before: CGImage, after: CGImage) -> Double {
-        let w = 64
-        let h = 40
-        let count = w * h
-        guard let bufA = downsampleGrayscale(before, width: w, height: h),
-              let bufB = downsampleGrayscale(after, width: w, height: h) else {
-            return 100.0
-        }
-        var totalDiff: Int = 0
-        for i in 0..<count {
-            totalDiff += abs(Int(bufA[i]) - Int(bufB[i]))
-        }
-        let pct = (Double(totalDiff) / Double(count * 255)) * 100.0
-        return (pct * 100.0).rounded() / 100.0
+        computeDirtyRegion(before: before, after: after).overallDiffPercent
     }
 
     private static func downsampleGrayscale(_ image: CGImage, width: Int, height: Int) -> [UInt8]? {
@@ -326,33 +291,316 @@ public final class LocalVisionEngine: @unchecked Sendable {
         return ok ? bytes : nil
     }
 
+    // MARK: - JPEG Decode / Crop / Encode
+
     public static func decodeCGImage(fromJPEG data: Data) -> CGImage? {
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let src = CGImageSourceCreateWithData(data as CFData, opts as CFDictionary) else { return nil }
         return CGImageSourceCreateImageAtIndex(src, 0, nil)
     }
 
-    // MARK: - Phase 1: Native Apple Vision OCR (Neural Engine, ~25 ms, 0 MB)
+    public static func encodeJPEG(_ image: CGImage, quality: Double = 0.80) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
+            return nil
+        }
+        let clampedQuality = min(max(quality, 0.1), 1.0)
+        let opts = [kCGImageDestinationLossyCompressionQuality: clampedQuality] as CFDictionary
+        CGImageDestinationAddImage(dest, image, opts)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
+    }
 
-    public static func recognizeText(
+    /// Crops `image` to `rect` (top-left pixel coordinates) expanded by `padding` on all sides,
+    /// clamping to image bounds and downscaling if either side exceeds `maxDimension`.
+    public static func cropCGImage(
+        from image: CGImage,
+        rect: ScreenRect,
+        padding: Double = 24,
+        maxDimension: Int = 1024
+    ) -> CGImage? {
+        let imgW = image.width
+        let imgH = image.height
+        guard imgW > 0, imgH > 0,
+              rect.x.isFinite, rect.y.isFinite, rect.width.isFinite, rect.height.isFinite,
+              padding.isFinite,
+              rect.width > 0, rect.height > 0 else { return nil }
+
+        let pad = max(0.0, padding)
+        let maxW = Double(imgW)
+        let maxH = Double(imgH)
+        let fx0 = min(Double(imgW - 1), max(0.0, floor(rect.x - pad)))
+        let fy0 = min(Double(imgH - 1), max(0.0, floor(rect.y - pad)))
+        let fx1 = min(maxW, max(fx0 + 1.0, ceil(rect.x + rect.width + pad)))
+        let fy1 = min(maxH, max(fy0 + 1.0, ceil(rect.y + rect.height + pad)))
+        let x0 = Int(fx0)
+        let y0 = Int(fy0)
+        let x1 = Int(fx1)
+        let y1 = Int(fy1)
+        let cropW = x1 - x0
+        let cropH = y1 - y0
+        guard cropW >= 1, cropH >= 1 else { return nil }
+
+        // CGImage.cropping(to:) uses top-left pixel coordinates.
+        guard let cropped = image.cropping(to: CGRect(x: x0, y: y0, width: cropW, height: cropH)) else {
+            return nil
+        }
+
+        guard maxDimension > 0, max(cropped.width, cropped.height) > maxDimension else {
+            return cropped
+        }
+
+        let scale = Double(maxDimension) / Double(max(cropped.width, cropped.height))
+        let targetW = max(1, Int((Double(cropped.width) * scale).rounded()))
+        let targetH = max(1, Int((Double(cropped.height) * scale).rounded()))
+        let colorSpace = cropped.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else {
+            return cropped
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        return ctx.makeImage() ?? cropped
+    }
+
+    /// Crops a JPEG image to `rect` (top-left pixel coordinates) with optional `padding`,
+    /// downscaling if larger than `maxDimension`, and re-encoding as JPEG.
+    public static func cropJPEG(
+        fromJPEG data: Data,
+        rect: ScreenRect,
+        padding: Double = 24,
+        maxDimension: Int = 1024,
+        quality: Double = 0.80
+    ) -> Data? {
+        guard let cgImage = decodeCGImage(fromJPEG: data),
+              let cropped = cropCGImage(from: cgImage, rect: rect, padding: padding, maxDimension: maxDimension) else {
+            return nil
+        }
+        return encodeJPEG(cropped, quality: quality)
+    }
+
+    // MARK: - Negation-Safe Assertion Verification
+
+    private static let negationCueTokens: Set<String> = [
+        // English
+        "no", "not", "without", "absent", "gone", "missing", "never",
+        "neither", "nor", "none", "disappeared", "dismissed", "hidden",
+        "closed", "removed", "cannot",
+        // English contraction stems after splitting apostrophes ("isn't" -> "isn")
+        "isn", "aren", "wasn", "weren", "doesn", "don", "didn", "won",
+        "couldn", "shouldn", "wouldn", "hasn", "haven", "hadn", "mustn", "ain",
+        // Portuguese (normalized, diacritic-free)
+        "nenhum", "nenhuma", "sem", "nao", "nunca", "ausente",
+        "sumiu", "desapareceu", "fechado", "fechada"
+    ]
+
+    private static let assertionStopWords: Set<String> = [
+        // English filler & UI chrome words
+        "is", "are", "was", "were", "be", "been", "being", "the", "an", "on", "in", "at",
+        "of", "to", "for", "with", "from", "by", "that", "this", "there", "it", "should",
+        "must", "any", "all", "still", "anymore", "longer", "visible", "shown", "showing",
+        "displayed", "displaying", "appears", "appearing", "present", "screen", "page",
+        "window", "view", "ui", "banner", "toast", "modal", "dialog", "popup", "message",
+        "text", "label", "button", "field", "element", "indicator", "icon", "alert", "box",
+        "section", "panel", "bar", "card", "has", "have", "does", "do", "did", "can",
+        // Portuguese filler & UI chrome words (normalized)
+        "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das", "em",
+        "na", "nos", "nas", "por", "para", "com", "que", "esta", "este", "esse", "essa",
+        "isso", "estao", "foi", "ser", "ha", "existe", "visivel", "visiveis", "aparece",
+        "aparecendo", "mostrando", "exibido", "exibida", "tela", "pagina", "janela",
+        "texto", "mensagem", "botao", "campo", "elemento", "alerta", "aviso",
+        "notificacao", "dialogo", "barra", "cartao", "secao", "painel", "mais"
+    ]
+
+    private static func normalizeForMatching(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+    }
+
+    private static func tokenizePreservingTwoChar(_ normalized: String) -> [String] {
+        normalized
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count >= 2 }
+    }
+
+    private static func hasNegationContraction(_ normalized: String) -> Bool {
+        normalized.contains("n't") || normalized.contains("n’t") || normalized.contains("cannot")
+    }
+
+    private static func extractQuotedPhrases(from raw: String) -> [String] {
+        var phrases: [String] = []
+        for quote: Character in ["\"", "“", "'"] {
+            let closing: Character = quote == "“" ? "”" : quote
+            var cursor = raw.startIndex
+            while cursor < raw.endIndex, let start = raw[cursor...].firstIndex(of: quote) {
+                let afterStart = raw.index(after: start)
+                guard afterStart < raw.endIndex, let end = raw[afterStart...].firstIndex(of: closing) else {
+                    break
+                }
+                let candidate = String(raw[afterStart..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if candidate.count >= 2 && !candidate.contains(quote) {
+                    phrases.append(candidate)
+                }
+                cursor = raw.index(after: end)
+            }
+        }
+        return phrases
+    }
+
+    /// Returns true when the assertion expresses absence/negation (EN or PT).
+    public static func isNegatedAssertion(_ assertion: String) -> Bool {
+        let folded = normalizeForMatching(assertion)
+        if hasNegationContraction(folded) { return true }
+        let tokens = tokenizePreservingTwoChar(folded)
+        return tokens.contains(where: { negationCueTokens.contains($0) })
+    }
+
+    /// Verifies a natural-language assertion against OCR or DOM/AX text with full EN/PT negation handling.
+    ///
+    /// Preserves 2-character negation cues such as `"no"` and flips polarity cleanly so
+    /// `"No error banner visible"` returns `verified: true` when `"error"` is absent and
+    /// `verified: false` when `"error"` is present.
+    public static func verifyAssertion(
+        _ assertion: String,
+        againstOCRText text: String
+    ) -> (verified: Bool, evidence: String) {
+        let trimmedAssertion = assertion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAssertion.isEmpty else {
+            return (false, "Empty verification assertion.")
+        }
+
+        let foldedAssertion = normalizeForMatching(trimmedAssertion)
+        let foldedText = normalizeForMatching(text)
+        let textWords = Set(tokenizePreservingTwoChar(foldedText))
+
+        let rawTokens = tokenizePreservingTwoChar(foldedAssertion)
+        let negated = hasNegationContraction(foldedAssertion)
+            || rawTokens.contains(where: { negationCueTokens.contains($0) })
+
+        // Quoted phrases get exact substring priority when present (e.g. `No "404 Not Found" visible`).
+        let quotedPhrases = extractQuotedPhrases(from: trimmedAssertion)
+            .map(normalizeForMatching)
+            .filter { !$0.isEmpty }
+        if !quotedPhrases.isEmpty {
+            let matchedPhrases = quotedPhrases.filter { foldedText.contains($0) }
+            let anyFound = !matchedPhrases.isEmpty
+            let allFound = matchedPhrases.count == quotedPhrases.count
+            if negated {
+                let verified = !anyFound
+                let evidence = verified
+                    ? "Verified absence: \"\(quotedPhrases.joined(separator: "\", \""))\" not found in visible text."
+                    : "Negated assertion failed: forbidden text \"\(matchedPhrases.joined(separator: "\", \""))\" is visible."
+                return (verified, evidence)
+            } else {
+                let verified = allFound
+                let evidence = verified
+                    ? "Verified presence: matched \"\(matchedPhrases.joined(separator: "\", \""))\" in visible text."
+                    : "Assertion failed: expected \"\(quotedPhrases.joined(separator: "\", \""))\" not found in visible text."
+                return (verified, evidence)
+            }
+        }
+
+        let nonNegationTokens = rawTokens.filter { !negationCueTokens.contains($0) }
+        var subjectTokens = nonNegationTokens.filter { !assertionStopWords.contains($0) }
+        if subjectTokens.isEmpty {
+            subjectTokens = nonNegationTokens
+        }
+        // Deduplicate while preserving order
+        var seen: Set<String> = []
+        subjectTokens = subjectTokens.filter { seen.insert($0).inserted }
+
+        guard !subjectTokens.isEmpty else {
+            return (false, "Assertion \"\(trimmedAssertion)\" contained no searchable subject terms.")
+        }
+
+        let matchedTokens = subjectTokens.filter { tok in
+            if tok.count <= 3 {
+                return textWords.contains(tok)
+            }
+            return foldedText.contains(tok)
+        }
+        let matchRatio = Double(matchedTokens.count) / Double(subjectTokens.count)
+
+        if negated {
+            // For multi-token forbidden subjects (e.g. "No invalid email"), require >= 60% match
+            // so partial benign overlap ("Email saved") does not trigger a false failure.
+            let threshold = subjectTokens.count <= 1 ? 1.0 : 0.6
+            let forbiddenPresent = matchRatio >= threshold
+            let verified = !forbiddenPresent
+            let evidence: String
+            if verified {
+                evidence = "Verified absence (negated): [\(subjectTokens.joined(separator: ", "))] not present in visible text."
+            } else {
+                evidence = "Negated assertion failed: found forbidden term(s) [\(matchedTokens.joined(separator: ", "))] in visible text."
+            }
+            return (verified, evidence)
+        } else {
+            let verified = matchRatio >= 0.5
+            let evidence: String
+            if verified {
+                evidence = "Verified presence: matched [\(matchedTokens.joined(separator: ", "))] in visible text."
+            } else {
+                let preview = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let clipped = preview.count > 160 ? String(preview.prefix(160)) + "..." : preview
+                evidence = clipped.isEmpty
+                    ? "Assertion failed: expected [\(subjectTokens.joined(separator: ", "))], but no readable text was detected."
+                    : "Assertion failed: expected [\(subjectTokens.joined(separator: ", "))] not found. Visible text: \(clipped)"
+            }
+            return (verified, evidence)
+        }
+    }
+
+    // MARK: - Native Apple Vision OCR (Neural Engine, ~5-25 ms, 0 MB)
+
+    /// True in CI or virtualized macOS guests (`kern.hv_vmm_present != 0`) where Apple Vision's default
+    /// ANE/E5RT hardware pipeline can stall indefinitely; pinning Vision to the CPU compute device avoids hangs.
+    public static let prefersCPUComputeDevice: Bool = {
+        if ProcessInfo.processInfo.environment["CI"] != nil {
+            return true
+        }
+        var isVM: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("kern.hv_vmm_present", &isVM, &size, nil, 0) == 0, isVM != 0 {
+            return true
+        }
+        return false
+    }()
+
+    public static func recognizeTextDetailed(
         in cgImage: CGImage,
         viewportWidth: Double,
         viewportHeight: Double,
-        fast: Bool = false
-    ) -> [VisionDetection] {
+        fast: Bool = false,
+        forceCPU: Bool = LocalVisionEngine.prefersCPUComputeDevice
+    ) -> (detections: [VisionDetection], error: String?) {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = fast ? .fast : .accurate
         request.usesLanguageCorrection = !fast
         request.recognitionLanguages = ["pt-BR", "en-US"]
+        if forceCPU,
+           let devices = try? request.supportedComputeStageDevices[.main],
+           let cpuDevice = devices.first(where: {
+               if case .cpu = $0 { return true }
+               return false
+           }) {
+            request.setComputeDevice(cpuDevice, for: .main)
+        }
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
             try handler.perform([request])
         } catch {
-            return []
+            return ([], error.localizedDescription)
         }
 
-        guard let observations = request.results else { return [] }
+        guard let observations = request.results else { return ([], nil) }
         var detections: [VisionDetection] = []
         detections.reserveCapacity(observations.count)
 
@@ -376,184 +624,132 @@ public final class LocalVisionEngine: @unchecked Sendable {
                 source: "apple-vision-ocr"
             ))
         }
-        return detections
+        return (detections, nil)
     }
 
-    // MARK: - Phase 2: One-Click Install (MLX-VLM + Model Weights)
-
-    public func install(modelId requestedModel: String? = nil, enable: Bool = true) async -> VisionStatus {
-        let targetModel = (requestedModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? requestedModel!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : currentStatus().modelId
-
-        let alreadyInstalling = lock.withLock { () -> Bool in
-            if _installing { return true }
-            _installing = true
-            _modelId = targetModel
-            UserDefaults.standard.set(targetModel, forKey: DefaultsKeys.modelId)
-            _lastError = nil
-            _installProgress = "Checking Apple Silicon MLX runtime…"
-            return false
-        }
-        if alreadyInstalling {
-            return currentStatus()
-        }
-        notifyStatusChanged()
-
-        defer {
-            lock.withLock {
-                _installing = false
-                _installProgress = nil
-            }
-            notifyStatusChanged()
-        }
-
-        do {
-            try FileManager.default.createDirectory(at: Self.appSupportDir, withIntermediateDirectories: true)
-
-            if !Self.isRuntimeInstalled() {
-                guard let uvPath = Self.resolveUVPath() else {
-                    throw NSError(
-                        domain: "UseMacVision",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "uv not found (~/.local/bin/uv or /opt/homebrew/bin/uv). Install uv first."]
-                    )
-                }
-
-                updateProgress("Creating isolated MLX Python 3.12 runtime…")
-                if !FileManager.default.isExecutableFile(atPath: Self.venvPythonURL.path) {
-                    try await runShell(
-                        executable: uvPath,
-                        arguments: ["venv", "--python", "3.12", Self.venvDir.path]
-                    )
-                }
-
-                updateProgress("Installing Apple Silicon mlx-vlm packages…")
-                try await runShell(
-                    executable: uvPath,
-                    arguments: ["pip", "install", "--python", Self.venvPythonURL.path, "mlx-vlm>=0.1.24", "pillow", "huggingface_hub"]
-                )
-            }
-
-            if !Self.isModelCached(targetModel) {
-                updateProgress("Downloading \(targetModel)…")
-                let script = "from huggingface_hub import snapshot_download; print(snapshot_download(\(Self.pythonStringLiteral(targetModel))))"
-                try await runShell(
-                    executable: Self.venvPythonURL.path,
-                    arguments: ["-c", script]
-                )
-            }
-
-            lock.withLock {
-                if enable {
-                    _enabled = true
-                    UserDefaults.standard.set(true, forKey: DefaultsKeys.enabled)
-                }
-                _lastError = nil
-            }
-        } catch {
-            lock.withLock {
-                _lastError = error.localizedDescription
-            }
-        }
-
-        return currentStatus()
-    }
-
-    private func updateProgress(_ text: String) {
-        lock.lock()
-        _installProgress = text
-        lock.unlock()
-        notifyStatusChanged()
-    }
-
-    private static func pythonStringLiteral(_ value: String) -> String {
-        let escaped = value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        return "\"\(escaped)\""
-    }
-
-    private func runShell(executable: String, arguments: [String]) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: executable)
-                proc.arguments = arguments
-                let errPipe = Pipe()
-                proc.standardOutput = Pipe()
-                proc.standardError = errPipe
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    if proc.terminationStatus == 0 {
-                        cont.resume()
-                    } else {
-                        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                        let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        let tail = errStr.split(separator: "\n").suffix(4).joined(separator: " | ")
-                        cont.resume(throwing: NSError(
-                            domain: "UseMacVision",
-                            code: Int(proc.terminationStatus),
-                            userInfo: [NSLocalizedDescriptionKey: tail.isEmpty ? "Command failed with exit \(proc.terminationStatus)" : tail]
-                        ))
-                    }
-                } catch {
-                    cont.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    // MARK: - Unified Vision Query (MLX-VLM + Apple Vision OCR Hybrid)
-
-    private static func extractCompactOCRContext(
-        imagePath: String,
+    public static func recognizeText(
+        in cgImage: CGImage,
         viewportWidth: Double,
         viewportHeight: Double,
-        maxChars: Int = 1800
-    ) async -> String {
-        await Task.detached(priority: .userInitiated) {
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: imagePath)),
-                  let cgImage = Self.decodeCGImage(fromJPEG: data) else {
-                return ""
-            }
-            let detections = Self.recognizeText(in: cgImage, viewportWidth: viewportWidth, viewportHeight: viewportHeight, fast: true)
-            guard !detections.isEmpty else { return "" }
-            // Sort top-to-bottom (row buckets of ~14px), then left-to-right for natural reading order
-            let sorted = detections.sorted { a, b in
-                let rowA = Int(a.y / 14.0)
-                let rowB = Int(b.y / 14.0)
-                if rowA != rowB { return rowA < rowB }
-                return a.x < b.x
-            }
-            var lines: [String] = []
-            var totalChars = 0
-            var currentRow = Int.min
-            var rowBuffer: [String] = []
+        fast: Bool = false
+    ) -> [VisionDetection] {
+        recognizeTextDetailed(
+            in: cgImage,
+            viewportWidth: viewportWidth,
+            viewportHeight: viewportHeight,
+            fast: fast
+        ).detections
+    }
 
-            func flushRow() {
-                guard !rowBuffer.isEmpty else { return }
-                let joined = rowBuffer.joined(separator: " | ")
-                if totalChars + joined.count + 1 <= maxChars {
-                    lines.append(joined)
-                    totalChars += joined.count + 1
-                }
-                rowBuffer.removeAll(keepingCapacity: true)
-            }
+    /// Dirty-rect cropped Apple Vision OCR (~5–15 ms on Apple Neural Engine).
+    ///
+    /// When `region` is provided (top-left pixel coordinates matching the image), only that cropped
+    /// region is OCR'd; otherwise the full image is scanned.
+    public static func recognizeText(
+        inJPEG data: Data,
+        region: ScreenRect? = nil,
+        fast: Bool = true
+    ) -> (text: String, lines: [String]) {
+        guard let cgImage = decodeCGImage(fromJPEG: data) else {
+            return ("", [])
+        }
+        return recognizeText(in: cgImage, region: region, fast: fast)
+    }
 
-            for det in sorted {
-                let row = Int(det.y / 14.0)
-                if row != currentRow {
-                    flushRow()
-                    currentRow = row
-                }
-                if totalChars >= maxChars { break }
-                rowBuffer.append(det.label)
-            }
-            flushRow()
-            return lines.joined(separator: "\n")
-        }.value
+    /// Dirty-rect cropped Apple Vision OCR directly from an in-memory `CGImage`.
+    public static func recognizeText(
+        in cgImage: CGImage,
+        region: ScreenRect? = nil,
+        fast: Bool = true
+    ) -> (text: String, lines: [String]) {
+        let targetImage: CGImage
+        if let region,
+           let cropped = cropCGImage(from: cgImage, rect: region, padding: 16, maxDimension: 1280),
+           cropped.width >= 16,
+           cropped.height >= 16 {
+            targetImage = cropped
+        } else {
+            targetImage = cgImage
+        }
+
+        let raw = recognizeText(
+            in: targetImage,
+            viewportWidth: Double(targetImage.width),
+            viewportHeight: Double(targetImage.height),
+            fast: fast
+        )
+        let sorted = sortInReadingOrder(raw)
+        let lines = sorted.map(\.label)
+        return (lines.joined(separator: " | "), lines)
+    }
+
+    /// Converts visible screen text detected by Apple Vision OCR into clickable `@v1..@vN`
+    /// `ElementNode` entries anchored in global screen coordinates matching `windowBounds`.
+    public static func ocrElementNodes(
+        fromJPEG data: Data,
+        windowBounds: ScreenRect,
+        maxElements: Int = 80
+    ) -> [ElementNode] {
+        guard let cgImage = decodeCGImage(fromJPEG: data) else {
+            return []
+        }
+        return ocrElementNodes(from: cgImage, windowBounds: windowBounds, maxElements: maxElements)
+    }
+
+    /// Converts visible screen text in `cgImage` into clickable `@v1..@vN` `ElementNode` entries
+    /// anchored in global screen coordinates matching `windowBounds`.
+    public static func ocrElementNodes(
+        from cgImage: CGImage,
+        windowBounds: ScreenRect,
+        maxElements: Int = 80
+    ) -> [ElementNode] {
+        guard windowBounds.width > 0, windowBounds.height > 0, maxElements > 0 else { return [] }
+        let raw = recognizeText(
+            in: cgImage,
+            viewportWidth: windowBounds.width,
+            viewportHeight: windowBounds.height,
+            fast: true
+        )
+        return ocrElementNodes(fromDetections: raw, windowBounds: windowBounds, maxElements: maxElements)
+    }
+
+    /// Pure deterministic conversion from Vision detections to `@v1..@vN` `ElementNode` entries in global coordinates.
+    public static func ocrElementNodes(
+        fromDetections detections: [VisionDetection],
+        windowBounds: ScreenRect,
+        maxElements: Int = 80
+    ) -> [ElementNode] {
+        guard windowBounds.width > 0, windowBounds.height > 0, maxElements > 0 else { return [] }
+        let sorted = sortInReadingOrder(detections).prefix(maxElements)
+        return sorted.enumerated().map { idx, det in
+            let local = det.frame ?? ScreenRect(x: det.x, y: det.y, width: 1, height: 1)
+            let globalFrame = ScreenRect(
+                x: ((windowBounds.x + local.x) * 10).rounded() / 10,
+                y: ((windowBounds.y + local.y) * 10).rounded() / 10,
+                width: max(1.0, local.width),
+                height: max(1.0, local.height)
+            )
+            return ElementNode(
+                id: "@v\(idx + 1)",
+                role: "AXStaticText",
+                title: det.label,
+                value: nil,
+                roleDescription: "ocr-text",
+                enabled: true,
+                focused: false,
+                frame: globalFrame,
+                actions: []
+            )
+        }
+    }
+
+    private static func sortInReadingOrder(_ detections: [VisionDetection]) -> [VisionDetection] {
+        detections.sorted { a, b in
+            let rowA = Int(a.y / 14.0)
+            let rowB = Int(b.y / 14.0)
+            if rowA != rowB { return rowA < rowB }
+            return a.x < b.x
+        }
     }
 
     /// Throws `LocalVisionError.captureTooSmall` when the image's shorter side is under `minimumImageSide`.
@@ -600,46 +796,6 @@ public final class LocalVisionEngine: @unchecked Sendable {
             )
         }
 
-        // Direct OCR mode
-        if effectiveMode == "ocr" {
-            return await runOCRQuery(
-                mode: "ocr",
-                query: query,
-                imagePath: imagePath,
-                viewportWidth: viewportWidth,
-                viewportHeight: viewportHeight,
-                startNs: startNs
-            )
-        }
-
-        // Try Local MLX VLM if this engine may load it and it is enabled, installed, and cached.
-        // The worker starts and loads the model here, on the first query that needs it.
-        let status = currentStatus()
-        if status.backend == "mlx-vlm" {
-            // Hybrid boost: attach ~25ms Apple Vision OCR text for exact literal fidelity on hostnames, codes, errors & numbers
-            let needsOCRContext = (effectiveMode == "ask" || effectiveMode == "verify" || effectiveMode == "describe" || effectiveMode == "diagnose")
-            let ocrContext = needsOCRContext
-                ? await Self.extractCompactOCRContext(
-                    imagePath: imagePath,
-                    viewportWidth: viewportWidth,
-                    viewportHeight: viewportHeight
-                )
-                : ""
-
-            if let mlxResult = await queryMLXWorker(
-                modelId: status.modelId,
-                mode: effectiveMode,
-                query: query ?? "",
-                ocrContext: ocrContext,
-                imagePath: imagePath,
-                viewportWidth: viewportWidth,
-                viewportHeight: viewportHeight
-            ) {
-                return mlxResult
-            }
-        }
-
-        // Seamless Apple Vision OCR fallback (always works with 0 MB extra)
         return await runOCRQuery(
             mode: effectiveMode,
             query: query,
@@ -660,22 +816,47 @@ public final class LocalVisionEngine: @unchecked Sendable {
     ) async -> VisionQueryResult {
         await Task.detached(priority: .userInitiated) {
             let data = try? Data(contentsOf: URL(fileURLWithPath: imagePath))
-            let cgImage = data.flatMap { Self.decodeCGImage(fromJPEG: $0) }
-            let rawDetections = cgImage.map {
-                Self.recognizeText(in: $0, viewportWidth: viewportWidth, viewportHeight: viewportHeight)
-            } ?? []
-            let detections = rawDetections.sorted { a, b in
-                let rowA = Int(a.y / 14.0)
-                let rowB = Int(b.y / 14.0)
-                if rowA != rowB { return rowA < rowB }
-                return a.x < b.x
+            guard let cgImage = data.flatMap({ Self.decodeCGImage(fromJPEG: $0) }) else {
+                let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+                return VisionQueryResult(
+                    mode: mode,
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: (latencyMs * 100).rounded() / 100,
+                    answer: "Apple Vision OCR could not decode the captured image.",
+                    verified: nil,
+                    blockingDetected: false,
+                    detections: [],
+                    imagePath: imagePath
+                )
             }
+            let detailed = Self.recognizeTextDetailed(
+                in: cgImage,
+                viewportWidth: viewportWidth,
+                viewportHeight: viewportHeight,
+                fast: Self.prefersCPUComputeDevice
+            )
+            if let ocrError = detailed.error {
+                let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+                return VisionQueryResult(
+                    mode: mode,
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: (latencyMs * 100).rounded() / 100,
+                    answer: "Apple Vision OCR failed: \(ocrError)",
+                    verified: nil,
+                    blockingDetected: false,
+                    detections: [],
+                    imagePath: imagePath
+                )
+            }
+            let detections = Self.sortInReadingOrder(detailed.detections)
             let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
             if mode == "ocr" || mode == "describe" {
                 let preview = detections.prefix(32).map(\.label).joined(separator: " | ")
                 let prefix = mode == "describe"
-                    ? "Visible screen text (Apple Vision OCR fallback, \(detections.count) blocks): "
+                    ? "Visible screen text (Apple Vision OCR, \(detections.count) blocks): "
                     : "Detected \(detections.count) text blocks: "
                 return VisionQueryResult(
                     mode: mode,
@@ -689,66 +870,81 @@ public final class LocalVisionEngine: @unchecked Sendable {
                 )
             }
 
-            if mode == "ask" || mode == "verify" {
-                let q = (query ?? "").lowercased()
-                let tokens = q.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count >= 3 }
-                let matched = detections.filter { det in
-                    let lower = det.label.lowercased()
-                    return tokens.contains(where: { lower.contains($0) })
-                }
-                let matchedPreview = matched.prefix(12).map(\.label).joined(separator: " | ")
-                let allPreview = detections.prefix(20).map(\.label).joined(separator: " | ")
-                if mode == "verify" {
-                    let matchRatio = tokens.isEmpty ? 0.0 : Double(tokens.filter { tok in
-                        detections.contains(where: { $0.label.lowercased().contains(tok) })
-                    }.count) / Double(tokens.count)
-                    let isVerified: Bool? = tokens.isEmpty ? nil : (matchRatio >= 0.5)
-                    let ans = matched.isEmpty
-                        ? "Apple Vision OCR did not find matching text for \"\(query ?? "")\". Visible text: \(allPreview)"
-                        : "Apple Vision OCR matched: \(matchedPreview)"
+            if mode == "verify" {
+                let trimmedQuery = (query ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let allText = detections.map(\.label).joined(separator: " | ")
+                guard !trimmedQuery.isEmpty else {
                     return VisionQueryResult(
                         mode: "verify",
                         backend: "apple-vision-ocr",
                         modelId: nil,
                         latencyMs: (latencyMs * 100).rounded() / 100,
-                        answer: ans,
-                        verified: isVerified,
+                        answer: detections.isEmpty ? "No readable text detected." : "Visible screen text: \(allText)",
+                        verified: nil,
                         blockingDetected: false,
-                        detections: Array((matched.isEmpty ? detections : matched).prefix(20)),
-                        imagePath: imagePath
-                    )
-                } else {
-                    let ans = matched.isEmpty
-                        ? "Visible screen text (Apple Vision OCR): \(allPreview)"
-                        : "Relevant screen text (Apple Vision OCR): \(matchedPreview) | Context: \(allPreview)"
-                    return VisionQueryResult(
-                        mode: "ask",
-                        backend: "apple-vision-ocr",
-                        modelId: nil,
-                        latencyMs: (latencyMs * 100).rounded() / 100,
-                        answer: detections.isEmpty ? "No readable text detected on screen." : ans,
-                        blockingDetected: false,
-                        detections: Array((matched.isEmpty ? detections : matched).prefix(20)),
+                        detections: Array(detections.prefix(20)),
                         imagePath: imagePath
                     )
                 }
+                let check = Self.verifyAssertion(trimmedQuery, againstOCRText: allText)
+                let foldedQ = Self.normalizeForMatching(trimmedQuery)
+                let tokens = Self.tokenizePreservingTwoChar(foldedQ).filter { !Self.negationCueTokens.contains($0) && !Self.assertionStopWords.contains($0) }
+                let matched = detections.filter { det in
+                    let lower = Self.normalizeForMatching(det.label)
+                    return tokens.contains(where: { lower.contains($0) })
+                }
+                return VisionQueryResult(
+                    mode: "verify",
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: (latencyMs * 100).rounded() / 100,
+                    answer: check.evidence,
+                    verified: check.verified,
+                    blockingDetected: false,
+                    detections: Array((matched.isEmpty ? detections : matched).prefix(20)),
+                    imagePath: imagePath
+                )
             }
 
-            // Smart OCR matching for locate/diagnose fallback
-            let q = (query ?? "").lowercased()
-            let tokens = q.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count >= 2 }
-            let dismissKeywords = ["fechar", "close", "não", "nao", "agora não", "recusar", "rejeitar", "no thanks", "not now", "x", "×"]
-            let popupKeywords = ["notificaç", "notificac", "cookies", "permitir", "eu quero", "newsletter", "assine"]
+            if mode == "ask" {
+                let q = Self.normalizeForMatching(query ?? "")
+                let tokens = Self.tokenizePreservingTwoChar(q).filter { $0.count >= 3 }
+                let matched = detections.filter { det in
+                    let lower = Self.normalizeForMatching(det.label)
+                    return tokens.contains(where: { lower.contains($0) })
+                }
+                let matchedPreview = matched.prefix(12).map(\.label).joined(separator: " | ")
+                let allPreview = detections.prefix(20).map(\.label).joined(separator: " | ")
+                let ans = matched.isEmpty
+                    ? "Visible screen text (Apple Vision OCR): \(allPreview)"
+                    : "Relevant screen text (Apple Vision OCR): \(matchedPreview) | Context: \(allPreview)"
+                return VisionQueryResult(
+                    mode: "ask",
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: (latencyMs * 100).rounded() / 100,
+                    answer: detections.isEmpty ? "No readable text detected on screen." : ans,
+                    blockingDetected: false,
+                    detections: Array((matched.isEmpty ? detections : matched).prefix(20)),
+                    imagePath: imagePath
+                )
+            }
+
+            // Smart OCR matching for locate/diagnose
+            let q = Self.normalizeForMatching(query ?? "")
+            let tokens = Self.tokenizePreservingTwoChar(q)
+            let dismissKeywords = ["fechar", "close", "nao", "agora nao", "recusar", "rejeitar", "no thanks", "not now", "x", "×"]
+            let popupKeywords = ["notificac", "cookies", "permitir", "eu quero", "newsletter", "assine"]
 
             let hasPopupHint = detections.contains { det in
-                let lower = det.label.lowercased()
+                let lower = Self.normalizeForMatching(det.label)
                 return popupKeywords.contains(where: { lower.contains($0) })
             }
 
             var best: VisionDetection?
             var bestScore = 0
             for det in detections {
-                let lower = det.label.lowercased()
+                let lower = Self.normalizeForMatching(det.label)
                 var score = 0
                 if !q.isEmpty && lower == q { score += 20 }
                 if !q.isEmpty && lower.contains(q) { score += 12 }
@@ -770,7 +966,7 @@ public final class LocalVisionEngine: @unchecked Sendable {
             if let best {
                 answer = "Apple Vision OCR matched \"\(best.label)\" at (\(Int(best.x)), \(Int(best.y)))."
             } else if hasPopupHint {
-                answer = "Apple Vision OCR detected popup/notification text on screen, but no text close button. Enable Local MLX Vision for icon-level grounding (e.g. 'X' buttons)."
+                answer = "Apple Vision OCR detected popup/notification text on screen, but no text close button. Use observe or screenshot to inspect non-text controls."
             } else {
                 answer = "Apple Vision OCR scanned \(detections.count) text blocks; no exact match for \"\(query ?? "")\"."
             }
@@ -789,228 +985,5 @@ public final class LocalVisionEngine: @unchecked Sendable {
                 imagePath: imagePath
             )
         }.value
-    }
-
-    // MARK: - Persistent MLX Worker Process
-
-    private func queryMLXWorker(
-        modelId: String,
-        mode: String,
-        query: String,
-        ocrContext: String,
-        imagePath: String,
-        viewportWidth: Double,
-        viewportHeight: Double
-    ) async -> VisionQueryResult? {
-        await withCheckedContinuation { cont in
-            workerQueue.async { [weak self] in
-                guard let self else {
-                    cont.resume(returning: nil)
-                    return
-                }
-                let result = self.performSyncMLXQuery(
-                    modelId: modelId,
-                    mode: mode,
-                    query: query,
-                    ocrContext: ocrContext,
-                    imagePath: imagePath,
-                    viewportWidth: viewportWidth,
-                    viewportHeight: viewportHeight
-                )
-                cont.resume(returning: result)
-            }
-        }
-    }
-
-    private func performSyncMLXQuery(
-        modelId: String,
-        mode: String,
-        query: String,
-        ocrContext: String,
-        imagePath: String,
-        viewportWidth: Double,
-        viewportHeight: Double
-    ) -> VisionQueryResult? {
-        guard ensureWorkerRunningLocked() else { return nil }
-        guard let stdin = workerStdin, let stdout = workerStdout else { return nil }
-
-        let reqId = UUID().uuidString
-        var payload: [String: Any] = [
-            "id": reqId,
-            "cmd": "query",
-            "model": modelId,
-            "mode": mode,
-            "query": query,
-            "imagePath": imagePath,
-            "viewportWidth": viewportWidth,
-            "viewportHeight": viewportHeight
-        ]
-        if !ocrContext.isEmpty {
-            payload["ocrContext"] = ocrContext
-        }
-
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
-        var lineData = jsonData
-        lineData.append(0x0A)
-        do {
-            try stdin.write(contentsOf: lineData)
-        } catch {
-            stopWorker()
-            return nil
-        }
-
-        scheduleIdleUnload()
-
-        guard let respLine = readNextLine(from: stdout),
-              let respData = respLine.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: respData) as? [String: Any] else {
-            stopWorker()
-            return nil
-        }
-
-        guard (json["ok"] as? Bool) == true else {
-            let errMsg = json["error"] as? String ?? "MLX worker error"
-            lock.lock()
-            _lastError = errMsg
-            lock.unlock()
-            notifyStatusChanged()
-            return nil
-        }
-
-        workerLoadedModel = modelId
-        let xVal = json["x"] as? Double
-        let yVal = json["y"] as? Double
-        var frameRect: ScreenRect?
-        if let f = json["frame"] as? [String: Any],
-           let fx = f["x"] as? Double,
-           let fy = f["y"] as? Double,
-           let fw = f["width"] as? Double,
-           let fh = f["height"] as? Double {
-            frameRect = ScreenRect(x: fx, y: fy, width: fw, height: fh)
-        }
-
-        var detections: [VisionDetection] = []
-        if let rawDets = json["detections"] as? [[String: Any]] {
-            for d in rawDets {
-                if let label = d["label"] as? String,
-                   let dx = d["x"] as? Double,
-                   let dy = d["y"] as? Double {
-                    var df: ScreenRect?
-                    if let f = d["frame"] as? [String: Any],
-                       let fx = f["x"] as? Double,
-                       let fy = f["y"] as? Double,
-                       let fw = f["width"] as? Double,
-                       let fh = f["height"] as? Double {
-                        df = ScreenRect(x: fx, y: fy, width: fw, height: fh)
-                    }
-                    detections.append(VisionDetection(
-                        label: label,
-                        x: dx,
-                        y: dy,
-                        frame: df,
-                        confidence: d["confidence"] as? Double ?? 0.9,
-                        source: d["source"] as? String ?? "mlx-vlm"
-                    ))
-                }
-            }
-        }
-
-        return VisionQueryResult(
-            mode: json["mode"] as? String ?? mode,
-            backend: "mlx-vlm",
-            modelId: json["modelId"] as? String ?? modelId,
-            latencyMs: json["latencyMs"] as? Double ?? 0,
-            answer: json["answer"] as? String ?? "",
-            verified: json["verified"] as? Bool,
-            x: xVal,
-            y: yVal,
-            frame: frameRect,
-            blockingDetected: json["blockingDetected"] as? Bool ?? false,
-            detections: detections,
-            imagePath: imagePath
-        )
-    }
-
-    private func ensureWorkerRunningLocked() -> Bool {
-        if let proc = workerProcess, proc.isRunning {
-            return true
-        }
-        guard let scriptPath = Self.resolveWorkerScriptPath(),
-              FileManager.default.isExecutableFile(atPath: Self.venvPythonURL.path) else {
-            return false
-        }
-
-        let proc = Process()
-        proc.executableURL = Self.venvPythonURL
-        proc.arguments = ["-u", scriptPath]
-        let inPipe = Pipe()
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardInput = inPipe
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-
-        do {
-            try proc.run()
-        } catch {
-            lock.lock()
-            _lastError = error.localizedDescription
-            lock.unlock()
-            return false
-        }
-
-        workerProcess = proc
-        workerStdin = inPipe.fileHandleForWriting
-        workerStdout = outPipe.fileHandleForReading
-        workerReadBuffer.removeAll(keepingCapacity: true)
-
-        // Read ready banner
-        if let readyLine = readNextLine(from: outPipe.fileHandleForReading),
-           readyLine.contains("\"ready\"") {
-            notifyStatusChanged()
-            return true
-        }
-        stopWorker()
-        return false
-    }
-
-    private func readNextLine(from handle: FileHandle) -> String? {
-        while true {
-            if let range = workerReadBuffer.range(of: Data([0x0A])) {
-                let lineData = workerReadBuffer.subdata(in: 0..<range.lowerBound)
-                workerReadBuffer.removeSubrange(0..<range.upperBound)
-                return String(data: lineData, encoding: .utf8)
-            }
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                return nil
-            }
-            workerReadBuffer.append(chunk)
-        }
-    }
-
-    private func scheduleIdleUnload() {
-        idleUnloadWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            self?.stopWorker()
-        }
-        idleUnloadWorkItem = item
-        workerQueue.asyncAfter(deadline: .now() + 300, execute: item)
-    }
-
-    public func stopWorker() {
-        idleUnloadWorkItem?.cancel()
-        idleUnloadWorkItem = nil
-        if let proc = workerProcess {
-            if proc.isRunning {
-                proc.terminate()
-            }
-        }
-        workerProcess = nil
-        workerStdin = nil
-        workerStdout = nil
-        workerLoadedModel = nil
-        workerReadBuffer.removeAll(keepingCapacity: false)
-        notifyStatusChanged()
     }
 }

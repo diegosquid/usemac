@@ -74,9 +74,20 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
     private var runningReconcileToken: UInt64?
     private var lastEmittedStatus: LiveStreamStatus = .idle
 
+    private struct CachedWindowFrame {
+        let windowId: CGWindowID
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let bgraData: Data?
+        let prebuiltImage: CGImage?
+        let sourceBounds: ScreenRect?
+    }
+
     private var setupTask: Task<Void, Never>?
     private var permissionPollTask: Task<Void, Never>?
     private var metadataTask: Task<Void, Never>?
+    private var latestWindowFrame: CachedWindowFrame?
 
     public var onFrame: FrameHandler? {
         get {
@@ -122,6 +133,63 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         lock.lock()
         defer { lock.unlock() }
         return currentIsWindow ? currentWindowID : nil
+    }
+
+    /// Returns the latest live-streamed `CGImage` for `windowID` without issuing an `SCShareableContent` XPC,
+    /// or `nil` if the stream is not currently capturing that window or no frame has arrived yet.
+    public func latestFrame(forWindowID windowID: CGWindowID) -> CGImage? {
+        latestFrameWithBounds(forWindowID: windowID)?.image
+    }
+
+    internal func latestFrameWithBounds(forWindowID windowID: CGWindowID) -> (image: CGImage, windowBounds: ScreenRect?)? {
+        lock.lock()
+        let cached = latestWindowFrame
+        let activeMatches = (isActive && currentIsWindow && currentWindowID == windowID)
+            || (cached?.prebuiltImage != nil && cached?.windowId == windowID)
+        lock.unlock()
+
+        guard activeMatches, let cached, cached.windowId == windowID else {
+            return nil
+        }
+        if let prebuilt = cached.prebuiltImage {
+            return (prebuilt, cached.sourceBounds)
+        }
+        guard let bgra = cached.bgraData,
+              let provider = CGDataProvider(data: bgra as CFData),
+              let image = CGImage(
+                  width: cached.width,
+                  height: cached.height,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: cached.bytesPerRow,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue),
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: true,
+                  intent: .defaultIntent
+              ) else {
+            return nil
+        }
+        return (image, cached.sourceBounds)
+    }
+
+    internal func storeCachedFrameForTesting(windowID: CGWindowID, image: CGImage, bounds: ScreenRect? = nil) {
+        lock.lock()
+        isActive = true
+        currentIsWindow = true
+        currentWindowID = windowID
+        currentSourceBounds = bounds
+        latestWindowFrame = CachedWindowFrame(
+            windowId: windowID,
+            width: image.width,
+            height: image.height,
+            bytesPerRow: image.bytesPerRow,
+            bgraData: nil,
+            prebuiltImage: image,
+            sourceBounds: bounds
+        )
+        lock.unlock()
     }
 
     public override init() {
@@ -223,6 +291,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         currentWindowID = nil
         lastStreamedPid = nil
         runningReconcileToken = nil
+        latestWindowFrame = nil
         clearPinLocked()
         lock.unlock()
 
@@ -278,7 +347,36 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         if shouldEmitThumb {
             lastThumbnailNs = nowNs
         }
+        let cacheWindowId = isWindow ? currentWindowID : nil
         lock.unlock()
+
+        // Snapshot BGRA bytes cheaply (~0.05 ms memcpy) so FastScreenCapturer can reuse the latest frame
+        // without retaining CVPixelBuffer from ScreenCaptureKit's buffer pool.
+        if let cacheWindowId,
+           CVPixelBufferGetPlaneCount(pixelBuffer) == 0,
+           CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess {
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            if let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                let byteCount = bytesPerRow * height
+                if byteCount > 0 {
+                    let copied = Data(bytes: baseAddress, count: byteCount)
+                    lock.lock()
+                    if isActive && currentIsWindow && currentWindowID == cacheWindowId {
+                        latestWindowFrame = CachedWindowFrame(
+                            windowId: cacheWindowId,
+                            width: width,
+                            height: height,
+                            bytesPerRow: bytesPerRow,
+                            bgraData: copied,
+                            prebuiltImage: nil,
+                            sourceBounds: bounds
+                        )
+                    }
+                    lock.unlock()
+                }
+            }
+        }
 
         handler?(surfaceRef as AnyObject, width, height, bounds, name, isWindow, windowId, pid > 0 ? pid : nil)
 
@@ -299,6 +397,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         self.stream = nil
         self.activeTargetKey = nil
         self.activeSourceSize = .zero
+        self.latestWindowFrame = nil
         let gen = self.generation
         lock.unlock()
 
@@ -621,6 +720,9 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
 
     /// Caller holds `lock`.
     private func applySourceLocked(_ resolved: ResolvedTarget) {
+        if currentWindowID != resolved.windowId || currentIsWindow != resolved.isWindow {
+            latestWindowFrame = nil
+        }
         currentSourceBounds = resolved.sourceBounds
         currentSourceName = resolved.sourceName
         currentIsWindow = resolved.isWindow
@@ -765,6 +867,7 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
         stream = nil
         activeTargetKey = nil
         activeSourceSize = .zero
+        latestWindowFrame = nil
         if !keepMetadataLoop {
             metadataTask?.cancel()
             metadataTask = nil

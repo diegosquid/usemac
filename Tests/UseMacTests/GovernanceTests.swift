@@ -302,31 +302,6 @@ final class GovernanceTests: XCTestCase {
         }
     }
 
-    func testVisionInstallRejectsUnknownModelWithoutInstalling() async {
-        let service = makeService(prefix: "usemac-gov-vision-install")
-
-        let badModelRes = await service.handle(RPCRequest(
-            method: .visionInstall,
-            visionInstall: VisionInstallParams(modelId: "attacker/repo")
-        ))
-        XCTAssertFalse(badModelRes.ok)
-        XCTAssertEqual(badModelRes.error?.code, "INVALID_MODEL")
-        XCTAssertTrue(
-            badModelRes.error?.message.hasPrefix("Unknown local vision model. Allowed: ") == true,
-            "Unexpected error message: \(badModelRes.error?.message ?? "<nil>")"
-        )
-
-        service.setGovernancePolicy(.readOnly)
-        for modelId in ["attacker/repo", LocalVisionModelPreset.qwen35_08B.rawValue, nil] as [String?] {
-            let roRes = await service.handle(RPCRequest(
-                method: .visionInstall,
-                visionInstall: VisionInstallParams(modelId: modelId)
-            ))
-            XCTAssertFalse(roRes.ok)
-            XCTAssertEqual(roRes.error?.code, "POLICY_BLOCKED")
-        }
-    }
-
     func testVisionQueryImagePathIsRestricted() async {
         let service = makeService(prefix: "usemac-gov-vision-path")
 

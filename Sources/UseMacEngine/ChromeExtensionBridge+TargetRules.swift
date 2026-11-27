@@ -7,7 +7,7 @@ import UseMacProtocol
 extension ChromeExtensionBridge {
     /// How long the tab lookup before a command may take (capped by the bridge's base timeout). The extension
     /// answers it in milliseconds.
-    static let targetRulesLookupTimeoutSeconds: UInt64 = 2
+    static let targetRulesLookupTimeoutSeconds: TimeInterval = 2.0
 
     /// Lookup failures where the command itself could not be sent either, so its own error is the answer.
     static let targetRulesUnreachableCodes: Set<String> = ["EXTENSION_NOT_CONNECTED", "EXTENSION_NOT_PAIRED"]
@@ -38,7 +38,22 @@ extension ChromeExtensionBridge {
         }
         guard checksTab, rules.hasSiteRules else { return nil }
 
-        let timeout = min(Self.targetRulesLookupTimeoutSeconds, max(1, baseCommandTimeoutSeconds))
+        // Fast path: when targeting an explicit tabId and the extension pushes live `tab_url` events,
+        // consult the in-memory `profile -> tabId -> url` cache without an all-tabs WS round-trip.
+        if let requestedTabId = tabId,
+           let cached = liveCachedTabURL(profileQuery: profile, tabId: requestedTabId) {
+            let trimmed = cached.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                guard rules.blocksURL(trimmed) else { return nil }
+                return Self.targetBlockedResponse(
+                    TargetRules.blockedSiteMessage(host: nil),
+                    tabId: requestedTabId,
+                    profileName: cached.profileName
+                )
+            }
+        }
+
+        let timeout = min(Self.targetRulesLookupTimeoutSeconds, max(0.05, baseCommandTimeoutSeconds))
         let listing = await unfilteredTabs(profile: profile, timeoutSeconds: timeout)
         guard listing.ok else {
             if let code = listing.error?.code, Self.targetRulesUnreachableCodes.contains(code) {

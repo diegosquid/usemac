@@ -238,6 +238,8 @@ public final class AppState: ObservableObject {
     /// which cancels auto-hide, never keeps a finished card in the deck.
     private var completionCleanupTask: Task<Void, Never>?
     private var taskIdleSettleTask: Task<Void, Never>?
+    private var refreshDebounceTask: Task<Void, Never>?
+    private static let refreshDebounceNanoseconds: UInt64 = 250_000_000
     /// Ghost-card cleanup and background card stills (AppState+DeckHygiene.swift).
     var deckHygiene = DeckHygieneState()
     var deckShuffle = DeckShuffleState()
@@ -251,7 +253,7 @@ public final class AppState: ObservableObject {
     private var policyBeforePause: GovernancePolicy?
 
     public init(socketPath: String = UseMacDefaults.defaultSocketPath) {
-        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore(), allowsLocalVisionModel: true)
+        let engineService = UseMacEngineService(socketPath: socketPath, auditStore: AuditLogStore())
         let defaults = UserDefaults.standard
 
         // Nothing saved, or an unknown mode, starts in Autonomous with the Emergency stop off (StartupSafetyStateTests).
@@ -303,7 +305,7 @@ public final class AppState: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.engine.updateActiveClientCount(count)
-                    self.refreshState()
+                    self.scheduleRefreshState()
                 }
             }
         )
@@ -490,7 +492,7 @@ public final class AppState: ObservableObject {
         }
         engine.onStateChanged = { [weak self] in
             Task { @MainActor [weak self] in
-                self?.refreshState()
+                self?.scheduleRefreshState()
             }
         }
         engine.onLiveActivity = { [weak self] item in
@@ -538,7 +540,7 @@ public final class AppState: ObservableObject {
                     }
                 }
                 if case .streaming = status, !self.status.permissions.screenRecordingGranted {
-                    self.refreshState()
+                    self.scheduleRefreshState()
                 }
             }
         }
@@ -547,7 +549,7 @@ public final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.connectedBrowserProfiles = profiles
-                self.refreshState()
+                self.scheduleRefreshState()
             }
         }
 
@@ -812,6 +814,8 @@ public final class AppState: ObservableObject {
     }
 
     public func stopDaemon() {
+        refreshDebounceTask?.cancel()
+        refreshDebounceTask = nil
         isAgentBusy = false
         isBrowserStreamActive = false
         if !isHUDManuallyPinned && isHUDVisible {
@@ -824,7 +828,24 @@ public final class AppState: ObservableObject {
         clearOverlay()
     }
 
+    /// Coalesces rapid engine state updates (e.g. RPC bursts) into at most one `@MainActor` refresh per 250 ms.
+    public func scheduleRefreshState() {
+        guard refreshDebounceTask == nil else { return }
+        refreshDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.refreshDebounceNanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            self.refreshDebounceTask = nil
+            self.performRefreshState()
+        }
+    }
+
     public func refreshState() {
+        refreshDebounceTask?.cancel()
+        refreshDebounceTask = nil
+        performRefreshState()
+    }
+
+    private func performRefreshState() {
         let previousPolicy = status.policy
         let newStatus = engine.currentStatus()
         if newStatus.policy != previousPolicy {
@@ -873,10 +894,6 @@ public final class AppState: ObservableObject {
         if perms != status.permissions {
             status.permissions = perms
         }
-    }
-
-    public var isLocalVisionInstallerAvailable: Bool {
-        LocalVisionEngine.isInstallerAvailable
     }
 
     // MARK: - Agent setup prompts (shared by Settings → Connect and the setup guide)
@@ -1614,25 +1631,6 @@ public final class AppState: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: DefaultsKeys.autoShowHUDOnActivity)
         if !enabled && isHUDVisible && !isHUDManuallyPinned && !status.killSwitchTripped {
             hideHUD(userInitiated: false)
-        }
-    }
-
-    public func setLocalVisionEnabled(_ enabled: Bool) {
-        engine.localVision.setEnabled(enabled)
-        visionStatus = engine.localVision.currentStatus()
-    }
-
-    public func selectLocalVisionModel(_ preset: LocalVisionModelPreset) {
-        engine.localVision.setModelId(preset.rawValue)
-        visionStatus = engine.localVision.currentStatus()
-    }
-
-    public func installLocalVision() {
-        let modelId = visionStatus.modelId
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let updated = await self.engine.localVision.install(modelId: modelId, enable: true)
-            self.visionStatus = updated
         }
     }
 

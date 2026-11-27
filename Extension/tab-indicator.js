@@ -305,6 +305,9 @@ function usemacTabIndicatorPage(cmd) {
 }
 
 const TAB_INDICATOR_PAGE_SOURCE = usemacTabIndicatorPage.toString();
+// Tiny dispatcher used once TAB_INDICATOR_PAGE_SOURCE has bootstrapped __usemacTabIndicator in a contextId.
+const TAB_INDICATOR_FAST_CALL_SOURCE =
+  "function(cmd){const c=globalThis.__usemacTabIndicator;return c&&c.version===1?c.apply(cmd||{}):{__usemacUnbootstrapped:true};}";
 
 // --- Extension side -------------------------------------------------------------------------------------------------
 
@@ -322,6 +325,7 @@ function tabIndicatorState(session) {
       inertTimer: null,
       mainFrameId: null,
       contextId: null, // the "usemac" isolated world of the current top document
+      bootstrappedContextId: null, // contextId where TAB_INDICATOR_PAGE_SOURCE was already evaluated
       bindingAdded: false,
       mounted: false,
       everMounted: false,
@@ -533,6 +537,7 @@ async function ensureTabIndicatorContext(tabId, ind) {
     grantUniveralAccess: false
   });
   ind.contextId = world?.executionContextId ?? null;
+  ind.bootstrappedContextId = null;
   return ind.contextId;
 }
 
@@ -547,8 +552,9 @@ async function callTabIndicatorPage(tabId, session, cmd, { create = true } = {})
     }
     if (contextId == null) return null;
     try {
-      const res = await tabIndicatorCDP(tabId, "Runtime.callFunctionOn", {
-        functionDeclaration: TAB_INDICATOR_PAGE_SOURCE,
+      const useFastCall = ind.bootstrappedContextId === contextId;
+      let res = await tabIndicatorCDP(tabId, "Runtime.callFunctionOn", {
+        functionDeclaration: useFastCall ? TAB_INDICATOR_FAST_CALL_SOURCE : TAB_INDICATOR_PAGE_SOURCE,
         executionContextId: contextId,
         arguments: [{ value: cmd }],
         returnByValue: true,
@@ -556,11 +562,31 @@ async function callTabIndicatorPage(tabId, session, cmd, { create = true } = {})
         silent: true
       });
       if (res?.exceptionDetails) return null;
-      return res?.result?.value ?? null;
+      let val = res?.result?.value ?? null;
+      if (useFastCall && val && val.__usemacUnbootstrapped === true) {
+        ind.bootstrappedContextId = null;
+        res = await tabIndicatorCDP(tabId, "Runtime.callFunctionOn", {
+          functionDeclaration: TAB_INDICATOR_PAGE_SOURCE,
+          executionContextId: contextId,
+          arguments: [{ value: cmd }],
+          returnByValue: true,
+          awaitPromise: true,
+          silent: true
+        });
+        if (res?.exceptionDetails) return null;
+        val = res?.result?.value ?? null;
+      }
+      if (!res?.exceptionDetails) {
+        ind.bootstrappedContextId = contextId;
+      }
+      return val;
     } catch (err) {
       if (/timeout/i.test(String(err?.message || ""))) return null;
       // The document changed under us (a navigation): make a new world, once.
-      if (ind.contextId === contextId) ind.contextId = null;
+      if (ind.contextId === contextId) {
+        ind.contextId = null;
+        ind.bootstrappedContextId = null;
+      }
       if (!create) return null;
     }
   }
@@ -671,6 +697,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     // A new top document: draw into it again if the tab is still controlled (or clean up a restored one).
     ind.mainFrameId = params.frame.id || ind.mainFrameId;
     ind.contextId = null;
+    ind.bootstrappedContextId = null;
     ind.mounted = false;
     ind.shown = false;
     ind.pill = null;
@@ -679,10 +706,12 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
   if (method === "Runtime.executionContextDestroyed" && params?.executionContextId === ind.contextId) {
     ind.contextId = null;
+    ind.bootstrappedContextId = null;
     return;
   }
   if (method === "Runtime.executionContextsCleared") {
     ind.contextId = null;
+    ind.bootstrappedContextId = null;
     return;
   }
   if (method === "Runtime.bindingCalled" && params?.name === TAB_INDICATOR_BINDING) {

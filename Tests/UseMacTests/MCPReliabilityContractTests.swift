@@ -210,22 +210,45 @@ final class MCPReliabilityContractTests: XCTestCase {
 
     // MARK: - Schemas and instructions
 
-    func testSchemasExposeNewFields() async throws {
+    func testSchemasExpose9CompactToolsUnder10_5KBAndSotaFields() async throws {
         let (mcp, _) = makeServer()
         defer { mcp.close() }
-        let tools = try await toolList(mcp)
-        XCTAssertEqual(tools.count, 17)
+        let rawListOpt = await mcp.processLine(#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#)
+        let rawList = try XCTUnwrap(rawListOpt)
+        let toolsListBytes = rawList.utf8.count
+        XCTAssertLessThan(toolsListBytes, 10_500, "tools/list compact JSON should be < 10.5 KB (got \(toolsListBytes) bytes)")
+
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(rawList.utf8)) as? [String: Any])
+        let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 9)
+        let names = Set(tools.compactMap { $0["name"] as? String })
+        XCTAssertEqual(names, [
+            "usemac_observe",
+            "usemac_act",
+            "usemac_browser_open",
+            "usemac_browser_extract",
+            "usemac_screenshot",
+            "usemac_discover",
+            "usemac_vision",
+            "usemac_skill",
+            "usemac_session"
+        ])
+
+        // Dead viewport/deviceScaleFactor params must not bloat tools/list.
+        for deadParam in ["viewportWidth", "viewportHeight", "deviceScaleFactor"] {
+            XCTAssertFalse(rawList.contains(deadParam), "Dead param \(deadParam) should not appear in tools/list")
+        }
 
         let actProps = try properties(of: "usemac_act", in: tools)
-        for key in ["expectWindowTitle", "allowStaleSnapshot", "foreground", "steps"] {
+        for key in ["app", "window", "tabId", "profile", "steps", "verify", "observationMode", "returnDiffOnly", "diffCrop", "foregroundFallback", "returnImageContent", "task", "completeTask", "expectWindowTitle", "allowStaleSnapshot", "foreground", "taskId"] {
             XCTAssertNotNil(actProps[key], "usemac_act is missing \(key)")
         }
         let stepProps = try XCTUnwrap(((actProps["steps"] as? [String: Any])?["items"] as? [String: Any])?["properties"] as? [String: Any])
         let actions = try XCTUnwrap((stepProps["action"] as? [String: Any])?["enum"] as? [String])
-        for action in ["scrollIntoView", "axAction", "waitFor", "click", "uploadFile", "openURL"] {
+        for action in ["scrollIntoView", "axAction", "waitFor", "click", "uploadFile", "openURL", "navigate", "assert", "scrollUntil", "fillForm", "menuAction"] {
             XCTAssertTrue(actions.contains(action), "usemac_act step enum is missing \(action)")
         }
-        for key in ["match", "actionName", "timeoutMs", "gone", "elementId", "files"] {
+        for key in ["match", "actionName", "timeoutMs", "gone", "elementId", "files", "optional", "fields", "menuPath", "expectText", "maxScrolls"] {
             XCTAssertNotNil(stepProps[key], "usemac_act step is missing \(key)")
         }
         let matchProps = try XCTUnwrap((stepProps["match"] as? [String: Any])?["properties"] as? [String: Any])
@@ -233,23 +256,48 @@ final class MCPReliabilityContractTests: XCTestCase {
         XCTAssertEqual((matchProps["index"] as? [String: Any])?["type"] as? String, "integer")
         XCTAssertEqual((matchProps["exact"] as? [String: Any])?["type"] as? String, "boolean")
 
-        // Accessibility-only steps are not offered to the browser tool.
-        let browserActProps = try properties(of: "usemac_browser_act", in: tools)
-        let browserStepProps = try XCTUnwrap(((browserActProps["steps"] as? [String: Any])?["items"] as? [String: Any])?["properties"] as? [String: Any])
-        let browserActions = try XCTUnwrap((browserStepProps["action"] as? [String: Any])?["enum"] as? [String])
-        XCTAssertFalse(browserActions.contains("axAction"))
-        XCTAssertTrue(browserActions.contains("navigate"))
-        XCTAssertNil(browserStepProps["match"])
-
         let observeProps = try properties(of: "usemac_observe", in: tools)
         XCTAssertEqual((observeProps["includeOffscreen"] as? [String: Any])?["type"] as? String, "boolean")
+        for key in ["app", "window", "tabId", "profile", "filter", "maxElements", "returnImageContent", "task", "taskId"] {
+            XCTAssertNotNil(observeProps[key], "usemac_observe is missing \(key)")
+        }
 
         let openTool = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "usemac_browser_open" }))
         let openSchema = try XCTUnwrap(openTool["inputSchema"] as? [String: Any])
         let openProps = try XCTUnwrap(openSchema["properties"] as? [String: Any])
-        XCTAssertNotNil(openProps["activate"])
-        XCTAssertNotNil(openProps["newWindow"])
+        for key in ["url", "tabId", "profile", "activate", "newWindow", "steps", "autoDismissOverlays", "task"] {
+            XCTAssertNotNil(openProps[key], "usemac_browser_open is missing \(key)")
+        }
         XCTAssertFalse((openSchema["required"] as? [String] ?? []).contains("url"), "url is optional for tabId + activate")
+
+        let extractProps = try properties(of: "usemac_browser_extract", in: tools)
+        for key in ["mode", "tabId", "profile", "urlFilter", "scanHorizontal", "scanVertical", "frameIndex", "maxChars", "urls"] {
+            XCTAssertNotNil(extractProps[key], "usemac_browser_extract is missing \(key)")
+        }
+        let extractModes = try XCTUnwrap((extractProps["mode"] as? [String: Any])?["enum"] as? [String])
+        XCTAssertTrue(extractModes.contains("network"))
+
+        let shotProps = try properties(of: "usemac_screenshot", in: tools)
+        for key in ["app", "tabId", "profile", "maxDimension", "diffCrop", "region", "elementId", "selector", "fullPage", "returnImageContent"] {
+            XCTAssertNotNil(shotProps[key], "usemac_screenshot is missing \(key)")
+        }
+
+        let discoverProps = try properties(of: "usemac_discover", in: tools)
+        let discoverKinds = try XCTUnwrap((discoverProps["kind"] as? [String: Any])?["enum"] as? [String])
+        XCTAssertEqual(Set(discoverKinds), ["apps", "tabs", "menu", "status"])
+
+        let visionProps = try properties(of: "usemac_vision", in: tools)
+        let visionModes = try XCTUnwrap((visionProps["mode"] as? [String: Any])?["enum"] as? [String])
+        XCTAssertEqual(Set(visionModes), ["ocr", "verify", "locate", "diagnose"])
+
+        let skillProps = try properties(of: "usemac_skill", in: tools)
+        let skillActions = try XCTUnwrap((skillProps["action"] as? [String: Any])?["enum"] as? [String])
+        XCTAssertEqual(Set(skillActions), ["list", "save", "run"])
+        XCTAssertNotNil(skillProps["postAssertions"])
+
+        let sessionProps = try properties(of: "usemac_session", in: tools)
+        let sessionActions = try XCTUnwrap((sessionProps["action"] as? [String: Any])?["enum"] as? [String])
+        XCTAssertEqual(Set(sessionActions), ["status", "task_start", "task_complete", "highlight", "report_prepare"])
     }
 
     func testInstructionsCoverTheReliabilityRules() async throws {
@@ -259,9 +307,274 @@ final class MCPReliabilityContractTests: XCTestCase {
         let raw = try XCTUnwrap(output)
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
         let instructions = try XCTUnwrap((obj["result"] as? [String: Any])?["instructions"] as? String)
-        for phrase in ["untrusted data", "background", "match", "effect", "RESTRICTED_PAGE", "newWindow", "uploadFile", "foreground", "USER_ACTIVE", "POLICY_BLOCKED", "SELF_TARGET_BLOCKED", "TARGET_BLOCKED"] {
+        XCTAssertFalse(instructions.contains("Call usemac_status first."), "Zero-ceremony instructions must not force status first")
+        for phrase in [
+            "untrusted data", "background", "match", "effect", "RESTRICTED_PAGE", "newWindow",
+            "uploadFile", "foreground", "USER_ACTIVE", "POLICY_BLOCKED", "SELF_TARGET_BLOCKED",
+            "TARGET_BLOCKED", "task", "completeTask", "browser_open", "steps", "fillForm",
+            "optional", "assert", "menuAction", "network", "skill"
+        ] {
             XCTAssertTrue(instructions.contains(phrase), "Instructions should mention \(phrase)")
         }
+    }
+
+    func testConsolidatedToolsAndLegacyAliasesDispatchCleanly() async throws {
+        let (mcp, box) = makeServer { req in
+            switch req.method {
+            case .appMenu:
+                return .success(id: req.id, latencyMs: 2.0, appMenuResult: AppMenuResult(
+                    app: "Notes",
+                    items: [AppMenuItemInfo(path: ["File", "Export as PDF…"], title: "Export as PDF…", shortcut: "⌘E", enabled: true)]
+                ))
+            case .browserBatch:
+                return .success(id: req.id, latencyMs: 12.0, browserBatchResult: BrowserBatchResult(
+                    results: [BrowserBatchItemResult(url: "https://a.test", tabId: 10, success: true, extract: BrowserExtractResult(mode: "text", text: "Alpha"), latencyMs: 5.0)],
+                    totalLatencyMs: 12.0
+                ))
+            case .skillList:
+                return .success(id: req.id, latencyMs: 1.0, skills: SkillListResult(skills: [
+                    SkillRecord(name: "export-pdf", description: "Export note", target: "native", app: "Notes", params: ["path"], steps: [ActionStep(action: .menuAction, menuPath: ["File", "Export as PDF…"])])
+                ]))
+            case .skillSave:
+                return .success(id: req.id, latencyMs: 1.0, skills: SkillListResult(saved: SkillRecord(
+                    name: req.skillSave?.name ?? "s", target: req.skillSave?.target, steps: req.skillSave?.steps ?? []
+                )))
+            case .skillRun:
+                return .success(id: req.id, latencyMs: 8.0, skillResult: SkillRunResult(
+                    name: req.skillRun?.name ?? "s",
+                    success: true,
+                    actionResult: BatchActionResult(success: true, totalLatencyMs: 7.0, stepResults: [
+                        ActionStepResult(index: 0, action: .click, success: true, mechanism: "cdp", latencyMs: 3.0, skipped: true)
+                    ]),
+                    totalLatencyMs: 8.0
+                ))
+            default:
+                return .success(id: req.id, latencyMs: 0.5)
+            }
+        }
+        defer { mcp.close() }
+
+        // Consolidated routing
+        _ = try await call(mcp, tool: "usemac_observe", arguments: #"{"tabId":55,"filter":{"role":"button","viewportOnly":true}}"#)
+        XCTAssertEqual(box.last?.method, .browserObserve)
+        XCTAssertEqual(box.last?.browserObserve?.tabId, 55)
+        XCTAssertEqual(box.last?.browserObserve?.filter?.role, "button")
+
+        _ = try await call(mcp, tool: "usemac_act", arguments: #"{"tabId":55,"steps":[{"action":"click","elementId":"@b2"}],"observationMode":"delta","diffCrop":true}"#)
+        XCTAssertEqual(box.last?.method, .browserAct)
+        XCTAssertEqual(box.last?.browserAct?.tabId, 55)
+        XCTAssertEqual(box.last?.browserAct?.observationMode, .delta)
+        XCTAssertEqual(box.last?.browserAct?.diffCrop, true)
+
+        let batchResp = try await call(mcp, tool: "usemac_browser_extract", arguments: #"{"urls":["https://a.test","https://b.test"],"mode":"text","closeAfter":true}"#)
+        XCTAssertEqual(box.last?.method, .browserBatch)
+        XCTAssertEqual(box.last?.browserBatch?.urls, ["https://a.test", "https://b.test"])
+        XCTAssertEqual(box.last?.browserBatch?.extractMode, "text")
+        XCTAssertTrue(try resultText(batchResp).text.contains("Browser batch (1 URLs"))
+
+        let menuResp = try await call(mcp, tool: "usemac_discover", arguments: #"{"kind":"menu","app":"Notes","query":"Export"}"#)
+        XCTAssertEqual(box.last?.method, .appMenu)
+        XCTAssertEqual(box.last?.appMenu?.app, "Notes")
+        XCTAssertEqual(box.last?.appMenu?.query, "Export")
+        XCTAssertTrue(try resultText(menuResp).text.contains("File → Export as PDF… (⌘E)"))
+
+        let saveResp = try await call(mcp, tool: "usemac_skill", arguments: ##"{"action":"save","name":"my-flow","kind":"browser","steps":[{"action":"click","selector":"#go"}],"postAssertions":[{"expectText":"Done"}]}"##)
+        XCTAssertEqual(box.last?.method, .skillSave)
+        XCTAssertEqual(box.last?.skillSave?.target, "browser")
+        XCTAssertEqual(box.last?.skillSave?.steps.map(\.action), [.click, .assert])
+        XCTAssertEqual(box.last?.skillSave?.steps.last?.expectText, "Done")
+        XCTAssertTrue(try resultText(saveResp).text.contains("Saved skill 'my-flow'"))
+
+        let listResp = try await call(mcp, tool: "usemac_skill", arguments: #"{"action":"list","kind":"native"}"#)
+        XCTAssertEqual(box.last?.method, .skillList)
+        XCTAssertTrue(try resultText(listResp).text.contains("export-pdf"))
+
+        let runResp = try await call(mcp, tool: "usemac_skill", arguments: #"{"action":"run","name":"export-pdf","params":{"path":"/tmp/a.pdf"}}"#)
+        XCTAssertEqual(box.last?.method, .skillRun)
+        XCTAssertEqual(box.last?.skillRun?.params?["path"], "/tmp/a.pdf")
+        XCTAssertTrue(try resultText(runResp).text.contains("SKIPPED"))
+
+        _ = try await call(mcp, tool: "usemac_vision", arguments: #"{"mode":"verify","query":"Success","tabId":9}"#)
+        XCTAssertEqual(box.last?.method, .visionQuery)
+        XCTAssertEqual(box.last?.visionQuery?.mode, "verify")
+
+        _ = try await call(mcp, tool: "usemac_session", arguments: #"{"action":"highlight","elementId":"@e3","durationMs":500}"#)
+        XCTAssertEqual(box.last?.method, .highlight)
+        XCTAssertEqual(box.last?.elementId, "@e3")
+
+        // All 12 legacy aliases still dispatch cleanly in tools/call
+        let legacyCases: [(String, String, RPCMethod)] = [
+            ("usemac_status", "{}", .status),
+            ("usemac_list_apps", "{}", .listApps),
+            ("usemac_browser_tabs", #"{"query":"mail"}"#, .browserTabs),
+            ("usemac_browser_observe", #"{"tabId":12}"#, .browserObserve),
+            ("usemac_browser_act", #"{"tabId":12,"steps":[{"action":"wait","durationMs":1}]}"#, .browserAct),
+            ("usemac_browser_screenshot", #"{"tabId":12}"#, .browserScreenshot),
+            ("usemac_vision_status", "{}", .visionStatus),
+            ("usemac_vision_query", #"{"mode":"ocr"}"#, .visionQuery),
+            ("usemac_task_start", #"{"summary":"Legacy"}"#, .taskStart),
+            ("usemac_task_complete", #"{"summary":"Done"}"#, .taskComplete),
+            ("usemac_highlight", #"{"elementId":"@e1"}"#, .highlight),
+            ("usemac_report_prepare", #"{"summary":"Bug details"}"#, .reportPrepare)
+        ]
+        for (name, args, expectedMethod) in legacyCases {
+            let resp = try await call(mcp, tool: name, arguments: args)
+            XCTAssertNil(resp["error"], "Legacy alias \(name) returned JSON-RPC error: \(String(describing: resp["error"]))")
+            XCTAssertEqual(box.last?.method, expectedMethod, "Legacy alias \(name) routed wrong")
+        }
+    }
+
+    func testPiggybackedTaskStartAndCompletePropagateIntoMCPTaskScope() async throws {
+        let (mcp, box) = makeServer { req in
+            if req.taskStart != nil {
+                return .success(id: req.id, latencyMs: 1.0, browserTabId: 88, taskId: "task-piggy-1")
+            }
+            if req.taskComplete != nil {
+                return .success(
+                    id: req.id,
+                    latencyMs: 1.0,
+                    actionResult: BatchActionResult(success: true, totalLatencyMs: 2.0, stepResults: []),
+                    taskId: req.taskId ?? "task-piggy-1",
+                    taskSummary: TaskSummary(taskId: "task-piggy-1", requests: 2, actions: 1, durationMs: 1200)
+                )
+            }
+            return .success(id: req.id, latencyMs: 1.0, actionResult: BatchActionResult(success: true, totalLatencyMs: 1.0, stepResults: []))
+        }
+        defer { mcp.close() }
+
+        // 1. Piggybacked taskStart on browser_open registers task-piggy-1 in MCPTaskScope
+        let openResp = try await call(mcp, tool: "usemac_browser_open", arguments: #"{"url":"https://example.com","task":"Check pricing","autoDismissOverlays":true}"#)
+        XCTAssertEqual(box.last?.taskStart?.summary, "Check pricing")
+        XCTAssertEqual(box.last?.browserOpen?.autoDismissOverlays, true)
+        XCTAssertTrue(try resultText(openResp).text.contains("taskId: task-piggy-1"))
+
+        // 2. Next call without explicit taskId automatically receives task-piggy-1
+        _ = try await call(mcp, tool: "usemac_act", arguments: #"{"tabId":88,"steps":[{"action":"wait","durationMs":1}]}"#)
+        XCTAssertEqual(box.last?.taskId, "task-piggy-1")
+
+        // 3. Piggybacked completeTask closes task-piggy-1 in MCPTaskScope
+        let doneResp = try await call(mcp, tool: "usemac_act", arguments: #"{"tabId":88,"steps":[{"action":"wait","durationMs":1}],"completeTask":"Pricing verified"}"#)
+        XCTAssertEqual(box.last?.taskComplete?.summary, "Pricing verified")
+        XCTAssertEqual(box.last?.taskComplete?.taskId, "task-piggy-1")
+        XCTAssertTrue(try resultText(doneResp).text.contains("Summary: 2 requests"))
+
+        // 4. Subsequent call has no active taskId
+        _ = try await call(mcp, tool: "usemac_observe", arguments: #"{"tabId":88}"#)
+        XCTAssertNil(box.last?.taskId)
+    }
+
+    func testInlineImageReturnedForNativeScreenshotObserveAndAct() async throws {
+        try FileManager.default.createDirectory(atPath: UseMacDefaults.captureDirectory, withIntermediateDirectories: true)
+        let captureFile = (UseMacDefaults.captureDirectory as NSString).appendingPathComponent("native-inline-\(UUID().uuidString).jpg")
+        let fakeJPEG = Data([0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9])
+        let fakeB64 = fakeJPEG.base64EncodedString()
+        try fakeJPEG.write(to: URL(fileURLWithPath: captureFile))
+        defer { try? FileManager.default.removeItem(atPath: captureFile) }
+
+        let (mcp, box) = makeServer { req in
+            switch req.method {
+            case .screenshot:
+                return .success(id: req.id, latencyMs: 2.0, screenshot: ScreenshotResult(
+                    path: captureFile, width: 640, height: 480, byteCount: fakeJPEG.count, latencyMs: 2.0, base64Data: fakeB64
+                ))
+            case .observe:
+                return .success(id: req.id, latencyMs: 3.0, snapshot: WindowSnapshot(
+                    app: AppDescriptor(pid: 12, name: "Notes"),
+                    timestampMs: 1,
+                    latencyMs: 3.0,
+                    elements: [],
+                    screenshotPath: captureFile
+                ))
+            case .act:
+                return .success(id: req.id, latencyMs: 4.0, actionResult: BatchActionResult(
+                    success: true,
+                    totalLatencyMs: 4.0,
+                    stepResults: [],
+                    observation: WindowSnapshot(app: AppDescriptor(pid: 12, name: "Notes"), timestampMs: 2, latencyMs: 2.0, elements: [], screenshotPath: captureFile),
+                    networkErrors: ["500 POST /api/save"],
+                    dirtyRect: ScreenRect(x: 10, y: 20, width: 300, height: 120),
+                    visualDeltaOCR: "Saved successfully"
+                ))
+            default:
+                return .success(id: req.id, latencyMs: 1.0)
+            }
+        }
+        defer { mcp.close() }
+
+        // 1. Native usemac_screenshot defaults returnImageContent to true!
+        let shotResp = try await call(mcp, tool: "usemac_screenshot", arguments: #"{"app":"Notes","diffCrop":true}"#)
+        XCTAssertEqual(box.last?.screenshot?.includeBase64, true)
+        XCTAssertEqual(box.last?.screenshot?.diffCrop, true)
+        let shotBlocks = try XCTUnwrap((shotResp["result"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(shotBlocks.count, 2)
+        XCTAssertEqual(shotBlocks[1]["type"] as? String, "image")
+        XCTAssertEqual(shotBlocks[1]["data"] as? String, fakeB64)
+
+        // 2. Native usemac_observe(returnImageContent: true) reads from screenshotPath inside captureDirectory
+        let obsResp = try await call(mcp, tool: "usemac_observe", arguments: #"{"app":"Notes","returnImageContent":true}"#)
+        XCTAssertEqual(box.last?.observe?.includeScreenshot, true)
+        let obsBlocks = try XCTUnwrap((obsResp["result"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(obsBlocks.count, 2)
+        XCTAssertEqual(obsBlocks[1]["type"] as? String, "image")
+        XCTAssertEqual(obsBlocks[1]["data"] as? String, fakeB64)
+
+        // 3. Native usemac_act(returnImageContent: true) returns inline image + formats networkErrors/dirtyRect/visualDeltaOCR
+        let actResp = try await call(mcp, tool: "usemac_act", arguments: #"{"app":"Notes","returnImageContent":true,"steps":[{"action":"wait","durationMs":1}]}"#)
+        XCTAssertEqual(box.last?.act?.includeScreenshot, true)
+        let actBlocks = try XCTUnwrap((actResp["result"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(actBlocks.count, 2)
+        XCTAssertEqual(actBlocks[1]["type"] as? String, "image")
+        XCTAssertEqual(actBlocks[1]["data"] as? String, fakeB64)
+        let actText = try XCTUnwrap(actBlocks[0]["text"] as? String)
+        XCTAssertTrue(actText.contains("NetworkErrors (1):"), actText)
+        XCTAssertTrue(actText.contains("500 POST /api/save"), actText)
+        XCTAssertTrue(actText.contains("DirtyRect: (10,20 300x120)"), actText)
+        XCTAssertTrue(actText.contains("VisualDeltaOCR: Saved successfully"), actText)
+    }
+
+    func testMaxElementsAndReturnDiffOnlyAreRespectedInMCPFormatting() async throws {
+        let manyNodes = (1...300).map { i in
+            ElementNode(id: "@e\(i)", role: "AXButton", title: "Btn \(i)", frame: ScreenRect(x: 0, y: Double(i), width: 20, height: 20))
+        }
+        let addedNode = ElementNode(id: "@e999", role: "AXStaticText", title: "Toast Saved", frame: ScreenRect(x: 0, y: 0, width: 100, height: 20))
+        let diff = SnapshotDiff(added: [addedNode], removedIds: ["@e5"], changed: [], summary: "+1 -1")
+
+        let (mcp, _) = makeServer { req in
+            switch req.method {
+            case .observe:
+                return .success(id: req.id, latencyMs: 2.0, snapshot: WindowSnapshot(
+                    app: AppDescriptor(pid: 9, name: "Notes"), timestampMs: 1, latencyMs: 2.0, elements: manyNodes
+                ))
+            case .act:
+                return .success(id: req.id, latencyMs: 2.0, actionResult: BatchActionResult(
+                    success: true,
+                    totalLatencyMs: 2.0,
+                    stepResults: [],
+                    observation: WindowSnapshot(
+                        app: AppDescriptor(pid: 9, name: "Notes"),
+                        timestampMs: 2,
+                        latencyMs: 2.0,
+                        elements: [],
+                        diff: diff
+                    )
+                ))
+            default:
+                return .success(id: req.id, latencyMs: 1.0)
+            }
+        }
+        defer { mcp.close() }
+
+        // Requesting maxElements: 300 must not silently truncate at 250!
+        let obsResp = try await call(mcp, tool: "usemac_observe", arguments: #"{"app":"Notes","maxElements":300}"#)
+        let obsText = try resultText(obsResp).text
+        XCTAssertTrue(obsText.contains("@e300"), "Expected @e300 when maxElements=300 was requested")
+        XCTAssertFalse(obsText.contains("more elements omitted"))
+
+        // Delta-only snapshot (elements: [], diff != nil) must render + / - diff entries!
+        let actResp = try await call(mcp, tool: "usemac_act", arguments: #"{"app":"Notes","returnDiffOnly":true,"steps":[{"action":"wait","durationMs":1}]}"#)
+        let actText = try resultText(actResp).text
+        XCTAssertTrue(actText.contains("+ @e999"), actText)
+        XCTAssertTrue(actText.contains("- @e5"), actText)
     }
 
     // MARK: - Reporting effects, warnings and error codes

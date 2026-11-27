@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Acme Treasury SPA — Transactions &amp; Approvals</title>
+  <!-- Realistic local SPA fixture for scripts/bench-sota.py:
+       1. Dismissible cookie consent modal overlay (tests autoDismissOverlays / optional click)
+       2. Multi-field form: <input>, <select>, custom ARIA combobox, checkbox, validation toast & success banner (tests fillForm + assert)
+       3. Async fetch('/api/transactions') JSON endpoint feeding a 120-row scrollable table (tests browser_extract mode:"network" & scanVertical)
+       4. 150 realistic nav/sidebar links + offscreen footer controls (tests viewport-first sorting & includeOffscreen:false compression) -->
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #0f172a;
+      background: #f8fafc;
+    }
+    body.modal-open { overflow: hidden; }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 24px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    .brand { font-size: 16px; font-weight: 700; color: #0f172a; }
+    .top-nav { display: flex; gap: 14px; flex-wrap: wrap; }
+    .top-nav a { color: #475569; text-decoration: none; font-weight: 500; }
+    .top-nav a:hover { color: #2563eb; }
+    .shell {
+      display: grid;
+      grid-template-columns: 240px 1fr;
+      gap: 20px;
+      padding: 20px 24px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    aside {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 14px;
+    }
+    aside h2 {
+      margin: 14px 0 6px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #64748b;
+    }
+    aside h2:first-child { margin-top: 0; }
+    .nav-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 2px;
+    }
+    .nav-list a {
+      display: block;
+      padding: 5px 8px;
+      border-radius: 6px;
+      color: #334155;
+      text-decoration: none;
+      font-size: 13px;
+    }
+    .nav-list a[aria-current="page"] {
+      background: #e0e7ff;
+      color: #3730a3;
+      font-weight: 600;
+    }
+    main { display: grid; gap: 18px; align-content: start; }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .kpi {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .kpi .label { font-size: 12px; color: #64748b; }
+    .kpi .val { font-size: 20px; font-weight: 700; margin-top: 2px; }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 18px 20px;
+    }
+    .card h1, .card h2 { margin: 0 0 12px; }
+    .card h1 { font-size: 18px; }
+    .card h2 { font-size: 16px; }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px 16px;
+    }
+    .field { display: grid; gap: 5px; position: relative; }
+    .field label { font-size: 12px; font-weight: 600; color: #475569; }
+    input[type="text"], input[type="number"], input[type="email"], select {
+      font: inherit;
+      padding: 8px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      background: #ffffff;
+      color: #0f172a;
+      width: 100%;
+    }
+    input[aria-invalid="true"], select[aria-invalid="true"] {
+      border-color: #dc2626;
+      background: #fef2f2;
+    }
+    .combobox-listbox {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      z-index: 30;
+      margin: 4px 0 0;
+      padding: 4px;
+      list-style: none;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.12);
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .combobox-listbox[hidden] { display: none; }
+    .combobox-listbox li {
+      padding: 7px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .combobox-listbox li:hover,
+    .combobox-listbox li[aria-selected="true"] {
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-weight: 600;
+    }
+    .checkbox-row {
+      grid-column: span 2;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    button {
+      font: inherit;
+      padding: 8px 14px;
+      border-radius: 7px;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #0f172a;
+      cursor: pointer;
+    }
+    button.primary {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #ffffff;
+      font-weight: 600;
+    }
+    .banner {
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+    .banner.error {
+      background: #fef2f2;
+      border: 1px solid #fca5a5;
+      color: #991b1b;
+    }
+    .banner.success {
+      background: #ecfdf5;
+      border: 1px solid #6ee7b7;
+      color: #065f46;
+    }
+    .table-scroll {
+      max-height: 360px;
+      overflow-y: auto;
+      overflow-x: auto;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      min-width: 780px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead th {
+      position: sticky;
+      top: 0;
+      background: #f1f5f9;
+      text-align: left;
+      padding: 9px 10px;
+      border-bottom: 1px solid #e2e8f0;
+      color: #475569;
+      font-weight: 600;
+    }
+    tbody td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #f1f5f9;
+      white-space: nowrap;
+    }
+    footer {
+      margin-top: 40px;
+      padding: 28px 24px 48px;
+      background: #ffffff;
+      border-top: 1px solid #e2e8f0;
+    }
+    .footer-inner {
+      max-width: 1440px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 20px;
+    }
+    .cookie-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(15, 23, 42, 0.55);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .cookie-backdrop[hidden] { display: none; }
+    .cookie-consent-modal {
+      width: 100%;
+      max-width: 480px;
+      background: #ffffff;
+      border-radius: 14px;
+      padding: 22px 24px;
+      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.35);
+    }
+    .cookie-consent-modal h2 { margin: 0 0 8px; font-size: 18px; }
+    .cookie-consent-modal p { margin: 0 0 16px; color: #475569; }
+    .cookie-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  </style>
+</head>
+<body class="modal-open">
+  <div id="cookie-consent-backdrop" class="cookie-backdrop">
+    <div id="cookie-consent-modal" class="cookie-consent-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
+      <h2 id="cookie-title">Cookie &amp; Privacy Preferences</h2>
+      <p>We use cookies to remember workspace filters, secure sessions, and measure treasury dashboard performance.</p>
+      <div class="cookie-actions">
+        <button type="button" id="cookie-reject">Reject non-essential</button>
+        <button type="button" id="cookie-accept" class="primary">Accept All</button>
+      </div>
+    </div>
+  </div>
+
+  <header>
+    <div class="brand">Acme Treasury SPA</div>
+    <nav class="top-nav" aria-label="Primary navigation">
+      <a href="#overview">Overview</a>
+      <a href="#transactions" aria-current="page">Transactions</a>
+      <a href="#approvals">Approvals</a>
+      <a href="#budgets">Budgets</a>
+      <a href="#vendors">Vendors</a>
+      <a href="#audit">Audit Log</a>
+      <a href="#settings">Settings</a>
+    </nav>
+  </header>
+
+  <div class="shell">
+    <aside aria-label="Workspace directory">
+      <h2>Quick Navigation</h2>
+      <ul class="nav-list" id="sidebar-links"></ul>
+    </aside>
+
+    <main>
+      <section class="kpis" aria-label="Summary metrics">
+        <div class="kpi"><div class="label">Loaded Transactions</div><div class="val" id="kpi-count">—</div></div>
+        <div class="kpi"><div class="label">Total Volume (USD)</div><div class="val" id="kpi-volume">—</div></div>
+        <div class="kpi"><div class="label">Pending Approval</div><div class="val" id="kpi-pending">—</div></div>
+        <div class="kpi"><div class="label">API Source</div><div class="val" id="kpi-source">Loading…</div></div>
+      </section>
+
+      <section class="card" id="expense-section">
+        <h1>New Treasury Transaction</h1>
+        <div id="validation-toast" class="banner error" role="alert" aria-live="assertive" hidden></div>
+        <div id="success-banner" class="banner success" role="status" aria-live="polite" hidden></div>
+
+        <form id="transaction-form" novalidate>
+          <div class="form-grid">
+            <div class="field">
+              <label for="vendor">Vendor</label>
+              <input id="vendor" name="vendor" type="text" required placeholder="e.g. Northwind Cloud" />
+            </div>
+
+            <div class="field">
+              <label for="amount">Amount (USD)</label>
+              <input id="amount" name="amount" type="number" step="0.01" min="0.01" required placeholder="0.00" />
+            </div>
+
+            <div class="field">
+              <label for="category">Category</label>
+              <select id="category" name="category">
+                <option value="Cloud hosting">Cloud hosting</option>
+                <option value="Software">Software</option>
+                <option value="Travel">Travel</option>
+                <option value="Meals">Meals</option>
+                <option value="Hardware">Hardware</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="cost-center">Cost Center</label>
+              <input
+                id="cost-center"
+                name="costCenter"
+                type="text"
+                role="combobox"
+                aria-label="Cost Center"
+                aria-autocomplete="list"
+                aria-expanded="false"
+                aria-controls="cost-center-listbox"
+                placeholder="Select cost center…"
+                autocomplete="off"
+              />
+              <ul id="cost-center-listbox" class="combobox-listbox" role="listbox" aria-label="Cost Center options" hidden>
+                <li role="option" data-value="ENG-101 Platform">ENG-101 Platform</li>
+                <li role="option" data-value="FIN-202 Treasury">FIN-202 Treasury</li>
+                <li role="option" data-value="OPS-303 Infrastructure">OPS-303 Infrastructure</li>
+                <li role="option" data-value="SEC-404 Security">SEC-404 Security</li>
+                <li role="option" data-value="MKT-505 Growth">MKT-505 Growth</li>
+              </ul>
+            </div>
+
+            <div class="checkbox-row">
+              <input id="billable" name="billable" type="checkbox" />
+              <label for="billable">Client billable reimbursement</label>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button type="button" id="reset-btn">Clear Form</button>
+            <button type="submit" id="submit-btn" class="primary">Submit Transaction</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card" id="transactions">
+        <h2>Ledger Transactions (120 rows)</h2>
+        <div class="table-scroll" id="transactions-scroll" tabindex="0" aria-label="Scrollable transactions table">
+          <table id="transactions-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Vendor</th>
+                <th>Category</th>
+                <th>Cost Center</th>
+                <th>Date</th>
+                <th>Amount</th>
+                <th>Billable</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="transactions-tbody">
+              <tr><td colspan="8">Fetching /api/transactions…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer aria-label="Footer controls">
+    <div class="footer-inner">
+      <div class="field">
+        <label for="digest-email">Monthly Treasury Digest</label>
+        <input id="digest-email" type="email" placeholder="finance@acme.example" />
+        <button type="button" id="digest-subscribe">Subscribe Digest</button>
+      </div>
+      <div class="field">
+        <label for="footer-region">Reporting Region</label>
+        <select id="footer-region">
+          <option value="US-East">US-East (USD)</option>
+          <option value="EU-Central">EU-Central (EUR)</option>
+          <option value="AP-Tokyo">AP-Tokyo (JPY)</option>
+        </select>
+        <button type="button" id="export-archive">Export Audit Archive</button>
+      </div>
+      <div>
+        <strong>Compliance &amp; Pagination</strong>
+        <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+          <button type="button" id="footer-prev">Previous Ledger</button>
+          <button type="button" id="footer-next">Next Ledger</button>
+          <a href="#policy">Privacy Policy</a>
+          <a href="#soc2">SOC 2 Report</a>
+          <a href="#status">System Status</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      "use strict";
+
+      // 1. Cookie consent overlay dismissal
+      var backdrop = document.getElementById("cookie-consent-backdrop");
+      function closeCookieModal() {
+        backdrop.hidden = true;
+        document.body.classList.remove("modal-open");
+      }
+      document.getElementById("cookie-accept").addEventListener("click", closeCookieModal);
+      document.getElementById("cookie-reject").addEventListener("click", closeCookieModal);
+
+      // 2. Populate 150 realistic sidebar links (tests viewport-first sorting & includeOffscreen:false)
+      var sections = [
+        "Core Workspaces",
+        "Cost Centers",
+        "Regional Ledgers",
+        "Vendor Portals",
+        "Compliance Reports",
+        "API Integrations"
+      ];
+      var linkGroups = [
+        "Overview", "Cash Flow", "Corporate Cards", "Reimbursements", "Wire Transfers",
+        "Payroll Runs", "Tax Withholding", "FX Hedging", "Treasury Yield", "Cap Table",
+        "Invoice Queue", "Purchase Orders", "Contract Renewals", "Cloud Spend", "SaaS Licenses",
+        "Travel Desk", "Audit Trail", "Board Pack", "Variance Analysis", "Forecast Q1",
+        "Forecast Q2", "Forecast Q3", "Forecast Q4", "Close Checklist", "Subsidiary Sync"
+      ];
+      var sidebar = document.getElementById("sidebar-links");
+      var linkIndex = 0;
+      for (var s = 0; s < sections.length; s++) {
+        for (var g = 0; g < linkGroups.length; g++) {
+          linkIndex += 1;
+          var li = document.createElement("li");
+          var a = document.createElement("a");
+          a.href = "#section-" + linkIndex;
+          a.textContent = sections[s].split(" ")[0] + " · " + linkGroups[g] + " #" + linkIndex;
+          if (linkIndex === 1) a.setAttribute("aria-current", "page");
+          li.appendChild(a);
+          sidebar.appendChild(li);
+        }
+      }
+
+      // 3. Custom ARIA combobox (click/focus -> filter -> click [role="option"])
+      var combo = document.getElementById("cost-center");
+      var listbox = document.getElementById("cost-center-listbox");
+      var optionNodes = Array.prototype.slice.call(listbox.querySelectorAll('[role="option"]'));
+
+      function openListbox() {
+        listbox.hidden = false;
+        combo.setAttribute("aria-expanded", "true");
+      }
+      function closeListbox() {
+        listbox.hidden = true;
+        combo.setAttribute("aria-expanded", "false");
+      }
+      function filterOptions() {
+        var q = combo.value.trim().toLowerCase();
+        optionNodes.forEach(function (opt) {
+          var match = !q || opt.textContent.toLowerCase().indexOf(q) !== -1;
+          opt.hidden = !match;
+        });
+      }
+      combo.addEventListener("focus", function () { filterOptions(); openListbox(); });
+      combo.addEventListener("click", function () { filterOptions(); openListbox(); });
+      combo.addEventListener("input", function () { filterOptions(); openListbox(); });
+      optionNodes.forEach(function (opt) {
+        opt.addEventListener("click", function () {
+          optionNodes.forEach(function (o) { o.setAttribute("aria-selected", "false"); });
+          opt.setAttribute("aria-selected", "true");
+          combo.value = opt.getAttribute("data-value") || opt.textContent;
+          combo.removeAttribute("aria-invalid");
+          closeListbox();
+        });
+      });
+      document.addEventListener("click", function (ev) {
+        if (!combo.contains(ev.target) && !listbox.contains(ev.target)) {
+          closeListbox();
+        }
+      });
+
+      // 4. Async fetch('/api/transactions') -> 120-row scrollable table
+      var allTransactions = [];
+      var tbody = document.getElementById("transactions-tbody");
+
+      function fallbackTransactions() {
+        var vendors = ["Northwind Cloud", "Contoso Analytics", "Fabrikam Air", "Blue Yonder", "Litware Design", "Tailspin Security"];
+        var cats = ["Cloud hosting", "Software", "Travel", "Meals", "Hardware"];
+        var ccs = ["ENG-101 Platform", "FIN-202 Treasury", "OPS-303 Infrastructure", "SEC-404 Security", "MKT-505 Growth"];
+        var statuses = ["Paid", "Approved", "Pending"];
+        var items = [];
+        for (var i = 1; i <= 120; i++) {
+          var day = String(((i - 1) % 28) + 1).padStart(2, "0");
+          var month = String(((i - 1) % 11) + 1).padStart(2, "0");
+          items.push({
+            id: "TXN-" + (1000 + i),
+            vendor: vendors[i % vendors.length] + " " + i,
+            category: cats[i % cats.length],
+            costCenter: ccs[i % ccs.length],
+            date: "2026-" + month + "-" + day,
+            amount: Number((42.5 + ((i * 37.15) % 980)).toFixed(2)),
+            billable: i % 3 === 0,
+            status: statuses[i % statuses.length]
+          });
+        }
+        return { total: items.length, currency: "USD", items: items };
+      }
+
+      function renderTable(items, sourceLabel) {
+        allTransactions = items.slice();
+        var frag = document.createDocumentFragment();
+        var volume = 0;
+        var pending = 0;
+        for (var i = 0; i < items.length; i++) {
+          var row = items[i];
+          volume += Number(row.amount || 0);
+          if (row.status === "Pending") pending += 1;
+          var tr = document.createElement("tr");
+          var cells = [
+            row.id,
+            row.vendor,
+            row.category,
+            row.costCenter,
+            row.date,
+            "$" + Number(row.amount).toFixed(2),
+            row.billable ? "Yes" : "No",
+            row.status
+          ];
+          for (var c = 0; c < cells.length; c++) {
+            var td = document.createElement("td");
+            td.textContent = cells[c];
+            tr.appendChild(td);
+          }
+          frag.appendChild(tr);
+        }
+        tbody.innerHTML = "";
+        tbody.appendChild(frag);
+        document.getElementById("kpi-count").textContent = String(items.length);
+        document.getElementById("kpi-volume").textContent = "$" + volume.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        document.getElementById("kpi-pending").textContent = String(pending);
+        document.getElementById("kpi-source").textContent = sourceLabel;
+      }
+
+      fetch("/api/transactions")
+        .then(function (res) {
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          return res.json();
+        })
+        .then(function (payload) {
+          var items = Array.isArray(payload.items) ? payload.items : [];
+          renderTable(items, "/api/transactions");
+        })
+        .catch(function () {
+          renderTable(fallbackTransactions().items, "local-fallback");
+        });
+
+      // 5. Form validation toast & success banner
+      var form = document.getElementById("transaction-form");
+      var vendorInput = document.getElementById("vendor");
+      var amountInput = document.getElementById("amount");
+      var categorySelect = document.getElementById("category");
+      var billableInput = document.getElementById("billable");
+      var toast = document.getElementById("validation-toast");
+      var successBanner = document.getElementById("success-banner");
+
+      document.getElementById("reset-btn").addEventListener("click", function () {
+        form.reset();
+        [vendorInput, amountInput, combo].forEach(function (el) { el.removeAttribute("aria-invalid"); });
+        toast.hidden = true;
+        successBanner.hidden = true;
+      });
+
+      form.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        var errors = [];
+        var vendor = vendorInput.value.trim();
+        var amount = parseFloat(amountInput.value);
+        var costCenter = combo.value.trim();
+
+        vendorInput.setAttribute("aria-invalid", vendor ? "false" : "true");
+        amountInput.setAttribute("aria-invalid", (!isNaN(amount) && amount > 0) ? "false" : "true");
+        combo.setAttribute("aria-invalid", costCenter ? "false" : "true");
+
+        if (!vendor) errors.push("Vendor is required");
+        if (isNaN(amount) || amount <= 0) errors.push("Amount must be greater than 0");
+        if (!costCenter) errors.push("Cost Center is required");
+
+        if (errors.length > 0) {
+          successBanner.hidden = true;
+          toast.textContent = "Validation error: " + errors.join("; ") + ".";
+          toast.hidden = false;
+          return;
+        }
+
+        toast.hidden = true;
+        var nextId = "TXN-" + (1001 + allTransactions.length);
+        var entry = {
+          id: nextId,
+          vendor: vendor,
+          category: categorySelect.value,
+          costCenter: costCenter,
+          date: "2026-11-26",
+          amount: Number(amount.toFixed(2)),
+          billable: billableInput.checked,
+          status: "Pending"
+        };
+        allTransactions.unshift(entry);
+        renderTable(allTransactions, document.getElementById("kpi-source").textContent);
+        successBanner.textContent = "Transaction " + nextId + " for " + vendor + " ($" + entry.amount.toFixed(2) + ") submitted successfully.";
+        successBanner.hidden = false;
+      });
+    })();
+  </script>
+</body>
+</html>

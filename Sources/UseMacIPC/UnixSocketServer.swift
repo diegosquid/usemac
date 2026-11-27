@@ -472,17 +472,108 @@ public final class UnixSocketServer: @unchecked Sendable {
         }
     }
 
+    private final class AtomicFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value = false
+
+        var value: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _value
+        }
+
+        func set(_ newValue: Bool) {
+            lock.lock()
+            _value = newValue
+            lock.unlock()
+        }
+    }
+
+    private static let maxConcurrentRequestsPerClient = 16
+
+    private final class ClientTaskRegistry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tasks: [UUID: Task<Void, Never>] = [:]
+        private var cancelled = false
+
+        func register(_ id: UUID, task: Task<Void, Never>) {
+            lock.lock()
+            let shouldCancel = cancelled
+            if !shouldCancel {
+                tasks[id] = task
+            }
+            lock.unlock()
+            if shouldCancel {
+                task.cancel()
+            }
+        }
+
+        func remove(_ id: UUID) {
+            lock.lock()
+            tasks.removeValue(forKey: id)
+            lock.unlock()
+        }
+
+        func cancelAll() {
+            lock.lock()
+            cancelled = true
+            let all = Array(tasks.values)
+            tasks.removeAll()
+            lock.unlock()
+            for task in all {
+                task.cancel()
+            }
+        }
+    }
+
+    private static func requiresOrderedExecution(_ request: RPCRequest) -> Bool {
+        if request.actsOnTarget || request.taskStart != nil || request.taskComplete != nil {
+            return true
+        }
+        switch request.method {
+        case .taskStart, .taskComplete, .setPolicy, .pairApp, .skillSave, .browserOpen, .browserBatch, .browserReloadExtension:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func handleClient(clientFd: Int32) {
+        let replyQueue = DispatchQueue(label: "app.usemac.ipc.server.reply.\(clientFd)", qos: .userInteractive)
+        let inFlightGroup = DispatchGroup()
+        let concurrencyLimit = DispatchSemaphore(value: Self.maxConcurrentRequestsPerClient)
+        let taskRegistry = ClientTaskRegistry()
+        let writeFailed = AtomicFlag()
+        var orderedTail: Task<Void, Never>?
+
         defer {
+            if writeFailed.value || !isRunning {
+                taskRegistry.cancelAll()
+            }
+            inFlightGroup.wait()
+            replyQueue.sync {}
             unregisterAndCloseClient(clientFd)
         }
 
+        let sendResponse: @Sendable (RPCResponse) -> Void = { [weak self] response in
+            guard let self, self.isRunning, !writeFailed.value else { return }
+            guard var encoded = try? JSONEncoder().encode(response) else { return }
+            encoded.append(0x0A)
+            replyQueue.async { [weak self] in
+                guard let self, self.isRunning, !writeFailed.value else { return }
+                if !self.writeAll(fd: clientFd, data: encoded) {
+                    writeFailed.set(true)
+                    taskRegistry.cancelAll()
+                    Darwin.shutdown(clientFd, SHUT_RDWR)
+                }
+            }
+        }
+
         let decoder = JSONDecoder()
-        let encoder = JSONEncoder()
         var readBuffer = Data()
         var chunk = [UInt8](repeating: 0, count: 65536)
 
-        while isRunning {
+        while isRunning && !writeFailed.value {
             let bytesRead = Darwin.read(clientFd, &chunk, chunk.count)
             if bytesRead < 0 {
                 if errno == EINTR {
@@ -502,7 +593,9 @@ public final class UnixSocketServer: @unchecked Sendable {
                 while true {
                     let lineLength = readBuffer.distance(from: readBuffer.startIndex, to: newlineIndex)
                     if lineLength > Self.maxRequestBytes {
-                        sendOversizedRequestError(clientFd: clientFd, encoder: encoder)
+                        replyQueue.sync {
+                            sendOversizedRequestError(clientFd: clientFd)
+                        }
                         return
                     }
 
@@ -513,30 +606,38 @@ public final class UnixSocketServer: @unchecked Sendable {
                         lineData.removeLast()
                     }
                     if !lineData.isEmpty {
-                        let response: RPCResponse
                         do {
                             let request = try decoder.decode(RPCRequest.self, from: lineData)
-                            response = awaitService(request)
+                            let svc = service
+                            let ordered = Self.requiresOrderedExecution(request)
+                            let previousOrdered = ordered ? orderedTail : nil
+                            let taskId = UUID()
+                            concurrencyLimit.wait()
+                            inFlightGroup.enter()
+                            let task = Task {
+                                defer {
+                                    taskRegistry.remove(taskId)
+                                    inFlightGroup.leave()
+                                    concurrencyLimit.signal()
+                                }
+                                if let previousOrdered {
+                                    _ = await previousOrdered.value
+                                }
+                                guard !Task.isCancelled, !writeFailed.value else { return }
+                                let response = await svc.handle(request)
+                                sendResponse(response)
+                            }
+                            taskRegistry.register(taskId, task: task)
+                            if ordered {
+                                orderedTail = task
+                            }
                         } catch {
-                            response = RPCResponse.failure(
+                            let failure = RPCResponse.failure(
                                 id: "unknown",
                                 code: "invalid_request",
                                 message: "Failed to decode RPCRequest: \(error.localizedDescription)"
                             )
-                        }
-
-                        guard isRunning else {
-                            return
-                        }
-
-                        do {
-                            var encoded = try encoder.encode(response)
-                            encoded.append(0x0A)
-                            if !writeAll(fd: clientFd, data: encoded) {
-                                return
-                            }
-                        } catch {
-                            return
+                            sendResponse(failure)
                         }
                     }
 
@@ -548,42 +649,24 @@ public final class UnixSocketServer: @unchecked Sendable {
             }
 
             if readBuffer.count > Self.maxRequestBytes {
-                sendOversizedRequestError(clientFd: clientFd, encoder: encoder)
+                replyQueue.sync {
+                    sendOversizedRequestError(clientFd: clientFd)
+                }
                 return
             }
         }
     }
 
-    private func sendOversizedRequestError(clientFd: Int32, encoder: JSONEncoder) {
+    private func sendOversizedRequestError(clientFd: Int32) {
         let response = RPCResponse.failure(
             id: "unknown",
             code: "message_too_large",
             message: "Request exceeds 16 MiB"
         )
-        if var encoded = try? encoder.encode(response) {
+        if var encoded = try? JSONEncoder().encode(response) {
             encoded.append(0x0A)
             _ = writeAll(fd: clientFd, data: encoded)
         }
-    }
-
-    private final class ResponseBox: @unchecked Sendable {
-        var value: RPCResponse?
-    }
-
-    private func awaitService(_ request: RPCRequest) -> RPCResponse {
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = ResponseBox()
-        let svc = service
-        Task {
-            box.value = await svc.handle(request)
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return box.value ?? RPCResponse.failure(
-            id: request.id,
-            code: "internal_error",
-            message: "Service returned no response"
-        )
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {

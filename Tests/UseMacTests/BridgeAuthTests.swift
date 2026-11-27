@@ -528,8 +528,8 @@ final class BridgeAuthTests: XCTestCase {
         let key = try XCTUnwrap(bridge.pairingKeyText().flatMap(BridgeKey.init(text:)))
 
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 3
-        config.timeoutIntervalForResource = 3
+        config.timeoutIntervalForRequest = 0.5
+        config.timeoutIntervalForResource = 0.5
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 
@@ -625,7 +625,7 @@ final class BridgeAuthTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: keyDir) }
 
         let bridge = ChromeExtensionBridge(port: 0, pairingStore: BridgePairingStore(directory: keyDir))
-        bridge.baseCommandTimeoutSeconds = 1
+        bridge.baseCommandTimeoutSeconds = 0.25
         bridge.start()
         defer { bridge.stop() }
 
@@ -656,13 +656,13 @@ final class BridgeAuthTests: XCTestCase {
         let resp = await bridge.act(BrowserActParams(
             profile: "SlowExt",
             tabId: 7,
-            steps: [ActionStep(action: .wait, durationMs: 1000)]
+            steps: [ActionStep(action: .wait, durationMs: 350)]
         ))
         let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000_000.0
 
         XCTAssertFalse(resp.ok)
         XCTAssertEqual(resp.error?.code, "EXTENSION_TIMEOUT")
-        XCTAssertGreaterThanOrEqual(elapsedSeconds, 2.0, "Expected timeout >= 2.0s (1s base + 1s wait), got \(elapsedSeconds)s")
+        XCTAssertGreaterThanOrEqual(elapsedSeconds, 0.55, "Expected timeout >= 0.55s (0.25s base + 0.35s wait), got \(elapsedSeconds)s")
 
         let gotCancel = await waitForBridgeCondition(timeoutMs: 1500) {
             received.snapshot().contains { ($0["type"] as? String) == "cancel" && ($0["tabId"] as? Int) == 7 }

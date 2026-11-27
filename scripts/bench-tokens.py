@@ -22,10 +22,10 @@ import sys
 import urllib.request
 from pathlib import Path
 
-# Compact observation text is dense with ids, roles, coordinates and punctuation, which tokenize into short pieces:
-# a line like `@b11 [AXTextField] "Who did you pay?" (275,165 468x37) {AXConfirm,AXSetValue}` is about 30 tokens for
-# 77 characters. 2.5 characters per token errs on the high side (English prose is closer to 4), so the text side is
-# not undercounted.
+# Compact observation text is dense with ids, roles, labels and punctuation, which tokenize into short pieces:
+# a line like `@b11 [input] "Who did you pay?"` or `@b11 [AXTextField] "Who did you pay?" (275,165 468x37)`
+# tokenizes densely; 2.5 characters per token errs on the high side (English prose is closer to 4), so the text
+# side is never undercounted.
 CHARS_PER_TOKEN = 2.5
 IMAGE_MAX_EDGE = 1568
 IMAGE_MAX_TOKENS = 1600

@@ -118,7 +118,10 @@ struct UseMacCLI {
         .act,
         .browserAct,
         .browserOpen,
-        .visionInstall,
+        .browserBatch,
+        .appMenu,
+        .skillSave,
+        .skillRun,
         .setPolicy,
         .pairApp,
         .browserReloadExtension,
@@ -163,19 +166,28 @@ struct UseMacCLI {
     private static let batchActionAllowedKeys: [String] = [
         "allowStaleSnapshot",
         "app",
+        "diffCrop",
         "expectWindowTitle",
         "foreground",
+        "foregroundFallback",
         "includeScreenshot",
+        "includeTables",
+        "includeText",
+        "maxElements",
+        "observationMode",
         "returnDiffOnly",
+        "returnImageContent",
         "returnObservation",
         "steps",
         "stopOnError",
+        "verify",
+        "waitForIdleMs",
         "window"
     ]
 
     /// Flags shared by every command that sends an `act` batch.
-    private static let batchValueFlags: Set<String> = ["--app", "--expect-title", "--window"]
-    private static let batchBoolFlags: Set<String> = ["--foreground", "--allow-stale"]
+    private static let batchValueFlags: Set<String> = ["--app", "--expect-title", "--window", "--mode", "--verify", "--max-elements"]
+    private static let batchBoolFlags: Set<String> = ["--foreground", "--foreground-fallback", "--allow-stale", "--diff-crop", "--diff-only"]
 
     private static func exitCode(forErrorCode code: String) -> Int32 {
         if code == "DAEMON_REQUIRED" { return 3 }
@@ -197,6 +209,11 @@ struct UseMacCLI {
     }
 
     private static let browserActAllowedKeys: [String] = [
+        "diffCrop",
+        "includeTables",
+        "includeText",
+        "maxElements",
+        "observationMode",
         "profile",
         "readOnly",
         "returnDiffOnly",
@@ -230,7 +247,7 @@ struct UseMacCLI {
             }
             if options.help {
                 // Only group commands take a subcommand word; for the others the next word is data (JSON, text).
-                let isGroup = command == "browser" || command == "vision" || command == "debug"
+                let isGroup = command == "browser" || command == "vision" || command == "debug" || command == "skill"
                 let path = isGroup && !(rest.first?.hasPrefix("-") ?? true) ? [command, rest[0]] : [command]
                 return try printHelp(for: path)
             }
@@ -249,6 +266,8 @@ struct UseMacCLI {
                 return try await handleObserve(args: rest, options: options)
             case "find":
                 return try await handleFind(args: rest, options: options)
+            case "menu":
+                return try await handleMenu(args: rest, options: options)
             case "act":
                 return try await handleAct(args: rest, options: options)
             case "click":
@@ -265,6 +284,11 @@ struct UseMacCLI {
                 return try await handleBrowser(args: rest, options: options)
             case "vision":
                 return try await handleVision(args: rest, options: options)
+            case "skill":
+                if rest.isEmpty || (rest.first?.hasPrefix("-") == true) {
+                    return try handleInstallSkill(args: rest, options: options)
+                }
+                return try await handleSkill(args: rest, options: options)
             case "start":
                 return try await handleTaskStart(args: rest, options: options)
             case "done", "complete", "stop":
@@ -279,7 +303,7 @@ struct UseMacCLI {
                 return try await handleServe(options: options)
             case "mcp":
                 return await handleMCP(options: options)
-            case "install-skill", "skill":
+            case "install-skill":
                 return try handleInstallSkill(args: rest, options: options)
             case "bench":
                 return try await handleBench(args: rest, options: options)
@@ -498,6 +522,17 @@ struct UseMacCLI {
         return value
     }
 
+    private static func parseObservationMode(
+        _ values: [String: String],
+        flag: String = "--mode"
+    ) throws -> ObservationMode? {
+        guard let raw = values[flag] else { return nil }
+        guard let mode = ObservationMode(rawValue: raw) else {
+            throw CLIError.usage("\(flag) expects one of: auto, delta, interactive, full, none.")
+        }
+        return mode
+    }
+
     // MARK: - RPC Execution
 
     private static func executeRPC(
@@ -523,10 +558,17 @@ struct UseMacCLI {
         // In Ask mode a sensitive step waits for the user's answer before it runs.
         let waitMs = timeoutMs + ApprovalTiming.clientAllowanceMs(for: request.method)
         let client = UnixSocketClient(socketPath: options.socketPath, timeoutMs: waitMs, keepAlive: false)
-        if client.isDaemonReachable() {
-            defer { client.close() }
+        defer { client.close() }
+        do {
             let (response, rttMs) = try client.send(request)
             return (response, rttMs, .daemon)
+        } catch let error as UnixSocketClientError {
+            switch error {
+            case .connectionFailed, .socketCreationFailed, .pathTooLong:
+                break
+            default:
+                throw error
+            }
         }
 
         if options.requireDaemon {
@@ -645,8 +687,8 @@ struct UseMacCLI {
     private static func handleObserve(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--app", "--max-depth", "--max-elements", "--role", "--text", "--window"],
-            boolFlags: ["--no-cache", "--diff", "--no-diff", "--screenshot", "--no-offscreen"]
+            valueFlags: ["--app", "--max-depth", "--max-elements", "--role", "--text", "--filter-role", "--filter-text", "--window"],
+            boolFlags: ["--no-cache", "--diff", "--no-diff", "--diff-only", "--screenshot", "--no-offscreen"]
         )
         if let extra = parsed.positionals.first {
             throw CLIError.usage("Unexpected argument '\(extra)'. Run 'usemac help observe'.")
@@ -655,9 +697,14 @@ struct UseMacCLI {
         let maxDepth = try parseOptionalInt(parsed.values, flag: "--max-depth", positive: true)
         let maxElements = try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true)
         let useCache = !parsed.flags.contains("--no-cache")
-        let includeDiff = parsed.flags.contains("--diff") || !parsed.flags.contains("--no-diff")
+        let includeDiff = parsed.flags.contains("--diff") || parsed.flags.contains("--diff-only") || !parsed.flags.contains("--no-diff")
         let includeScreenshot = parsed.flags.contains("--screenshot")
         let filter = ElementMatch(role: parsed.values["--role"], text: parsed.values["--text"])
+        let serverFilter: ElementFilter? = {
+            let role = parsed.values["--filter-role"]
+            let text = parsed.values["--filter-text"]
+            return (role == nil && text == nil) ? nil : ElementFilter(role: role, text: text)
+        }()
 
         let params = ObserveParams(
             app: parsed.values["--app"],
@@ -667,7 +714,8 @@ struct UseMacCLI {
             includeDiff: includeDiff,
             includeScreenshot: includeScreenshot,
             includeOffscreen: parsed.flags.contains("--no-offscreen") ? false : nil,
-            window: parsed.values["--window"]
+            window: parsed.values["--window"],
+            filter: serverFilter
         )
         let req = RPCRequest(method: .observe, observe: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -696,7 +744,8 @@ struct UseMacCLI {
         if !filter.isEmpty {
             print("Filter: \(describeMatch(filter)) → \(snapshot.elements.count) of \(totalElements) elements")
         }
-        print(snapshot.formattedCompactSummary())
+        let diffOnly = parsed.flags.contains("--diff-only") || (snapshot.elements.isEmpty && snapshot.diff != nil)
+        print(snapshot.formattedCompactSummary(maxElements: maxElements ?? 250, returnDiffOnly: diffOnly))
         return 0
     }
 
@@ -796,27 +845,131 @@ struct UseMacCLI {
         return parts.joined(separator: " ")
     }
 
+    private static func parseMenuPathString(_ raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("["),
+           let data = trimmed.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data),
+           !decoded.isEmpty {
+            return decoded
+        }
+        for sep in [" → ", " -> ", " > ", ">", "→", "/"] {
+            if trimmed.contains(sep) {
+                let parts = trimmed.components(separatedBy: sep)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                if !parts.isEmpty { return parts }
+            }
+        }
+        return trimmed.isEmpty ? [] : [trimmed]
+    }
+
+    private static func handleMenu(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let usage = "Usage: usemac menu [--app <name|pid>] [--query <text>] [--invoke \"File > Save\"] | usemac menu invoke --app <name> <Menu> <Item>..."
+        var effectiveArgs = args
+        var isInvokeSub = false
+        if let first = args.first {
+            if first == "invoke" {
+                isInvokeSub = true
+                effectiveArgs = Array(args.dropFirst())
+            } else if first == "list" || first == "search" {
+                effectiveArgs = Array(args.dropFirst())
+            }
+        }
+
+        let parsed = try parseAppAndExtras(
+            args: effectiveArgs,
+            valueFlags: ["--app", "--query", "--invoke"],
+            boolFlags: []
+        )
+        var menuPath: [String]?
+        if let rawInvoke = parsed.values["--invoke"] {
+            let parts = parseMenuPathString(rawInvoke)
+            guard !parts.isEmpty else {
+                throw CLIError.usage("--invoke expects a menu path like \"File > Export as PDF…\".")
+            }
+            menuPath = parts
+        } else if isInvokeSub {
+            guard !parsed.positionals.isEmpty else {
+                throw CLIError.usage("menu invoke needs menu path segments. \(usage)")
+            }
+            menuPath = parsed.positionals
+        }
+
+        let query = menuPath == nil ? (parsed.values["--query"] ?? parsed.positionals.first) : nil
+        let params = AppMenuParams(app: parsed.values["--app"], query: query, menuPath: menuPath)
+        let req = RPCRequest(method: .appMenu, appMenu: params)
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 20_000)
+        try ensureOK(res)
+
+        if options.json {
+            if let menu = res.appMenuResult {
+                printEncodableJSON(menu)
+                return 0
+            }
+            printEncodableJSON(res)
+            return 0
+        }
+
+        guard let menu = res.appMenuResult else {
+            throw CLIError.rpcFailure(code: "empty_menu_result", message: "Response missing AppMenuResult.")
+        }
+        if let invoked = menu.invokedPath, !invoked.isEmpty {
+            let msg = menu.message.map { " — \($0)" } ?? ""
+            print(String(format: "[%@] Menu [%@]: invoked %@%@ (%.2f ms)", mode.rawValue, menu.app, invoked.joined(separator: " → "), msg, rttMs))
+            return 0
+        }
+        let items = menu.items ?? []
+        print(String(format: "[%@] Menu [%@]: %d item(s) (%.2f ms)", mode.rawValue, menu.app, items.count, rttMs))
+        for item in items {
+            let shortcut = item.shortcut.flatMap { $0.isEmpty ? nil : " (\($0))" } ?? ""
+            let disabled = item.enabled ? "" : " [disabled]"
+            print("  • \(item.path.joined(separator: " → "))\(shortcut)\(disabled)")
+        }
+        return 0
+    }
+
     private static func parseBatchArgs(_ args: [String]) throws -> (values: [String: String], flags: Set<String>, positionals: [String]) {
         let parsed = try parseAppAndExtras(args: args, valueFlags: batchValueFlags, boolFlags: batchBoolFlags)
         if let title = parsed.values["--expect-title"], title.trimmingCharacters(in: .whitespaces).isEmpty {
             throw CLIError.usage("--expect-title expects the text the window title must contain.")
         }
+        _ = try parseObservationMode(parsed.values)
+        _ = try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true)
         return parsed
     }
 
     /// Flags win over the same keys in the JSON, so a caller can add a precondition to a saved batch.
-    private static func applyBatchFlags(_ parsed: (values: [String: String], flags: Set<String>, positionals: [String]), to batch: inout BatchActionRequest) {
+    private static func applyBatchFlags(_ parsed: (values: [String: String], flags: Set<String>, positionals: [String]), to batch: inout BatchActionRequest) throws {
         if parsed.flags.contains("--foreground") {
             batch.foreground = true
         }
+        if parsed.flags.contains("--foreground-fallback") {
+            batch.foregroundFallback = true
+        }
         if parsed.flags.contains("--allow-stale") {
             batch.allowStaleSnapshot = true
+        }
+        if parsed.flags.contains("--diff-crop") {
+            batch.diffCrop = true
+        }
+        if parsed.flags.contains("--diff-only") {
+            batch.returnDiffOnly = true
         }
         if let title = parsed.values["--expect-title"] {
             batch.expectWindowTitle = title
         }
         if let window = parsed.values["--window"] {
             batch.window = window
+        }
+        if let obsMode = try parseObservationMode(parsed.values) {
+            batch.observationMode = obsMode
+        }
+        if let verify = parsed.values["--verify"] {
+            batch.verify = verify
+        }
+        if let maxElements = try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true) {
+            batch.maxElements = maxElements
         }
     }
 
@@ -866,7 +1019,7 @@ struct UseMacCLI {
             }
         }
 
-        applyBatchFlags(parsed, to: &batch)
+        try applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
@@ -880,7 +1033,7 @@ struct UseMacCLI {
             app: app,
             steps: [ActionStep(action: .click, app: app, elementId: elementId)]
         )
-        applyBatchFlags(parsed, to: &batch)
+        try applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
@@ -896,7 +1049,7 @@ struct UseMacCLI {
             app: app,
             steps: [ActionStep(action: .setValue, app: app, elementId: elementId, text: text)]
         )
-        applyBatchFlags(parsed, to: &batch)
+        try applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
@@ -911,7 +1064,7 @@ struct UseMacCLI {
             app: app,
             steps: [ActionStep(action: .type, app: app, text: text)]
         )
-        applyBatchFlags(parsed, to: &batch)
+        try applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
@@ -926,7 +1079,7 @@ struct UseMacCLI {
             app: app,
             steps: [ActionStep(action: .pressKey, app: app, key: key, modifiers: modifiers.isEmpty ? nil : modifiers)]
         )
-        applyBatchFlags(parsed, to: &batch)
+        try applyBatchFlags(parsed, to: &batch)
         return try await sendBatchAction(batch, options: options)
     }
 
@@ -949,7 +1102,13 @@ struct UseMacCLI {
             throw CLIError.rpcFailure(code: "empty_action_result", message: "Response missing BatchActionResult.")
         }
 
-        printBatchActionResult(result, rttMs: rttMs, mode: mode)
+        printBatchActionResult(
+            result,
+            rttMs: rttMs,
+            mode: mode,
+            maxElements: batch.maxElements,
+            returnDiffOnly: batch.returnDiffOnly || batch.observationMode == .delta
+        )
         return exitCode(for: result)
     }
 
@@ -957,7 +1116,9 @@ struct UseMacCLI {
         _ result: BatchActionResult,
         rttMs: Double,
         mode: ExecutionMode,
-        headerDetail: String? = nil
+        headerDetail: String? = nil,
+        maxElements: Int? = nil,
+        returnDiffOnly: Bool = false
     ) {
         let detailPart = headerDetail.map { " | \($0)" } ?? ""
         print(String(
@@ -988,7 +1149,7 @@ struct UseMacCLI {
                 extras.append(m)
             }
             let msg = extras.isEmpty ? "" : " — " + extras.joined(separator: " | ")
-            var status = step.success ? "ok" : "error"
+            var status = step.skipped == true ? "skipped" : (step.success ? "ok" : "error")
             if let code = step.errorCode, !code.isEmpty {
                 status += " [\(code)]"
             }
@@ -1013,6 +1174,18 @@ struct UseMacCLI {
         if let code = firstFailureCode(result), let hint = UseMacErrorGuide.hint(for: code) {
             print("Next: \(hint)")
         }
+        if let netErrors = result.networkErrors, !netErrors.isEmpty {
+            print("NetworkErrors (\(netErrors.count)):")
+            for err in netErrors.prefix(10) {
+                print("  ! \(err)")
+            }
+        }
+        if let rect = result.dirtyRect {
+            print(String(format: "DirtyRect: (%.0f,%.0f %.0fx%.0f)", rect.x, rect.y, rect.width, rect.height))
+        }
+        if let deltaOCR = result.visualDeltaOCR, !deltaOCR.isEmpty {
+            print("VisualDeltaOCR: \(deltaOCR)")
+        }
         if let verification = result.visualVerification {
             print("")
             let badge = verification.verified == true ? "PASS" : (verification.verified == false ? "FAIL" : "INFO")
@@ -1034,13 +1207,14 @@ struct UseMacCLI {
         }
         if let obs = result.observation {
             print("")
-            print(obs.formattedCompactSummary())
+            let effectiveDiffOnly = returnDiffOnly || (obs.elements.isEmpty && obs.diff != nil)
+            print(obs.formattedCompactSummary(maxElements: maxElements ?? 250, returnDiffOnly: effectiveDiffOnly))
         }
     }
 
     private static func handleBrowser(args: [String], options: GlobalOptions) async throws -> Int32 {
         guard let subcommand = args.first else {
-            throw CLIError.usage("Usage: usemac browser <status|tabs|open|observe|extract|screenshot|act|reload-extension> ...")
+            throw CLIError.usage("Usage: usemac browser <status|tabs|open|observe|extract|batch|screenshot|act|reload-extension> ...")
         }
         let rest = Array(args.dropFirst())
         switch subcommand {
@@ -1054,6 +1228,8 @@ struct UseMacCLI {
             return try await handleBrowserObserve(args: rest, options: options)
         case "extract":
             return try await handleBrowserExtract(args: rest, options: options)
+        case "batch":
+            return try await handleBrowserBatch(args: rest, options: options)
         case "screenshot":
             return try await handleBrowserScreenshot(args: rest, options: options)
         case "act":
@@ -1063,7 +1239,7 @@ struct UseMacCLI {
         case "help":
             return try printHelp(for: ["browser"] + rest.prefix(1))
         default:
-            throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, screenshot, act, reload-extension.")
+            throw CLIError.usage("Unknown browser subcommand: '\(subcommand)'. Use: status, tabs, open, observe, extract, batch, screenshot, act, reload-extension.")
         }
     }
 
@@ -1174,13 +1350,14 @@ struct UseMacCLI {
     private static func handleBrowserOpen(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab"],
-            boolFlags: ["--same-tab", "--new-tab", "--no-stream", "--activate", "--new-window"]
+            valueFlags: ["--profile", "--tab", "--steps", "--mode"],
+            boolFlags: ["--same-tab", "--new-tab", "--no-stream", "--activate", "--new-window", "--auto-dismiss", "--diff-only"]
         )
-        let usage = "Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream] [--task <taskId>], or: usemac browser open --tab <id> --activate"
+        let usage = "Usage: usemac browser open <url> [--profile <name>] [--tab <id>] [--same-tab|--new-tab] [--activate] [--new-window] [--no-stream] [--auto-dismiss] [--steps '<json>'] [--mode <m>] [--task <taskId>], or: usemac browser open --tab <id> --activate"
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let activate = parsed.flags.contains("--activate")
         let newWindow = parsed.flags.contains("--new-window")
+        let obsMode = try parseObservationMode(parsed.values)
         let url = parsed.positionals.first ?? ""
         // Only "activate this existing tab" may leave out the URL (sent as "").
         if url.isEmpty, !(tabId != nil && activate) {
@@ -1195,12 +1372,24 @@ struct UseMacCLI {
         if newWindow, parsed.flags.contains("--same-tab") {
             throw CLIError.usage("--new-window cannot be combined with --same-tab.")
         }
+        var postSteps: [ActionStep]?
+        if let rawSteps = parsed.values["--steps"] {
+            guard let data = rawSteps.data(using: .utf8) else {
+                throw CLIError.invalidJSON("--steps is not valid UTF-8.")
+            }
+            do {
+                postSteps = try JSONDecoder().decode([ActionStep].self, from: data)
+            } catch {
+                throw CLIError.invalidJSON(formatDecodingError(error))
+            }
+        }
         let openNewTab: Bool = {
             if url.isEmpty { return false }
             if parsed.flags.contains("--same-tab") { return false }
             if parsed.flags.contains("--new-tab") { return true }
             return tabId == nil
         }()
+        let returnDiffOnly = parsed.flags.contains("--diff-only")
         let params = BrowserOpenParams(
             url: url,
             profile: parsed.values["--profile"],
@@ -1209,10 +1398,14 @@ struct UseMacCLI {
             stream: !parsed.flags.contains("--no-stream"),
             activate: activate ? true : nil,
             newWindow: newWindow ? true : nil,
-            taskId: options.taskId
+            taskId: options.taskId,
+            steps: postSteps,
+            autoDismissOverlays: parsed.flags.contains("--auto-dismiss") ? true : nil,
+            returnDiffOnly: returnDiffOnly ? true : nil,
+            observationMode: obsMode
         )
         let req = RPCRequest(method: .browserOpen, browserOpen: params)
-        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 20000)
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: postSteps == nil ? 20000 : 45000)
         try ensureOK(res)
 
         if options.json {
@@ -1225,9 +1418,13 @@ struct UseMacCLI {
         let titlePart = res.browserTitle.map { " — \"\($0)\"" } ?? ""
         let verb = url.isEmpty ? "Chrome tab activated" : (newWindow ? "Chrome opened in a new window" : "Chrome opened")
         print(String(format: "[%@] %@ (%@): %@%@ (%.2f ms)", mode.rawValue, verb, tabStr, resolvedUrl, titlePart, rttMs))
-        if let snapshot = res.snapshot {
+        if let actionResult = res.actionResult {
             print("")
-            print(snapshot.formattedCompactSummary())
+            printBatchActionResult(actionResult, rttMs: rttMs, mode: mode, returnDiffOnly: returnDiffOnly || obsMode == .delta)
+        } else if let snapshot = res.snapshot {
+            print("")
+            let effectiveDiffOnly = returnDiffOnly || obsMode == .delta || (snapshot.elements.isEmpty && snapshot.diff != nil)
+            print(snapshot.formattedCompactSummary(maxElements: 250, returnDiffOnly: effectiveDiffOnly))
         }
         return 0
     }
@@ -1235,7 +1432,7 @@ struct UseMacCLI {
     private static func handleBrowserObserve(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--max-elements", "--width", "--height", "--scale"],
+            valueFlags: ["--profile", "--tab", "--max-elements", "--width", "--height", "--scale", "--filter-role", "--filter-text", "--selector"],
             boolFlags: ["--screenshot", "--no-text", "--no-tables"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
@@ -1243,6 +1440,13 @@ struct UseMacCLI {
         let vpWidth = try parseOptionalInt(parsed.values, flag: "--width", positive: true)
         let vpHeight = try parseOptionalInt(parsed.values, flag: "--height", positive: true)
         let scale = try parseOptionalDouble(parsed.values, flag: "--scale", positive: true)
+        let filter: ElementFilter? = {
+            let role = parsed.values["--filter-role"]
+            let text = parsed.values["--filter-text"]
+            let selector = parsed.values["--selector"]
+            if role == nil && text == nil && selector == nil { return nil }
+            return ElementFilter(role: role, text: text, selector: selector)
+        }()
 
         let params = BrowserObserveParams(
             profile: parsed.values["--profile"],
@@ -1251,6 +1455,7 @@ struct UseMacCLI {
             includeText: !parsed.flags.contains("--no-text"),
             includeTables: !parsed.flags.contains("--no-tables"),
             includeScreenshot: parsed.flags.contains("--screenshot"),
+            filter: filter,
             viewportWidth: vpWidth,
             viewportHeight: vpHeight,
             deviceScaleFactor: scale
@@ -1274,19 +1479,20 @@ struct UseMacCLI {
         let tabInfo = res.browserTabId.map { " | tab=\($0)" } ?? ""
         let urlInfo = res.browserUrl.map { " | \($0)" } ?? ""
         print(String(format: "[%@] RTT: %.2f ms%@%@", mode.rawValue, rttMs, tabInfo, urlInfo))
-        print(snapshot.formattedCompactSummary())
+        print(snapshot.formattedCompactSummary(maxElements: maxElements ?? 250, returnDiffOnly: snapshot.elements.isEmpty && snapshot.diff != nil))
         return 0
     }
 
     private static func handleBrowserExtract(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
-            valueFlags: ["--profile", "--tab", "--selector", "--expr", "--max-chars"],
-            boolFlags: ["--scan-horizontal"]
+            valueFlags: ["--profile", "--tab", "--selector", "--expr", "--max-chars", "--url-filter", "--frame-index"],
+            boolFlags: ["--scan-horizontal", "--scan-vertical"]
         )
         let extractMode = parsed.positionals.first ?? "auto"
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let maxChars = try parseOptionalInt(parsed.values, flag: "--max-chars", positive: true) ?? 16000
+        let frameIndex = try parseOptionalInt(parsed.values, flag: "--frame-index")
         let params = BrowserExtractParams(
             profile: parsed.values["--profile"],
             tabId: tabId,
@@ -1294,7 +1500,10 @@ struct UseMacCLI {
             selector: parsed.values["--selector"],
             expression: parsed.values["--expr"],
             scanHorizontal: parsed.flags.contains("--scan-horizontal"),
-            maxChars: maxChars
+            maxChars: maxChars,
+            urlFilter: parsed.values["--url-filter"],
+            scanVertical: parsed.flags.contains("--scan-vertical") ? true : nil,
+            frameIndex: frameIndex
         )
         let req = RPCRequest(method: .browserExtract, browserExtract: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 35000)
@@ -1318,7 +1527,7 @@ struct UseMacCLI {
             print(tables)
         }
         if let json = ext.jsonResult, !json.isEmpty {
-            print("--- EVAL RESULT ---")
+            print(ext.mode == "network" ? "--- NETWORK RESULT ---" : "--- EVAL RESULT ---")
             print(json)
         }
         if let text = ext.text, !text.isEmpty {
@@ -1334,11 +1543,63 @@ struct UseMacCLI {
         return 0
     }
 
+    private static func handleBrowserBatch(args: [String], options: GlobalOptions) async throws -> Int32 {
+        let parsed = try parseAppAndExtras(
+            args: args,
+            valueFlags: ["--profile", "--mode", "--extract-mode", "--max-elements"],
+            boolFlags: ["--auto-dismiss", "--close-after"]
+        )
+        guard !parsed.positionals.isEmpty else {
+            throw CLIError.usage("Usage: usemac browser batch <url1> [<url2> ...] [--profile <name>] [--mode observe|extract] [--extract-mode <m>] [--max-elements <n>] [--auto-dismiss] [--close-after]")
+        }
+        let maxElements = try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true)
+        let params = BrowserBatchParams(
+            profile: parsed.values["--profile"],
+            urls: parsed.positionals,
+            mode: parsed.values["--mode"],
+            extractMode: parsed.values["--extract-mode"],
+            maxElements: maxElements,
+            autoDismissOverlays: parsed.flags.contains("--auto-dismiss") ? true : nil,
+            closeAfter: parsed.flags.contains("--close-after") ? true : nil
+        )
+        let req = RPCRequest(method: .browserBatch, browserBatch: params)
+        let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 45_000)
+        try ensureOK(res)
+
+        if options.json {
+            if let batch = res.browserBatchResult {
+                printEncodableJSON(batch)
+                return 0
+            }
+            printEncodableJSON(res)
+            return 0
+        }
+
+        guard let batch = res.browserBatchResult else {
+            throw CLIError.rpcFailure(code: "empty_batch_result", message: "Response missing BrowserBatchResult.")
+        }
+        print(String(format: "[%@] Browser batch: %d URL(s) (%.1f ms, rtt=%.1f ms)", mode.rawValue, batch.results.count, batch.totalLatencyMs, rttMs))
+        for (idx, item) in batch.results.enumerated() {
+            let tabStr = item.tabId.map { " | tab=\($0)" } ?? ""
+            let errStr = item.error.flatMap { $0.isEmpty ? nil : " — \($0)" } ?? ""
+            print(String(format: "  [%d] %@ | %@%@ (%.1f ms)%@", idx, item.success ? "OK" : "FAIL", item.url, tabStr, item.latencyMs, errStr))
+            if let ext = item.extract {
+                if let tables = ext.tablesMarkdown, !tables.isEmpty { print(tables) }
+                if let json = ext.jsonResult, !json.isEmpty { print(json) }
+                if let text = ext.text, !text.isEmpty { print(text) }
+            }
+            if let snap = item.snapshot {
+                print(snap.formattedCompactSummary(maxElements: maxElements ?? 250, returnDiffOnly: snap.elements.isEmpty && snap.diff != nil))
+            }
+        }
+        return batch.results.allSatisfy(\.success) ? 0 : 1
+    }
+
     private static func handleBrowserScreenshot(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
             valueFlags: ["--profile", "--tab", "--selector", "--element", "--width", "--height", "--scale", "--quality"],
-            boolFlags: ["--full-page"]
+            boolFlags: ["--full-page", "--diff-crop"]
         )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
         let vpWidth = try parseOptionalInt(parsed.values, flag: "--width", positive: true)
@@ -1355,7 +1616,8 @@ struct UseMacCLI {
             viewportHeight: vpHeight,
             deviceScaleFactor: scale,
             quality: quality,
-            returnImageContent: false
+            returnImageContent: false,
+            diffCrop: parsed.flags.contains("--diff-crop") ? true : nil
         )
         let req = RPCRequest(method: .browserScreenshot, browserScreenshot: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 25000)
@@ -1381,11 +1643,17 @@ struct UseMacCLI {
     }
 
     private static func handleBrowserAct(args: [String], options: GlobalOptions) async throws -> Int32 {
-        let parsed = try parseAppAndExtras(args: args, valueFlags: ["--profile", "--tab", "--verify"], boolFlags: ["--read-only", "--screenshot"])
+        let parsed = try parseAppAndExtras(
+            args: args,
+            valueFlags: ["--profile", "--tab", "--verify", "--mode", "--max-elements"],
+            boolFlags: ["--read-only", "--screenshot", "--diff-crop", "--diff-only"]
+        )
         let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
+        let obsModeOverride = try parseObservationMode(parsed.values)
+        let maxElementsOverride = try parseOptionalInt(parsed.values, flag: "--max-elements", positive: true)
 
         guard let rawInput = parsed.positionals.first else {
-            throw CLIError.usage("Usage: usemac browser act '<steps-or-BrowserActParams-json>' [--profile <name>] [--tab <id>] [--read-only] [--verify \"<condition>\"] [--screenshot]")
+            throw CLIError.usage("Usage: usemac browser act '<steps-or-BrowserActParams-json>' [--profile <name>] [--tab <id>] [--read-only] [--verify \"<condition>\"] [--screenshot] [--mode <m>] [--diff-crop] [--diff-only]")
         }
 
         let jsonString: String
@@ -1410,6 +1678,8 @@ struct UseMacCLI {
         let decoder = JSONDecoder()
         let readOnlyFlag = parsed.flags.contains("--read-only")
         let screenshotFlag = parsed.flags.contains("--screenshot")
+        let diffCropFlag = parsed.flags.contains("--diff-crop")
+        let diffOnlyFlag = parsed.flags.contains("--diff-only")
         let verifyOverride = parsed.values["--verify"]
         var params: BrowserActParams
         if trimmed.hasPrefix("[") {
@@ -1419,9 +1689,13 @@ struct UseMacCLI {
                     profile: parsed.values["--profile"],
                     tabId: tabId,
                     steps: steps,
+                    returnDiffOnly: diffOnlyFlag,
                     readOnly: readOnlyFlag ? true : nil,
                     verify: verifyOverride,
-                    returnImageContent: screenshotFlag ? true : nil
+                    returnImageContent: screenshotFlag ? true : nil,
+                    observationMode: obsModeOverride,
+                    maxElements: maxElementsOverride,
+                    diffCrop: diffCropFlag ? true : nil
                 )
             } catch {
                 throw CLIError.invalidJSON(formatDecodingError(error))
@@ -1448,6 +1722,18 @@ struct UseMacCLI {
             }
             if screenshotFlag {
                 decoded.returnImageContent = true
+            }
+            if let obsModeOverride {
+                decoded.observationMode = obsModeOverride
+            }
+            if let maxElementsOverride {
+                decoded.maxElements = maxElementsOverride
+            }
+            if diffCropFlag {
+                decoded.diffCrop = true
+            }
+            if diffOnlyFlag {
+                decoded.returnDiffOnly = true
             }
             params = decoded
         }
@@ -1477,13 +1763,20 @@ struct UseMacCLI {
             detailParts.append(resUrl)
         }
         let headerDetail = detailParts.isEmpty ? nil : detailParts.joined(separator: " ")
-        printBatchActionResult(result, rttMs: rttMs, mode: mode, headerDetail: headerDetail)
+        printBatchActionResult(
+            result,
+            rttMs: rttMs,
+            mode: mode,
+            headerDetail: headerDetail,
+            maxElements: params.maxElements,
+            returnDiffOnly: params.returnDiffOnly || params.observationMode == .delta
+        )
         return exitCode(for: result)
     }
 
     private static func handleVision(args: [String], options: GlobalOptions) async throws -> Int32 {
         guard let sub = args.first else {
-            throw CLIError.usage("Usage: usemac vision <status|install|ask|verify|describe|locate|diagnose|ocr> ...")
+            throw CLIError.usage("Usage: usemac vision <status|ask|verify|describe|locate|diagnose|ocr> ...")
         }
         let rest = Array(args.dropFirst())
         switch sub {
@@ -1503,24 +1796,9 @@ struct UseMacCLI {
                 throw CLIError.rpcFailure(code: "empty_vision_status", message: "Empty vision status response.")
             }
             print(String(format: "[%@] Local Vision: %@ | backend=%@ | enabled=%@ | rtt=%.2f ms", mode.rawValue, vs.state, vs.backend, vs.enabled ? "yes" : "no", rttMs))
-            print("Model: \(vs.modelId) | runtime=\(vs.runtimeInstalled ? "ok" : "not installed") | weights=\(vs.modelDownloaded ? "ok" : "pending") | worker=\(vs.workerRunning ? "running" : "idle") | Apple OCR=ok")
+            print("Apple Vision OCR: \(vs.ocrAvailable ? "ok" : "unavailable")")
             if let err = vs.lastError, !err.isEmpty {
                 print("Last error: \(err)")
-            }
-            return 0
-
-        case "install":
-            let parsed = try parseAppAndExtras(args: rest, valueFlags: ["--model"])
-            let params = VisionInstallParams(modelId: parsed.values["--model"], enable: true)
-            let req = RPCRequest(method: .visionInstall, visionInstall: params)
-            let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 300_000)
-            try ensureOK(res)
-            if options.json {
-                printEncodableJSON(res)
-                return 0
-            }
-            if let vs = res.visionStatus {
-                print(String(format: "[%@] Vision install complete (%.1f ms): state=%@ model=%@", mode.rawValue, rttMs, vs.state, vs.modelId))
             }
             return 0
 
@@ -1580,7 +1858,7 @@ struct UseMacCLI {
         case "help":
             return try printHelp(for: ["vision"] + rest.prefix(1))
         default:
-            throw CLIError.usage("Unknown vision subcommand: '\(sub)'. Use: status, install, ask, verify, describe, locate, diagnose, or ocr.")
+            throw CLIError.usage("Unknown vision subcommand: '\(sub)'. Use: status, ask, verify, describe, locate, diagnose, or ocr.")
         }
     }
 
@@ -1793,11 +2071,197 @@ struct UseMacCLI {
         return 0
     }
 
+    private static func handleSkill(args: [String], options: GlobalOptions) async throws -> Int32 {
+        guard let sub = args.first else {
+            throw CLIError.usage("Usage: usemac skill <list|save|run|delete> ...")
+        }
+        let rest = Array(args.dropFirst())
+        switch sub {
+        case "list":
+            let parsed = try parseAppAndExtras(
+                args: rest,
+                valueFlags: ["--query", "--kind", "--target", "--app", "--url"]
+            )
+            let params = SkillListParams(
+                query: parsed.values["--query"] ?? parsed.positionals.first,
+                target: parsed.values["--kind"] ?? parsed.values["--target"],
+                app: parsed.values["--app"],
+                url: parsed.values["--url"]
+            )
+            let req = RPCRequest(method: .skillList, skillList: params)
+            let (res, rttMs, mode) = try await executeRPC(req, options: options)
+            try ensureOK(res)
+            if options.json {
+                if let skills = res.skills { printEncodableJSON(skills); return 0 }
+                printEncodableJSON(res)
+                return 0
+            }
+            let skills = res.skills?.skills ?? []
+            print(String(format: "[%@] %d skill(s) (%.2f ms):", mode.rawValue, skills.count, rttMs))
+            for s in skills {
+                let target = s.target ?? "auto"
+                let paramsStr = (s.params?.isEmpty == false) ? " params=[\(s.params!.joined(separator: ","))]" : ""
+                let desc = s.description.flatMap { $0.isEmpty ? nil : " — \($0)" } ?? ""
+                print("  • \(s.name) [\(target)] | \(s.steps.count) steps | runs=\(s.runCount)\(paramsStr)\(desc)")
+            }
+            return 0
+
+        case "delete":
+            let parsed = try parseAppAndExtras(args: rest, valueFlags: [], boolFlags: [])
+            guard let name = parsed.positionals.first, !name.isEmpty else {
+                throw CLIError.usage("Usage: usemac skill delete <name>")
+            }
+            let req = RPCRequest(method: .skillSave, skillSave: SkillSaveParams(name: name, delete: true))
+            let (res, rttMs, mode) = try await executeRPC(req, options: options)
+            try ensureOK(res)
+            if options.json {
+                printEncodableJSON(res)
+                return 0
+            }
+            print(String(format: "[%@] Deleted skill '%@' (%.2f ms)", mode.rawValue, name, rttMs))
+            return 0
+
+        case "save":
+            let parsed = try parseAppAndExtras(
+                args: rest,
+                valueFlags: ["--description", "--kind", "--target", "--app", "--url-pattern"],
+                boolFlags: ["--delete"]
+            )
+            let usage = "Usage: usemac skill save <name> '<steps-json>'|- [--description <text>] [--kind browser|native] [--app <name>] [--url-pattern <glob>] [--delete]"
+            let deleteFlag = parsed.flags.contains("--delete")
+            let params: SkillSaveParams
+            if deleteFlag {
+                guard let name = parsed.positionals.first, !name.isEmpty else {
+                    throw CLIError.usage(usage)
+                }
+                params = SkillSaveParams(name: name, delete: true)
+            } else if parsed.positionals.count == 1,
+                      parsed.positionals[0].trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") {
+                guard let data = parsed.positionals[0].data(using: .utf8) else {
+                    throw CLIError.invalidJSON("Input is not valid UTF-8.")
+                }
+                do {
+                    params = try JSONDecoder().decode(SkillSaveParams.self, from: data)
+                } catch {
+                    throw CLIError.invalidJSON(formatDecodingError(error))
+                }
+            } else {
+                guard parsed.positionals.count >= 2 else {
+                    throw CLIError.usage(usage)
+                }
+                let name = parsed.positionals[0]
+                let rawSteps: String
+                if parsed.positionals[1] == "-" {
+                    let stdinData = FileHandle.standardInput.readDataToEndOfFile()
+                    guard let text = String(data: stdinData, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw CLIError.invalidJSON("Empty stdin input.")
+                    }
+                    rawSteps = text
+                } else {
+                    rawSteps = parsed.positionals[1]
+                }
+                guard let data = rawSteps.data(using: .utf8) else {
+                    throw CLIError.invalidJSON("Steps JSON is not valid UTF-8.")
+                }
+                let steps: [ActionStep]
+                do {
+                    steps = try JSONDecoder().decode([ActionStep].self, from: data)
+                } catch {
+                    throw CLIError.invalidJSON(formatDecodingError(error))
+                }
+                params = SkillSaveParams(
+                    name: name,
+                    description: parsed.values["--description"],
+                    target: parsed.values["--kind"] ?? parsed.values["--target"],
+                    app: parsed.values["--app"],
+                    urlPattern: parsed.values["--url-pattern"],
+                    steps: steps
+                )
+            }
+            let req = RPCRequest(method: .skillSave, skillSave: params)
+            let (res, rttMs, mode) = try await executeRPC(req, options: options)
+            try ensureOK(res)
+            if options.json {
+                if let skills = res.skills { printEncodableJSON(skills); return 0 }
+                printEncodableJSON(res)
+                return 0
+            }
+            if deleteFlag {
+                print(String(format: "[%@] Deleted skill '%@' (%.2f ms)", mode.rawValue, params.name, rttMs))
+            } else if let saved = res.skills?.saved {
+                print(String(format: "[%@] Saved skill '%@' (%d steps, %.2f ms)", mode.rawValue, saved.name, saved.steps.count, rttMs))
+            } else {
+                print(String(format: "[%@] Saved skill '%@' (%.2f ms)", mode.rawValue, params.name, rttMs))
+            }
+            return 0
+
+        case "run":
+            let parsed = try parseAppAndExtras(
+                args: rest,
+                valueFlags: ["--params", "--app", "--profile", "--tab", "--mode"],
+                boolFlags: ["--diff-only", "--no-observation"]
+            )
+            guard let name = parsed.positionals.first, !name.isEmpty else {
+                throw CLIError.usage("Usage: usemac skill run <name> [--params '{\"k\":\"v\"}'] [--app <name>] [--profile <name>] [--tab <id>] [--mode <m>] [--diff-only]")
+            }
+            let tabId = try parseOptionalInt(parsed.values, flag: "--tab")
+            let obsMode = try parseObservationMode(parsed.values)
+            var paramValues: [String: String]?
+            if let rawParams = parsed.values["--params"] {
+                guard let data = rawParams.data(using: .utf8) else {
+                    throw CLIError.invalidJSON("--params is not valid UTF-8.")
+                }
+                do {
+                    paramValues = try JSONDecoder().decode([String: String].self, from: data)
+                } catch {
+                    throw CLIError.invalidJSON(formatDecodingError(error))
+                }
+            }
+            let diffOnly = parsed.flags.contains("--diff-only")
+            let params = SkillRunParams(
+                name: name,
+                params: paramValues,
+                app: parsed.values["--app"],
+                profile: parsed.values["--profile"],
+                tabId: tabId,
+                returnObservation: parsed.flags.contains("--no-observation") ? false : nil,
+                returnDiffOnly: diffOnly ? true : nil,
+                observationMode: obsMode
+            )
+            let req = RPCRequest(method: .skillRun, skillRun: params)
+            let (res, rttMs, mode) = try await executeRPC(req, options: options, timeoutMs: 60_000)
+            try ensureOK(res)
+            if options.json {
+                if let sr = res.skillResult {
+                    printEncodableJSON(sr)
+                    return sr.success ? 0 : (sr.actionResult.map(exitCode(for:)) ?? 1)
+                }
+                printEncodableJSON(res)
+                return 0
+            }
+            guard let sr = res.skillResult else {
+                throw CLIError.rpcFailure(code: "empty_skill_result", message: "Response missing SkillRunResult.")
+            }
+            let msg = sr.message.flatMap { $0.isEmpty ? nil : " — \($0)" } ?? ""
+            print(String(format: "[%@] Skill '%@' %@ (%.1f ms, rtt=%.1f ms)%@", mode.rawValue, sr.name, sr.success ? "OK" : "FAILED", sr.totalLatencyMs, rttMs, msg))
+            if let actionResult = sr.actionResult {
+                printBatchActionResult(actionResult, rttMs: rttMs, mode: mode, returnDiffOnly: diffOnly || obsMode == .delta)
+                return exitCode(for: actionResult)
+            }
+            return sr.success ? 0 : 1
+
+        case "help":
+            return try printHelp(for: ["skill"] + rest.prefix(1))
+        default:
+            throw CLIError.usage("Unknown skill subcommand: '\(sub)'. Use: list, save, run, delete.")
+        }
+    }
+
     private static func handleScreenshot(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(
             args: args,
             valueFlags: ["--app", "--max-dim"],
-            boolFlags: ["--base64"]
+            boolFlags: ["--base64", "--diff-crop"]
         )
 
         let maxDim = try parseOptionalInt(parsed.values, flag: "--max-dim", positive: true) ?? 1280
@@ -1809,7 +2273,8 @@ struct UseMacCLI {
                 app: parsed.values["--app"],
                 maxDimension: maxDim,
                 quality: 0.78,
-                includeBase64: includeBase64
+                includeBase64: includeBase64,
+                diffCrop: parsed.flags.contains("--diff-crop") ? true : nil
             )
         )
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -1845,8 +2310,7 @@ struct UseMacCLI {
     }
 
     private static func handleServe(options: GlobalOptions) async throws -> Int32 {
-        // `serve` stands in for the app, so it is the one engine here that may load the local vision model.
-        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore(), allowsLocalVisionModel: true)
+        let service = UseMacEngineService(socketPath: options.socketPath, auditStore: AuditLogStore())
         let server = UnixSocketServer(socketPath: options.socketPath, service: service, onClientCountChange: nil)
         try server.start()
 
@@ -1890,18 +2354,18 @@ struct UseMacCLI {
         let parsed = try parseAppAndExtras(args: args, valueFlags: ["--iterations", "--app"])
         let iterations = try parseOptionalInt(parsed.values, flag: "--iterations", positive: true) ?? 100
 
-        let probeClient = UnixSocketClient(socketPath: options.socketPath, timeoutMs: 2000, keepAlive: false)
-        let daemonRunning = !options.standalone && probeClient.isDaemonReachable()
-        probeClient.close()
-
         var ephemeralServer: UnixSocketServer?
         let benchSocketPath: String
         let mode: ExecutionMode
+        let client: UnixSocketClient
 
-        if daemonRunning {
+        let daemonClient = UnixSocketClient(socketPath: options.socketPath, timeoutMs: 10000, keepAlive: true)
+        if !options.standalone && daemonClient.ensureConnected() {
             benchSocketPath = options.socketPath
             mode = .daemon
+            client = daemonClient
         } else {
+            daemonClient.close()
             if options.requireDaemon {
                 throw CLIError.daemonRequired("The UseMac daemon is not reachable at \(options.socketPath) (--require-daemon is set).")
             }
@@ -1911,17 +2375,16 @@ struct UseMacCLI {
             try server.start()
             ephemeralServer = server
             mode = .inProcess
+            client = UnixSocketClient(socketPath: benchSocketPath, timeoutMs: 10000, keepAlive: true)
         }
 
         defer {
+            client.close()
             if let server = ephemeralServer {
                 server.stop()
                 try? FileManager.default.removeItem(atPath: benchSocketPath)
             }
         }
-
-        let client = UnixSocketClient(socketPath: benchSocketPath, timeoutMs: 10000, keepAlive: true)
-        defer { client.close() }
 
         // Warmup connection
         _ = try client.send(RPCRequest(method: .ping))
@@ -2208,38 +2671,42 @@ struct UseMacCLI {
           ping                                       Test socket and engine latency
           status                                     Show daemon status, permissions, and telemetry
           apps                                       List running applications
-          observe [--app <n|pid>] [--role <r>] [--text <t>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--no-offscreen] [--screenshot]
+          observe [--app <n|pid>] [--role <r>] [--text <t>] [--filter-role <r>] [--filter-text <t>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--no-offscreen] [--screenshot]
                                                      Capture a compact accessibility snapshot (stable @eN ids)
           find --app <n|pid> [--role <r>] [--text <t>] [--title <t>] [--value <v>] [--exact] [--first] [--max-depth <n>] [--max-elements <n>]
                                                      Search the live accessibility tree with the same rules as act's "match"
-          act '<json>'|- [--app <name>] [--foreground] [--expect-title <text>] [--allow-stale]
+          menu [--app <n|pid>] [--query <q>] [--invoke "File > Save"]
+                                                     Search or invoke native app menu bar items without stealing focus
+          act '<json>'|- [--app <name>] [--foreground] [--foreground-fallback] [--mode <m>] [--diff-crop] [--expect-title <text>] [--allow-stale]
                                                      Execute a BatchActionRequest or [ActionStep]
           click <@eID> [--app <name>]                Click an element by ID
           set <@eID> <text> [--app <name>]           Set the value of an element by ID
           type <text> [--app <name>]                 Type text
           key <chord> [--app <name>]                 Press a key or shortcut (e.g. cmd+shift+p, return)
-                                                     (click, set, type and key also take --foreground, --expect-title, --allow-stale)
-          screenshot [--app <name>] [--max-dim <n>] [--base64]
+                                                     (click, set, type and key also take --foreground, --foreground-fallback, --mode, --diff-crop, --expect-title, --allow-stale)
+          screenshot [--app <name>] [--max-dim <n>] [--diff-crop] [--base64]
                                                      Capture a window or screen screenshot
           browser status                             List Chrome profiles connected to the extension (version, outdated, source)
           browser tabs [--profile <n>] [--query <q>] List open Chrome tabs with tabId, title, and URL
-          browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--activate] [--new-window] [--no-stream]
+          browser open <url> [--profile <name>] [--tab <id>] [--same-tab] [--activate] [--new-window] [--auto-dismiss] [--steps '<json>'] [--mode <m>] [--no-stream]
                                                      Open a URL in a background tab, navigate --tab, or open it in a new window
           browser open --tab <id> --activate         Make an existing tab the active tab of its window (for native observe/act)
-          browser observe [--profile <n>] [--tab <id>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables]
+          browser observe [--profile <n>] [--tab <id>] [--filter-role <r>] [--filter-text <t>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables]
                                                      Inspect DOM (including cross-origin iframes and Shadow DOM), tables, text, and overlays (@b1..@bN)
-          browser extract [auto|tables|text|kpis|eval|downloads] [--profile <n>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]
-                                                     Extract tables/ARIA grids (with horizontal scan), KPIs, text, JS, or downloads
-          browser screenshot [--profile <n>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--width <px>] [--height <px>] [--quality <n>]
+          browser extract [auto|tables|text|kpis|network|eval|downloads] [--profile <n>] [--tab <id>] [--selector <css>] [--url-filter <q>] [--expr <js>] [--scan-horizontal] [--scan-vertical] [--max-chars <n>]
+                                                     Extract tables/ARIA grids, KPIs, text, network JSON, JS, or downloads
+          browser batch <url1> [<url2> ...] [--profile <n>] [--mode observe|extract] [--auto-dismiss] [--close-after]
+                                                     Open and observe/extract multiple URLs in parallel Chrome tabs
+          browser screenshot [--profile <n>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--diff-crop] [--width <px>] [--height <px>] [--quality <n>]
                                                      Capture the tab or one element at its real size (--width/--height: fit the image in that box)
-          browser act '<json>' [--profile <name>] [--tab <id>] [--read-only] [--verify "<condition>"] [--screenshot]
+          browser act '<json>' [--profile <name>] [--tab <id>] [--read-only] [--verify "<condition>"] [--mode <m>] [--diff-crop] [--screenshot]
                                                      Execute BrowserActParams or [ActionStep] in Chrome with optional local verification or screenshot
           browser reload-extension [--profile <n>] [--force]
                                                      Reload the extension so Chrome runs the code now in its folder (stops running browser work)
-          vision status                              Show Local Vision engine status (Apple OCR + MLX-VLM)
-          vision install [--model <hf-repo>]         Optional: install the MLX runtime and a local model (Apple OCR works without it)
+          skill list|save|run|delete ...             Manage and deterministically replay saved automation skills
+          vision status                              Show Local Vision engine status (Apple Vision OCR)
           vision ask|verify|describe|locate|diagnose|ocr ["<text>"] [--profile <n>] [--tab <id>] [--app <n>] [--image <path>] [--selector <css>] [--element <@bID>]
-                                                     Ask Apple OCR, or the on-device model when it is on, about the screen (zero cloud image tokens)
+                                                     Ask Apple Vision OCR about the screen (zero cloud image tokens)
           start [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"] [--agent <name>]
                                                      Start a task (prints its taskId) keeping the live preview open between steps
           stop|done [--profile <n>] [--tab <id>] [--app <n>] [--summary "<text>"]
@@ -2288,6 +2755,10 @@ struct UseMacCLI {
     private static let batchFlagHelp: [(String, String)] = [
         ("--app <name|pid>", "Target app (default: the app in the JSON, else the paired or frontmost app)"),
         ("--foreground", "Foreground burst: bring the app to the front, run the steps with real input, then give focus back. Refused with USER_ACTIVE if the user typed or used the mouse in the last 1.5 s. Use only when a background step had no effect or failed with TARGET_NOT_FRONTMOST."),
+        ("--foreground-fallback", "Automatically escalate to a foreground burst if a background step fails with TARGET_NOT_FRONTMOST"),
+        ("--mode <m>", "Post-action observation mode: auto, delta, interactive, full, none"),
+        ("--diff-crop", "Crop post-action screenshot to the changed dirty rect"),
+        ("--diff-only", "Render only changed/added/removed elements from the post-action diff"),
         ("--expect-title <text>", "Precondition: fail with STALE_SNAPSHOT before any step unless the target window title contains <text> (digits ignored)"),
         ("--allow-stale", "Skip the automatic check that the window still shows what your last observe saw"),
         ("--window <title>", "Act in the window whose title contains this text (default: the window of your last observe)")
@@ -2304,15 +2775,22 @@ struct UseMacCLI {
         ("tabs", "List open Chrome tabs with tabId, title and URL"),
         ("open", "Open a URL in a background tab, navigate a tab, activate a tab, or open a new window"),
         ("observe", "Inspect a tab's DOM (@b1..@bN), tables, text and overlays"),
-        ("extract", "Extract tables, KPIs, text, JS results or session downloads"),
+        ("extract", "Extract tables, KPIs, text, network JSON, JS results or session downloads"),
+        ("batch", "Open and observe/extract multiple URLs in parallel Chrome tabs"),
         ("screenshot", "Capture a JPEG of a tab or one element"),
         ("act", "Run DOM action steps in a tab"),
         ("reload-extension", "Reload the extension so Chrome runs its current code")
     ]
 
+    private static let skillSubcommands: [(String, String)] = [
+        ("list", "List saved automation skills (filter by --query, --kind, --app, --url)"),
+        ("save", "Save or update a parameterized automation skill"),
+        ("run", "Replay a saved skill with --params"),
+        ("delete", "Delete a saved skill by name")
+    ]
+
     private static let visionSubcommands: [(String, String)] = [
-        ("status", "Show Local Vision status (Apple OCR + MLX model)"),
-        ("install", "Optional: install the MLX runtime and a preset model"),
+        ("status", "Show Local Vision status (Apple Vision OCR)"),
         ("ask", "Ask a visual question about the screen"),
         ("verify", "Check a visual assertion (YES/NO + evidence)"),
         ("describe", "Summarize the visible state (errors, values, buttons, modals)"),
@@ -2607,7 +3085,7 @@ struct UseMacCLI {
         case "vision":
             return CommandHelp(
                 usage: ["usemac vision <subcommand> [arguments]"],
-                summary: "On-device vision (Apple Vision OCR plus an optional MLX model). Images never leave the Mac.",
+                summary: "On-device vision (Apple Vision OCR). Images never leave the Mac.",
                 flags: visionSubcommands,
                 notes: ["Run 'usemac help vision <subcommand>' for its flags."],
                 examples: ["usemac vision verify \"Success banner is visible\" --tab 123"]
@@ -2615,16 +3093,9 @@ struct UseMacCLI {
         case "vision status":
             return CommandHelp(
                 usage: ["usemac vision status"],
-                summary: "Show whether OCR and the local model are ready.",
+                summary: "Show whether on-device Apple Vision OCR is ready.",
                 examples: ["usemac vision status"],
-                json: "VisionStatus {state, enabled, backend, modelId, runtimeInstalled, modelDownloaded, workerRunning, lastError}"
-            )
-        case "vision install":
-            return CommandHelp(
-                usage: ["usemac vision install [--model <hf-repo>]"],
-                summary: "Optional. Install the MLX runtime and download one of the three preset models (INVALID_MODEL otherwise). Most tasks don't need it: Apple Vision OCR reads screen text, and a model only adds icons, colors and greyed-out buttons. It loads in the UseMac app on the first visual check and unloads after 5 idle minutes.",
-                flags: [("--model <hf-repo>", "Preset model id (default: the preset selected in Settings)")],
-                examples: ["usemac vision install"]
+                json: "VisionStatus {state, enabled, backend, ocrAvailable, lastError}"
             )
         case "vision ask", "vision verify", "vision describe", "vision locate", "vision diagnose", "vision ocr":
             let mode = String(key.dropFirst("vision ".count))
@@ -2734,7 +3205,66 @@ struct UseMacCLI {
                 summary: "Start the stdio MCP server. Register it in your agent's MCP config as {\"command\": \"<path to usemac>\", \"args\": [\"mcp\"]}.",
                 examples: ["claude mcp add --scope user usemac -- \"/Applications/UseMac.app/Contents/Helpers/usemac\" mcp"]
             )
-        case "install-skill", "skill":
+        case "menu":
+            return CommandHelp(
+                usage: [
+                    "usemac menu [--app <name|pid>] [--query <text>]",
+                    "usemac menu --app <name> --invoke \"File > Export as PDF…\""
+                ],
+                summary: "Search or invoke native macOS application menu bar items in the background without stealing focus.",
+                flags: [
+                    ("--app <name|pid>", "Target app (default: paired or frontmost app)"),
+                    ("--query <text>", "Substring filter when listing menu items"),
+                    ("--invoke <path>", "Menu path to invoke (e.g. \"File > Save\" or JSON array)")
+                ],
+                examples: ["usemac menu --app Notes --query export", "usemac menu --app Notes --invoke \"File > Export as PDF…\""],
+                json: "AppMenuResult {app, items, invokedPath, message}"
+            )
+        case "browser batch":
+            return CommandHelp(
+                usage: ["usemac browser batch <url1> [<url2> ...] [--profile <name>] [--mode observe|extract] [--extract-mode <m>] [--max-elements <n>] [--auto-dismiss] [--close-after]"],
+                summary: "Open and observe or extract multiple URLs concurrently in parallel background Chrome tabs.",
+                flags: [
+                    ("--profile <name>", "Chrome profile name"),
+                    ("--mode <observe|extract>", "Batch mode (default extract)"),
+                    ("--extract-mode <m>", "Extract mode when mode=extract (auto, tables, text, kpis, network)"),
+                    ("--max-elements <n>", "Maximum DOM elements per tab when observing"),
+                    ("--auto-dismiss", "Auto-dismiss cookie/modal overlays on each tab"),
+                    ("--close-after", "Close batch tabs automatically after extraction")
+                ],
+                examples: ["usemac browser batch https://a.test https://b.test --mode extract --close-after"],
+                json: "BrowserBatchResult {results, totalLatencyMs}"
+            )
+        case "skill":
+            return CommandHelp(
+                usage: ["usemac skill <list|save|run|delete> [arguments]"],
+                summary: "Persist and deterministically replay parameterized ({{param}}) automation workflows.",
+                flags: skillSubcommands,
+                notes: ["Run 'usemac help skill <subcommand>' for flags."],
+                examples: ["usemac skill list", "usemac skill run export-pdf --params '{\"name\":\"q4\"}'"]
+            )
+        case "skill list":
+            return CommandHelp(
+                usage: ["usemac skill list [--query <q>] [--kind browser|native] [--app <name>] [--url <url>]"],
+                summary: "List saved automation skills.",
+                examples: ["usemac skill list --kind browser"],
+                json: "SkillListResult {skills}"
+            )
+        case "skill save":
+            return CommandHelp(
+                usage: ["usemac skill save <name> '<steps-json>'|- [--description <text>] [--kind browser|native] [--app <name>] [--url-pattern <glob>] [--delete]"],
+                summary: "Save or update a reusable automation skill.",
+                examples: ["usemac skill save search-docs '[{\"action\":\"setValue\",\"selector\":\"#q\",\"text\":\"{{query}}\" }]' --kind browser"],
+                json: "SkillListResult {saved}"
+            )
+        case "skill run":
+            return CommandHelp(
+                usage: ["usemac skill run <name> [--params '{\"k\":\"v\"}'] [--app <name>] [--profile <name>] [--tab <id>] [--mode <m>] [--diff-only]"],
+                summary: "Deterministically replay a saved skill through UseMac's governed action pipeline.",
+                examples: ["usemac skill run search-docs --params '{\"query\":\"hooks\"}' --tab 123"],
+                json: "SkillRunResult {name, success, actionResult, totalLatencyMs, message}"
+            )
+        case "install-skill":
             return CommandHelp(
                 usage: ["usemac install-skill [--workspace] [--dir <path>] [--force] [--dry-run]"],
                 summary: "Install the usemac SKILL.md, stamped with this Mac's binary and socket path, into every detected agent skills folder.",
@@ -2790,7 +3320,7 @@ struct UseMacCLI {
         var lines: [String] = ["usemac \(key) — \(help.summary)", "", "Usage:"]
         lines.append(contentsOf: help.usage.map { "  \($0)" })
         if !help.flags.isEmpty {
-            let isGroup = key == "browser" || key == "vision" || key == "debug"
+            let isGroup = key == "browser" || key == "vision" || key == "debug" || key == "skill"
             lines.append("")
             lines.append(isGroup ? "Subcommands:" : "Flags:")
             let width = min(28, help.flags.map(\.0.count).max() ?? 0)
@@ -2865,6 +3395,9 @@ struct UseMacCLI {
         let stampedSkill = rawSkill
             .replacingOccurrences(of: "{{USEMAC_BIN}}", with: resolvedBin)
             .replacingOccurrences(of: "{{USEMAC_SOCKET}}", with: options.socketPath)
+        let stampedReference = loadSkillReferenceTemplate(execURL: execURL)?
+            .replacingOccurrences(of: "{{USEMAC_BIN}}", with: resolvedBin)
+            .replacingOccurrences(of: "{{USEMAC_SOCKET}}", with: options.socketPath)
 
         var targetSkillRoots: [URL] = []
         let fm = FileManager.default
@@ -2930,6 +3463,37 @@ struct UseMacCLI {
             let reportedStatus = dryRun ? "would be \(status)" : status
             results.append(InstallSkillTargetResult(path: destFile.path, status: reportedStatus))
 
+            // Keep references/REFERENCE.md in sync alongside SKILL.md whenever the skill itself was installed/updated/up-to-date.
+            if let stampedReference,
+               status == "installed" || status == "updated" || status == "replaced" || status == "up to date" {
+                let refDir = destDir.appendingPathComponent("references", isDirectory: true)
+                let refFile = refDir.appendingPathComponent("REFERENCE.md", isDirectory: false)
+                let refStatus: String
+                if isSymbolicLink(atPath: refDir.path) || isSymbolicLink(atPath: refFile.path) {
+                    refStatus = "skipped (symlink)"
+                } else if !fm.fileExists(atPath: refFile.path) {
+                    refStatus = "installed"
+                    if !dryRun {
+                        try fm.createDirectory(at: refDir, withIntermediateDirectories: true)
+                        try stampedReference.write(to: refFile, atomically: true, encoding: .utf8)
+                    }
+                } else {
+                    let existingRef = try? String(contentsOf: refFile, encoding: .utf8)
+                    if existingRef == stampedReference {
+                        refStatus = "up to date"
+                    } else {
+                        refStatus = "updated"
+                        if !dryRun {
+                            try stampedReference.write(to: refFile, atomically: true, encoding: .utf8)
+                        }
+                    }
+                }
+                results.append(InstallSkillTargetResult(
+                    path: refFile.path,
+                    status: dryRun ? "would be \(refStatus)" : refStatus
+                ))
+            }
+
             let legacyDir = root.appendingPathComponent("macuse", isDirectory: true) // Legacy skill folder from the old product name.
             let legacyFile = legacyDir.appendingPathComponent("SKILL.md", isDirectory: false)
             if !isSymbolicLink(atPath: legacyDir.path),
@@ -2990,6 +3554,24 @@ struct UseMacCLI {
         guard let content else { return false }
         let lines = content.components(separatedBy: .newlines).prefix(10)
         return lines.contains { $0.trimmingCharacters(in: .whitespaces) == "name: macuse" } // Legacy skill folder from the old product name.
+    }
+
+    private static func loadSkillReferenceTemplate(execURL: URL) -> String? {
+        // 1. Inside UseMac.app/Contents/Helpers/usemac -> ../Resources/agent/skills/usemac/references/REFERENCE.md
+        let bundledRef = execURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/agent/skills/usemac/references/REFERENCE.md")
+        if let content = try? String(contentsOf: bundledRef, encoding: .utf8), !content.isEmpty {
+            return content
+        }
+        // 2. Repo-relative fallback during local CLI development
+        let cwdRef = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".agents/skills/usemac/references/REFERENCE.md")
+        if let content = try? String(contentsOf: cwdRef, encoding: .utf8), !content.isEmpty {
+            return content
+        }
+        return nil
     }
 
     private static func loadSkillMarkdownTemplate(execURL: URL) -> String {

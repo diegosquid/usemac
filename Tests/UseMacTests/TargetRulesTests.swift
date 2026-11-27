@@ -442,7 +442,7 @@ final class TargetRulesTests: XCTestCase {
         let keyDir = makeTemporaryBridgeKeyDirectory()
         defer { try? FileManager.default.removeItem(at: keyDir) }
         let bridge = ChromeExtensionBridge(port: 0, pairingStore: BridgePairingStore(directory: keyDir))
-        bridge.baseCommandTimeoutSeconds = 1
+        bridge.baseCommandTimeoutSeconds = 0.15
         bridge.start()
         defer { bridge.stop() }
         let port = await waitForListeningPort(of: bridge)

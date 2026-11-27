@@ -75,6 +75,11 @@ public enum WindowResolver {
         return nil
     }
 
+    nonisolated(unsafe) private static let focusedMainWindowAttrs: CFArray = [
+        kAXFocusedWindowAttribute as CFString,
+        kAXMainWindowAttribute as CFString
+    ] as CFArray
+
     /// The app's target AX window: the pinned window when a pin is set (nil if it is gone), otherwise the
     /// focused window (or its first window), with the CGWindowID behind it.
     public static func focusedWindow(pid: pid_t) -> (element: AXUIElement, windowId: CGWindowID?)? {
@@ -84,11 +89,24 @@ public enum WindowResolver {
         }
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.35)
-        if let focused = copyElement(axApp, kAXFocusedWindowAttribute) {
-            return (focused, windowID(of: focused))
-        }
-        if let main = copyElement(axApp, kAXMainWindowAttribute) {
-            return (main, windowID(of: main))
+        var valuesRef: CFArray?
+        if AXUIElementCopyMultipleAttributeValues(
+            axApp,
+            focusedMainWindowAttrs,
+            AXCopyMultipleAttributeOptions(rawValue: 0),
+            &valuesRef
+        ) == .success, let values = valuesRef as? [AnyObject], values.count >= 2 {
+            for item in values where CFGetTypeID(item) == AXUIElementGetTypeID() {
+                let win = unsafeBitCast(item, to: AXUIElement.self)
+                return (win, windowID(of: win))
+            }
+        } else {
+            if let focused = copyElement(axApp, kAXFocusedWindowAttribute) {
+                return (focused, windowID(of: focused))
+            }
+            if let main = copyElement(axApp, kAXMainWindowAttribute) {
+                return (main, windowID(of: main))
+            }
         }
         var value: CFTypeRef?
         if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value) == .success,

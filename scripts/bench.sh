@@ -8,8 +8,8 @@
 # 2. What an agent reads per look, for each --url (a background Chrome tab, its screenshot fit to 1280x800) and for
 #    --app (a native window): the text UseMac returns (`usemac browser observe` / `usemac observe`, the same text the
 #    MCP tools return) next to a screenshot of the same view (`usemac browser screenshot` / `usemac screenshot`).
-# 3. With --vision: `usemac vision verify "<assertion>"` on the first --url tab, three times, answered by the
-#    on-device model (needs `usemac vision install` first). The first run can include loading the model.
+# 3. With --vision: `usemac vision verify "<assertion>"` on the first --url tab, three times, answered instantly by
+#    on-device Apple Vision OCR (zero setup, no external runtime install required).
 #
 # scripts/bench-tokens.py turns the captures into token counts. They are estimates unless you pass --count-tokens,
 # which sends the captures to Anthropic's count_tokens endpoint (needs ANTHROPIC_API_KEY) for exact counts.

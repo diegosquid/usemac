@@ -6,6 +6,34 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **5 new SOTA RPC methods (29 methods total):**
+  - `app_menu`: search or invoke native macOS app menu bar items via `kAXMenuBarAttribute` in the background without stealing focus.
+  - `browser_batch`: open and `observe` or `extract` multiple URLs concurrently in background Chrome tabs under full site-rule governance.
+  - `skill_save`, `skill_run`, `skill_list`: persist and deterministically replay reusable, parameterized `{{param}}` workflows through the full governed execution pipeline (`SkillStore`).
+- **Zero-ceremony piggybacked task lifecycle:** any RPC request accepts inline `taskStart` and `taskComplete` (MCP: inline `task` / `completeTask`) to eliminate standalone ceremony turns.
+- **Resilient compound action steps (`act` and `browser_act`):** `optional: true` (skip missing targets without aborting a batch), `assert` (`expectText`, `expectNotText`, `expectUrl`, `expectTitle`, `match`, `gone`; fails with `ASSERTION_FAILED`), `scrollUntil` (bounded local scroll loop), `fillForm` (inputs, `<select>`, checkboxes, ARIA comboboxes, validation error surfacing; fails with `FORM_FILL_FAILED`), `menuAction` (direct background menu bar click), and live `match` resolution in Chrome.
+- **One-turn Chrome navigation (`browser_open`):** supports `autoDismissOverlays: true` and inline `steps` so agents open, dismiss modals, act, and receive the settled snapshot in a single turn.
+- **Passive CDP network capture & vertical table scanning:** `browser_extract(mode: "network", urlFilter: "...")` reads captured XHR/Fetch JSON directly from an in-memory CDP ring buffer; `browser_extract(mode: "tables")` adds `scanVertical: true` for vertically virtualized tables; `eval` adds `frameIndex`; `browser_act` surfaces `4xx`/`5xx` `networkErrors`; `browser_observe` discovers WebMCP tools (`webMcpTools`).
+- **Observation & screenshot compression:** `observationMode` (`auto`, `delta`, `interactive`, `full`, `none`), server-side `filter` (`role`, `text`, `selector`, `viewportOnly`), viewport-first sorting with `includeOffscreen: false` default (`offscreenCount`), compact short-role lines (`btn`, `input`, `link`, …), and `16×10` tile dirty-rect `diffCrop: true` screenshots.
+- **Native Apple Vision OCR fusion & negation-safe `verify`:** automatic `@v1..@vN` OCR node fusion on AX-blind native windows, negation-safe on-device OCR `verify` on both native `act` and `browser_act`, and `<20 ms` dirty-rect OCR deltas (`visualDeltaOCR`).
+- **SOTA benchmark suite:** `scripts/bench-sota.py` and realistic local SPA fixture `scripts/bench/spa-fixture.html` measuring MCP schema + skill context tax, IPC/AX/menu/skill/OCR latencies, SPA compression & network extraction, and an Amdahl end-to-end wall-clock/token model with `--compare`.
+- **CLI SOTA subcommands & flags:** `usemac menu`, `usemac browser batch`, `usemac skill list|save|run`, plus `--diff-crop`, `--mode`, `--filter-role`, `--filter-text`, `--url-filter`, `--scan-vertical`, `--auto-dismiss`, and `--foreground-fallback`.
+
+### Changed
+
+- **MCP schema diet (9 tools + legacy aliases):** consolidated MCP `tools/list` into 9 compact, orthogonal tools (`usemac_observe`, `usemac_act`, `usemac_browser_open`, `usemac_browser_extract`, `usemac_screenshot`, `usemac_discover`, `usemac_vision`, `usemac_skill`, `usemac_session`) while preserving all legacy tool names as backwards-compatible `tools/call` aliases.
+- **Skill context diet:** slimmed `.agents/skills/usemac/SKILL.md` from ~45 KB to a ≤ 5.5 KB high-signal core guide with full reference details moved to `.agents/skills/usemac/references/REFERENCE.md`.
+- **Batched native AX & event-driven waits:** `AXIndexer` batches attribute reads via `AXUIElementCopyMultipleAttributeValues`, moves `AXObserver` onto a background runloop for millisecond `waitForChange` wakes, sets `AXManualAccessibility` for Electron/Chromium windows, and ignores sub-5 px frame jitter in diffs. Chrome `observeTab` keeps stable `@bN` refs via a per-document `WeakMap` and runs event-driven `MutationObserver` `waitFor`.
+- **Unix socket concurrent pipelining:** replaced blocking per-connection semaphore serialization with concurrent async dispatch and serialized reply writes over persistent connections.
+- **Inline MCP `.image` support & diff/maxElements fixes:** `usemac_observe`, `usemac_act`, and `usemac_screenshot` now return inline image blocks for both native apps and Chrome, and `maxElements` / `returnDiffOnly` are honored across MCP and CLI formatters.
+- **Fewer spurious retries:** softened same-window `STALE_SNAPSHOT` with per-element liveness checks, added opt-in `foregroundFallback` and `waitForIdleMs`, reported reformatted `setValue` changes as `effect: changed`, and fixed the spurious `browser_act` auto-reflex trigger on small UI clicks.
+
+### Removed
+
+- **Python / MLX sidecar and `vision_install`:** removed `vision_install`, `INVALID_MODEL`, and `scripts/usemac-vision-worker.py` in favor of instant, zero-setup on-device Apple Vision OCR (`VNRecognizeTextRequest`) and dirty-rect diff cropping.
+
 ## [0.8.0-beta.1] - 2026-11-26
 
 ### Changed

@@ -5,23 +5,84 @@ import UseMacProtocol
 /// its task's last tab instead of the last tab any agent touched, an acting request waits (`TARGET_BUSY`) while
 /// another running task holds its window or tab, what the request did counts toward the task's `task_complete`
 /// summary, and its preview cards show the task's agent. Requests of no task run exactly as before.
+///
+/// Supports zero-ceremony piggybacked lifecycle: any non-`task_start` request may carry `taskStart` to start a task
+/// inline (stamping `taskId` onto the response), and any non-`task_complete` request may carry `taskComplete` to
+/// finish the task right after the request executes (attaching `taskSummary` onto the response).
 extension UseMacEngineService {
     public func handle(_ request: RPCRequest) async -> RPCResponse {
-        let scope = taskTabs.scope(request)
-        let agent = request.method == .taskStart
-            ? TaskTabRegistry.cleanAgent(request.taskStart?.agent)
-            : taskTabs.agent(of: scope.taskId)
-        let response = await TaskActivityContext.$agentName.withValue(agent) {
-            await TaskActivityContext.$taskId.withValue(scope.taskId) {
-                await handleScoped(request, scope: scope)
+        // Wrap the entire lifecycle (including piggybacked taskStart/taskComplete) in AuditRequestContext
+        // so task summaries that echo typed values or skill params are scrubbed when text recording is off.
+        await AuditRequestContext.$request.withValue(request) {
+            var workingRequest = request
+            var startedTaskId: String?
+
+            // Zero-ceremony piggybacked task_start on any non-taskStart request.
+            if workingRequest.method != .taskStart, let inlineStart = workingRequest.taskStart {
+                let taskId = startTaskInline(inlineStart, explicitTaskId: workingRequest.taskId)
+                startedTaskId = taskId
+                workingRequest.taskId = taskId
+                if workingRequest.method == .browserOpen, workingRequest.browserOpen?.taskId == nil {
+                    workingRequest.browserOpen?.taskId = taskId
+                }
             }
+
+            let scope = taskTabs.scope(workingRequest)
+            let effectiveTaskId = scope.taskId ?? startedTaskId
+            let agent: String? = {
+                if workingRequest.method == .taskStart {
+                    return TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent)
+                }
+                if let inlineAgent = TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent) {
+                    return inlineAgent
+                }
+                return taskTabs.agent(of: effectiveTaskId)
+            }()
+
+            var response = await AuditRequestContext.$request.withValue(workingRequest) {
+                await TaskActivityContext.$agentName.withValue(agent) {
+                    await TaskActivityContext.$taskId.withValue(effectiveTaskId) {
+                        await handleScoped(workingRequest, scope: scope)
+                    }
+                }
+            }
+
+            if let startedTaskId, response.taskId == nil {
+                response.taskId = startedTaskId
+            }
+
+            // Zero-ceremony piggybacked task_complete on any non-taskComplete request.
+            if workingRequest.method != .taskComplete, let inlineComplete = workingRequest.taskComplete {
+                let completionTaskId = inlineComplete.taskId ?? effectiveTaskId ?? workingRequest.namedTaskId
+                let completion = AuditRequestContext.$request.withValue(workingRequest) {
+                    TaskActivityContext.$agentName.withValue(agent) {
+                        TaskActivityContext.$taskId.withValue(completionTaskId) {
+                            completeTaskInline(
+                                inlineComplete,
+                                taskId: completionTaskId,
+                                fallbackTabId: response.browserTabId ?? workingRequest.namedTabId,
+                                fallbackProfile: workingRequest.namedProfile,
+                                success: response.ok
+                            )
+                        }
+                    }
+                }
+                if response.taskId == nil {
+                    response.taskId = completion.taskId ?? completionTaskId
+                }
+                response.taskSummary = completion.summary
+            }
+
+            // Audit entries don't carry error codes; a problem report lists them from here.
+            problemReports.record(response, of: workingRequest, taskId: effectiveTaskId)
+            return response
         }
-        // Audit entries don't carry error codes; a problem report lists them from here.
-        problemReports.record(response, of: request, taskId: scope.taskId)
-        return response
     }
 
     private func handleScoped(_ request: RPCRequest, scope initialScope: TaskTabRegistry.Scope) async -> RPCResponse {
+        if request.method == .skillRun {
+            return await handleScopedSkillRun(request, initialScope: initialScope)
+        }
         var scope = initialScope
         if let busy = leaseConflict(scope) {
             let refused = targetBusyResponse(request: scope.request, busy: busy)
@@ -50,6 +111,43 @@ extension UseMacEngineService {
         return response
     }
 
+    /// Expands a `skill_run` into its underlying `.browserAct`/`.act` BEFORE task scoping and window/tab leasing,
+    /// so saved skills obey task tab isolation and `TARGET_BUSY` locks identically to direct actions and are
+    /// accounted for once in the task summary.
+    private func handleScopedSkillRun(_ request: RPCRequest, initialScope: TaskTabRegistry.Scope) async -> RPCResponse {
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        switch prepareSkillRun(request, startNs: startNs) {
+        case .failure(let errorResponse):
+            taskTabs.record(initialScope, response: errorResponse)
+            return errorResponse
+        case .success(let prepared):
+            let expandedScope = taskTabs.scope(prepared.delegatedRequest)
+            if let busy = leaseConflict(expandedScope) {
+                let refused = targetBusyResponse(request: expandedScope.request, busy: busy)
+                taskTabs.record(expandedScope, response: refused)
+                return refused
+            }
+            var execResp = await handleRequest(expandedScope.request)
+            if let staleTabId = expandedScope.filledTabId, Self.isClosedTabError(execResp) {
+                taskTabs.forgetTab(staleTabId)
+                execResp = .failure(
+                    id: request.id,
+                    code: "NO_USEMAC_TAB",
+                    message: "Tab \(staleTabId), the last tab this task worked in, is closed. Pass a tabId (see browser_tabs), or open a tab with browser_open.",
+                    latencyMs: execResp.serverLatencyMs
+                )
+            }
+            let finalResponse = finalizeSkillRun(
+                request: request,
+                prepared: prepared,
+                execResp: execResp,
+                startNs: startNs
+            )
+            taskTabs.record(expandedScope, response: finalResponse)
+            return finalResponse
+        }
+    }
+
     /// Leases the window or tab an acting request works in for its task, or says which running task holds it. Reads
     /// never wait, requests of no task are never refused, and a Kill Switch or pause answers POLICY_BLOCKED first.
     private func leaseConflict(_ scope: TaskTabRegistry.Scope) -> TaskTabRegistry.Busy? {
@@ -60,20 +158,32 @@ extension UseMacEngineService {
         return taskTabs.claim(scope, windows: leaseWindows(for: request), tabs: request.namedTabId.map { [$0] } ?? [])
     }
 
-    /// The windows a native `act` works in: the target window of each app it names (the `window` it pins, else the
-    /// app's focused window), or the whole app when UseMac can't tell the window.
+    /// The windows a native `act` or mutating `app_menu` works in: the target window of each app it names (the `window`
+    /// it pins, else the app's focused window), or the whole app when UseMac can't tell the window.
     private func leaseWindows(for request: RPCRequest) -> [TaskTabRegistry.WindowLease] {
-        guard request.method == .act, let batch = request.act else { return [] }
-        var queries: [String?] = batch.steps.contains { $0.app == nil } ? [batch.app] : []
-        for step in batch.steps {
-            if let app = step.app, !queries.contains(app) { queries.append(app) }
+        var queries: [String?] = []
+        var pinnedWindow: String?
+        if request.method == .act, let batch = request.act {
+            if batch.steps.contains(where: { $0.app == nil }) {
+                queries.append(batch.app)
+            }
+            for step in batch.steps {
+                if let app = step.app, !queries.contains(app) { queries.append(app) }
+            }
+            pinnedWindow = batch.window
+        } else if request.method == .appMenu, let menu = request.appMenu,
+                  menu.menuPath?.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) == true {
+            queries.append(menu.app)
+        } else {
+            return []
         }
+
         var leases: [TaskTabRegistry.WindowLease] = []
         for query in queries {
             guard case .app(let app) = workspaceMonitor.resolveTarget(query: query), app.pid > 0 else { continue }
             var windowId = app.windowId
             var title = app.windowTitle
-            if let wanted = batch.window?.trimmingCharacters(in: .whitespacesAndNewlines), !wanted.isEmpty,
+            if let wanted = pinnedWindow?.trimmingCharacters(in: .whitespacesAndNewlines), !wanted.isEmpty,
                let element = WindowResolver.window(pid: app.pid, titleContains: wanted) {
                 windowId = WindowResolver.windowID(of: element).map { UInt32($0) }
                 title = wanted

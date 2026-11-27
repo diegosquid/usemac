@@ -154,27 +154,17 @@ final class ProtocolAndIPCTests: XCTestCase {
         let toolNames = Set(tools.compactMap { $0["name"] as? String })
 
         let expectedTools = [
-            "usemac_status",
-            "usemac_list_apps",
             "usemac_observe",
             "usemac_act",
-            "usemac_screenshot",
-            "usemac_highlight",
-            "usemac_browser_tabs",
             "usemac_browser_open",
-            "usemac_browser_observe",
             "usemac_browser_extract",
-            "usemac_browser_screenshot",
-            "usemac_browser_act",
-            "usemac_vision_status",
-            "usemac_vision_query",
-            "usemac_task_start",
-            "usemac_task_complete",
-            "usemac_report_prepare"
+            "usemac_screenshot",
+            "usemac_discover",
+            "usemac_vision",
+            "usemac_skill",
+            "usemac_session"
         ]
-        for expected in expectedTools {
-            XCTAssertTrue(toolNames.contains(expected), "Missing MCP tool: \(expected)")
-        }
+        XCTAssertEqual(toolNames, Set(expectedTools))
 
         // Verify usemac_act includes openURL, hover, uploadFile, selector, and files in action schema
         if let actTool = tools.first(where: { ($0["name"] as? String) == "usemac_act" }),
@@ -670,7 +660,7 @@ final class ProtocolAndIPCTests: XCTestCase {
                 suggestedAction: "Click close X button",
                 suggestedX: 1103.3,
                 suggestedY: 279.4,
-                source: "mlx-vlm",
+                source: "apple-vision-ocr",
                 latencyMs: 320
             )
         )
@@ -1205,9 +1195,9 @@ final class ProtocolAndIPCTests: XCTestCase {
 
         let vRes = VisionQueryResult(
             mode: "verify",
-            backend: "mlx-vlm",
-            modelId: LocalVisionModelPreset.qwen35_08B.rawValue,
-            latencyMs: 312.5,
+            backend: "apple-vision-ocr",
+            modelId: nil,
+            latencyMs: 24.5,
             answer: "CNAME Record gru.rp.dezeneiro.com.br is visible with no errors.",
             verified: true
         )
@@ -1232,11 +1222,8 @@ final class ProtocolAndIPCTests: XCTestCase {
         XCTAssertEqual(decodedBatch.visualVerification?.verified, true)
         XCTAssertEqual(decodedBatch.visualVerification?.mode, "verify")
 
-        // 2. Verify Apple Vision OCR fallback handles ask / verify / describe cleanly when MLX is disabled
+        // 2. Verify Apple Vision OCR handles ask / verify / describe cleanly
         let engine = LocalVisionEngine()
-        let wasEnabled = engine.currentStatus().enabled
-        engine.setEnabled(false)
-        defer { engine.setEnabled(wasEnabled) }
 
         let tmpDir = FileManager.default.temporaryDirectory
         let blankPath = tmpDir.appendingPathComponent("usemac-ut-blank-\(UUID().uuidString).jpg").path
@@ -1260,27 +1247,28 @@ final class ProtocolAndIPCTests: XCTestCase {
         XCTAssertEqual(describeRes.mode, "describe")
         XCTAssertEqual(describeRes.backend, "apple-vision-ocr")
 
-        // 3. Verify MCP tools/list exposes the new vision modes & browser_act verify parameter
+        // 3. Verify MCP tools/list exposes consolidated usemac_vision & usemac_act verify parameter
         let sockPath = makeTempSocketPath(prefix: "usemac-ut-mcp-vis")
         let service = UseMacEngineService(socketPath: sockPath)
         let mcp = MCPStdioServer(socketPath: sockPath, fallbackService: service)
         let rawList = await mcp.processLine(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
         let listJSON = try parseJSON(try XCTUnwrap(rawList))
         let tools = try XCTUnwrap((listJSON["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        let visionToolOpt: [String: Any]? = tools.first(where: { ($0["name"] as? String) == "usemac_vision_query" })
+        let visionToolOpt: [String: Any]? = tools.first(where: { ($0["name"] as? String) == "usemac_vision" })
         let visionTool = try XCTUnwrap(visionToolOpt)
         let visionProps = try XCTUnwrap((visionTool["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])
         let modeEnum = try XCTUnwrap((visionProps["mode"] as? [String: Any])?["enum"] as? [String])
-        XCTAssertTrue(modeEnum.contains("ask"))
+        XCTAssertTrue(modeEnum.contains("ocr"))
         XCTAssertTrue(modeEnum.contains("verify"))
-        XCTAssertTrue(modeEnum.contains("describe"))
+        XCTAssertTrue(modeEnum.contains("locate"))
+        XCTAssertTrue(modeEnum.contains("diagnose"))
         XCTAssertNotNil(visionProps["selector"])
         XCTAssertNotNil(visionProps["elementId"])
 
-        let browserActToolOpt: [String: Any]? = tools.first(where: { ($0["name"] as? String) == "usemac_browser_act" })
-        let browserActTool = try XCTUnwrap(browserActToolOpt)
-        let browserActProps = try XCTUnwrap((browserActTool["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])
-        XCTAssertNotNil(browserActProps["verify"])
+        let actToolOpt: [String: Any]? = tools.first(where: { ($0["name"] as? String) == "usemac_act" })
+        let actTool = try XCTUnwrap(actToolOpt)
+        let actProps = try XCTUnwrap((actTool["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])
+        XCTAssertNotNil(actProps["verify"])
     }
 
     func testChromeBridgeRejectsWebPageOriginHeader() async throws {
@@ -1296,8 +1284,8 @@ final class ProtocolAndIPCTests: XCTestCase {
         let pairingKey = try XCTUnwrap(bridge.pairingKeyText().flatMap(BridgeKey.init(text:)))
 
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 3
-        config.timeoutIntervalForResource = 3
+        config.timeoutIntervalForRequest = 0.5
+        config.timeoutIntervalForResource = 0.5
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 
@@ -1496,7 +1484,7 @@ final class ProtocolAndIPCTests: XCTestCase {
         XCTAssertEqual(actIncludeShot, true)
         XCTAssertEqual(actFirstAction, "navigate")
 
-        // D. Verify MCP tools/list exposes tabId on usemac_browser_open, navigate in action enum, and returnImageContent on usemac_browser_act
+        // D. Verify MCP tools/list exposes tabId on usemac_browser_open, navigate in action enum, and returnImageContent on usemac_act
         let rawList = await mcp.processLine(#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#)
         let listJSON = try parseJSON(try XCTUnwrap(rawList))
         let tools = try XCTUnwrap((listJSON["result"] as? [String: Any])?["tools"] as? [[String: Any]])
@@ -1504,7 +1492,7 @@ final class ProtocolAndIPCTests: XCTestCase {
         let openProps = try XCTUnwrap((openTool["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])
         XCTAssertNotNil(openProps["tabId"])
 
-        let actTool = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "usemac_browser_act" }))
+        let actTool = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "usemac_act" }))
         let actProps = try XCTUnwrap((actTool["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])
         XCTAssertNotNil(actProps["returnImageContent"])
         let stepsItems = try XCTUnwrap((actProps["steps"] as? [String: Any])?["items"] as? [String: Any])

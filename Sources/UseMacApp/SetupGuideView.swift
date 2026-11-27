@@ -8,7 +8,6 @@ import UseMacProtocol
 public enum SetupGuideStep: Int, CaseIterable, Identifiable {
     case welcome
     case permissions
-    case vision
     case chrome
     case agent
     case ready
@@ -130,7 +129,6 @@ public struct SetupGuideView: View {
 
     @State private var step: SetupGuideStep
     @State private var movingForward = true
-    @State private var visionChoice: SetupVisionChoice
     @State private var agentChoice: SetupAgentChoice = .claudeCode
     @State private var copiedKey: String?
     /// Chrome step on a build with a store ID: the user chose the bundled folder over the Chrome Web Store.
@@ -148,7 +146,6 @@ public struct SetupGuideView: View {
         self.onRequestFocus = onRequestFocus
         self.appIconOverride = appIcon
         _step = State(initialValue: initialStep)
-        _visionChoice = State(initialValue: SetupVisionChoice.initial(status: appState.visionStatus))
     }
 
     public var body: some View {
@@ -164,8 +161,6 @@ public struct SetupGuideView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .padding(.top, 54)
                 .clipped()
-
-                visionInstallBanner
 
                 footer
             }
@@ -242,7 +237,6 @@ public struct SetupGuideView: View {
         switch step {
         case .welcome: welcomeStep
         case .permissions: permissionsStep
-        case .vision: visionStep
         case .chrome: chromeStep
         case .agent: agentStep
         case .ready: readyStep
@@ -346,7 +340,7 @@ public struct SetupGuideView: View {
                 SetupRow(
                     leading: { SetupSymbolTile(symbol: "rectangle.dashed.badge.record") },
                     title: "Screen Recording",
-                    detail: "Lets agents take screenshots, and shows you a live preview while they work."
+                    detail: "Lets agents take screenshots, run instant on-device Apple Vision OCR, and shows you a live preview while they work."
                 ) {
                     permissionControl(granted: perms.screenRecordingGranted) {
                         appState.triggerPermissionFlow(for: .screenRecording, prompt: true)
@@ -382,65 +376,7 @@ public struct SetupGuideView: View {
         }
     }
 
-    // 3. Local vision
-
-    private var visionStep: some View {
-        let installerAvailable = appState.isLocalVisionInstallerAvailable
-        let vision = appState.visionStatus
-
-        return VStack(spacing: 22) {
-            stepHeader(
-                symbol: "eye.circle",
-                title: "On-device vision is optional",
-                subtitle: "Most tasks don't need it: UseMac reads apps and pages as text, and Apple's OCR reads the rest. A model only adds icons, colors and greyed-out buttons."
-            )
-
-            VStack(spacing: 7) {
-                ForEach(SetupVisionChoice.allChoices, id: \.self) { choice in
-                    SetupChoiceCard(
-                        title: choice.title,
-                        detail: choice.detail,
-                        trailing: choice.trailingLabel(status: vision),
-                        trailingIsPositive: choice.isInstalled(status: vision),
-                        badge: choice.badge,
-                        isSelected: visionChoice == choice,
-                        isEnabled: choice == .textOnly || installerAvailable
-                    ) {
-                        visionChoice = choice
-                    }
-                }
-            }
-            .frame(width: 540)
-
-            Text(installerAvailable
-                 ? "It runs only on your Mac, so those checks never send a screenshot to the cloud. Model from Hugging Face, runtime (about 700 MB) from PyPI."
-                 : "On-device models need the free uv installer. Run brew install uv, then pick a model in Settings → General → Local Vision.")
-                .font(.system(size: 11.5))
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 520)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    private func applyVisionChoice() {
-        switch visionChoice {
-        case .textOnly:
-            if appState.visionStatus.enabled {
-                appState.setLocalVisionEnabled(false)
-            }
-        case .model(let preset):
-            if visionChoice.isInstalled(status: appState.visionStatus) {
-                appState.setLocalVisionEnabled(true)
-            } else if appState.isLocalVisionInstallerAvailable && appState.visionStatus.state != "installing" {
-                appState.selectLocalVisionModel(preset)
-                appState.installLocalVision()
-            }
-        }
-    }
-
-    // 4. Chrome
+    // 3. Chrome
 
     private var chromeStep: some View {
         // Release builds that know the Chrome Web Store ID offer the store first, no Developer mode needed.
@@ -531,7 +467,7 @@ public struct SetupGuideView: View {
         }
     }
 
-    // 5. Agent
+    // 4. Agent
 
     private var agentStep: some View {
         let prompt = agentChoice.usesMCP ? appState.mcpAgentPrompt : appState.socketAgentPrompt
@@ -601,7 +537,7 @@ public struct SetupGuideView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // 6. Ready
+    // 5. Ready
 
     private var readyStep: some View {
         VStack(spacing: 26) {
@@ -667,35 +603,6 @@ public struct SetupGuideView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: Vision install banner
-
-    @ViewBuilder
-    private var visionInstallBanner: some View {
-        let vision = appState.visionStatus
-        if step.rawValue > SetupGuideStep.vision.rawValue {
-            if vision.state == "installing" {
-                HStack(spacing: 8) {
-                    SetupSpinner(size: 11)
-                    Text("Setting up on-device vision · \(vision.installProgress ?? "Preparing…")")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                .padding(.bottom, 12)
-                .transition(.opacity)
-            } else if let error = vision.lastError, !error.isEmpty {
-                Text("On-device vision couldn't be set up: \(error). You can retry in Settings → General → Local Vision.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(UseMacTheme.statusAmber)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 560)
-                    .padding(.bottom, 12)
-                    .transition(.opacity)
-            }
-        }
-    }
-
     // MARK: Footer
 
     private var footer: some View {
@@ -744,16 +651,6 @@ public struct SetupGuideView: View {
             return "Get Started"
         case .permissions, .chrome, .agent:
             return "Continue"
-        case .vision:
-            switch visionChoice {
-            case .textOnly:
-                return "Continue"
-            case .model(let preset):
-                if visionChoice.isInstalled(status: appState.visionStatus) || !appState.isLocalVisionInstallerAvailable {
-                    return "Continue"
-                }
-                return "Download \(SetupVisionChoice.downloadSize(preset)) & Continue"
-            }
         case .ready:
             return "Start Using UseMac"
         }
@@ -775,9 +672,6 @@ public struct SetupGuideView: View {
 
     private func primaryAction() {
         switch step {
-        case .vision:
-            applyVisionChoice()
-            advance()
         case .ready:
             onFinish()
         default:
@@ -797,74 +691,6 @@ public struct SetupGuideView: View {
 }
 
 // MARK: - Choices
-
-enum SetupVisionChoice: Hashable {
-    case textOnly
-    case model(LocalVisionModelPreset)
-
-    static let allChoices: [SetupVisionChoice] = [
-        .textOnly,
-        .model(.qwen35_08B),
-        .model(.qwen25VL3B),
-        .model(.holo1_3B)
-    ]
-
-    /// Text only unless a model is already installed and on: the model is an opt-in download.
-    static func initial(status: VisionStatus) -> SetupVisionChoice {
-        let current = LocalVisionModelPreset(rawValue: status.modelId)
-        if status.runtimeInstalled && status.modelDownloaded, let current {
-            return status.enabled ? .model(current) : .textOnly
-        }
-        return .textOnly
-    }
-
-    static func downloadSize(_ preset: LocalVisionModelPreset) -> String {
-        switch preset {
-        case .qwen35_08B: return "620 MB"
-        case .qwen25VL3B: return "2.1 GB"
-        case .holo1_3B: return "1.9 GB"
-        }
-    }
-
-    var title: String {
-        switch self {
-        case .textOnly: return "Text only"
-        case .model(.qwen35_08B): return "Qwen3.5 0.8B"
-        case .model(.qwen25VL3B): return "Qwen2.5-VL 3B"
-        case .model(.holo1_3B): return "Holo1 3B"
-        }
-    }
-
-    var detail: String {
-        switch self {
-        case .textOnly: return "Reads apps, pages and screen text. Enough for most tasks."
-        case .model(.qwen35_08B): return "Fastest. Good for quick visual checks."
-        case .model(.qwen25VL3B): return "Best balance of speed and accuracy."
-        case .model(.holo1_3B): return "Tuned for finding buttons and controls."
-        }
-    }
-
-    var badge: SetupBadge? {
-        switch self {
-        case .textOnly: return SetupBadge(text: "Included", tint: UseMacTheme.statusGreen)
-        default: return nil
-        }
-    }
-
-    func isInstalled(status: VisionStatus) -> Bool {
-        guard case .model(let preset) = self else { return false }
-        return status.runtimeInstalled && status.modelDownloaded && status.modelId == preset.rawValue
-    }
-
-    func trailingLabel(status: VisionStatus) -> String {
-        switch self {
-        case .textOnly:
-            return "No download"
-        case .model(let preset):
-            return isInstalled(status: status) ? "Installed" : Self.downloadSize(preset)
-        }
-    }
-}
 
 enum SetupAgentChoice: String, CaseIterable, Hashable {
     case claudeCode

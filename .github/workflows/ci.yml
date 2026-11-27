@@ -48,7 +48,18 @@ jobs:
         run: swift build
 
       - name: swift test
-        run: swift test
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee /tmp/swift-test.log
+        continue-on-error: false
+
+      - name: Summarize Swift test failures
+        if: failure()
+        run: |
+          if [[ -f /tmp/swift-test.log ]]; then
+            echo "=== Failed Swift tests ==="
+            grep -nE "failed|XCTAssert|error:" /tmp/swift-test.log | tail -n 100 || true
+          fi
 
       - name: Extension tests
         run: node --test Tests/ExtensionTests/*.test.mjs
