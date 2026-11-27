@@ -109,6 +109,8 @@ public struct RPCRequest: Codable, Sendable {
     public var debugCapture: DebugCaptureParams?
     /// The caller's agent or client name, independent of whether a task is open.
     public var agent: String?
+    /// Optional time (0...30_000 ms, default 0) to wait for another task's window/tab lease to release before returning `TARGET_BUSY`.
+    public var waitForLeaseMs: Int?
 
     public init(
         id: String = UUID().uuidString,
@@ -139,7 +141,8 @@ public struct RPCRequest: Codable, Sendable {
         browserReloadExtension: BrowserReloadExtensionParams? = nil,
         reportPrepare: ReportPrepareParams? = nil,
         debugCapture: DebugCaptureParams? = nil,
-        agent: String? = nil
+        agent: String? = nil,
+        waitForLeaseMs: Int? = nil
     ) {
         self.id = id
         self.method = method
@@ -170,6 +173,7 @@ public struct RPCRequest: Codable, Sendable {
         self.reportPrepare = reportPrepare
         self.debugCapture = debugCapture
         self.agent = agent
+        self.waitForLeaseMs = waitForLeaseMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -203,6 +207,23 @@ public struct RPCRequest: Codable, Sendable {
         self.reportPrepare = try c.decodeIfPresent(ReportPrepareParams.self, forKey: .reportPrepare)
         self.debugCapture = try c.decodeIfPresent(DebugCaptureParams.self, forKey: .debugCapture)
         self.agent = try c.decodeIfPresent(String.self, forKey: .agent)
+        self.waitForLeaseMs = try c.decodeIfPresent(Int.self, forKey: .waitForLeaseMs)
+    }
+
+    public static let maxWaitForLeaseMs = 30_000
+
+    /// Clamped lease wait budget (0...30_000 ms) from the top-level envelope or method payload.
+    public var effectiveWaitForLeaseMs: Int {
+        let raw: Int = {
+            if let ms = waitForLeaseMs { return ms }
+            if let ms = act?.waitForLeaseMs { return ms }
+            if let ms = browserAct?.waitForLeaseMs { return ms }
+            if let ms = browserOpen?.waitForLeaseMs { return ms }
+            if let ms = appMenu?.waitForLeaseMs { return ms }
+            if let ms = skillRun?.waitForLeaseMs { return ms }
+            return 0
+        }()
+        return min(max(0, raw), Self.maxWaitForLeaseMs)
     }
 }
 

@@ -112,7 +112,22 @@ public final class TaskTabRegistry: @unchecked Sendable {
 
     private var tasks: [String: RunningTask] = [:]
     private var pendingBrowserOpens = 0
+    private var leaseWaiters: [LeaseWaiter] = []
     private let lock = NSLock()
+
+    struct LeaseWait {
+        let id: UUID
+        let signals: AsyncStream<Void>
+        let signal: AsyncStream<Void>.Continuation
+    }
+
+    private struct LeaseWaiter {
+        let id: UUID
+        let taskId: String
+        let signal: AsyncStream<Void>.Continuation
+        var windows: [WindowLease]
+        var tabs: [Int]
+    }
 
     public init() {}
 
@@ -167,6 +182,52 @@ public final class TaskTabRegistry: @unchecked Sendable {
         lock.lock()
         let expiredTaskIds = expire(now: now)
         defer { unlockAndClearExpiredPins(expiredTaskIds) }
+        return claimLocked(scope, windows: windows, tabs: tabs, now: now)
+    }
+
+    /// Claims immediately if possible; otherwise queues atomically with the first conflict check. Only
+    /// overlapping waiters compete for FIFO priority, so an unrelated busy window does not stall this one.
+    func claimWithWait(
+        _ scope: Scope, windows: [WindowLease], tabs: [Int], wait: LeaseWait? = nil
+    ) -> (busy: Busy?, wait: LeaseWait?) {
+        lock.lock()
+        let now = Date()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
+
+        let index = wait.flatMap { ticket in leaseWaiters.firstIndex { $0.id == ticket.id } } ?? leaseWaiters.endIndex
+        if index != leaseWaiters.endIndex,
+           leaseWaiters[index].windows != windows || leaseWaiters[index].tabs != tabs {
+            leaseWaiters[index].windows = windows
+            leaseWaiters[index].tabs = tabs
+            signalLeaseWaiters()
+        }
+        let busy = claimLocked(scope, windows: windows, tabs: tabs, now: now,
+                               earlierWaiters: leaseWaiters.prefix(index))
+        guard let busy, wait == nil, let taskId = scope.taskId ?? Self.clean(scope.request.namedTaskId) else {
+            return (busy, wait)
+        }
+        let id = UUID()
+        let (signals, signal) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        leaseWaiters.append(LeaseWaiter(id: id, taskId: taskId, signal: signal, windows: windows, tabs: tabs))
+        return (busy, LeaseWait(id: id, signals: signals, signal: signal))
+    }
+
+    func finishLeaseWait(_ wait: LeaseWait) {
+        lock.lock(); defer { lock.unlock() }
+        guard let index = leaseWaiters.firstIndex(where: { $0.id == wait.id }) else { return }
+        leaseWaiters.remove(at: index).signal.finish()
+        signalLeaseWaiters()
+    }
+
+    private func signalLeaseWaiters() {
+        for waiter in leaseWaiters { waiter.signal.yield(()) }
+    }
+
+    private func claimLocked(
+        _ scope: Scope, windows: [WindowLease], tabs: [Int], now: Date,
+        earlierWaiters: ArraySlice<LeaseWaiter> = []
+    ) -> Busy? {
         let requester = scope.taskId.flatMap { tasks[$0] != nil ? $0 : nil }
         guard requester != nil || Self.clean(scope.request.namedTaskId) != nil else { return nil }
         for (id, task) in tasks where id != requester {
@@ -177,6 +238,10 @@ public final class TaskTabRegistry: @unchecked Sendable {
             if let tab = tabs.first(where: { task.tabIds.contains($0) || task.leasedTabIds.contains($0) }) {
                 return Busy(taskId: id, agent: task.agent, target: "Chrome tab \(tab)", idleSeconds: idle)
             }
+        }
+        if !earlierWaiters.isEmpty,
+           let busy = earlierWaiterConflict(earlierWaiters, requester: requester, windows: windows, tabs: tabs, now: now) {
+            return busy
         }
         guard let requester else { return nil }
         for window in windows {
@@ -191,6 +256,26 @@ public final class TaskTabRegistry: @unchecked Sendable {
             tasks[requester]?.leasedTabIds.insert(tab)
         }
         tasks[requester]?.lastActivityAt = now
+        return nil
+    }
+
+    private func earlierWaiterConflict(
+        _ waiters: ArraySlice<LeaseWaiter>, requester: String?, windows: [WindowLease], tabs: [Int], now: Date
+    ) -> Busy? {
+        let held = requester.flatMap { tasks[$0] }
+        // Let a holder reuse its leases, even when another task is queued behind it.
+        let newWindows = windows.filter { wanted in
+            held?.windowLeases.contains { $0.pid == wanted.pid && ($0.windowId == nil || $0.windowId == wanted.windowId) } != true
+        }
+        let newTabs = tabs.filter { held?.tabIds.contains($0) != true && held?.leasedTabIds.contains($0) != true }
+        for waiter in waiters where waiter.taskId != requester {
+            let target = newWindows.first { wanted in waiter.windows.contains { $0.overlaps(wanted) } }?.label
+                ?? newTabs.first(where: waiter.tabs.contains).map { "Chrome tab \($0)" }
+            if let target {
+                let idle = tasks[waiter.taskId].map { max(0, Int(now.timeIntervalSince($0.lastActivityAt))) } ?? 0
+                return Busy(taskId: waiter.taskId, agent: tasks[waiter.taskId]?.agent, target: target, idleSeconds: idle)
+            }
+        }
         return nil
     }
 
@@ -320,6 +405,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
         let expiredTaskIds = expire(now: now)
         defer { unlockAndClearExpiredPins(expiredTaskIds) }
         if let finished = resolveLocked(taskId: taskId, tabId: tabId), let task = tasks.removeValue(forKey: finished) {
+            signalLeaseWaiters()
             let closing = keepTabs ? [] : task.openedTabIds.filter { task.tabIds.contains($0) && !keepTabIds.contains($0) }
             let summary = TaskSummary(
                 taskId: finished,
@@ -356,6 +442,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
             tasks[key]?.leasedTabIds.remove(tabId)
             tasks[key]?.recentTabs.removeAll { $0.tabId == tabId }
         }
+        signalLeaseWaiters()
     }
 
     /// Tabs running tasks own: the cleanup after another task's `task_complete` must leave them open.
@@ -447,6 +534,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
         for id in expired {
             tasks.removeValue(forKey: id)
         }
+        if !expired.isEmpty { signalLeaseWaiters() }
         return expired
     }
 

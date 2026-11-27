@@ -89,6 +89,10 @@ public enum ActivityCaption {
         case .menuAction:
             if let last = clipped(step.menuPath?.last, limit: 24) { return "Couldn't choose “\(last)”" }
             return "Couldn't use the menu\(stepSuffix)"
+        case .drag:
+            return couldnt("drag")
+        case .saveFile:
+            return "Couldn't save the file"
         }
     }
 

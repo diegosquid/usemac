@@ -2,8 +2,8 @@ import Foundation
 import Darwin
 
 public enum UseMacDefaults {
-    public static let version = "0.10.0"
-    public static let buildNumber = "66"
+    public static let version = "0.11.0"
+    public static let buildNumber = "67"
     public static let applicationSupportFolderName = "UseMac"
 
     /// Private per-user folder (mode 0700) that holds the default socket, like tmux's `/tmp/tmux-$UID`.
@@ -318,6 +318,7 @@ public struct PageState: Codable, Equatable, Sendable {
     public var scrollableContainers: [String]?
     public var tablesSummary: String?
     public var webMcpTools: [String]?
+    public var lastDialog: BrowserDialogInfo?
 
     public init(
         scrollX: Double = 0,
@@ -336,7 +337,8 @@ public struct PageState: Codable, Equatable, Sendable {
         tablesMarkdown: String? = nil,
         scrollableContainers: [String]? = nil,
         tablesSummary: String? = nil,
-        webMcpTools: [String]? = nil
+        webMcpTools: [String]? = nil,
+        lastDialog: BrowserDialogInfo? = nil
     ) {
         self.scrollX = scrollX
         self.scrollY = scrollY
@@ -355,6 +357,29 @@ public struct PageState: Codable, Equatable, Sendable {
         self.scrollableContainers = scrollableContainers
         self.tablesSummary = tablesSummary
         self.webMcpTools = webMcpTools
+        self.lastDialog = lastDialog
+    }
+}
+
+public struct BrowserDialogInfo: Codable, Equatable, Sendable {
+    public var type: String
+    public var message: String
+    public var defaultPrompt: String?
+    public var accepted: Bool
+    public var promptText: String?
+
+    public init(
+        type: String,
+        message: String,
+        defaultPrompt: String? = nil,
+        accepted: Bool,
+        promptText: String? = nil
+    ) {
+        self.type = type
+        self.message = message
+        self.defaultPrompt = defaultPrompt
+        self.accepted = accepted
+        self.promptText = promptText
     }
 }
 
@@ -506,6 +531,10 @@ public struct WindowSnapshot: Codable, Equatable, Sendable {
             if let webMcpTools = page.webMcpTools, !webMcpTools.isEmpty {
                 lines.append("WebMCP: \(webMcpTools.joined(separator: ", "))")
             }
+            if let dialog = page.lastDialog {
+                let outcome = dialog.accepted ? "accepted" : "dismissed"
+                lines.append("Dialog: [\(dialog.type)] \"\(dialog.message)\" (\(outcome))")
+            }
         }
         if let offscreenCount, offscreenCount > 0 {
             lines.append("Offscreen: \(offscreenCount) elements")
@@ -580,6 +609,10 @@ public enum ActionStepType: String, Codable, Sendable {
     case fillForm
     /// Invokes a native app menu bar item by `menuPath` (e.g. `["File", "Save"]`).
     case menuAction
+    /// Drags from the source target (`elementId`, `selector`, `match`, or `x`/`y`) to `toElementId`/`toSelector`/`toMatch`/`toX`,`toY`.
+    case drag
+    /// Saves/exports a file in a native `NSSavePanel` to `files: [destPath]` (`overwrite` defaults to false).
+    case saveFile
 }
 
 public struct FormFieldEntry: Codable, Equatable, Sendable {
@@ -690,6 +723,18 @@ public struct ActionStep: Codable, Equatable, Sendable {
     public var expectUrl: String?
     /// Expected window/page title substring for `assert`.
     public var expectTitle: String?
+    /// Destination element id for `drag`.
+    public var toElementId: String?
+    /// Destination CSS selector for `drag` (browser).
+    public var toSelector: String?
+    /// Destination semantic match for `drag`.
+    public var toMatch: ElementMatch?
+    /// Destination X coordinate for `drag`.
+    public var toX: Double?
+    /// Destination Y coordinate for `drag`.
+    public var toY: Double?
+    /// For `saveFile`: allow replacing an existing destination file (default false).
+    public var overwrite: Bool?
 
     public init(
         action: ActionStepType,
@@ -722,7 +767,13 @@ public struct ActionStep: Codable, Equatable, Sendable {
         expectText: String? = nil,
         expectNotText: String? = nil,
         expectUrl: String? = nil,
-        expectTitle: String? = nil
+        expectTitle: String? = nil,
+        toElementId: String? = nil,
+        toSelector: String? = nil,
+        toMatch: ElementMatch? = nil,
+        toX: Double? = nil,
+        toY: Double? = nil,
+        overwrite: Bool? = nil
     ) {
         self.action = action
         self.app = app
@@ -755,6 +806,12 @@ public struct ActionStep: Codable, Equatable, Sendable {
         self.expectNotText = expectNotText
         self.expectUrl = expectUrl
         self.expectTitle = expectTitle
+        self.toElementId = toElementId
+        self.toSelector = toSelector
+        self.toMatch = toMatch
+        self.toX = toX
+        self.toY = toY
+        self.overwrite = overwrite
     }
 }
 
@@ -855,6 +912,7 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
     public var verify: String?
     public var foregroundFallback: Bool?
     public var waitForIdleMs: Int?
+    public var waitForLeaseMs: Int?
     public var returnImageContent: Bool?
 
     public init(
@@ -876,6 +934,7 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         verify: String? = nil,
         foregroundFallback: Bool? = nil,
         waitForIdleMs: Int? = nil,
+        waitForLeaseMs: Int? = nil,
         returnImageContent: Bool? = nil
     ) {
         self.app = app
@@ -896,6 +955,7 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         self.verify = verify
         self.foregroundFallback = foregroundFallback
         self.waitForIdleMs = waitForIdleMs
+        self.waitForLeaseMs = waitForLeaseMs
         self.returnImageContent = returnImageContent
     }
 
@@ -919,6 +979,7 @@ public struct BatchActionRequest: Codable, Equatable, Sendable {
         self.verify = try c.decodeIfPresent(String.self, forKey: .verify)
         self.foregroundFallback = try c.decodeIfPresent(Bool.self, forKey: .foregroundFallback)
         self.waitForIdleMs = try c.decodeIfPresent(Int.self, forKey: .waitForIdleMs)
+        self.waitForLeaseMs = try c.decodeIfPresent(Int.self, forKey: .waitForLeaseMs)
         self.returnImageContent = try c.decodeIfPresent(Bool.self, forKey: .returnImageContent)
     }
 }
@@ -934,6 +995,7 @@ public struct BatchActionResult: Codable, Equatable, Sendable {
     public var networkErrors: [String]?
     public var dirtyRect: ScreenRect?
     public var visualDeltaOCR: String?
+    public var dialogs: [BrowserDialogInfo]?
 
     public init(
         success: Bool,
@@ -945,7 +1007,8 @@ public struct BatchActionResult: Codable, Equatable, Sendable {
         screenshot: ScreenshotResult? = nil,
         networkErrors: [String]? = nil,
         dirtyRect: ScreenRect? = nil,
-        visualDeltaOCR: String? = nil
+        visualDeltaOCR: String? = nil,
+        dialogs: [BrowserDialogInfo]? = nil
     ) {
         self.success = success
         self.totalLatencyMs = totalLatencyMs
@@ -957,6 +1020,7 @@ public struct BatchActionResult: Codable, Equatable, Sendable {
         self.networkErrors = networkErrors
         self.dirtyRect = dirtyRect
         self.visualDeltaOCR = visualDeltaOCR
+        self.dialogs = dialogs
     }
 }
 
@@ -1152,6 +1216,9 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
     public var autoDismissOverlays: Bool?
     public var returnDiffOnly: Bool?
     public var observationMode: ObservationMode?
+    public var waitForLeaseMs: Int?
+    public var dialogAction: String?
+    public var dialogPromptText: String?
 
     public init(
         url: String,
@@ -1165,7 +1232,10 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
         steps: [ActionStep]? = nil,
         autoDismissOverlays: Bool? = nil,
         returnDiffOnly: Bool? = nil,
-        observationMode: ObservationMode? = nil
+        observationMode: ObservationMode? = nil,
+        waitForLeaseMs: Int? = nil,
+        dialogAction: String? = nil,
+        dialogPromptText: String? = nil
     ) {
         self.url = url
         self.profile = profile
@@ -1179,6 +1249,9 @@ public struct BrowserOpenParams: Codable, Equatable, Sendable {
         self.autoDismissOverlays = autoDismissOverlays
         self.returnDiffOnly = returnDiffOnly
         self.observationMode = observationMode
+        self.waitForLeaseMs = waitForLeaseMs
+        self.dialogAction = dialogAction
+        self.dialogPromptText = dialogPromptText
     }
 }
 
@@ -1646,6 +1719,9 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
     public var includeText: Bool?
     public var includeTables: Bool?
     public var diffCrop: Bool?
+    public var waitForLeaseMs: Int?
+    public var dialogAction: String?
+    public var dialogPromptText: String?
 
     public init(
         profile: String? = nil,
@@ -1661,7 +1737,10 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
         maxElements: Int? = nil,
         includeText: Bool? = nil,
         includeTables: Bool? = nil,
-        diffCrop: Bool? = nil
+        diffCrop: Bool? = nil,
+        waitForLeaseMs: Int? = nil,
+        dialogAction: String? = nil,
+        dialogPromptText: String? = nil
     ) {
         self.profile = profile
         self.tabId = tabId
@@ -1677,6 +1756,9 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
         self.includeText = includeText
         self.includeTables = includeTables
         self.diffCrop = diffCrop
+        self.waitForLeaseMs = waitForLeaseMs
+        self.dialogAction = dialogAction
+        self.dialogPromptText = dialogPromptText
     }
 
     public init(from decoder: Decoder) throws {
@@ -1695,6 +1777,9 @@ public struct BrowserActParams: Codable, Equatable, Sendable {
         self.includeText = try c.decodeIfPresent(Bool.self, forKey: .includeText)
         self.includeTables = try c.decodeIfPresent(Bool.self, forKey: .includeTables)
         self.diffCrop = try c.decodeIfPresent(Bool.self, forKey: .diffCrop)
+        self.waitForLeaseMs = try c.decodeIfPresent(Int.self, forKey: .waitForLeaseMs)
+        self.dialogAction = try c.decodeIfPresent(String.self, forKey: .dialogAction)
+        self.dialogPromptText = try c.decodeIfPresent(String.self, forKey: .dialogPromptText)
     }
 }
 

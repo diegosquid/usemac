@@ -4,16 +4,25 @@ import XCTest
 @testable import UseMacEngine
 @testable import UseMacProtocol
 
-/// Native `pressKey` key names: the virtual key codes, the INVALID_REQUEST message, and parity with the Chrome
-/// path's key table (`buildKeyDescriptor` in Extension/background.js), so a step means the same in `act` and
-/// `browser_act`.
-final class NativeKeyMapTests: XCTestCase {
-    private static let backgroundJS = URL(fileURLWithPath: #filePath)
+/// Reads the worker entry point followed by its background modules in filename order for source parity checks.
+func readChromeBackgroundSource() throws -> String {
+    let extensionDirectory = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()  // Tests/UseMacTests
         .deletingLastPathComponent()  // Tests
         .deletingLastPathComponent()  // repository root
-        .appendingPathComponent("Extension/background.js")
+        .appendingPathComponent("Extension")
+    let moduleDirectory = extensionDirectory.appendingPathComponent("background")
+    let modules = try FileManager.default.contentsOfDirectory(at: moduleDirectory, includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "js" }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    let scripts = [extensionDirectory.appendingPathComponent("background.js")] + modules
+    return try scripts.map { try String(contentsOf: $0, encoding: .utf8) }.joined(separator: "\n")
+}
 
+/// Native `pressKey` key names: the virtual key codes, the INVALID_REQUEST message, and parity with the Chrome
+/// path's key table (`buildKeyDescriptor`), so a step means the same in `act` and
+/// `browser_act`.
+final class NativeKeyMapTests: XCTestCase {
     /// The native name for each DOM `key` value the Chrome table produces.
     private static let nativeNameForDOMKey: [String: String] = {
         var names = [
@@ -123,7 +132,7 @@ final class NativeKeyMapTests: XCTestCase {
 
     func testEveryChromeKeyNameMeansTheSameNatively() throws {
         let table = try chromeKeyTable()
-        XCTAssertGreaterThan(table.count, 20, "Couldn't read buildKeyDescriptor's table from \(Self.backgroundJS.path)")
+        XCTAssertGreaterThan(table.count, 20, "Couldn't read buildKeyDescriptor's table from the Chrome background scripts")
         for (name, domKey) in table {
             guard let native = NativeKeyMap.keyCode(for: name) else {
                 XCTFail("The Chrome path accepts \"\(name)\" (DOM key \"\(domKey)\") but native pressKey doesn't. Add it to NativeKeyMap.codes.")
@@ -171,7 +180,7 @@ final class NativeKeyMapTests: XCTestCase {
 
     /// `name -> DOM key` for each entry of the `special` table in buildKeyDescriptor.
     private func chromeKeyTable() throws -> [String: String] {
-        let source = try String(contentsOf: Self.backgroundJS, encoding: .utf8)
+        let source = try readChromeBackgroundSource()
         let start = try XCTUnwrap(source.range(of: "function buildKeyDescriptor("), "buildKeyDescriptor is gone")
         let open = try XCTUnwrap(source.range(of: "const special = {", range: start.upperBound..<source.endIndex))
         let close = try XCTUnwrap(source.range(of: "\n  };", range: open.upperBound..<source.endIndex))

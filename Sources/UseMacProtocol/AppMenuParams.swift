@@ -7,15 +7,18 @@ public struct AppMenuParams: Codable, Equatable, Sendable {
     public var query: String?
     /// Menu hierarchy to invoke, e.g. `["File", "Export as PDF…"]`. Omit to list items.
     public var menuPath: [String]?
+    public var waitForLeaseMs: Int?
 
     public init(
         app: String? = nil,
         query: String? = nil,
-        menuPath: [String]? = nil
+        menuPath: [String]? = nil,
+        waitForLeaseMs: Int? = nil
     ) {
         self.app = app
         self.query = query
         self.menuPath = menuPath
+        self.waitForLeaseMs = waitForLeaseMs
     }
 }
 

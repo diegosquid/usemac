@@ -209,6 +209,14 @@ public final class SkillStore: @unchecked Sendable {
                 match.value = interpolateString(match.value, with: params)
                 copy.match = match
             }
+            copy.selector = interpolateString(copy.selector, with: params)
+            copy.toSelector = interpolateString(copy.toSelector, with: params)
+            if var toMatch = copy.toMatch {
+                toMatch.title = interpolateString(toMatch.title, with: params)
+                toMatch.text = interpolateString(toMatch.text, with: params)
+                toMatch.value = interpolateString(toMatch.value, with: params)
+                copy.toMatch = toMatch
+            }
             if var submitMatch = copy.submitMatch {
                 submitMatch.title = interpolateString(submitMatch.title, with: params)
                 submitMatch.text = interpolateString(submitMatch.text, with: params)
@@ -281,6 +289,11 @@ public final class SkillStore: @unchecked Sendable {
             scan(step.expectTitle)
             for item in step.menuPath ?? [] { scan(item) }
             for file in step.files ?? [] { scan(file) }
+            scan(step.selector)
+            scan(step.toSelector)
+            scan(step.toMatch?.title)
+            scan(step.toMatch?.text)
+            scan(step.toMatch?.value)
         }
         return ordered
     }

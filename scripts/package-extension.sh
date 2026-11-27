@@ -28,13 +28,11 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXT_DIR="$ROOT_DIR/Extension"
 DIST_DIR="$ROOT_DIR/dist"
 
-echo "Validating Extension/*.js syntax..."
+echo "Validating JavaScript syntax under Extension/..."
 JS_FILES=()
-for js_file in "$EXT_DIR"/*.js; do
-  if [[ -f "$js_file" ]]; then
-    JS_FILES+=("$js_file")
-  fi
-done
+while IFS= read -r js_file; do
+  JS_FILES+=("$js_file")
+done < <(find "$EXT_DIR" -type f -name '*.js' | LC_ALL=C sort)
 if [[ ${#JS_FILES[@]} -eq 0 ]]; then
   echo "Error: no .js files found in $EXT_DIR" >&2
   exit 1

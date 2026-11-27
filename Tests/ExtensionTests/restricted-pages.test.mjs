@@ -422,7 +422,10 @@ test("open with newWindow creates an unfocused window, groups its tab and return
   assert.equal(response.ok, true, JSON.stringify(response.error));
   const created = sb.callsTo("windows.create");
   assert.equal(created.length, 1);
-  assert.deepEqual(created[0].args[0], { url: "https://example.org/", focused: false, type: "normal" });
+  assert.deepEqual(created[0].args[0], { url: "about:blank", focused: false, type: "normal" });
+  assert.equal(sb.callsTo("tabs.update").length, 0);
+  assert.ok(sb.callsTo("debugger.sendCommand").some(({ args: [id, method, params] }) =>
+    id === response.tabId && method === "Runtime.evaluate" && params.expression === 'location.replace("https://example.org/")'));
   assert.equal(sb.callsTo("tabs.create").length, 0, "no tab added to the user's window");
   assert.equal(sb.callsTo("windows.update").length, 0);
 

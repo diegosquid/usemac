@@ -498,6 +498,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let autoDismissOverlays: Bool?
         let returnDiffOnly: Bool?
         let observationMode: ObservationMode?
+        let dialogAction: String?
+        let dialogPromptText: String?
     }
 
     private struct ObserveWireCommand: Encodable {
@@ -558,6 +560,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let maxElements: Int?
         let includeText: Bool?
         let includeTables: Bool?
+        let dialogAction: String?
+        let dialogPromptText: String?
     }
 
     private struct StopStreamWireCommand: Encodable {
@@ -1121,14 +1125,38 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         return resp.ok
     }
 
+    static func isMutatingStep(_ step: ActionStep) -> Bool {
+        switch step.action {
+        case .target, .scroll, .hover, .wait, .scrollIntoView, .waitFor, .assert, .scrollUntil:
+            return false
+        case .openURL, .navigate, .click, .doubleClick, .rightClick, .setValue, .type, .pressKey, .focus, .uploadFile, .axAction, .fillForm, .menuAction, .drag, .saveFile:
+            return true
+        }
+    }
+
     public func open(_ params: BrowserOpenParams) async -> BridgeResponse {
         let url = params.url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId, url: url.isEmpty ? nil : url, checksTab: params.tabId != nil) {
+        let openIsMutating = (params.steps?.contains(where: Self.isMutatingStep) == true)
+            || params.autoDismissOverlays == true
+            || params.dialogAction != nil
+        if let blocked = await targetRulesPreflight(
+            profile: params.profile,
+            tabId: params.tabId,
+            url: url.isEmpty ? nil : url,
+            checksTab: params.tabId != nil,
+            isMutating: openIsMutating
+        ) {
             return blocked
         }
         if let steps = params.steps {
             for step in steps where step.action == .openURL || step.action == .navigate {
-                if let blocked = await targetRulesPreflight(profile: params.profile, tabId: nil, url: step.url ?? step.text, checksTab: false) {
+                if let blocked = await targetRulesPreflight(
+                    profile: params.profile,
+                    tabId: nil,
+                    url: step.url ?? step.text,
+                    checksTab: false,
+                    isMutating: true
+                ) {
                     return blocked
                 }
             }
@@ -1156,21 +1184,29 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
                 steps: params.steps,
                 autoDismissOverlays: params.autoDismissOverlays,
                 returnDiffOnly: params.returnDiffOnly,
-                observationMode: params.observationMode
+                observationMode: params.observationMode,
+                dialogAction: params.dialogAction,
+                dialogPromptText: params.dialogPromptText
             )
         }
     }
 
     private func computeStepsTimeoutSeconds(_ steps: [ActionStep]) -> TimeInterval {
-        let totalWaitMs: UInt64 = steps.reduce(0) { partial, step in
-            guard step.action == .wait, let ms = step.durationMs, ms > 0 else {
+        let totalTimedStepMs: UInt64 = steps.reduce(0) { partial, step in
+            let durationMs: Int
+            switch step.action {
+            case .wait:
+                durationMs = max(0, step.durationMs ?? 0)
+            case .drag:
+                durationMs = min(2_000, max(40, step.durationMs ?? 160))
+            default:
                 return partial
             }
-            let (sum, overflow) = partial.addingReportingOverflow(UInt64(ms))
+            let (sum, overflow) = partial.addingReportingOverflow(UInt64(durationMs))
             return overflow ? UInt64.max : sum
         }
-        let waitSeconds = min(Self.maxActTimeoutSeconds, Double(totalWaitMs) / 1000.0)
-        return min(Self.maxActTimeoutSeconds, baseCommandTimeoutSeconds + waitSeconds)
+        let timedStepSeconds = min(Self.maxActTimeoutSeconds, Double(totalTimedStepMs) / 1000.0)
+        return min(Self.maxActTimeoutSeconds, baseCommandTimeoutSeconds + timedStepSeconds)
     }
 
     /// Invalidates cached URL authorization for `tabId` (or all tabs in the matched profile when `tabId` is nil)
@@ -1297,8 +1333,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     public func extract(_ params: BrowserExtractParams) async -> BridgeResponse {
         let mode = params.normalizedMode
+        let isEval = (mode == "eval")
         let tabId = params.isDownloads ? nil : params.tabId
-        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: tabId, checksTab: !params.isDownloads) {
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: tabId, checksTab: !params.isDownloads, isMutating: isEval) {
             return blocked
         }
         let timeoutSec: TimeInterval = (params.scanHorizontal == true || params.scanVertical == true) ? 30.0 : 18.0
@@ -1338,13 +1375,14 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     public func act(_ params: BrowserActParams) async -> BridgeResponse {
-        // A batch that opens or navigates to a blocked site never runs, nor one on a tab that is on one.
+        let actIsMutating = params.steps.contains(where: Self.isMutatingStep) || params.dialogAction != nil
+        // A batch that opens or navigates to a blocked or Read-only site never runs, nor one on a tab that is on one.
         for step in params.steps where step.action == .openURL || step.action == .navigate {
-            if let blocked = await targetRulesPreflight(profile: params.profile, tabId: nil, url: step.url ?? step.text, checksTab: false) {
+            if let blocked = await targetRulesPreflight(profile: params.profile, tabId: nil, url: step.url ?? step.text, checksTab: false, isMutating: true) {
                 return blocked
             }
         }
-        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId, isMutating: actIsMutating) {
             return blocked
         }
         if params.steps.contains(where: { $0.action == .openURL || $0.action == .navigate }) {
@@ -1369,7 +1407,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
                 observationMode: params.observationMode,
                 maxElements: params.maxElements,
                 includeText: params.includeText,
-                includeTables: params.includeTables
+                includeTables: params.includeTables,
+                dialogAction: params.dialogAction,
+                dialogPromptText: params.dialogPromptText
             )
         }
     }

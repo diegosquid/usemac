@@ -197,10 +197,10 @@ public enum AuditLogSessionGrouper {
                 guard name.location != NSNotFound else { return nil }
                 switch ActionStepType(rawValue: source.substring(with: name)) {
                 case .fillForm: return .form
-                case .uploadFile: return .upload
+                case .uploadFile, .saveFile: return .upload
                 case .openURL, .navigate: return .open
                 case .type, .setValue: return .type
-                case .click, .doubleClick, .rightClick: return .click
+                case .click, .doubleClick, .rightClick, .drag: return .click
                 case .menuAction: return .menu
                 case .pressKey: return .shortcut
                 case .scroll, .scrollUntil: return .scroll

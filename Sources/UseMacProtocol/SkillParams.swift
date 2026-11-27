@@ -115,6 +115,7 @@ public struct SkillRunParams: Codable, Equatable, Sendable {
     public var returnObservation: Bool?
     public var returnDiffOnly: Bool?
     public var observationMode: ObservationMode?
+    public var waitForLeaseMs: Int?
 
     public init(
         name: String,
@@ -125,7 +126,8 @@ public struct SkillRunParams: Codable, Equatable, Sendable {
         stopOnError: Bool? = nil,
         returnObservation: Bool? = nil,
         returnDiffOnly: Bool? = nil,
-        observationMode: ObservationMode? = nil
+        observationMode: ObservationMode? = nil,
+        waitForLeaseMs: Int? = nil
     ) {
         self.name = name
         self.params = params
@@ -136,6 +138,7 @@ public struct SkillRunParams: Codable, Equatable, Sendable {
         self.returnObservation = returnObservation
         self.returnDiffOnly = returnDiffOnly
         self.observationMode = observationMode
+        self.waitForLeaseMs = waitForLeaseMs
     }
 }
 

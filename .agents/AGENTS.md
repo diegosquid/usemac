@@ -16,7 +16,9 @@ The helper binary lives at `/Applications/UseMac.app/Contents/Helpers/usemac`.
 
 ## 1. Set up
 
-Install the `usemac` skill once. It is pre-stamped with this Mac's socket and binary path and goes into every detected agent skill folder:
+In **UseMac → Settings → Connect**, the user can click **Connect** (or **Connect All**) in **Quick Setup** to configure MCP and install the bundled `usemac` skill in one physical click for Claude Code, Claude Desktop, Cursor, Codex, and Antigravity (backing up existing configs before updating).
+
+Or install the `usemac` skill from the shell. It is pre-stamped with this Mac's socket and binary path and goes into every detected agent skill folder:
 
 ```bash
 "/Applications/UseMac.app/Contents/Helpers/usemac" install-skill
@@ -83,7 +85,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), `
 | `status` | Daemon status, execution mode, Kill Switch state, permissions, telemetry and connected Chrome profiles. |
 | `list_apps` | Running macOS GUI apps with PIDs, bundle IDs and window metadata. Leaves out UseMac and apps the user's rules block. |
 | `observe` | Compact Accessibility tree snapshot (`@e1..@eN`, stable across observes, viewport-first, `includeOffscreen` defaults to `false` with `offscreenCount`), server-side `filter` (`role`, `text`, `selector`, `viewportOnly`), optional diff and parallel screenshot. Auto-fuses Apple Vision OCR `@v1..@vN` elements on AX-blind windows. |
-| `act` | Batch of native UI steps (`click`, `setValue`, `type`, `pressKey`, `scroll`, `scrollIntoView`, `axAction`, `waitFor`, `uploadFile`, `assert`, `scrollUntil`, `fillForm`, `menuAction`, `optional: true`), targeted by `elementId` or `match`. Supports `observationMode`, `returnDiffOnly`, `diffCrop`, inline `verify`, `foreground`, `foregroundFallback`, and `waitForIdleMs`. |
+| `act` | Batch of native UI steps (`click`, `setValue`, `type`, `pressKey`, `drag`, `saveFile`, `scroll`, `scrollIntoView`, `axAction`, `waitFor`, `uploadFile`, `assert`, `scrollUntil`, `fillForm`, `menuAction`, `optional: true`), targeted by `elementId` or `match`. Supports `observationMode`, `returnDiffOnly`, `diffCrop`, inline `verify`, `foreground`, `foregroundFallback`, `waitForIdleMs`, and `waitForLeaseMs`. |
 | `screenshot` | Downscaled JPEG of an app window or display (`maxDimension`, `quality`, `includeBase64`, `diffCrop`, `region`), saved to a private temp folder (pruned after 30 minutes). |
 | `set_policy` | Keep or tighten the execution mode (`autonomous` → `ask` → `confirmSensitive` → `readOnly` → `paused`); relaxing returns `POLICY_LOCKED`. |
 | `pair_app` | Set or clear the default target app (`appTarget`). |
@@ -92,11 +94,11 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), `
 | `app_menu` | Search (`query`) or directly invoke (`menuPath`, e.g. `["File", "Export as PDF…"]`) native macOS app menu bar items via `kAXMenuBarAttribute` in the background without stealing focus. |
 | `browser_status` | Paired, connected Chrome profiles and daemon status. |
 | `browser_tabs` | Open Chrome tabs (`tabId`, `title`, `url`, `active`, `restricted`, `usemac`), optional substring filter. Leaves out tabs on sites the user's rules block. |
-| `browser_open` | Open a URL in a new background tab, navigate an existing `tabId`, make a tab active (`activate`), or open a new unfocused window (`newWindow`). Supports `autoDismissOverlays: true`, inline `steps` (open + act in one turn), `returnDiffOnly`, and `observationMode`. Returns the settled snapshot directly. |
+| `browser_open` | Open a URL in a new background tab, navigate an existing `tabId`, make a tab active (`activate`), or open a new unfocused window (`newWindow`). Supports `autoDismissOverlays: true`, inline `steps` (open + act in one turn), `dialogAction` (`"accept"`/`"dismiss"`), `dialogPromptText`, `waitForLeaseMs`, `returnDiffOnly`, and `observationMode`. Returns the settled snapshot directly. |
 | `browser_observe` | Chrome tab DOM (`@b1..@bN` stable across observes across cross-origin iframes and Shadow DOM), viewport-first sorting, `offscreenCount`, server-side `filter`, tables (`tablesSummary`), readable text, overlays, and WebMCP tool discovery (`webMcpTools`). |
 | `browser_extract` | Tables and grids (`scanHorizontal`, `scanVertical`), KPIs, text, captured XHR/Fetch JSON (`mode: "network"`, `urlFilter`), recent Chrome profile `downloads`, or JavaScript `eval` (`expression`, optional `frameIndex`; `autonomous` mode, or `ask` once the user allows it). |
 | `browser_screenshot` | JPEG of a Chrome tab, an element, a `region`, a `diffCrop: true` dirty region, or the whole page (stitched), saved to a private temp folder (pruned after 30 minutes). |
-| `browser_act` | DOM action steps in a Chrome tab (`match`, `optional`, `assert`, `scrollUntil`, `fillForm`, `waitFor` via `MutationObserver`, `uploadFile`), with `readOnly`, `observationMode`, `returnDiffOnly`, `diffCrop`, inline `verify`, or post-action screenshot. Reports `networkErrors` (4xx/5xx XHRs), `dirtyRect`, and `visualDeltaOCR`. |
+| `browser_act` | DOM action steps in a Chrome tab (`match`, `optional`, `assert`, `scrollUntil`, `fillForm`, `drag`, `waitFor` via `MutationObserver`, `uploadFile`), with `dialogAction`, `dialogPromptText`, `waitForLeaseMs`, `readOnly`, `observationMode`, `returnDiffOnly`, `diffCrop`, inline `verify`, or post-action screenshot. Reports `dialogs`, `networkErrors` (4xx/5xx XHRs), `dirtyRect`, and `visualDeltaOCR`. |
 | `browser_batch` | Open and `observe` or `extract` multiple `urls` in parallel Chrome background tabs (`mode`, `extractMode`, `maxElements`, `autoDismissOverlays`, `closeAfter`), enforcing site rules per URL. |
 | `browser_reload_extension` | Reload the Chrome extension so it runs the code now in its folder, then wait until it has paired again (`profile` optional, `force` to interrupt running commands). Stops every agent's browser work: only when the user asks or nothing else uses Chrome. |
 | `vision_status` | Local Apple Vision OCR readiness (`backend: "apple-vision-ocr"`, `ocrAvailable: true`). Instant and zero-setup. |
@@ -114,9 +116,9 @@ While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) on, only `ping`, `sta
 
 UseMac starts in **Autonomous** unless the user picked another mode. Any other mode shows in UseMac's menu bar menu ("Mode: Read-only"), and only the user can relax it or resume.
 
-### Ask mode
+### Ask mode & per-target policies
 
-In **Ask** mode (`ask`), a request that has a sensitive step waits for the user before anything in it runs: an upload (`uploadFile`, or `axAction` `AXOpen` in a file panel), a `pressKey` with `cmd` or `ctrl`, or `browser_extract` `eval`. This applies to `act`, `browser_act`, `skill_run`, and `browser_extract`. A prompt next to the HUD shows the step, the app or tab, and the file path, shortcut or script size. Only one prompt shows at a time; the others queue.
+In **Ask** mode (`ask`), a request that has a sensitive step waits for the user before anything in it runs: an upload or save (`uploadFile`, `saveFile`, or `axAction` `AXOpen` in a file panel), a `pressKey` with `cmd` or `ctrl`, or `browser_extract` `eval`. In **Settings → General → App and site rules**, the user can also set per-app and per-site **Allow**, **Ask**, **Read-only**, or **Block** policies (precedence: **Block > Read-only > Ask > Allow**): **Read-only** targets allow reads and non-mutating scroll/hover/wait/assert while refusing mutations with `POLICY_BLOCKED`, and **Ask** targets prompt in the HUD on any mutating request even when UseMac is in **Autonomous** mode. This applies to `act`, `app_menu`, `browser_open`, `browser_act`, `skill_run`, and `browser_extract`. A prompt next to the HUD shows the step, the app or tab, and the file path, shortcut or script size. Only one prompt shows at a time; the others queue.
 
 - The request holds its connection until the user answers: up to 45 s from its arrival, plus 10 s if it waited behind another prompt. The CLI and the MCP server wait 75 s longer than usual for these methods. If your MCP host has its own tool-call timeout, keep it at 120 s or more.
 - Allowed: the request runs and answers as usual. Denied: `APPROVAL_DENIED`. No answer in time: `APPROVAL_TIMEOUT`. The user changed the mode or used the Kill Switch while it waited: `POLICY_BLOCKED`. In those three cases nothing in the request ran.
@@ -229,7 +231,7 @@ Several agents can work at the same time. The `taskId` is how UseMac keeps each 
 
 **Leases (`TARGET_BUSY`).** The first time a task acts in a window or tab, it leases it:
 - Acting means `act` (except a batch that only has `wait`/`waitFor`/`assert` steps), `browser_act`, `browser_open` on an existing `tabId`, `app_menu` with `menuPath`, `skill_run`, and `browser_extract` in `eval` mode. A task also holds the tabs it opened.
-- While the task runs, another task's action in the same window (same app and window; the whole app when UseMac can't tell the window) or tab fails at once with `TARGET_BUSY`, and nothing runs. The message names the task holding it.
+- While the task runs, another task's action in the same window (same app and window; the whole app when UseMac can't tell the window) or tab fails at once with `TARGET_BUSY` unless `waitForLeaseMs` (`0`–`30000`, CLI `--wait-for-lease <ms>`) is passed to wait in a FIFO queue for the lease to clear. If the timeout expires first, it returns `TARGET_BUSY` and nothing runs; if the Kill Switch or Pause activates while waiting, it aborts immediately with `POLICY_BLOCKED`.
 - `observe`, `screenshot`, `app_menu` search, other `browser_extract` modes, `browser_observe`, `browser_screenshot`, `skill_list`, and `vision_query` never wait.
 - A lease ends with the task's `task_complete`, or when the task has been idle for 30 minutes.
 - Requests UseMac can't tie to a task (no `taskId` while several tasks run, or no task at all) are never refused, so callers that don't use tasks keep working. With one task running, a request without `taskId` counts as that task's. A `taskId` that names no running task is refused like any other task, but leases nothing.
@@ -414,9 +416,11 @@ A failed batch exits with the code of its first failed step. With `--json`, succ
 | `assert` | `expectText`, `expectNotText`, `expectUrl`, `expectTitle`, `match`, `gone` | `<1 ms` deterministic post-check against window/page state. Fails with `ASSERTION_FAILED`. |
 | `scrollUntil` | `match`, `selector`, or `expectText`; `maxScrolls` (default 8) | Bounded local scroll loop until target becomes visible in viewport or scroll hits end. |
 | `fillForm` | `fields` (`[{elementId, selector, match, label, value, checked}]`), `submitMatch`, `submitSelector` | Fills text inputs, `<select>`, checkboxes/radios, and custom ARIA comboboxes, surfaces form validation errors, and optionally submits (`FORM_FILL_FAILED` on error). |
+| `drag` | Source (`elementId`, `selector`, `match`, or `x`/`y`) + destination (`toElementId`, `toSelector`, `toMatch`, or `toX`/`toY`), `durationMs` | Drags between elements or coordinates in Chrome (HTML5 `DataTransfer` + CDP mouse drag) and native apps (`CGEvent` drag with source/destination window checks and `foregroundFallback`). |
+| `saveFile` | `files` (`["/abs/dest"]`), `overwrite` (default `false`) | Native. Confirms a macOS `NSSavePanel` to a safe path (`UPLOAD_BLOCKED` on protected paths or existing files when `overwrite` is `false`; sensitive under `ask`/`confirmSensitive`/`readOnly`). |
 | `menuAction` | `menuPath` (`["File", "Export as PDF…"]`) | Native. Invokes a menu bar item via `kAXMenuBarAttribute` directly in the background (zero focus steal). |
 
-Any step accepts `"optional": true` — if the target is missing or the step fails, UseMac records `{success: true, skipped: true}` and continues the batch (ideal for cookie modals and conditional banners). `doubleClick` uses `AXOpen` first when the element supports it, so it stays in the background.
+Any step accepts `"optional": true` — if the target is missing or the step fails, UseMac records `{success: true, skipped: true}` and continues the batch (ideal for cookie modals and conditional banners). `doubleClick` uses `AXOpen` first when the element supports it, so it stays in the background. In Chrome, `browser_open` and `browser_act` intercept JavaScript dialogs (`alert`, `confirm`, `prompt`, `beforeunload`): by default, `alert` and `beforeunload` are accepted and `confirm`/`prompt` are dismissed with a warning; pass `dialogAction: "accept" | "dismiss"` and optional `dialogPromptText` (CLI `--dialog-action` / `--dialog-prompt`) to control them explicitly (`actionResult.dialogs`, `pageState.lastDialog`).
 
 ### Observation compression (`observationMode` & `diffCrop`)
 

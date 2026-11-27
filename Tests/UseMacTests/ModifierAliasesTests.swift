@@ -17,7 +17,7 @@ final class ModifierAliasesTests: XCTestCase {
 
     func testAliasesMatchTheChromeExtension() throws {
         let chrome = try chromeModifierNames()
-        XCTAssertEqual(chrome.count, 4, "Couldn't read buildModifierMask from Extension/background.js: \(chrome)")
+        XCTAssertEqual(chrome.count, 4, "Couldn't read buildModifierMask from the Chrome background scripts: \(chrome)")
         // CDP modifier bits: Alt 1, Ctrl 2, Meta/Command 4, Shift 8.
         let bits: [Int: ModifierAliases.Modifier] = [1: .option, 2: .control, 4: .command, 8: .shift]
         for (bit, modifier) in bits {
@@ -148,7 +148,7 @@ final class ModifierAliasesTests: XCTestCase {
 
     /// CDP modifier bit -> the names buildModifierMask maps to it.
     private func chromeModifierNames() throws -> [Int: Set<String>] {
-        let source = try String(contentsOf: Self.repoRoot.appendingPathComponent("Extension/background.js"), encoding: .utf8)
+        let source = try readChromeBackgroundSource()
         let start = try XCTUnwrap(source.range(of: "function buildModifierMask("), "buildModifierMask is gone")
         let end = try XCTUnwrap(source.range(of: "\n}\n", range: start.upperBound..<source.endIndex))
         let body = String(source[start.upperBound..<end.lowerBound])

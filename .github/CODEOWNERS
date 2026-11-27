@@ -22,6 +22,7 @@
 # Chrome extension: permissions, pairing and the bridge to the app.
 /Extension/manifest.json @diegosquid
 /Extension/background.js @diegosquid
+/Extension/background/ @diegosquid
 /Extension/bridge-auth.js @diegosquid
 
 # Safety engine: execution modes, Kill Switch, Ask approvals, rules, pairing, redaction, problem reports
