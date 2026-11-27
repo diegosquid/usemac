@@ -6,13 +6,24 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Chrome work indicators (#57):** the native overlay marks visible Chromium windows only while the agent uses native fallback on a restricted page. Typing or clicking in the main document or a same-origin iframe of an agent-controlled tab pauses the agent there and shows a Resume control.
+
 ### Changed
 
 - **Neutral live preview:** removed the per-task color bands and tinted cards. The preview keeps its card stack and automatic task switching, without extra space above the picture.
+- **Wide pages in the fixed live preview (#89):** wide pages are centered horizontally. The preview crops both sides equally and keeps the top aligned.
+- **Chromium site rules (#54):** site rules now apply to native observe, act, screenshot, app menu, and `vision_query` calls, including display captures that contain Chromium windows. If site rules are active and UseMac can't confirm the Chromium site, it blocks access.
 
 ### Fixed
 
 - **Saved Chrome groups:** finishing a task in its own window no longer leaves another closed UseMac group on the bookmarks bar. Cleanup ungroups its tabs before closing them, while still preserving kept tabs, visible tabs, other tasks' tabs and active downloads.
+- **Restricted Chrome pages (#52):** recovery hints now call out the need for a visible Chrome window and explain how to briefly focus the pinned window when native observe shows only the toolbar or a field ignores a background write.
+- **Chrome clicks (#53):** recheck the target after page reflow. If a DOM target is fully covered, skip the click and report why instead of clicking the covering element. The step reports its effect and warns when the click didn't reach the page or a link produced no observable effect. Clicks aren't automatically retried.
+- **Task isolation and reloads (#55):** window pins are per task. The HUD keeps separate cards for different windows of the same app and uses the task ID when no window ID is available. Finishing a task leaves other tasks' cards alone. The daemon restores the extension's owned-tab list when it reconnects after a reload.
+- **Native uploads (#56):** background uploads restore the previous focus if opening the file activates the app. The foreground Go to Folder fallback stops without confirming if it can't find the path field and waits for the Open button before using it.
+- **Native Accessibility:** untitled window controls expose their role descriptions again. The background scroll fallback finds offscreen targets on demand, and `usemac observe --include-offscreen` lets callers request them explicitly.
 
 ## [0.9.0-beta.1] - 2026-11-26
 

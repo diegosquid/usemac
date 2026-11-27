@@ -52,6 +52,8 @@ public final class FastScreenCapturer: @unchecked Sendable {
         if let targetApp, TargetRulesStore.shared.blocksProcess(pid: targetApp.pid) {
             throw CaptureError.targetBlocked(appName: targetApp.name)
         }
+        // A named app must never be replaced by the whole display, even if it could not be resolved.
+        let namedApp = !(request.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
         let capturedImage: CGImage
         if let liveImage = liveStreamImage(for: targetApp, streamer: streamer) {
@@ -61,13 +63,11 @@ public final class FastScreenCapturer: @unchecked Sendable {
                 maxDimension: request.maxDimension
             )
         } else {
-            // A capture for a named app must show that app. Falling back to the whole display would hand the
-            // agent the user's screen labeled as the app.
-            let namedApp = !(request.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             let prepared = try await prepareCapture(
                 targetApp: targetApp,
                 maxDimension: request.maxDimension,
-                allowDisplayFallback: !namedApp
+                allowDisplayFallback: !namedApp,
+                requestedAppName: request.app
             )
 
             let rawImage = try await SCScreenshotManager.captureImage(
@@ -134,6 +134,7 @@ public final class FastScreenCapturer: @unchecked Sendable {
             return nil
         }
         if let targetApp,
+           Self.shouldAllowLiveFrameReuse(for: targetApp, rules: TargetRulesStore.shared.rules),
            let streamer,
            let windowId = targetWindowIDForLiveLookup(targetApp: targetApp, streamer: streamer),
            let live = streamer.latestFrameWithBounds(forWindowID: windowId) {
@@ -169,10 +170,26 @@ public final class FastScreenCapturer: @unchecked Sendable {
 
     private func liveStreamImage(for targetApp: AppDescriptor?, streamer: LiveScreenStreamer?) -> CGImage? {
         guard let targetApp, let streamer,
+              Self.shouldAllowLiveFrameReuse(for: targetApp, rules: TargetRulesStore.shared.rules),
               let windowId = targetWindowIDForLiveLookup(targetApp: targetApp, streamer: streamer) else {
             return nil
         }
         return streamer.latestFrame(forWindowID: windowId)
+    }
+
+    static func shouldExcludeFromDisplayCapture(bundleId: String?, name: String?, rules: TargetRules) -> Bool {
+        rules.blocksApp(bundleId: bundleId)
+            || (rules.hasSiteRules && NativeBrowserSiteRules.isChromiumApp(bundleId: bundleId, name: name))
+    }
+
+    static func shouldAllowLiveFrameReuse(for app: AppDescriptor, rules: TargetRules) -> Bool {
+        // Tabs in the same browser window share a window id but may have different site permissions.
+        !(rules.hasSiteRules && NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name))
+    }
+
+    static func requiresExactWindowID(for app: AppDescriptor, rules: TargetRules) -> Bool {
+        (app.windowId ?? 0) != 0 && rules.hasSiteRules
+            && NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name)
     }
 
     private static func applyRegionAndScale(_ image: CGImage, region: ScreenRect?, maxDimension: Int) -> CGImage {
@@ -216,19 +233,24 @@ public final class FastScreenCapturer: @unchecked Sendable {
     private func prepareCapture(
         targetApp: AppDescriptor?,
         maxDimension: Int,
-        allowDisplayFallback: Bool
+        allowDisplayFallback: Bool,
+        requestedAppName: String? = nil
     ) async throws -> (filter: SCContentFilter, config: SCStreamConfiguration, windowBounds: ScreenRect?) {
         if let targetApp, TargetRulesStore.shared.blocksProcess(pid: targetApp.pid) {
             throw CaptureError.targetBlocked(appName: targetApp.name)
         }
+        if !allowDisplayFallback && targetApp == nil {
+            throw CaptureError.noCapturableWindow(appName: requestedAppName ?? "the target app")
+        }
         let shareable = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let rules = TargetRulesStore.shared.rules
 
         let filter: SCContentFilter
         let sourceSize: CGSize
         let windowBounds: ScreenRect?
 
         if let targetApp,
-           let targetWindow = selectWindow(for: targetApp, in: shareable.windows) {
+           let targetWindow = selectWindow(for: targetApp, in: shareable.windows, rules: rules) {
             filter = SCContentFilter(desktopIndependentWindow: targetWindow)
             sourceSize = targetWindow.frame.size
             windowBounds = ScreenRect(
@@ -237,12 +259,13 @@ public final class FastScreenCapturer: @unchecked Sendable {
                 width: Double(targetWindow.frame.size.width),
                 height: Double(targetWindow.frame.size.height)
             )
-        } else if let targetApp, !allowDisplayFallback {
+        } else if let targetApp, !allowDisplayFallback || Self.requiresExactWindowID(for: targetApp, rules: rules) {
             throw CaptureError.noCapturableWindow(appName: targetApp.name)
         } else if let display = shareable.displays.first {
-            // A whole-display capture leaves out the windows of apps the user's rules block.
-            let rules = TargetRulesStore.shared.rules
-            let blockedApps = shareable.applications.filter { rules.blocksApp(bundleId: $0.bundleIdentifier) }
+            // A display capture cannot confirm the active site in each browser window.
+            let blockedApps = shareable.applications.filter {
+                Self.shouldExcludeFromDisplayCapture(bundleId: $0.bundleIdentifier, name: $0.applicationName, rules: rules)
+            }
             filter = SCContentFilter(display: display, excludingApplications: blockedApps, exceptingWindows: [])
             sourceSize = CGSize(width: display.width, height: display.height)
             windowBounds = nil
@@ -266,8 +289,12 @@ public final class FastScreenCapturer: @unchecked Sendable {
 
     /// Same exact-id choice as the live preview (descriptor `windowId`, else the AX focused window), so a
     /// screenshot never lands on one of Chrome's tiny helper windows.
-    private func selectWindow(for app: AppDescriptor, in windows: [SCWindow]) -> SCWindow? {
-        let candidates = windows.compactMap(LiveScreenStreamer.captureCandidate(from:))
+    private func selectWindow(for app: AppDescriptor, in windows: [SCWindow], rules: TargetRules) -> SCWindow? {
+        var candidates = windows.compactMap(LiveScreenStreamer.captureCandidate(from:))
+        if Self.requiresExactWindowID(for: app, rules: rules), let windowId = app.windowId {
+            candidates = candidates.filter { $0.windowId == windowId }
+            guard !candidates.isEmpty else { return nil }
+        }
         let targets = WindowResolver.targetWindows(
             pid: app.pid,
             knownWindowId: app.windowId.map { CGWindowID($0) },

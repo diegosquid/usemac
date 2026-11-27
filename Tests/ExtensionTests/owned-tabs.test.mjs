@@ -144,6 +144,95 @@ test("a download starting during ungroup keeps the tab open", async (t) => {
   assert.equal(sb.callsTo("tabs.remove").length, 0);
 });
 
+test("close_owned_tabs preserves the tab when its window becomes focused during ungroup", async (t) => {
+  const sb = withSandbox(t, {
+    tabs: [{ id: 791, windowId: 1, url: "https://example.com/", active: true }],
+    windows: [{ id: 1, focused: true }]
+  });
+  const owned = await openTab(sb, { newWindow: true });
+  const ownedWindowId = sb.tabs.get(owned).windowId;
+  const ungroup = sb.chrome.tabs.ungroup;
+  sb.chrome.tabs.ungroup = async (ids) => {
+    await ungroup(ids);
+    sb.windows.get(1).focused = false;
+    sb.windows.get(ownedWindowId).focused = true;
+  };
+
+  const { response } = await closeOwned(sb);
+  assert.equal(sb.callsTo("tabs.ungroup").length, 1);
+  assert.deepEqual(response.closedTabs, []);
+  assert.deepEqual(response.keptTabs.map(({ tabId, reason }) => [tabId, reason]), [
+    [owned, "the user is looking at it"]
+  ]);
+  assert.equal(sb.callsTo("tabs.remove").length, 0);
+});
+
+test("close_owned_tabs keeps the tab if the final focus lookup fails", async (t) => {
+  const sb = withSandbox(t, { tabs: [{ id: 792, url: "https://example.com/", active: true }] });
+  const owned = await openTab(sb, { newWindow: true });
+  const getLastFocused = sb.chrome.windows.getLastFocused;
+  sb.chrome.windows.getLastFocused = async (query) => {
+    assert.deepEqual(Array.from(query.windowTypes), ["normal"]);
+    if (sb.callsTo("tabs.ungroup").length) throw new Error("Window focus unavailable");
+    return getLastFocused(query);
+  };
+
+  const { response } = await closeOwned(sb);
+  assert.deepEqual(response.closedTabs, []);
+  assert.deepEqual(response.keptTabs.map(({ tabId, reason }) => [tabId, reason]), [
+    [owned, "window focus unavailable"]
+  ]);
+  assert.equal(sb.callsTo("tabs.remove").length, 0);
+});
+
+test("browser_open reports a created tab when newTab is false and there are no normal windows", async (t) => {
+  for (const url of [PAGE, "https://example.com/new"]) {
+    const sb = withSandbox(t, { windows: [] });
+    const { response } = await sb.request({
+      type: "request", id: nextId(), command: "open", newTab: false, stream: false, url
+    });
+    assert.equal(response.ok, true, JSON.stringify(response.error));
+    assert.equal(Boolean(response.restricted), url === PAGE);
+    assert.equal(response.createdTab, true);
+    assert.deepEqual(sb.session.usemacOwnedTabIds, [response.tabId]);
+    assert.equal(sb.callsTo("windows.create").length, 1);
+  }
+});
+
+test("hello identifies the same extension instance after reload and a different instance in another profile", async (t) => {
+  const stored = {};
+  let writes = 0;
+  function worker(localStore) {
+    const sb = withSandbox(t);
+    sb.chrome.storage.local.get = async (keys) =>
+      Object.fromEntries(Array.from(keys).filter((key) => key in localStore).map((key) => [key, localStore[key]]));
+    sb.chrome.storage.local.set = async (items) => {
+      writes++;
+      Object.assign(localStore, items);
+    };
+    sb.markReady();
+    return sb;
+  }
+
+  const first = worker(stored);
+  await Promise.all([first.call("sendHello"), first.call("sendHello")]);
+  const hello = first.sent.find(({ type }) => type === "hello");
+  assert.match(hello.extensionInstanceId, /^[0-9a-f]{32}$/);
+  assert.equal(hello.extensionInstanceId, stored.usemacExtensionInstanceId);
+  assert.equal(writes, 1, "concurrent hellos share the same storage write");
+  first.dispose();
+
+  const reloaded = worker(stored);
+  await reloaded.call("sendHello");
+  assert.equal(reloaded.sent.find(({ type }) => type === "hello").extensionInstanceId, hello.extensionInstanceId);
+  assert.equal(writes, 1, "reloading does not overwrite the stored identity");
+
+  const other = worker({});
+  await other.call("sendHello");
+  assert.notEqual(other.sent.find(({ type }) => type === "hello").extensionInstanceId, hello.extensionInstanceId);
+  assert.equal(writes, 2);
+});
+
 test("the tab list marks UseMac's own tabs, never the user's", async (t) => {
   const sb = withSandbox(t, {
     tabs: [{ id: 801, windowId: 1, url: "https://forum.example.com/weekend", active: true }],
@@ -154,6 +243,60 @@ test("the tab list marks UseMac's own tabs, never the user's", async (t) => {
   const byId = Object.fromEntries(response.tabs.map((tab) => [tab.tabId, tab]));
   assert.equal(byId[owned].usemac, true);
   assert.equal(byId[801].usemac, undefined);
+});
+
+test("authenticated ready restores live owned tabs after reload without blocking profile_info", async (t) => {
+  const sb = withSandbox(t, {
+    tabs: [
+      { id: 811, url: PAGE },
+      { id: 812, url: "https://example.com/", active: true }
+    ]
+  });
+  assert.equal(sb.session.usemacOwnedTabIds, undefined, "reload lost the session storage");
+  let releaseValidation;
+  const validation = new Promise((resolve) => { releaseValidation = resolve; });
+  const originalGet = sb.chrome.tabs.get;
+  sb.chrome.tabs.get = async (id) => {
+    if (id === 811) await validation;
+    return originalGet(id);
+  };
+
+  sb.markReady();
+  sb.eval(`
+    state.authState = "authenticating";
+    state.awaitingAuthResult = true;
+    state.ws.onmessage({ data: '{"type":"ready","ownedTabIds":[811,819]}' });
+  `);
+  await new Promise(setImmediate);
+  assert.ok(sb.sent.some(({ type }) => type === "profile_info"), "profile info does not wait for tab validation");
+  assert.equal(sb.session.usemacOwnedTabIds, undefined);
+  releaseValidation();
+
+  const { response } = await closeOwned(sb);
+  assert.deepEqual(response.closedTabs.map(({ tabId }) => tabId), [811]);
+  assert.deepEqual(sb.callsTo("tabs.remove").map(({ args }) => args[0]), [811]);
+  assert.ok(sb.tabs.has(812));
+});
+
+test("sync_owned_tabs merges concurrent restores and opens, ignoring closed and invalid IDs", async (t) => {
+  const sb = withSandbox(t, {
+    tabs: [
+      { id: 821, url: "https://example.com/", active: true },
+      { id: 822, url: PAGE },
+      { id: 823, url: PAGE }
+    ],
+    apiDelayMs: (api) => api === "tabs.get" ? 10 : 0
+  });
+  sb.markReady();
+  await Promise.all([
+    sb.deliver({ type: "sync_owned_tabs", tabIds: [822, 829, "821", -1, 0, null, 2.5, 822] }),
+    sb.deliver({ type: "sync_owned_tabs", tabIds: [823] })
+  ]);
+  const created = await openTab(sb);
+  assert.deepEqual(sb.session.usemacOwnedTabIds, [822, 823, created]);
+  const { response } = await closeOwned(sb);
+  assert.deepEqual(response.closedTabs.map(({ tabId }) => tabId), [822, 823, created]);
+  assert.ok(sb.tabs.has(821), "a string ID could not mark the user's tab as owned");
 });
 
 const DOWNLOAD_TAB = 851;

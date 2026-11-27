@@ -78,7 +78,7 @@ public enum UseMacErrorGuide {
         case "WAIT_TIMEOUT":
             return "The element did not appear (or go away) in time. Observe to see the current state before retrying."
         case "RESTRICTED_PAGE":
-            return "The Chrome extension cannot script this page (Chrome Web Store or chrome:// pages). Make the tab active with browser_open tabId + activate: true (CLI: browser open --tab <id> --activate), or open the URL with newWindow: true (CLI: --new-window), then use native observe/act with app \"Google Chrome\"."
+            return "The Chrome extension cannot script this page (Chrome Web Store or chrome://). Activate the tab with browser_open tabId + activate: true (CLI: browser open --tab <id> --activate), or open the URL with newWindow: true (CLI: --new-window). Keep the Chrome window visible on screen and use native observe/act with app \"Google Chrome\" and window. If observe shows only the toolbar or setValue reports effect: none, use act with foreground: true (CLI: --foreground) to briefly focus the pinned window, act, and restore focus."
         case "CAPTURE_TOO_SMALL":
             return "The captured window is too small to trust (a helper strip or hidden window). Do not draw conclusions from it: observe the app instead, or make the right window visible and retry."
         case "POLICY_BLOCKED":

@@ -8,7 +8,7 @@
 
 # scroll_ready <window title>: the page is in the native tree, with rows out of view below the fold.
 scroll_ready() {
-  observe_window "Google Chrome" "$1" || return 1
+  observe_window "Google Chrome" "$1" --include-offscreen || return 1
   local rows offscreen
   rows=$(jout '[.elements[] | select(((.title // "") + " " + (.value // "")) | test("Row [0-9]+"))] | length')
   offscreen=$(jout '[.elements[] | select(.offscreen == true)] | length')
@@ -61,7 +61,7 @@ run_scroll_case() {
   [ "$other_before" = "0" ] || fail "the control window did not start at the top (window.scrollY: '${other_before:-unreadable}')"
 
   # The act must follow the observe directly: its stale-window check compares against the last observe.
-  observe_window "Google Chrome" "$title" || fail "observe --window $title failed: $(um_error)"
+  observe_window "Google Chrome" "$title" --include-offscreen || fail "observe --window $title failed: $(um_error)"
   skip_if_chrome_in_front
   um_ok act '[{"action":"scroll","deltaY":-600}]' --app "Google Chrome" --window "$title"
   local ok mech effect delta warning

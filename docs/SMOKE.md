@@ -43,10 +43,19 @@ connected one.
 | `textedit` | Native basics: observe an untitled document, type into it in the background, read the text back, close it without saving. |
 | `scroll-event` | Native background scroll of a page in a UseMac Chrome window. The page moves, through the wheel event (`cgevent-pid-scroll`) or the offscreen-element fallback (`ax-scroll-to-next`), and a second UseMac window gets neither scrolled nor any wheel event. |
 | `scroll-fallback` | The same on a page that swallows wheel events, so only the fallback (`ax-scroll-to-next`) can move it. |
-| `restricted-page` | The `RESTRICTED_PAGE` hybrid flow: `browser open --new-window` on the Chrome Web Store, `browser observe` refusing it, then native observe and act with `--window`. |
+| `restricted-page` | The background leg of the hybrid flow: open the Chrome Web Store with `browser open --new-window`, confirm `browser observe` returns `RESTRICTED_PAGE`, then observe the visible Chrome window and write to the search box natively with `--window`. |
 | `upload` | `uploadFile` in Chrome with files created a second before in `$TMPDIR`: into a file input on the page, then through an intercepted file chooser. |
 | `two-tasks` | Two tasks at once: `done --task A` closes A's tab and leaves B's open. |
-| `download-cleanup` | `done` while a download runs: the tab of the download stays open, and another tab of the task closes. |
+| `download-cleanup` | Click a download link and verify the transfer started. Run `done` while it is active: its tab stays open, the control tab closes, and the download finishes at the expected size. |
+
+For `restricted-page`, keep the Chrome window visible on screen even though Chrome is not the frontmost app.
+Outside this background-only smoke case, if native observe shows only the toolbar or `setValue` reports
+`effect: none`, use native `act --foreground` on the pinned window. UseMac briefly focuses it, acts, and restores
+the previous focus.
+
+The `download-cleanup` case checks transfer and tab state, not just click success. A `browser_act` click may
+report a warning if it didn't reach the page or the link produced no observable effect. UseMac does not
+automatically retry; the smoke script can explicitly click once more if there is no sign the transfer started.
 
 ## What it touches
 

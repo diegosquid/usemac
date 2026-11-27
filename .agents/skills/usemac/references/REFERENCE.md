@@ -38,7 +38,7 @@ Booleans on `act` and `browser_act` default to `stopOnError: true`, `returnObser
 | `skill_run` | Deterministically replay a saved skill (`name`, `params`, `app`, `profile`, `tabId`, `stopOnError`, `returnObservation`, `returnDiffOnly`, `observationMode`) through the full governed `act`/`browser_act` pipeline. |
 | `skill_list` | List saved skills filtered by `query`, `target`, `app`, or `url`. |
 | `task_start` | Start a tracked task session and hold the live preview open; returns `taskId` (`summary`, `agent`, `app`, `tabId`, `profile`). Can also be piggybacked via `taskStart` on any request. |
-| `task_complete` | Finish a task, close its live preview card, auto-close tabs opened by this task (~2 s later unless `keepTabs`/`keepTabIds`), and return `taskSummary`. Can also be piggybacked via `taskComplete` on any request. |
+| `task_complete` | Finish a task, close its live preview cards, auto-close eligible tabs it opened (~2 s later unless `keepTabs`/`keepTabIds`), and return `taskSummary`. Can also be piggybacked via `taskComplete` on any request. |
 | `report_prepare` | Prepare a redacted problem report for the user to review in UseMac before anything is sent (`summary`, optional `title`, `taskId`). |
 | `debug_capture` | Developing UseMac only: read-only PNG capture of UseMac's own windows and surrounding context once Debug capture is enabled in Settings (`DEBUG_CAPTURE_OFF` otherwise). |
 
@@ -66,6 +66,8 @@ CLI JSON (`"$USEMAC" --json browser extract downloads`) returns the result objec
 
 - Pass `"taskStart": {"summary": "...", "agent": "..."}` on your first request to start a task without a separate RPC turn; pass `"taskComplete": {"taskId": "...", "summary": "..."}` on your final request to finish cleanly.
 - Carry `taskId` at the top level of every intermediate request: tab-scoped browser calls without `tabId` route to your task's own last tab, `task_complete` closes only your task's tabs, and windows/tabs your task acts in are leased until completion (or 30 idle minutes). Another task's action on a leased target fails immediately with `TARGET_BUSY`; reads never block.
+- Native window pins are per `taskId`. UseMac tracks which native apps each task used, so `task_complete` leaves other tasks' native preview cards alone. The daemon resends `ownedTabIds` when the Chrome extension reconnects after a reload.
+- The fixed live preview centers wide pages horizontally, cropping both sides equally and keeping the top aligned. It doesn't resize the page.
 - While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) active, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start`, and `task_complete` answer (`report_prepare` also works while Paused, not under Kill Switch). Everything else returns `POLICY_BLOCKED`.
 
 ### Ask Mode
@@ -98,7 +100,7 @@ Register `{{USEMAC_BIN}}` with `"args": ["mcp"]`. Every tool carries `annotation
 
 ```bash
 USEMAC="{{USEMAC_BIN}}"
-"$USEMAC" observe --app "Notes" [--filter-role button] [--filter-text "new"] [--no-offscreen]
+"$USEMAC" observe --app "Notes" [--filter-role button] [--filter-text "new"] [--include-offscreen]
 "$USEMAC" menu --app "Finder" --query "New"          # search or invoke native menu bar items
 "$USEMAC" act '{"app":"Notes","observationMode":"auto","steps":[...]}' [--foreground-fallback] [--diff-crop]
 "$USEMAC" browser open "https://example.com" [--auto-dismiss] [--new-window | --activate]
@@ -142,6 +144,10 @@ Exit codes: `0` success; `1` command/RPC failure; `2` invalid usage/JSON; `3` `D
 
 Any step accepts `"optional": true` (failure/not-found records `{success: true, skipped: true}` and continues). Every step returns `effect` (`changed` / `none` / `unverified`), `warning`, `errorCode`, and `resolvedElementId`.
 
+`browser_act` rechecks click target geometry after reflow and reports the click's `effect`. A `warning` flags a click that didn't reach the page or a link click with no observable effect. UseMac doesn't automatically retry the click; observe the result before deciding what to do.
+
+For native `uploadFile`, UseMac restores the previous focus if opening the file during a background upload activates the target app. The foreground `⌘⇧G` (Go to Folder) fallback waits for the path field and Open button.
+
 `actionResult.stepResults[i].downloadPath` is an absolute local path. It appears only if a download correlated with the step's tab and action completes during the same `browser_act` (for example, a `click` followed by a `wait`). If it is absent for an asynchronous download, query `browser_extract` in `downloads` mode instead of clicking again.
 
 ### Chrome Rules & Hybrid Restricted Flow
@@ -149,7 +155,9 @@ Any step accepts `"optional": true` (failure/not-found records `{success: true, 
 - **Pairing**: copy `umk_…` from **UseMac → Settings → General → Chrome Extension** into the extension popup once per profile (`EXTENSION_NOT_PAIRED` until paired; key is never exposed over IPC).
 - **Extension source**: In `browser_status`, `extensionSource: "other_folder"` means Chrome loaded an unpacked copy outside the app bundle, even if `extensionOutdated: false` and the versions match. Reloading the existing copy only reads that folder again. To receive bundled updates, load the extension from `/Applications/UseMac.app/Contents/Resources/chrome-extension` in `chrome://extensions`.
 - **Tab size**: UseMac never resizes tabs. `browser_screenshot` scales captures to fit `viewportWidth`/`viewportHeight` while keeping aspect ratio (`deviceScaleFactor` is ignored).
-- **Hybrid flow (`RESTRICTED_PAGE`)**: open with `browser_open` `newWindow: true` (or `tabId` + `url: ""` + `activate: true`), then call native `observe` / `act` with `app: "Google Chrome"` and `window: "<title substring>"`; return to `browser_*` on normal pages.
+- **Hybrid flow (`RESTRICTED_PAGE`)**: for the Chrome Web Store or `chrome://`, open with `browser_open` `newWindow: true` or activate an existing tab (`tabId` + `url: ""` + `activate: true`). Keep the window visible on screen and use native `observe` / `act` with `app: "Google Chrome"` and `window: "<title substring>"`. If `observe` only shows the toolbar or `setValue` returns `effect: none`, use native `act` with `foreground: true` (CLI `--foreground`) to briefly focus the pinned window, act, and restore prior focus. Return to `browser_*` on normal pages.
+- **Site rules**: `TargetRules` apply to native `observe`, `act`, `screenshot`, and `app_menu` in Chromium windows. With site rules active, the request is blocked if UseMac can't confirm the target site.
+- **Active work indicators**: UseMac's native overlay marks visible Chromium windows on restricted pages. In a tab the agent controls, the user's typing or clicking pauses the agent there and changes the tab indicator to **You're using this tab, agent paused · Resume**. Only the user should resume it.
 
 ---
 

@@ -705,7 +705,7 @@ struct UseMacCLI {
         let parsed = try parseAppAndExtras(
             args: args,
             valueFlags: ["--app", "--max-depth", "--max-elements", "--role", "--text", "--filter-role", "--filter-text", "--window"],
-            boolFlags: ["--no-cache", "--diff", "--no-diff", "--diff-only", "--screenshot", "--no-offscreen"]
+            boolFlags: ["--no-cache", "--diff", "--no-diff", "--diff-only", "--screenshot", "--include-offscreen", "--no-offscreen"]
         )
         if let extra = parsed.positionals.first {
             throw CLIError.usage("Unexpected argument '\(extra)'. Run 'usemac help observe'.")
@@ -730,7 +730,9 @@ struct UseMacCLI {
             useCache: useCache,
             includeDiff: includeDiff,
             includeScreenshot: includeScreenshot,
-            includeOffscreen: parsed.flags.contains("--no-offscreen") ? false : nil,
+            includeOffscreen: parsed.flags.contains("--include-offscreen")
+                ? true
+                : (parsed.flags.contains("--no-offscreen") ? false : nil),
             window: parsed.values["--window"],
             filter: serverFilter
         )
@@ -2692,7 +2694,7 @@ struct UseMacCLI {
           ping                                       Test socket and engine latency
           status                                     Show daemon status, permissions, and telemetry
           apps                                       List running applications
-          observe [--app <n|pid>] [--role <r>] [--text <t>] [--filter-role <r>] [--filter-text <t>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--no-offscreen] [--screenshot]
+          observe [--app <n|pid>] [--role <r>] [--text <t>] [--filter-role <r>] [--filter-text <t>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--include-offscreen] [--no-offscreen] [--screenshot]
                                                      Capture a compact accessibility snapshot (stable @eN ids)
           find --app <n|pid> [--role <r>] [--text <t>] [--title <t>] [--value <v>] [--exact] [--first] [--max-depth <n>] [--max-elements <n>]
                                                      Search the live accessibility tree with the same rules as act's "match"
@@ -2790,7 +2792,7 @@ struct UseMacCLI {
 
     private static let snapshotJSON = "WindowSnapshot {app: {pid, name, bundleId, windowTitle, windowId}, timestampMs, latencyMs, fromHotCache, focusedElementId, elements: [{id, role, title, value, roleDescription, enabled, focused, frame {x, y, width, height}, actions, offscreen}], diff, screenshotPath}"
 
-    private static let restrictedPageNote = "On RESTRICTED_PAGE (Chrome Web Store, chrome:// pages the extension cannot script) switch to the hybrid flow: 'usemac browser open --tab <id> --activate' (or 'browser open <url> --new-window'), then 'usemac observe --app \"Google Chrome\"' and 'usemac act … --app \"Google Chrome\"'. Native observe only sees the active tab of each Chrome window."
+    private static let restrictedPageNote = "On RESTRICTED_PAGE (Chrome Web Store, chrome://), use 'usemac browser open --tab <id> --activate' (or 'browser open <url> --new-window'). Keep the Chrome window visible on screen, then use native observe and act with --app \"Google Chrome\" and --window <title>. If observe only shows the toolbar or setValue reports effect: none, use 'usemac act' with --foreground to briefly focus the pinned window, act, and restore focus."
 
     private static let browserSubcommands: [(String, String)] = [
         ("status", "List Chrome profiles connected to the extension"),
@@ -2846,8 +2848,8 @@ struct UseMacCLI {
             )
         case "observe":
             return CommandHelp(
-                usage: ["usemac observe [--app <name|pid>] [--role <role>] [--text <text>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--no-offscreen] [--screenshot]"],
-                summary: "Capture a compact accessibility snapshot of the app's focused window. The same element keeps the same @eN id across observes; elements scrolled out of view are listed as (offscreen) and acting on one scrolls it into view first.",
+                usage: ["usemac observe [--app <name|pid>] [--role <role>] [--text <text>] [--max-depth <n>] [--max-elements <n>] [--no-cache] [--no-diff] [--include-offscreen] [--no-offscreen] [--screenshot]"],
+                summary: "Capture a compact accessibility snapshot of the app's focused window. The same element keeps the same @eN id across observes; pass --include-offscreen to list scrolled-out elements as (offscreen).",
                 flags: [
                     ("--app <name|pid>", "Target app name, bundle id or pid (default: the paired app, else the frontmost app)"),
                     ("--role <role>", "Only print elements with this AX role, with or without the AX prefix (button = AXButton)"),
@@ -2856,7 +2858,8 @@ struct UseMacCLI {
                     ("--max-elements <n>", "Maximum number of elements to index"),
                     ("--no-cache", "Read the live tree instead of the hot cache"),
                     ("--diff | --no-diff", "Include (default) or leave out the diff against the previous snapshot"),
-                    ("--no-offscreen", "Leave out elements scrolled out of view"),
+                    ("--include-offscreen", "Also list elements scrolled out of view as (offscreen)"),
+                    ("--no-offscreen", "Leave out elements scrolled out of view (default)"),
                     ("--window <title>", "Observe the window whose title contains this text instead of the focused one; later acts keep using it"),
                     ("--screenshot", "Also save a JPEG of the window and print its path")
                 ],

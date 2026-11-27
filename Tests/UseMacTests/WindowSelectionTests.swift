@@ -222,4 +222,76 @@ final class WindowSelectionTests: XCTestCase {
         XCTAssertFalse(WindowResolver.isAttached(window(164, pid: other, CGRect(x: 200, y: 50, width: 700, height: 400)), to: parent))
         XCTAssertFalse(WindowResolver.isAttached(parent, to: parent))
     }
+
+    // MARK: Task-scoped title pins
+
+    func testTitlePinsIsolateTasksAndUnscopedRequestsForTheSamePid() {
+        let a = "pin-\(UUID())"
+        let b = "pin-\(UUID())"
+        defer {
+            WindowResolver.clearPins(forTaskId: a)
+            WindowResolver.clearPins(forTaskId: b)
+            WindowResolver.pin(pid: chrome, title: nil, taskId: nil)
+        }
+
+        WindowResolver.pin(pid: chrome, title: " Store ", taskId: " \(a)\n")
+        WindowResolver.pin(pid: chrome, title: "Editor", taskId: b)
+        XCTAssertNil(WindowResolver.pinnedTitle(pid: chrome, taskId: nil))
+        WindowResolver.pin(pid: chrome, title: "Unscoped", taskId: " \n")
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: chrome, taskId: nil), "Unscoped")
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: chrome, taskId: b), "Editor")
+
+        WindowResolver.pin(pid: chrome, title: nil, taskId: b)
+        XCTAssertNil(WindowResolver.pinnedTitle(pid: chrome, taskId: b))
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: chrome, taskId: a), "Store")
+        WindowResolver.pin(pid: chrome, title: nil, taskId: nil)
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: chrome, taskId: a), "Store")
+    }
+
+    func testTaskPinScopeBindsAndRestoresTheImplicitPinInDetachedWork() async {
+        let outer = "pin-\(UUID())"
+        let inner = "pin-\(UUID())"
+        let pid = chrome
+        defer {
+            WindowResolver.clearPins(forTaskId: outer)
+            WindowResolver.clearPins(forTaskId: inner)
+        }
+        WindowResolver.pin(pid: pid, title: "Outer window", taskId: outer)
+
+        let found = await Task.detached {
+            WindowResolver.withTaskPinScope(outer) {
+                XCTAssertEqual(WindowResolver.pinnedTitle(pid: pid), "Outer window")
+                WindowResolver.withTaskPinScope(inner) {
+                    XCTAssertNil(WindowResolver.pinnedTitle(pid: pid))
+                    WindowResolver.pin(pid: pid, title: "Inner window")
+                    XCTAssertEqual(WindowResolver.pinnedTitle(pid: pid), "Inner window")
+                }
+                return WindowResolver.pinnedTitle(pid: pid)
+            }
+        }.value
+        XCTAssertEqual(found, "Outer window")
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: pid, taskId: inner), "Inner window")
+    }
+
+    func testClearPinsRemovesOnlyTheNamedTasksPinsAcrossPids() {
+        let a = "pin-\(UUID())"
+        let b = "pin-\(UUID())"
+        defer {
+            WindowResolver.clearPins(forTaskId: a)
+            WindowResolver.clearPins(forTaskId: b)
+            WindowResolver.pin(pid: other, title: nil, taskId: nil)
+        }
+        WindowResolver.pin(pid: chrome, title: "Store", taskId: a)
+        WindowResolver.pin(pid: other, title: "Editor", taskId: a)
+        WindowResolver.pin(pid: other, title: "Other task", taskId: b)
+        WindowResolver.pin(pid: other, title: "Unscoped", taskId: nil)
+
+        WindowResolver.clearPins(forTaskId: " \(a)\n")
+        WindowResolver.clearPins(forTaskId: nil)
+        WindowResolver.clearPins(forTaskId: " \n")
+        XCTAssertNil(WindowResolver.pinnedTitle(pid: chrome, taskId: a))
+        XCTAssertNil(WindowResolver.pinnedTitle(pid: other, taskId: a))
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: other, taskId: b), "Other task")
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: other, taskId: nil), "Unscoped")
+    }
 }

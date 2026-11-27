@@ -474,9 +474,31 @@ function sendWS(payload) {
   }
 }
 
+let extensionInstanceIdPromise = null;
+
+function getOrCreateExtensionInstanceId() {
+  if (!extensionInstanceIdPromise) {
+    extensionInstanceIdPromise = (async () => {
+      const stored = await chrome.storage.local.get(["usemacExtensionInstanceId"]);
+      const existing = stored?.usemacExtensionInstanceId;
+      if (typeof existing === "string" && /^[0-9a-f]{32}$/.test(existing)) return existing;
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      const id = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      await chrome.storage.local.set({ usemacExtensionInstanceId: id });
+      return id;
+    })().catch(() => {
+      // Don't advertise a transient identity if storage is unavailable. Retry on the next hello.
+      extensionInstanceIdPromise = null;
+      return undefined;
+    });
+  }
+  return extensionInstanceIdPromise;
+}
+
 async function sendHello(socket = state.ws) {
   await resolveProfileInfo();
   const keyBytes = await loadPairingKey(true);
+  const extensionInstanceId = await getOrCreateExtensionInstanceId();
   if (!socket || state.ws !== socket || socket.readyState !== WebSocket.OPEN) {
     return;
   }
@@ -490,6 +512,7 @@ async function sendHello(socket = state.ws) {
     protocol: PROTOCOL_VERSION,
     extensionVersion: EXTENSION_VERSION,
     extensionId: typeof chrome.runtime.id === "string" ? chrome.runtime.id : undefined,
+    extensionInstanceId,
     profileName: state.profileName,
     clientNonce,
     hasKey: Boolean(keyBytes)
@@ -546,6 +569,11 @@ function scheduleReconnect(overrideDelayMs = null) {
   }, delay);
 }
 
+function cancelDisconnectedSessionWork() {
+  handleCancel(null, null).catch(() => {});
+  clearAllTabIndicatorUserPauses(true);
+}
+
 function enterKeyMismatch(socket) {
   if (socket && state.ws === socket) {
     try {
@@ -559,6 +587,7 @@ function enterKeyMismatch(socket) {
   }
   state.wsState = "disconnected";
   state.authState = "key_mismatch";
+  cancelDisconnectedSessionWork();
   state.pendingClientNonce = null;
   state.handshakeKeyBytes = null;
   state.awaitingAuthResult = false;
@@ -634,7 +663,9 @@ function connectWS(force = false) {
     return;
   }
 
-  if (force && state.ws) {
+  // The keepalive can replace a closing socket before its onclose callback runs.
+  if (state.ws && (force || state.ws.readyState === WebSocket.CLOSING || state.ws.readyState === WebSocket.CLOSED)) {
+    cancelDisconnectedSessionWork();
     try {
       state.ws.onopen = null;
       state.ws.onmessage = null;
@@ -728,6 +759,9 @@ function connectWS(force = false) {
         state.awaitingAuthResult = false;
         state.nextReconnectAllowedAt = 0;
         state.appExtensionStatus = msg.extensionStatus && typeof msg.extensionStatus === "object" ? msg.extensionStatus : null;
+        if (Array.isArray(msg.ownedTabIds) && msg.ownedTabIds.length > 0) {
+          syncOwnedTabIdsFromDaemon(msg.ownedTabIds);
+        }
         sendProfileInfo();
       } else if (state.authState === "authenticating") {
         enterKeyMismatch(socket);
@@ -754,6 +788,11 @@ function connectWS(force = false) {
       return;
     }
 
+    if (msg.type === "sync_owned_tabs") {
+      syncOwnedTabIdsFromDaemon(msg.tabIds);
+      return;
+    }
+
     if (msg.type === "request" && msg.id && msg.command) {
       dispatchDaemonRequest(msg);
     }
@@ -767,6 +806,7 @@ function connectWS(force = false) {
     if (state.ws !== socket) return;
     state.ws = null;
     state.wsState = "disconnected";
+    cancelDisconnectedSessionWork();
     state.pendingClientNonce = null;
     state.handshakeKeyBytes = null;
     state.awaitingAuthResult = false;
@@ -791,9 +831,19 @@ function ensureConnected() {
 }
 
 async function sendCDP(tabId, method, params = {}, cdpSessionId = null) {
-  if (!cdpSessionId && TAB_INDICATOR_POINTER_METHODS.has(method)) await tabIndicatorBeforeAgentPointer(tabId, method, params);
   const target = cdpSessionId ? { tabId, sessionId: cdpSessionId } : { tabId };
-  return chrome.debugger.sendCommand(target, method, params);
+  const pointer = TAB_INDICATOR_POINTER_METHODS.has(method);
+  if (pointer && !cdpSessionId) await tabIndicatorBeforeAgentPointer(tabId, method, params);
+  const kind = pointer && !(method === "Input.dispatchMouseEvent" && params.type === "mouseMoved")
+    ? "pointer"
+    : tabIndicatorKeyboardMethods.has(method) ? "keyboard" : null;
+  if (!kind) return chrome.debugger.sendCommand(target, method, params);
+  const input = beginTabIndicatorAgentInput(tabId, kind);
+  try {
+    return await chrome.debugger.sendCommand(target, method, params);
+  } finally {
+    endTabIndicatorAgentInput(tabId, kind, input);
+  }
 }
 
 async function initChildTargetSession(tabId, childSessionId) {
@@ -805,6 +855,7 @@ async function initChildTargetSession(tabId, childSessionId) {
     sendCDP(tabId, "Runtime.enable", {}, childSessionId).catch(() => {}),
     sendCDP(tabId, "DOM.enable", {}, childSessionId).catch(() => {}),
     sendCDP(tabId, "Page.enable", {}, childSessionId).catch(() => {}),
+    sendCDP(tabId, "Network.enable", { maxPostDataSize: 0 }, childSessionId).catch(() => {}),
     sendCDP(tabId, "Target.setAutoAttach", {
       autoAttach: true,
       waitForDebuggerOnStart: false,
@@ -1423,7 +1474,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     });
     return;
   }
-  if (method === "Network.requestWillBeSent" && !source.sessionId) {
+  if (method === "Network.requestWillBeSent") {
+    session.networkRequestSeq = (session.networkRequestSeq || 0) + 1;
+    if (source.sessionId) return;
     const reqId = params?.requestId;
     const reqType = params?.type || "";
     const reqUrl = params?.request?.url || "";
@@ -1560,6 +1613,7 @@ chrome.debugger.onDetach.addListener((source) => {
     pruneChildTarget(session, source.sessionId);
     return;
   }
+  clearTabIndicatorUserPause(session.tabIndicator, true);
   clearIdleTimer(session);
   stopCapturePump(session);
   clearPendingFileChooser(session, null);
@@ -1630,6 +1684,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   sendWS({ type: "tab_url", tabId, removed: true });
   const session = state.tabSessions.get(tabId);
   if (session) {
+    clearTabIndicatorUserPause(session.tabIndicator, true);
     clearIdleTimer(session);
     stopCapturePump(session);
     clearPendingFileChooser(session, null);
@@ -2046,13 +2101,15 @@ async function getTabOrNull(tabId) {
   }
 }
 
-function restrictedPageGuidance(tab) {
+function restrictedPageGuidance(tab, { activated = false } = {}) {
   const tabId = tab?.id ?? null;
   const url = effectiveTabUrl(tab);
   const tabRef = tabId != null ? String(tabId) : "<tabId>";
   const appName = BROWSER_APP_NAMES[BROWSER_FLAVOR] || "Google Chrome";
   let text;
-  if (tab?.active) {
+  if (activated) {
+    text = `The tab is now the active tab of its window. Use native observe/act with app "${appName}" to work on it.`;
+  } else if (tab?.active) {
     text = `use native observe/act with app "${appName}": it is already the active tab of its window, and native observe only sees the active tab of each window.`;
   } else {
     text = `make it the active tab of its window with browser_open {"tabId":${tabRef},"url":"","activate":true}`;
@@ -2061,6 +2118,8 @@ function restrictedPageGuidance(tab) {
     }
     text += `, then use native observe/act with app "${appName}" (native observe only sees the active tab of each window).`;
   }
+  text += ` The native route requires the ${appName} window to be visible on screen. In the background, the browser may omit the AXWebArea or fields may ignore setValue.`;
+  text += ` If observe shows only the browser toolbar or setValue returns effect: "none", use "foreground": true to briefly focus the window, act, and restore the previous focus.`;
   text += ` To leave the page, call browser_open with this tabId and another URL.`;
   return text;
 }
@@ -2126,10 +2185,10 @@ function restrictedPageFeedback(tab, reason, { activated = false } = {}) {
   const diagnosis = `${tabRef} is on a page Chrome does not let extensions script (${what}${url ? `: ${url}` : ""}). ` +
     `browser_observe, browser_extract, browser_screenshot and browser_act will answer RESTRICTED_PAGE there; ` +
     `navigation and tab activation still work.`;
-  const appName = BROWSER_APP_NAMES[BROWSER_FLAVOR] || "Google Chrome";
+  const guidance = restrictedPageGuidance(tab, { activated });
   const suggestedAction = activated
-    ? `The tab is now the active tab of its window. Use native observe/act with app "${appName}" to work on it. To leave the page, call browser_open with this tabId and another URL.`
-    : `To work on it, ${restrictedPageGuidance(tab)}`;
+    ? guidance
+    : `To work on it, ${guidance}`;
   return {
     severity: "warning",
     trigger: "restricted_page",
@@ -2460,7 +2519,26 @@ async function evalInFrame(tabId, frameMeta, expression, opts = {}) {
   return sendCDP(tabId, "Runtime.evaluate", params, cdpSessionId);
 }
 
-async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbackUrl = "", scrollOwnerIntoView = false) {
+async function evalAgentInputInFrame(tabId, frameMeta, expression, opts = {}) {
+  const input = beginTabIndicatorAgentInput(tabId, "keyboard");
+  try {
+    return await evalInFrame(tabId, frameMeta, expression, opts);
+  } finally {
+    endTabIndicatorAgentInput(tabId, "keyboard", input);
+  }
+}
+
+// Runs in the owner element's document, not in the iframe being clicked.
+function frameOwnerClickObstruction(owner, hitAtPoint, x, y) {
+  const hit = hitAtPoint(owner.ownerDocument, x, y);
+  return hit === owner ? null : hit?.localName || "an unknown element";
+}
+
+async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbackUrl = "", scrollOwnerIntoView = false, clickPoints = null) {
+  const hitTestSource = clickPoints ? `
+    const hitAtPoint = ${clickHitAtPoint.toString()};
+    const obstruction = ${frameOwnerClickObstruction.toString()};
+  ` : "";
   let owner = null;
   if (frameId) {
     try {
@@ -2481,8 +2559,9 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
       if (objectId) {
         const res = await sendCDP(tabId, "Runtime.callFunctionOn", {
           objectId,
-          arguments: [{ value: Boolean(scrollOwnerIntoView) }],
-          functionDeclaration: `function(scrollIfHidden) {
+          arguments: [{ value: Boolean(scrollOwnerIntoView) }, { value: clickPoints }],
+          functionDeclaration: `function(scrollIfHidden, clickPoints) {
+            ${hitTestSource}
             if (scrollIfHidden) {
               const ir = this.getBoundingClientRect();
               if (ir.bottom < 0 || ir.top > window.innerHeight || ir.right < 0 || ir.left > window.innerWidth) {
@@ -2496,6 +2575,7 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
             let height = 0;
             let first = true;
             let visible = true;
+            const pointObstructions = clickPoints?.map(() => null);
             const title = (this.getAttribute && (this.getAttribute('title') || this.getAttribute('aria-label') || this.name)) || '';
             while (cur) {
               const win = cur.ownerDocument?.defaultView || window;
@@ -2511,6 +2591,12 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
               const pt = parseFloat(cs.paddingTop) || 0;
               x += r.left + bl + pl;
               y += r.top + bt + pt;
+              if (clickPoints) {
+                for (let i = 0; i < clickPoints.length; i++) {
+                  const point = clickPoints[i];
+                  pointObstructions[i] ??= obstruction(cur, hitAtPoint, point.x + x, point.y + y);
+                }
+              }
               if (first) {
                 width = r.width;
                 height = r.height;
@@ -2522,7 +2608,7 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
                 cur = null;
               }
             }
-            return { visible: visible && width >= 24 && height >= 20, x, y, width, height, title };
+            return { visible: visible && width >= 24 && height >= 20, x, y, width, height, title, pointObstructions };
           }`,
           returnByValue: true
         }, parentSessionId);
@@ -2545,11 +2631,14 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
       const fb = await sendCDP(tabId, "Runtime.evaluate", {
         expression: `(() => {
           ${QUERY_DEEP_HELPER_JS}
+          ${hitTestSource}
+          const clickPoints = ${JSON.stringify(clickPoints)};
           const wanted = ${urlLit};
           let wantedOrigin = '';
           try { wantedOrigin = new URL(wanted).origin; } catch (_) {}
           const iframes = queryAllDeep(document, 'iframe');
           let best = null;
+          let bestFrame = null;
           let bestScore = -1;
           for (let i = 0; i < iframes.length; i++) {
             const f = iframes[i];
@@ -2564,6 +2653,7 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
             else if (wantedOrigin && src.startsWith(wantedOrigin)) score = 4;
             if (score > bestScore) {
               bestScore = score;
+              bestFrame = f;
               const bl = parseFloat(cs.borderLeftWidth) || 0;
               const bt = parseFloat(cs.borderTopWidth) || 0;
               const pl = parseFloat(cs.paddingLeft) || 0;
@@ -2578,7 +2668,12 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
               };
             }
           }
-          return bestScore >= 4 ? best : null;
+          if (bestScore < 4) return null;
+          if (clickPoints) {
+            best.pointObstructions = clickPoints.map((point) =>
+              obstruction(bestFrame, hitAtPoint, point.x + best.x, point.y + best.y));
+          }
+          return best;
         })()`,
         returnByValue: true
       }, parentSessionId);
@@ -2591,7 +2686,7 @@ async function getFrameOwnerRect(tabId, frameId, parentSessionId = null, fallbac
   return null;
 }
 
-async function computeFrameViewportRect(tabId, frameMeta, scrollOwnerIntoView = false) {
+async function computeFrameViewportRect(tabId, frameMeta, scrollOwnerIntoView = false, clickPoints = null) {
   if (!frameMeta || !Array.isArray(frameMeta.hops) || frameMeta.hops.length === 0) {
     return { visible: true, x: 0, y: 0, width: 0, height: 0, title: "" };
   }
@@ -2600,14 +2695,19 @@ async function computeFrameViewportRect(tabId, frameMeta, scrollOwnerIntoView = 
   let lastW = 0;
   let lastH = 0;
   let lastTitle = "";
+  const pointObstructions = clickPoints?.map(() => null);
   for (let i = 0; i < frameMeta.hops.length; i++) {
-    const hop = frameMeta.hops[i];
+    // To hit-test a click, walk toward the top document so each parent gets the point in its own coordinates.
+    const last = frameMeta.hops.length - 1;
+    const index = clickPoints ? last - i : i;
+    const hop = frameMeta.hops[index];
     const rect = await getFrameOwnerRect(
       tabId,
       hop.frameId,
       hop.parentSessionId,
       hop.url || "",
-      scrollOwnerIntoView && i === frameMeta.hops.length - 1
+      scrollOwnerIntoView && index === last,
+      clickPoints?.map((point) => ({ x: point.x + totalX, y: point.y + totalY })) ?? null
     );
     if (!rect || !rect.visible) {
       return {
@@ -2621,15 +2721,20 @@ async function computeFrameViewportRect(tabId, frameMeta, scrollOwnerIntoView = 
     }
     totalX += rect.x;
     totalY += rect.y;
-    lastW = rect.width;
-    lastH = rect.height;
-    lastTitle = rect.title || lastTitle;
+    if (!clickPoints || i === 0) {
+      lastW = rect.width;
+      lastH = rect.height;
+    }
+    lastTitle = clickPoints ? lastTitle || rect.title : rect.title || lastTitle;
+    if (pointObstructions) {
+      for (let j = 0; j < pointObstructions.length; j++) pointObstructions[j] ??= rect.pointObstructions?.[j] ?? null;
+    }
   }
   frameMeta.offsetX = totalX;
   frameMeta.offsetY = totalY;
   frameMeta.width = lastW;
   frameMeta.height = lastH;
-  return { visible: true, x: totalX, y: totalY, width: lastW, height: lastH, title: lastTitle };
+  return { visible: true, x: totalX, y: totalY, width: lastW, height: lastH, title: lastTitle, pointObstructions };
 }
 
 async function resolveSameOriginContextId(tabId, session, cdpSessionId, frameId) {
@@ -4214,6 +4319,138 @@ async function resolveStepTarget(tabId, step) {
   return null;
 }
 
+// Sent to the target frame, including for elements inside open shadow roots.
+function clickHitAtPoint(root, x, y) {
+  let hit = root.elementFromPoint?.(x, y) || null;
+  if (hit?.localName === "usemac-tab-indicator") {
+    // CDP makes the pill inert for the actual pointer event; test the page beneath it.
+    hit = root.elementsFromPoint?.(x, y).find((node) => node !== hit) || null;
+  }
+  while (hit?.shadowRoot) {
+    const inner = hit.shadowRoot.elementFromPoint?.(x, y);
+    if (!inner || inner === hit) break;
+    hit = inner;
+  }
+  return hit;
+}
+
+async function refreshClickTargetPoint(tabId, target, lookupExpr) {
+  const { frameMeta } = target;
+  const result = await evalInFrame(tabId, frameMeta, `(() => {
+    ${QUERY_DEEP_HELPER_JS}
+    const hitAtPoint = ${clickHitAtPoint.toString()};
+    const el = ${lookupExpr};
+    if (!el) return { missing: true };
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return { missing: true };
+    const control = el.closest?.('a[href], [role="link"], button, [role="button"], input, label, select, textarea, summary');
+    const isLink = Boolean(el.closest?.('a[href], [role="link"]'));
+    const candidates = [[0.5, 0.5], [0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]
+      .map(([x, y]) => ({ x: rect.left + rect.width * x, y: rect.top + rect.height * y }));
+    if (typeof document.elementFromPoint !== 'function') return { missing: true };
+    const hitsTarget = (hit) => Boolean(hit && (hit === el || el.contains(hit) || (hit === el.parentElement && hit === control)));
+    const points = [];
+    let obstructedBy = null;
+    for (const candidate of candidates) {
+      const hit = hitAtPoint(document, candidate.x, candidate.y);
+      if (hitsTarget(hit)) points.push(candidate);
+      else obstructedBy ??= hit?.localName || null;
+    }
+    return { points, isLink, fullyObstructed: points.length === 0, obstructedBy };
+  })()`);
+  const checked = result?.result?.value;
+  if (!checked || checked.missing || result?.exceptionDetails || !Array.isArray(checked.points)) {
+    throw { code: "ELEMENT_NOT_FOUND", message: "The click target could not be rechecked. Observe again before retrying." };
+  }
+  if (checked?.fullyObstructed) {
+    return { ...target, fullyObstructed: true, obstructedBy: checked.obstructedBy };
+  }
+  const frame = frameMeta?.frameId != null ? await computeFrameViewportRect(tabId, frameMeta, false, checked.points) : null;
+  if (frame && !frame.visible) {
+    throw { code: "ELEMENT_NOT_FOUND", message: "The click target's frame is no longer visible. Observe again before retrying." };
+  }
+  const point = checked.points.find((_, i) => !frame?.pointObstructions?.[i]);
+  if (!point) return { ...target, frameObstructedBy: frame.pointObstructions[0] };
+  return { ...target, x: point.x + (frame?.x || 0), y: point.y + (frame?.y || 0), isLink: checked.isLink };
+}
+
+const clickProbeLifetimeMs = 2000;
+
+// Runs in the clicked frame. Read and dispose together; the timeout also covers a lost CDP connection.
+function installClickProbe(key, el, watchTarget, lifetimeMs) {
+  if (typeof window.addEventListener !== "function") return false;
+  const events = ["pointerdown", "mousedown", "click", "auxclick", "dblclick"];
+  const readState = () => el && JSON.stringify([
+    el.checked, el.getAttribute("aria-expanded"), el.getAttribute("aria-selected"),
+    el.getAttribute("aria-pressed"), el.disabled, el.value, el.open ?? el.closest?.("details")?.open
+  ]);
+  const beforeHref = location.href;
+  const beforeTitle = document.title;
+  const beforeActive = document.activeElement;
+  const beforeScrollX = window.scrollX;
+  const beforeScrollY = window.scrollY;
+  const beforeState = readState();
+  const linkControl = el?.closest?.('a[href], [role="link"]') || null;
+  let sawEvent = false;
+  let mutated = false;
+  const targetParent = el?.parentElement;
+  const parentIsControl = targetParent?.matches?.('a[href], [role="link"], button, [role="button"], input, label, select, textarea, summary');
+  const onEvent = (event) => {
+    if (!event.isTrusted) return;
+    if (watchTarget && !event.composedPath().includes(el) && !(parentIsControl && event.target === targetParent)) return;
+    sawEvent = true;
+    removeListeners();
+  };
+  const removeListeners = () => {
+    for (const type of events) window.removeEventListener(type, onEvent, true);
+  };
+  const observer = typeof MutationObserver === "function" && document.documentElement
+    ? new MutationObserver((records) => {
+      // Ignore the extension's own UI becoming inert/visible or renewing its lease.
+      const isIndicator = (node) => node.localName === "usemac-tab-indicator";
+      if (!records.some((record) => {
+        if (isIndicator(record.target)) return false;
+        if (record.type !== "childList") return true;
+        return [...record.addedNodes, ...record.removedNodes].some((node) => !isIndicator(node));
+      })) return;
+      mutated = true;
+      observer.disconnect();
+    })
+    : null;
+  const dispose = () => {
+    clearTimeout(timer);
+    removeListeners();
+    observer?.disconnect();
+    delete globalThis[key];
+  };
+  const timer = setTimeout(dispose, lifetimeMs);
+  globalThis[key] = () => {
+    try {
+      const active = document.activeElement;
+      const focusedClickedLink = Boolean(
+        linkControl && active && (active === el || el?.contains?.(active) || active === linkControl)
+      );
+      return {
+        sawEvent, mutated,
+        stateChanged: beforeState !== readState(),
+        urlChanged: beforeHref !== location.href || beforeTitle !== document.title,
+        scrollChanged: beforeScrollX !== window.scrollX || beforeScrollY !== window.scrollY,
+        focusChanged: beforeActive !== active && !focusedClickedLink
+      };
+    } finally {
+      dispose();
+    }
+  };
+  for (const type of events) window.addEventListener(type, onEvent, true);
+  observer?.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+  return true;
+}
+
+function clickProbeContextLost(message) {
+  return /context.*(?:destroyed|not found)|cannot find (?:execution )?context|inspected target navigated|session with given id not found/i
+    .test(message || "");
+}
+
 // True when a step says where to act: a non-blank elementId, selector, match, or a full point.
 function stepNamesTarget(step) {
   const named = (value) => typeof value === "string" && value.trim() !== "";
@@ -4295,21 +4532,12 @@ function buildModifierMask(modifiers) {
   return mask;
 }
 
-async function dispatchMouseClick(tabId, x, y, button = "left", clickCount = 1) {
-  await sendCDP(tabId, "Input.dispatchMouseEvent", {
-    type: "mousePressed",
-    x,
-    y,
-    button,
-    clickCount
-  });
-  await sendCDP(tabId, "Input.dispatchMouseEvent", {
-    type: "mouseReleased",
-    x,
-    y,
-    button,
-    clickCount
-  });
+async function dispatchMouseClick(tabId, x, y, button = "left", count = 1) {
+  // A doubleClick explicitly requests two pairs. Never repeat a pair based on the observed effect.
+  for (let clickCount = 1; clickCount <= count; clickCount++) {
+    await sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
+    await sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
+  }
 }
 
 function buildWaitForMutationPromiseJs({ selector = null, elementId = null, match = null, text = null, gone = false, timeoutMs = 5000 }) {
@@ -4791,7 +5019,7 @@ async function executeScrollUntilStep(tabId, step, cancelToken = null) {
   let totalDeltaY = 0;
 
   for (let i = 0; i <= maxScrolls; i++) {
-    if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
+    await waitIfTabUserPaused(tabId, cancelToken);
     const probeRes = await evalInFrame(tabId, null, probeInViewportExpr).catch(() => null);
     const probe = probeRes?.result?.value;
     if (probe?.found) {
@@ -4872,7 +5100,7 @@ async function executeFillFormStep(tabId, step, cancelToken = null) {
   const fieldErrors = [];
 
   for (let fi = 0; fi < fields.length; fi++) {
-    if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
+    await waitIfTabUserPaused(tabId, cancelToken);
     const field = fields[fi];
     if (!field || typeof field !== "object") continue;
     const fieldDesc = field.label || field.selector || field.elementId || (hasNonEmptyMatch(field.match) ? formatMatchDesc(field.match) : `field[${fi}]`);
@@ -4880,7 +5108,7 @@ async function executeFillFormStep(tabId, step, cancelToken = null) {
 
     let outcome = null;
     for (const fMeta of candidateFrames) {
-      const res = await evalInFrame(tabId, fMeta, `(() => {
+      const res = await evalAgentInputInFrame(tabId, fMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
         const f = ${fieldLit};
         const roots = collectRoots(document);
@@ -5049,9 +5277,10 @@ async function executeFillFormStep(tabId, step, cancelToken = null) {
     }
 
     if (outcome.kind === "combobox") {
+      await waitIfTabUserPaused(tabId, cancelToken);
       // Wait via MutationObserver Promise (up to 350ms) for [role="option"] to appear, then click the matching option.
       const wantedLit = JSON.stringify(outcome.wanted || "");
-      const comboRes = await evalInFrame(tabId, outcome.frameMeta, `(() => {
+      const comboRes = await evalAgentInputInFrame(tabId, outcome.frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
         const wantedNorm = normalizeMatchText(${wantedLit});
         function findOption() {
@@ -5124,6 +5353,7 @@ async function executeFillFormStep(tabId, step, cancelToken = null) {
 
   // Optional submit action
   if (fieldErrors.length === 0 && (hasNonEmptyMatch(step.submitMatch) || (typeof step.submitSelector === "string" && step.submitSelector.trim() !== ""))) {
+    await waitIfTabUserPaused(tabId, cancelToken);
     const submitStep = {
       action: "click",
       match: hasNonEmptyMatch(step.submitMatch) ? step.submitMatch : undefined,
@@ -5270,10 +5500,20 @@ async function executeActionStep(tabId, step, cancelToken = null, batchClicks = 
   }
 
   if (action === "click" || action === "doubleClick" || action === "rightClick") {
-    const target = await resolveStepTarget(tabId, step);
+    const session = getOrCreateTabSession(tabId);
+    const elementId = typeof step.elementId === "string" ? step.elementId.trim() : "";
+    const selector = typeof step.selector === "string" ? step.selector.trim() : "";
+    const hasDomTarget = Boolean(elementId || selector || hasNonEmptyMatch(step.match));
+    if (hasDomTarget) {
+      const tab = await refreshTabMeta(tabId);
+      if (session.navigating || tab?.status === "loading") await waitForTabLoad(tabId, 1200);
+    }
+    let target = await resolveStepTarget(tabId, step);
     if (!target) {
       throw new Error(`${action} requires elementId, selector, match, or (x, y).`);
     }
+    const resolvedElementId = target.elementId || null;
+    const lookupExpr = findElementExprJs({ elementId: resolvedElementId, selector });
     const label =
       action === "doubleClick"
         ? "Double-clicking"
@@ -5282,27 +5522,82 @@ async function executeActionStep(tabId, step, cancelToken = null, batchClicks = 
           : target.label
             ? `Clicking ${target.label}`
             : "Clicking";
-    const session = getOrCreateTabSession(tabId);
-    const beforeUrl = session.url || "";
-    session.navigating = false;
-    const pt = await moveCursorSmoothly(tabId, target.x, target.y, label);
+    const targetDocumentId = session.documentId;
+    let pt = await moveCursorSmoothly(tabId, target.x, target.y, label);
+    if (hasDomTarget) {
+      // Both scrollIntoView and pointer hover can move the element. Recheck after both have settled.
+      await waitForAnimationFrames(tabId, 40);
+      await waitIfTabUserPaused(tabId, cancelToken);
+      target = await refreshClickTargetPoint(tabId, target, lookupExpr);
+      if (target.fullyObstructed || target.frameObstructedBy) {
+        const who = target.frameObstructedBy || target.obstructedBy || "an unknown element";
+        return {
+          mechanism: "cdp-mouse (obstructed)",
+          message: null,
+          effect: "none",
+          warning: `Skipped click because the target is completely covered by ${who}. Dismiss the overlay or observe again before retrying.`,
+          resolvedElementId
+        };
+      }
+      // Do not clamp a hit-tested point to a possibly stale viewport and send the click somewhere else.
+      pt = { x: target.x, y: target.y };
+      session.cursor = pt;
+    }
     emitCursor(tabId, pt.x, pt.y, "click", label);
 
+    const frameMeta = hasDomTarget ? target.frameMeta : findChildFrameAtPoint(session, pt.x, pt.y);
+    const pointX = pt.x - (frameMeta?.offsetX || 0);
+    const pointY = pt.y - (frameMeta?.offsetY || 0);
+    const probeKey = JSON.stringify("__usemacClickProbe_" + crypto.randomUUID());
+    const probeDeadline = Date.now() + clickProbeLifetimeMs;
+    const setup = await evalInFrame(tabId, frameMeta, `(() => {
+      ${hasDomTarget ? QUERY_DEEP_HELPER_JS : ""}
+      const el = ${hasDomTarget ? lookupExpr : `(${clickHitAtPoint.toString()})(document, ${pointX}, ${pointY})`};
+      if (${hasDomTarget} && !el) return { missing: true };
+      if (${!hasDomTarget} && (el?.localName === 'iframe' || el?.localName === 'frame')) return null;
+      return {
+        installed: (${installClickProbe.toString()})(${probeKey}, el, ${hasDomTarget}, ${clickProbeLifetimeMs}),
+        isLink: Boolean(el?.closest?.('a[href], [role="link"]'))
+      };
+    })()`).catch((err) => {
+      if (hasDomTarget && clickProbeContextLost(String(err?.message || err))) throw err;
+      return null;
+    });
+    const { installed = false, isLink = target.isLink, missing = false } = setup?.result?.value || {};
+    if (missing) {
+      throw { code: "ELEMENT_NOT_FOUND", message: "The click target disappeared before dispatch. Observe again before retrying." };
+    }
+    const beforeUrl = session.url || "";
+    const beforeDocumentId = session.documentId;
+    const beforeNetSeq = session.networkRequestSeq || 0;
+    session.navigating = false;
     const click = beginDownloadClick(tabId, beforeUrl);
     batchClicks?.push(click);
-    const resolvedElementId = target.elementId || null;
     try {
-      if (action === "click") {
-        await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
-      } else if (action === "doubleClick") {
-        await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
-        await dispatchMouseClick(tabId, pt.x, pt.y, "left", 2);
-      } else {
-        await dispatchMouseClick(tabId, pt.x, pt.y, "right", 1);
+      let probe = null;
+      let lostContext = false;
+      try {
+        if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
+        if (hasDomTarget && session.documentId !== targetDocumentId) {
+          throw { code: "ELEMENT_NOT_FOUND", message: "The page changed before the click. Observe again before retrying." };
+        }
+        await dispatchMouseClick(tabId, pt.x, pt.y, action === "rightClick" ? "right" : "left", action === "doubleClick" ? 2 : 1);
+        await waitForAnimationFrames(tabId, 40);
+      } finally {
+        if (installed) {
+          try {
+            const result = await evalInFrame(tabId, frameMeta, `globalThis[${probeKey}]?.() ?? null`);
+            probe = result?.result?.value;
+            // Runtime.evaluate without an explicit context can succeed in a new document instead of throwing.
+            lostContext = (probe === null && Date.now() < probeDeadline) ||
+              clickProbeContextLost(result?.exceptionDetails?.exception?.description || result?.exceptionDetails?.text);
+          } catch (err) {
+            lostContext = clickProbeContextLost(String(err?.message || err));
+          }
+        }
       }
 
-      // Ordinary clicks only pay the existing double-rAF settle; poll only for an observed, eligible download.
-      await waitForAnimationFrames(tabId, 40);
+      // Poll only for an observed, eligible download.
       const [download] = clickDownloads(click);
       if (download) {
         const finalDownload = await waitForDownloadCompletion(download.id, 4500, tabId, cancelToken);
@@ -5315,19 +5610,34 @@ async function executeActionStep(tabId, step, cancelToken = null, batchClicks = 
           mechanism: "cdp-mouse (download)",
           message: `Download ${status}${detail}`,
           downloadPath,
-          resolvedElementId
+          resolvedElementId,
+          effect: "changed"
         };
       }
       const afterTab = await refreshTabMeta(tabId);
-      if (session.navigating || (afterTab && (afterTab.status === "loading" || (beforeUrl && afterTab.url && afterTab.url !== beforeUrl)))) {
+      if (lostContext || session.documentId !== beforeDocumentId || session.navigating ||
+          (afterTab && (afterTab.status === "loading" || (beforeUrl && afterTab.url && afterTab.url !== beforeUrl)))) {
         await waitForTabLoad(tabId, 3200);
         return {
           mechanism: "cdp-mouse (navigated)",
           message: afterTab?.url || session.url || null,
-          resolvedElementId
+          resolvedElementId,
+          effect: "changed"
         };
       }
-      return { mechanism: "cdp-mouse", message: null, resolvedElementId };
+      const netFired = (session.networkRequestSeq || 0) > beforeNetSeq;
+      let effect = "unverified";
+      let warning = null;
+      if (probe?.mutated || probe?.stateChanged || probe?.urlChanged || probe?.scrollChanged || probe?.focusChanged || netFired) {
+        effect = "changed";
+      } else if (probe && !probe.sawEvent) {
+        effect = "none";
+        warning = "The page did not receive the click event (the page may still be loading or reflowed). Observe again before retrying.";
+      } else if (probe && isLink) {
+        effect = "none";
+        warning = "Clicked the link, but no navigation, download, network request, or DOM change was observed. Observe again before retrying.";
+      }
+      return { mechanism: "cdp-mouse", message: null, resolvedElementId, effect, warning };
     } finally {
       if (!batchClicks) state.activeDownloadClicks.delete(click);
     }
@@ -5354,7 +5664,7 @@ async function executeActionStep(tabId, step, cancelToken = null, batchClicks = 
     const resolvedId = target?.elementId || step.elementId || null;
     if (resolvedId || step.selector) {
       const lookupExpr = findElementExprJs({ elementId: resolvedId, selector: resolvedId ? null : step.selector });
-      await evalInFrame(tabId, target?.frameMeta || null, `(() => {
+      await evalAgentInputInFrame(tabId, target?.frameMeta || null, `(() => {
         ${QUERY_DEEP_HELPER_JS}
         const el = ${lookupExpr};
         if (el) el.focus();
@@ -5386,7 +5696,7 @@ async function executeActionStep(tabId, step, cancelToken = null, batchClicks = 
     // Single collapsed eval for setValue on DOM targets: handles <select>, checkbox/radio, OR focuses & clears text input!
     if (action === "setValue" && hasDomRef) {
       const textLit = JSON.stringify(String(text));
-      const prepRes = await evalInFrame(tabId, frameMeta, `(() => {
+      const prepRes = await evalAgentInputInFrame(tabId, frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
         const el = ${lookupExpr};
         if (!el) return { handled: false, cleared: false };
@@ -5504,7 +5814,7 @@ async function executeActionStep(tabId, step, cancelToken = null, batchClicks = 
       const isOOPIF = frameMeta?.isOOPIF === true;
       const textLit = JSON.stringify(String(text));
       const isSetValue = action === "setValue" ? "true" : "false";
-      await evalInFrame(tabId, frameMeta, `(() => {
+      await evalAgentInputInFrame(tabId, frameMeta, `(() => {
         ${QUERY_DEEP_HELPER_JS}
         const el = ${lookupExpr};
         if (!el) return;
@@ -5924,6 +6234,7 @@ async function handleTabsCommand(req) {
       usemacGroupIds.add(group.id);
     }
   } catch (_) {}
+  await ownedTabIdsUpdates;
   const ownedIds = await loadOwnedTabIds();
   const tabs = filtered.map((t) => {
     const info = {
@@ -7235,6 +7546,14 @@ async function handleScreenshotCommand(req, preResolvedTab = null) {
 // user had open (reached through tabId) are never closed. Kept in session storage so a service-worker
 // restart does not forget them.
 const OWNED_TABS_KEY = "usemacOwnedTabIds";
+let ownedTabIdsUpdates = Promise.resolve();
+
+// A restore, an open, and a task cleanup can arrive on different command queues.
+function enqueueOwnedTabIdsUpdate(update) {
+  const next = ownedTabIdsUpdates.then(update);
+  ownedTabIdsUpdates = next.catch(() => {});
+  return next;
+}
 
 async function loadOwnedTabIds() {
   try {
@@ -7253,16 +7572,31 @@ async function saveOwnedTabIds(ids) {
 
 async function markTabOwned(tabId) {
   if (tabId == null) return;
-  const ids = await loadOwnedTabIds();
-  ids.add(tabId);
-  await saveOwnedTabIds(ids);
+  return enqueueOwnedTabIdsUpdate(async () => {
+    const ids = await loadOwnedTabIds();
+    ids.add(tabId);
+    await saveOwnedTabIds(ids);
+  });
 }
 
 async function forgetOwnedTab(tabId) {
-  const ids = await loadOwnedTabIds();
-  if (ids.delete(tabId)) {
-    await saveOwnedTabIds(ids);
-  }
+  return enqueueOwnedTabIdsUpdate(async () => {
+    const ids = await loadOwnedTabIds();
+    if (ids.delete(tabId)) await saveOwnedTabIds(ids);
+  });
+}
+
+async function syncOwnedTabIdsFromDaemon(tabIds) {
+  if (!Array.isArray(tabIds) || tabIds.length === 0) return;
+  const candidates = new Set(tabIds.filter((id) => Number.isInteger(id) && id > 0));
+  return enqueueOwnedTabIdsUpdate(async () => {
+    const owned = await loadOwnedTabIds();
+    const previousSize = owned.size;
+    for (const id of candidates) {
+      if (!owned.has(id) && await getTabOrNull(id)) owned.add(id);
+    }
+    if (owned.size !== previousSize) await saveOwnedTabIds(owned);
+  });
 }
 
 function httpDownloadOrigin(url) {
@@ -7310,9 +7644,9 @@ async function handleCloseOwnedTabsCommand(req) {
     if (focused?.focused) focusedWindowId = focused.id;
   } catch (_) {}
   const activeDownloads = await queryActiveDownloads();
-  const keepReason = (tab) => {
+  const keepReason = (tab, windowId = focusedWindowId) => {
     if (keep.has(tab.id)) return "asked to keep";
-    if (tab.active && tab.windowId === focusedWindowId) return "the user is looking at it";
+    if (tab.active && tab.windowId === windowId) return "the user is looking at it";
     if (!activeDownloads) return "download status unavailable";
     const observed = new Map(activeDownloads.map((download) => [download.id, download]));
     for (const download of state.downloads.values()) observed.set(download.id, download);
@@ -7348,7 +7682,12 @@ async function handleCloseOwnedTabsCommand(req) {
         }
         // Downloads/user activation may arrive during the async group operations. Check again and
         // don't yield between this final decision and remove. The group lock also excludes regrouping.
-        reason = keepReason(await chrome.tabs.get(tabId));
+        const finalTab = await chrome.tabs.get(tabId);
+        let focused;
+        try {
+          focused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+        } catch (_) {}
+        reason = focused ? keepReason(finalTab, focused.focused ? focused.id : null) : "window focus unavailable";
         if (!reason) await chrome.tabs.remove(tabId);
       });
       if (reason) {
@@ -7457,6 +7796,7 @@ async function runActionStepsPipeline(tabId, steps, { stopOnError = true, cancel
       resetIdleTimer(tabId);
 
       try {
+        await waitIfTabUserPaused(tabId, cancelToken);
         if (stepNeedsDebugger(step)) {
           const blocked = await restrictedPageErrorIfDetached(tabId);
           if (blocked) throw blocked;
@@ -7478,6 +7818,8 @@ async function runActionStepsPipeline(tabId, steps, { stopOnError = true, cancel
         if (outcome.resolvedElementId) {
           entry.resolvedElementId = outcome.resolvedElementId;
         }
+        if (outcome.effect != null) entry.effect = outcome.effect;
+        if (outcome.warning != null) entry.warning = outcome.warning;
         stepResults.push(entry);
         if (clicks.length > previousClickCount) {
           const click = clicks[clicks.length - 1];
@@ -7568,6 +7910,8 @@ async function runActionStepsPipeline(tabId, steps, { stopOnError = true, cancel
         const navigationNote = entry.mechanism === "cdp-mouse (navigated)" && entry.message;
         entry.mechanism = "cdp-mouse (download)";
         entry.downloadPath = path;
+        entry.effect = "changed";
+        entry.warning = null;
         entry.message = navigationNote ? `Navigated to ${navigationNote} · Download complete: ${path}` : `Download complete: ${path}`;
         break;
       }
@@ -7586,7 +7930,7 @@ async function handleOpenCommand(req, cancelToken = null) {
 
   if (!targetUrl) {
     if (req.tabId != null && activate && !newWindow) {
-      return handleActivateTabCommand(req);
+      return { ...(await handleActivateTabCommand(req)), createdTab: false };
     }
     throw {
       code: "INVALID_ARGUMENT",
@@ -7611,6 +7955,7 @@ async function handleOpenCommand(req, cancelToken = null) {
 
   let tab;
   let createdByUsemac = false;
+  if (isCancelled(req.tabId ?? null, cancelToken)) throw CANCELLED_ERROR;
   if (newWindow) {
     const createdWin = await createUsemacWindow(targetUrl);
     tab = createdWin?.tabs?.[0];
@@ -7620,6 +7965,7 @@ async function handleOpenCommand(req, cancelToken = null) {
     createdByUsemac = true;
   } else {
     const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    if (isCancelled(req.tabId ?? null, cancelToken)) throw CANCELLED_ERROR;
     if (windows.length === 0) {
       const createdWin = await createUsemacWindow(targetUrl);
       tab = createdWin?.tabs?.[0];
@@ -7640,6 +7986,8 @@ async function handleOpenCommand(req, cancelToken = null) {
         const existing = await resolveTargetTab(req.tabId);
         const update = { url: targetUrl };
         if (activate) update.active = true;
+        if (req.tabId != null) await waitIfTabUserPaused(existing.id, cancelToken);
+        else if (isCancelled(null, cancelToken)) throw CANCELLED_ERROR;
         tab = await chrome.tabs.update(existing.id, update);
       }
     }
@@ -7666,6 +8014,7 @@ async function handleOpenCommand(req, cancelToken = null) {
     profileName: state.profileName,
     url: tabNow.url || targetUrl,
     title: tabNow.title || "",
+    createdTab: Boolean(createdByUsemac),
     restricted: true,
     snapshot: actionResult ? null : restrictedPageSnapshot(tabNow, reason),
     actionResult,
@@ -7722,6 +8071,7 @@ async function handleOpenCommand(req, cancelToken = null) {
     if (req.autoDismissOverlays === true && overlayHighConfidence) {
       const ov = snapshot?.pageState?.blockingOverlay;
       if (ov && (ov.closeElementId || (Number.isFinite(ov.closeX) && Number.isFinite(ov.closeY)))) {
+        await waitIfTabUserPaused(tab.id, cancelToken);
         try {
           await executeActionStep(tab.id, {
             action: "click",
@@ -7738,7 +8088,9 @@ async function handleOpenCommand(req, cancelToken = null) {
             screenshotWidth = refreshed.screenshotWidth;
             screenshotHeight = refreshed.screenshotHeight;
           }
-        } catch (_) {}
+        } catch (err) {
+          if (err?.code === "CANCELLED") throw err;
+        }
       }
     }
 
@@ -7763,6 +8115,7 @@ async function handleOpenCommand(req, cancelToken = null) {
           profileName: state.profileName,
           url: session.url || targetUrl,
           title: session.title || "",
+          createdTab: Boolean(createdByUsemac),
           snapshot: null,
           actionResult: {
             success: false,
@@ -7830,6 +8183,7 @@ async function handleOpenCommand(req, cancelToken = null) {
     profileName: state.profileName,
     url: tabInfo?.url || targetUrl,
     title: tabInfo?.title || snapshot?.app?.windowTitle || "",
+    createdTab: Boolean(createdByUsemac),
     screenshotBase64: screenshotBase64 || null,
     screenshotWidth: screenshotWidth ?? null,
     screenshotHeight: screenshotHeight ?? null,
@@ -8158,6 +8512,10 @@ function dispatchDaemonRequest(req) {
   }
 
   if (req.command === "stop_stream") {
+    // A paused batch owns the tab's queue. Cancel its wait before queuing an explicit detach.
+    for (const [id, session] of state.tabSessions) {
+      if (req.tabId == null || req.tabId === id) cancelTabIndicatorUserPause(id, session.tabIndicator);
+    }
     if (req.tabId != null) {
       const cancelToken = createCancelToken(req.tabId, reqGlobalGen);
       enqueueTabCommand(req.tabId, () => handleDaemonRequest(req, null, cancelToken));
@@ -8265,7 +8623,7 @@ async function handleDaemonRequest(req, preResolvedTab = null, cancelToken = nul
         response = await handleStopStreamCommand(req);
         break;
       case "close_owned_tabs":
-        response = await handleCloseOwnedTabsCommand(req);
+        response = await enqueueOwnedTabIdsUpdate(() => handleCloseOwnedTabsCommand(req));
         break;
       case "reload_extension":
         response = handleReloadExtensionCommand(req);

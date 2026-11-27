@@ -1,7 +1,9 @@
 import AppKit
-import Foundation
 import Combine
+import CoreImage
+import Foundation
 import ImageIO
+import IOSurface
 import SwiftUI
 import UseMacProtocol
 import UseMacEngine
@@ -232,6 +234,7 @@ public final class AppState: ObservableObject {
     @Published public var highlightRole: String?
     /// Window of `highlightedRect`; nil when the event carried no pid (drawn everywhere, as before).
     @Published public private(set) var highlightTarget: OverlayTargetWindow?
+    @Published public private(set) var restrictedWindowOverlay: RestrictedWindowOverlayState?
     @Published public var pulsePoint: OverlayPulse?
     @Published public var virtualAgentPoint: CGPoint?
     @Published public var virtualAgentLabel: String?
@@ -256,6 +259,7 @@ public final class AppState: ObservableObject {
     public var onSetOptionSpaceShortcutEnabled: ((Bool) -> Void)?
 
     private var highlightClearTask: Task<Void, Never>?
+    private var restrictedOverlayClearTask: Task<Void, Never>?
     private var pulseClearTask: Task<Void, Never>?
     private var captionClearTask: Task<Void, Never>?
     private var virtualAgentFadeTask: Task<Void, Never>?
@@ -278,6 +282,8 @@ public final class AppState: ObservableObject {
     private var dismissedDuringActiveRun: Bool = false
     private var lastUserDismissDate: Date?
     private var isStreamActive: Bool = false
+    private lazy var nativeThumbnailContext = CIContext()
+    private var lastNativeThumbnail: (cardId: String, time: TimeInterval)?
     private var policyBeforePause: GovernancePolicy?
 
     public init(socketPath: String = UseMacDefaults.defaultSocketPath) {
@@ -530,7 +536,12 @@ public final class AppState: ObservableObject {
         }
         engine.liveStreamer.onFrame = { [weak self] surface, width, height, sourceBounds, sourceName, isWindow, windowId, pid in
             Task { @MainActor [weak self] in
-                guard let self, !self.isBrowserStreamActive && !self.showingFrozenBrowserFrame, !self.chromePreviewHidden else { return }
+                guard let self, self.isStreamActive, !self.isBrowserStreamActive,
+                      !self.showingFrozenBrowserFrame, !self.chromePreviewHidden else { return }
+                if self.hudStreamMode == .autoWindow, let target = self.liveStreamTargetApp,
+                   let targetWindowId = target.windowId {
+                    guard isWindow, pid == target.pid, windowId == targetWindowId else { return }
+                }
                 self.videoSink.pushFrame(
                     surface: surface,
                     width: width,
@@ -541,18 +552,18 @@ public final class AppState: ObservableObject {
                     windowId: windowId,
                     pid: pid
                 )
-            }
-        }
-        engine.liveStreamer.onThumbnail = { [weak self] cgImage, pid, appName in
-            Task { @MainActor [weak self] in
-                guard let self, let idx = self.hudDeck.firstIndex(where: { $0.id == "app:\(pid)" }) else { return }
-                if self.chromePreviewHidden, let app = self.hudDeck[idx].appDescriptor, Self.isChromium(app) {
-                    self.hudDeck[idx].previewImage = nil
-                    return
-                }
-                self.hudDeck[idx].previewImage = cgImage
-                if self.hudDeck[idx].title.isEmpty {
-                    self.hudDeck[idx].title = appName
+                // Use the frame's window identity, not the PID-only thumbnail callback.
+                guard isWindow, let surface = surface as? IOSurface,
+                      let front = self.hudDeck.first, !front.isBrowser, let app = front.appDescriptor,
+                      pid == app.pid, app.windowId == nil || windowId == app.windowId else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                if let last = self.lastNativeThumbnail, last.cardId == front.id,
+                   front.previewImage != nil, now - last.time < 0.5 { return }
+                let scale = min(1, 320 / CGFloat(max(1, max(width, height))))
+                let thumbnail = CIImage(ioSurface: surface).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                if let image = self.nativeThumbnailContext.createCGImage(thumbnail, from: thumbnail.extent.integral) {
+                    self.hudDeck[0].previewImage = image
+                    self.lastNativeThumbnail = (front.id, now)
                 }
             }
         }
@@ -913,6 +924,9 @@ public final class AppState: ObservableObject {
             persistSafetyPolicy(newStatus.policy, previous: previousPolicy)
         }
         status = newStatus
+        if newStatus.killSwitchTripped || newStatus.policy == .paused {
+            clearRestrictedWindowOverlay()
+        }
         pairedApp = engine.getPairedApp()
         runningApps = engine.listRunningApps()
         auditEntries = engine.recentAuditEntries(limit: 50)
@@ -1107,6 +1121,7 @@ public final class AppState: ObservableObject {
             safetySealNotice = nil
         }
         if policy == .paused {
+            clearRestrictedWindowOverlay()
             isAgentBusy = false
             clearActivityIndicator()
             scheduleCaptionClearIfIdle()
@@ -1624,6 +1639,10 @@ public final class AppState: ObservableObject {
                 && !videoSink.isBrowserStream
                 && videoSink.sourcePid != nil
                 && videoSink.sourcePid == front.appDescriptor?.pid
+                && (front.appDescriptor?.windowId == nil || videoSink.sourceWindowId == front.appDescriptor?.windowId)
+            if hudStreamMode == .autoWindow, front.appDescriptor?.windowId != nil, !previewShowsCardApp {
+                videoSink.reset()
+            }
             if let cgImage = front.previewImage, !previewShowsCardApp {
                 let w = cgImage.width
                 let h = cgImage.height
@@ -1769,6 +1788,14 @@ public final class AppState: ObservableObject {
         onOpenControlCenter?()
     }
 
+    private var liveStreamTargetApp: AppDescriptor? {
+        // A pinned activity card names the exact window, even when the HUD has a paired app.
+        if let app = hudDeck.first?.appDescriptor, hudDeck.first?.isBrowser == false, app.windowId != nil {
+            return app
+        }
+        return pairedApp ?? activeTargetApp
+    }
+
     public func syncLiveStream() {
         if isBrowserStreamActive || showingFrozenBrowserFrame {
             if isStreamActive {
@@ -1779,7 +1806,7 @@ public final class AppState: ObservableObject {
         }
 
         let shouldStream = isServerRunning && isHUDVisible && !isHUDCollapsed
-        let target = pairedApp ?? activeTargetApp
+        let target = liveStreamTargetApp
         if shouldStream, hudStreamMode == .autoWindow, let target, Self.isChromium(target), !connectedBrowserProfiles.isEmpty {
             // Chrome windows only stream when their active tab is UseMac's; never show the user's own tabs.
             if chromeWindowShowsUsemacTab(target) != true {
@@ -1791,7 +1818,9 @@ public final class AppState: ObservableObject {
                 chromePreviewHidden = true
                 // Drop any Chrome window thumbnail captured before the check answered.
                 for index in hudDeck.indices where !hudDeck[index].isBrowser {
-                    if let app = hudDeck[index].appDescriptor, Self.isChromium(app) {
+                    if let app = hudDeck[index].appDescriptor, Self.isChromium(app),
+                       app.pid == target.pid,
+                       target.windowId == nil || app.windowId == nil || app.windowId == target.windowId {
                         hudDeck[index].previewImage = nil
                     }
                 }
@@ -1823,10 +1852,7 @@ public final class AppState: ObservableObject {
     private var chromeWindowCheckTask: Task<Void, Never>?
 
     static func isChromium(_ app: AppDescriptor) -> Bool {
-        let bid = (app.bundleId ?? "").lowercased()
-        let name = app.name.lowercased()
-        return bid.contains("chrome") || bid.contains("chromium") || bid.contains("brave") || bid.contains("edgemac")
-            || name.contains("chrome") || name.contains("brave") || name.contains("edge")
+        NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name)
     }
 
     /// Whether the targeted Chrome window is showing a UseMac tab. Returns the cached answer (nil while the
@@ -1869,10 +1895,21 @@ public final class AppState: ObservableObject {
         if liveActivities.count > 80 {
             liveActivities.removeFirst(liveActivities.count - 80)
         }
+        let canAct = !engine.isKillSwitchTripped() && status.policy != .paused
+        let isChromeBridgeActivity = item.browserTabId != nil || item.browserProfile != nil
+            || (item.appPid == nil && (item.bundleId == "com.google.Chrome" || item.appName?.hasPrefix("Chrome (") == true))
+        let resolvedTarget = resolveTargetApp(from: item)
+        let cardAppDescriptor = !isChromeBridgeActivity && (resolvedTarget?.pid ?? 0) > 0 ? resolvedTarget : nil
+        let nativeCardId = cardAppDescriptor.map {
+            RestrictedWindowIndicator.nativeCardId(pid: $0.pid, windowId: $0.windowId, taskId: item.taskId)
+        }
+        updateRestrictedWindowOverlay(
+            for: item, app: cardAppDescriptor, isChromeBridgeActivity: isChromeBridgeActivity, canAct: canAct
+        )
+
         // Golden rule: the preview only shows UseMac's tabs and apps an agent named. Work on a guessed target (no app
         // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
         guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
-        let canAct = !engine.isKillSwitchTripped() && status.policy != .paused
         if Self.renewsIdleTimeout(item.kind) && canAct {
             isAgentBusy = true
             if item.kind == .taskStart {
@@ -1915,12 +1952,18 @@ public final class AppState: ObservableObject {
 
         // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
         // cursor or stream target on the large preview of the card the user is watching.
-        let isBackgroundActivity = PreviewDeckFocus.isBackgroundActivity(
-            front: deckFront,
-            tabId: item.browserTabId,
-            appPid: item.appPid,
-            isChromiumApp: resolveTargetApp(from: item).map(Self.isChromium) ?? false
-        )
+        let isBackgroundActivity: Bool
+        if let front = hudDeck.first, !front.isBrowser,
+           let app = cardAppDescriptor, front.appDescriptor?.pid == app.pid {
+            isBackgroundActivity = front.id != nativeCardId
+        } else {
+            isBackgroundActivity = PreviewDeckFocus.isBackgroundActivity(
+                front: deckFront,
+                tabId: item.browserTabId,
+                appPid: item.appPid,
+                isChromiumApp: resolvedTarget.map(Self.isChromium) ?? false
+            )
+        }
 
         switch item.kind {
         case .taskStart, .actionStart, .actionStep, .actionComplete, .observe, .screenshot:
@@ -1978,10 +2021,9 @@ public final class AppState: ObservableObject {
             virtualClickPulseId = UUID()
         }
 
-        let isChromeBridgeActivity = item.browserTabId != nil || item.browserProfile != nil || (item.appPid == nil && (item.bundleId == "com.google.Chrome" || (item.appName?.hasPrefix("Chrome (") == true)))
         var cardId: String?
         var cardProfile = item.browserProfile
-        var cardAppDescriptor: AppDescriptor?
+        let previousFrontId = hudDeck.first?.id
 
         if isChromeBridgeActivity {
             let rawProfile = cardProfile ?? item.appName?
@@ -1990,23 +2032,20 @@ public final class AppState: ObservableObject {
             let prof = resolvedBrowserProfile(rawProfile)
             cardProfile = prof
             cardId = browserCardIdForTab(item.browserTabId) ?? Self.browserCardId(profile: prof, tabId: item.browserTabId)
-        } else if let resolvedTarget = resolveTargetApp(from: item), resolvedTarget.pid > 0 {
-            // A generic task_start may have made a browser placeholder before this task named a native app.
-            hudDeck.removeAll {
-                $0.isBrowser && $0.browserTabId == nil && $0.previewImage == nil && $0.taskId == item.taskId
-            }
-            cardAppDescriptor = resolvedTarget
-            // Work in a background card's app must not switch the large preview's stream away from the front card.
-            if !isBackgroundActivity {
-                showingFrozenBrowserFrame = false
-                if activeTargetApp != resolvedTarget {
-                    activeTargetApp = resolvedTarget
-                    if isHUDVisible {
-                        syncLiveStream()
+        } else if let app = cardAppDescriptor {
+            cardId = nativeCardId
+            if item.kind != .taskComplete {
+                hudDeck.removeAll { card in
+                    guard card.taskId == item.taskId else { return false }
+                    if card.isBrowser {
+                        // A generic task_start may have created a placeholder before naming a native target.
+                        return card.browserTabId == nil && card.previewImage == nil
                     }
+                    // Once this task names an exact window, its old app-level card no longer has a target.
+                    return app.windowId != nil && card.appDescriptor?.pid == app.pid
+                        && card.appDescriptor?.windowId == nil
                 }
             }
-            cardId = "app:\(resolvedTarget.pid)"
         }
         // Otherwise the activity names no app (a task_start without one, a vision query, a resume): it must not
         // pick whatever app is in front as the target, or the preview would show the user's own screen.
@@ -2020,13 +2059,24 @@ public final class AppState: ObservableObject {
             if chromeWindowShowsUsemacTab(app) != true {
                 cardId = nil
                 suppressNativeChromePreview = true
-                hudDeck.removeAll { !$0.isBrowser && $0.appDescriptor?.pid == app.pid }
             } else if let tabCard = browserCard(shownIn: app) {
                 // Native work in a window that shows a UseMac tab is that tab's work: reuse its card instead of
                 // adding a second, imageless "Google Chrome" card for the same page.
                 cardId = tabCard.id
-                hudDeck.removeAll { !$0.isBrowser && $0.appDescriptor?.pid == app.pid }
             }
+            if cardId != nativeCardId {
+                hudDeck.removeAll { card in
+                    guard !card.isBrowser, let target = card.appDescriptor, target.pid == app.pid else { return false }
+                    return app.windowId == nil || target.windowId == nil || target.windowId == app.windowId
+                }
+            }
+        }
+        if hudDeck.first?.id != previousFrontId {
+            syncFrontCardToUI()
+        }
+        if suppressNativeChromePreview, hudDeck.isEmpty, let app = cardAppDescriptor {
+            activeTargetApp = app
+            syncLiveStream()
         }
 
         if item.kind == .taskComplete, let finishedTabs = item.taskTabIds.map(Set.init) {
@@ -2046,7 +2096,8 @@ public final class AppState: ObservableObject {
                     appPid: card.appDescriptor?.pid,
                     finishedTabIds: finishedTabs,
                     finishedTabId: item.browserTabId,
-                    finishedAppPid: item.appPid
+                    finishedAppPid: item.appPid,
+                    finishedAppPids: item.taskAppPids.map(Set.init)
                 )
                 if isFinishedTasks {
                     markHUDCardCompleted(at: idx, with: item, finishedAt: finishedAt)
@@ -2345,7 +2396,8 @@ public final class AppState: ObservableObject {
                 isActive: matched.isActive,
                 isHidden: matched.isHidden,
                 windowTitle: item.windowTitle ?? matched.windowTitle,
-                windowBounds: item.windowBounds ?? matched.windowBounds
+                windowBounds: item.windowBounds ?? matched.windowBounds,
+                windowId: item.windowId
             )
         }
 
@@ -2360,11 +2412,89 @@ public final class AppState: ObservableObject {
             isActive: true,
             isHidden: false,
             windowTitle: item.windowTitle,
-            windowBounds: item.windowBounds
+            windowBounds: item.windowBounds,
+            windowId: item.windowId
         )
     }
 
     // MARK: - Overlay Events
+
+    private func updateRestrictedWindowOverlay(
+        for item: LiveActivityItem,
+        app: AppDescriptor?,
+        isChromeBridgeActivity: Bool,
+        canAct: Bool
+    ) {
+        let isChromium = app.map(Self.isChromium)
+            ?? NativeBrowserSiteRules.isChromiumApp(bundleId: item.bundleId, name: item.appName)
+        switch RestrictedWindowIndicator.decide(
+            for: item,
+            isChromeBridgeActivity: isChromeBridgeActivity,
+            isChromiumApp: isChromium,
+            canAct: canAct,
+            currentTaskId: restrictedWindowOverlay?.taskId
+        ) {
+        case .clear:
+            clearRestrictedWindowOverlay()
+        case .show(let step):
+            guard let bounds = item.windowBounds, let pid = app?.pid ?? item.appPid, pid > 0 else { return }
+            let windowId = item.windowId ?? app?.windowId ?? WindowResolver.withTaskPinScope(item.taskId) {
+                WindowResolver.targetWindowID(pid: pid)
+            }
+            let frame = CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)
+            guard Self.canDrawRestrictedWindowOverlay(frame: frame, pid: pid, windowId: windowId) else {
+                clearRestrictedWindowOverlay()
+                return
+            }
+            restrictedWindowOverlay = RestrictedWindowOverlayState(
+                pid: pid, windowId: windowId, frame: bounds, step: step, taskId: item.taskId, isVisibleOnScreen: true
+            )
+            monitorRestrictedWindowOverlay(frame: frame, pid: pid, windowId: windowId)
+        case .ignore:
+            break
+        }
+    }
+
+    private static func canDrawRestrictedWindowOverlay(frame: CGRect, pid: Int32, windowId: CGWindowID?) -> Bool {
+        guard WindowResolver.isRectVisible(frame, pid: pid, windowId: windowId) else { return false }
+        // A single visible probe is not enough for a panel above other apps. Recheck the frame and
+        // reject overlapping windows in front of it, ignoring our own overlay and HUD panels.
+        let level = NSWindow.Level.statusBar.rawValue
+        let windows = WindowResolver.onScreenWindows(upToLayer: level)
+        guard let targetIndex = windows.firstIndex(where: {
+            $0.pid == pid && $0.layer == 0 && $0.frame.integral == frame.integral
+                && (windowId == nil || $0.windowId == windowId)
+        }) else { return false }
+        let overlayPID = ProcessInfo.processInfo.processIdentifier
+        return !windows[..<targetIndex].contains { window in
+            !(window.pid == overlayPID && window.layer > 0) && !window.frame.intersection(frame).isEmpty
+        }
+    }
+
+    private func monitorRestrictedWindowOverlay(frame: CGRect, pid: Int32, windowId: CGWindowID?) {
+        restrictedOverlayClearTask?.cancel()
+        restrictedOverlayClearTask = Task { @MainActor [weak self] in
+            let clock = ContinuousClock()
+            let expiresAt = clock.now + .seconds(RestrictedWindowIndicator.lingerSeconds)
+            // The browser can move, minimize, or become covered between live activity events.
+            while !Task.isCancelled {
+                try? await clock.sleep(until: min(expiresAt, clock.now + .milliseconds(100)))
+                guard !Task.isCancelled, let self else { return }
+                if clock.now >= expiresAt || !Self.canDrawRestrictedWindowOverlay(frame: frame, pid: pid, windowId: windowId) {
+                    self.clearRestrictedWindowOverlay()
+                    return
+                }
+            }
+        }
+    }
+
+    func clearRestrictedWindowOverlay() {
+        restrictedOverlayClearTask?.cancel()
+        restrictedOverlayClearTask = nil
+        if restrictedWindowOverlay != nil {
+            restrictedWindowOverlay = nil
+        }
+    }
 
     public func handleOverlayEvent(_ event: OverlayVisualEvent) {
         switch event {
@@ -2444,6 +2574,7 @@ public final class AppState: ObservableObject {
     }
 
     public func clearOverlay() {
+        clearRestrictedWindowOverlay()
         highlightClearTask?.cancel()
         pulseClearTask?.cancel()
         virtualAgentFadeTask?.cancel()

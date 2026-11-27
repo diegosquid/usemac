@@ -2,8 +2,8 @@ import Foundation
 import Darwin
 
 public enum UseMacDefaults {
-    public static let version = "0.9.0-beta.1"
-    public static let buildNumber = "65"
+    public static let version = "0.10.0"
+    public static let buildNumber = "66"
     public static let applicationSupportFolderName = "UseMac"
 
     /// Private per-user folder (mode 0700) that holds the default socket, like tmux's `/tmp/tmux-$UID`.
@@ -1936,10 +1936,16 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     /// On `taskComplete`: the tabs of the task that finished, so the preview marks only their cards as done. Nil when
     /// UseMac could not tell which task finished and no other task is running (every card is that task's).
     public var taskTabIds: [Int]?
+    /// On `taskComplete`: the native apps the finished task used, or nil when app ownership is unknown.
+    public var taskAppPids: [Int32]?
     /// The agent or client of the task the item belongs to, shown on its preview card.
     public var agentName: String?
     /// The task the item belongs to, when UseMac could tell.
     public var taskId: String?
+    /// Exact CGWindowID resolved for this activity, so the HUD streams and keys the right window.
+    public var windowId: UInt32?
+    /// True when native Chromium activity is explicitly operating on a restricted page (chrome://, Web Store, etc.).
+    public var isRestrictedPageFallback: Bool?
 
     public init(
         id: String = UUID().uuidString,
@@ -1962,8 +1968,11 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         browserProfile: String? = nil,
         targetGuessed: Bool? = nil,
         taskTabIds: [Int]? = nil,
+        taskAppPids: [Int32]? = nil,
         agentName: String? = nil,
-        taskId: String? = nil
+        taskId: String? = nil,
+        windowId: UInt32? = nil,
+        isRestrictedPageFallback: Bool? = nil
     ) {
         self.id = id
         self.timestampMs = timestampMs
@@ -1985,8 +1994,11 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
         self.browserProfile = browserProfile
         self.targetGuessed = targetGuessed
         self.taskTabIds = taskTabIds
+        self.taskAppPids = taskAppPids
         self.agentName = agentName
         self.taskId = taskId
+        self.windowId = windowId
+        self.isRestrictedPageFallback = isRestrictedPageFallback
     }
 }
 

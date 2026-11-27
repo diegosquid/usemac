@@ -94,17 +94,16 @@ public enum PreviewCardLifecycle {
     /// Whether a `task_complete` that names its task finishes a card (marks it done, so it leaves after the check).
     /// - A browser card is done when its tab belongs to the finished task (or is the tab the call named). A browser
     ///   placeholder (a `task_start` that never opened a tab) has nothing to show for any task, so it finishes too.
-    /// - A native card is done when it is the app the call named. When the call named no app, UseMac cannot tell
-    ///   which task worked in which app: native cards finish when the finished task owned no tab (a native-app task),
-    ///   and stay when it was a browser task. A wrong guess is recoverable: the other agent's next step brings its
-    ///   card back.
+    /// - A native card is done when it is the app the call named, or, if none was named, an app the finished task used.
+    ///   With no app ownership information, preserve the legacy behavior: finish native cards if no tabs were owned.
     public static func taskCompleteFinishes(
         isBrowser: Bool,
         browserTabId: Int?,
         appPid: Int32?,
         finishedTabIds: Set<Int>,
         finishedTabId: Int?,
-        finishedAppPid: Int32?
+        finishedAppPid: Int32?,
+        finishedAppPids: Set<Int32>? = nil
     ) -> Bool {
         if isBrowser {
             guard let browserTabId else { return true }
@@ -112,6 +111,9 @@ public enum PreviewCardLifecycle {
         }
         if let finishedAppPid {
             return appPid == finishedAppPid
+        }
+        if let finishedAppPids {
+            return appPid.map { finishedAppPids.contains($0) } ?? false
         }
         return finishedTabIds.isEmpty
     }

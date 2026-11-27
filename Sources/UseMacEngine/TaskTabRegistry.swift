@@ -19,6 +19,9 @@ public final class TaskTabRegistry: @unchecked Sendable {
         var lastActivityAt: Date
         /// Tabs the task opened that are still open.
         var tabIds: Set<Int>
+        /// Known profiles of open tabs, kept even after a tab falls out of the recent history.
+        var tabProfiles: [Int: String] = [:]
+        var appPids: Set<Int32> = []
         /// Tabs the task opened, oldest first, and those of them that closed during the task.
         var openedTabIds: [Int] = []
         var closedTabIds: [Int] = []
@@ -79,6 +82,22 @@ public final class TaskTabRegistry: @unchecked Sendable {
         public var ownTabIds: Set<Int>?
         /// What the finished task did. Nil when UseMac could not tell which task finished.
         public var summary: TaskSummary?
+        /// Apps the finished task used. Like `ownTabIds`, nil means no running task and an empty set matches none.
+        public var ownAppPids: Set<Int32>?
+
+        public init(
+            taskId: String?,
+            protectedTabIds: Set<Int>,
+            ownTabIds: Set<Int>?,
+            summary: TaskSummary?,
+            ownAppPids: Set<Int32>? = nil
+        ) {
+            self.taskId = taskId
+            self.protectedTabIds = protectedTabIds
+            self.ownTabIds = ownTabIds
+            self.summary = summary
+            self.ownAppPids = ownAppPids
+        }
     }
 
     /// A request tied to its task, with its tab filled in from that task's last tab when it named none.
@@ -92,6 +111,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
     }
 
     private var tasks: [String: RunningTask] = [:]
+    private var pendingBrowserOpens = 0
     private let lock = NSLock()
 
     public init() {}
@@ -99,8 +119,9 @@ public final class TaskTabRegistry: @unchecked Sendable {
     /// Opens a task and returns its id (the caller's, or a new one).
     @discardableResult
     public func start(taskId: String? = nil, agent: String? = nil, now: Date = Date()) -> String {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         let id = Self.clean(taskId) ?? Self.newId()
         if tasks[id] == nil {
             tasks[id] = RunningTask(startedAt: now, lastActivityAt: now, tabIds: [])
@@ -122,8 +143,9 @@ public final class TaskTabRegistry: @unchecked Sendable {
 
     /// Distinct names of running agents active within the given interval, most recently active first.
     public func activeAgentNames(activeWithin seconds: TimeInterval, now: Date = Date()) -> [String] {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         let recent = tasks.values.sorted { lhs, rhs in
             if lhs.lastActivityAt == rhs.lastActivityAt {
                 return (lhs.agent ?? "") < (rhs.agent ?? "")
@@ -142,8 +164,9 @@ public final class TaskTabRegistry: @unchecked Sendable {
     /// of them. A request of no task (no `taskId`, and UseMac can't tell its task) is never refused, so callers that
     /// don't use tasks work as before. One with a `taskId` that names no running task is refused but leases nothing.
     public func claim(_ scope: Scope, windows: [WindowLease], tabs: [Int], now: Date = Date()) -> Busy? {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         let requester = scope.taskId.flatMap { tasks[$0] != nil ? $0 : nil }
         guard requester != nil || Self.clean(scope.request.namedTaskId) != nil else { return nil }
         for (id, task) in tasks where id != requester {
@@ -156,8 +179,13 @@ public final class TaskTabRegistry: @unchecked Sendable {
             }
         }
         guard let requester else { return nil }
-        for window in windows where !(tasks[requester]?.windowLeases.contains { $0.pid == window.pid && $0.windowId == window.windowId } ?? true) {
-            tasks[requester]?.windowLeases.append(window)
+        for window in windows {
+            if tasks[requester]?.windowLeases.contains(where: { $0.pid == window.pid && $0.windowId == window.windowId }) == false {
+                tasks[requester]?.windowLeases.append(window)
+            }
+            if window.pid > 0 {
+                tasks[requester]?.appPids.insert(window.pid)
+            }
         }
         for tab in tabs where tasks[requester]?.tabIds.contains(tab) == false {
             tasks[requester]?.leasedTabIds.insert(tab)
@@ -172,18 +200,38 @@ public final class TaskTabRegistry: @unchecked Sendable {
         return !tasks.isEmpty
     }
 
+    public func beginBrowserOpen() {
+        lock.lock(); defer { lock.unlock() }
+        pendingBrowserOpens += 1
+    }
+
+    public func endBrowserOpen() {
+        lock.lock(); defer { lock.unlock() }
+        if pendingBrowserOpens > 0 {
+            pendingBrowserOpens -= 1
+        }
+    }
+
+    /// An open may have reached Chrome before the new tab's ownership has been recorded here.
+    public var hasPendingBrowserOpen: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pendingBrowserOpens > 0
+    }
+
     /// The running task a request belongs to, if UseMac can tell.
     public func resolve(taskId: String?, tabId: Int?, now: Date = Date()) -> String? {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         return resolveLocked(taskId: taskId, tabId: tabId)
     }
 
     /// Ties a request to its task and, when it names no tab and would otherwise go to the extension's last tab (the
     /// last tab any agent touched), aims it at the task's own last tab. Requests of no task are left as they are.
     public func scope(_ request: RPCRequest, now: Date = Date()) -> Scope {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         guard request.method != .taskStart,
               let owner = resolveLocked(taskId: request.namedTaskId, tabId: request.namedTabId) else {
             return Scope(request: request, taskId: nil, filledTabId: nil)
@@ -231,17 +279,33 @@ public final class TaskTabRegistry: @unchecked Sendable {
         }
     }
 
+    /// Records a native app the task used, even when the request did not claim a window.
+    public func recordApp(_ pid: Int32, taskId: String?, now: Date = Date()) {
+        guard pid > 0 else { return }
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
+        guard let owner = resolveLocked(taskId: taskId, tabId: nil) else { return }
+        tasks[owner]?.appPids.insert(pid)
+        tasks[owner]?.lastActivityAt = now
+    }
+
     /// Records a tab UseMac opened for the task the request belongs to (if it can tell).
     public func recordOpenedTab(_ tabId: Int, taskId: String?, profile: String? = nil, now: Date = Date()) {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         guard let owner = resolveLocked(taskId: taskId, tabId: nil) else { return }
         tasks[owner]?.tabIds.insert(tabId)
         if tasks[owner]?.openedTabIds.contains(tabId) == false {
             tasks[owner]?.openedTabIds.append(tabId)
         }
+        let cleanProfile = Self.clean(profile)
+        if let cleanProfile {
+            tasks[owner]?.tabProfiles[tabId] = cleanProfile
+        }
         tasks[owner]?.lastActivityAt = now
-        touchLocked(owner, tab: TabRef(tabId: tabId, profile: Self.clean(profile)))
+        touchLocked(owner, tab: TabRef(tabId: tabId, profile: cleanProfile))
     }
 
     /// Finishes the task a `task_complete` belongs to and says which tabs the cleanup must leave alone.
@@ -252,8 +316,9 @@ public final class TaskTabRegistry: @unchecked Sendable {
         keepTabs: Bool = false,
         now: Date = Date()
     ) -> Completion {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         if let finished = resolveLocked(taskId: taskId, tabId: tabId), let task = tasks.removeValue(forKey: finished) {
             let closing = keepTabs ? [] : task.openedTabIds.filter { task.tabIds.contains($0) && !keepTabIds.contains($0) }
             let summary = TaskSummary(
@@ -268,13 +333,16 @@ public final class TaskTabRegistry: @unchecked Sendable {
                 tabsClosing: closing,
                 durationMs: max(0, Int((now.timeIntervalSince(task.startedAt) * 1000).rounded()))
             )
-            return Completion(taskId: finished, protectedTabIds: allTabsLocked(), ownTabIds: task.tabIds, summary: summary)
+            return Completion(
+                taskId: finished, protectedTabIds: allTabsLocked(), ownTabIds: task.tabIds,
+                summary: summary, ownAppPids: task.appPids
+            )
         }
         if tasks.isEmpty {
             return Completion(taskId: nil, protectedTabIds: [], ownTabIds: nil, summary: nil)
         }
-        // Several tasks are running and nothing says which one finished: close nothing they own, mark no card done.
-        return Completion(taskId: nil, protectedTabIds: allTabsLocked(), ownTabIds: [], summary: nil)
+        // A task is running but we cannot match the completion: close nothing it owns or mark its cards done.
+        return Completion(taskId: nil, protectedTabIds: allTabsLocked(), ownTabIds: [], summary: nil, ownAppPids: [])
     }
 
     /// Forgets a tab that closed: it no longer belongs to its task, and requests without `tabId` stop going there.
@@ -284,6 +352,7 @@ public final class TaskTabRegistry: @unchecked Sendable {
             if tasks[key]?.tabIds.remove(tabId) != nil {
                 tasks[key]?.closedTabIds.append(tabId)
             }
+            tasks[key]?.tabProfiles.removeValue(forKey: tabId)
             tasks[key]?.leasedTabIds.remove(tabId)
             tasks[key]?.recentTabs.removeAll { $0.tabId == tabId }
         }
@@ -291,9 +360,26 @@ public final class TaskTabRegistry: @unchecked Sendable {
 
     /// Tabs running tasks own: the cleanup after another task's `task_complete` must leave them open.
     public func protectedTabIds(now: Date = Date()) -> Set<Int> {
-        lock.lock(); defer { lock.unlock() }
-        expire(now: now)
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
         return allTabsLocked()
+    }
+
+    /// Tabs running tasks opened, for restoring extension ownership after a reconnect.
+    public func ownedTabIds(forProfile profile: String? = nil, now: Date = Date()) -> [Int] {
+        lock.lock()
+        let expiredTaskIds = expire(now: now)
+        defer { unlockAndClearExpiredPins(expiredTaskIds) }
+        let wantedProfile = Self.clean(profile)
+        var owned: Set<Int> = []
+        for task in tasks.values {
+            owned.formUnion(task.tabIds.filter { tabId in
+                guard let wantedProfile else { return true }
+                return task.tabProfiles[tabId]?.caseInsensitiveCompare(wantedProfile) == .orderedSame
+            })
+        }
+        return owned.sorted()
     }
 
     /// True when a running task opened or worked in this tab.
@@ -354,8 +440,22 @@ public final class TaskTabRegistry: @unchecked Sendable {
         tasks.values.reduce(into: Set<Int>()) { $0.formUnion($1.tabIds); $0.formUnion($1.leasedTabIds) }
     }
 
-    private func expire(now: Date) {
-        tasks = tasks.filter { now.timeIntervalSince($0.value.lastActivityAt) < Self.idleExpiry }
+    private func expire(now: Date) -> [String] {
+        let expired = tasks.compactMap { id, task in
+            now.timeIntervalSince(task.lastActivityAt) >= Self.idleExpiry ? id : nil
+        }
+        for id in expired {
+            tasks.removeValue(forKey: id)
+        }
+        return expired
+    }
+
+    private func unlockAndClearExpiredPins(_ taskIds: [String]) {
+        lock.unlock()
+        // WindowResolver has its own lock; never hold the registry lock while acquiring it.
+        for id in taskIds {
+            WindowResolver.clearPins(forTaskId: id)
+        }
     }
 
     private static func clean(_ id: String?) -> String? {
