@@ -54,6 +54,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), `
 - **Tabs**: for tab-scoped calls without `tabId`, a task (see `task_start` / piggybacked `taskStart`) uses the last tab it opened or named, so it never lands in another agent's tab. Without a task the call uses the last tab UseMac used or a tab in the `UseMac` tab group; if there is none it returns `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
 - **URLs**: `browser_open`, `browser_batch`, and `openURL`/`navigate` steps accept only `http://`, `https://` and `about:blank`. A URL without a scheme gets `https://`; anything else returns `URL_BLOCKED`.
 - **Tab size**: UseMac never resizes a tab. Pages are observed and captured at the size Chrome gives them, background tabs included, and `@bN` coordinates use that size. On `browser_screenshot`, `viewportWidth`/`viewportHeight` (CLI `--width`/`--height`) are the largest image size: a bigger capture is scaled down to fit, keeping its aspect ratio. `browser_observe` ignores them, and `deviceScaleFactor` (CLI `--scale`) is ignored everywhere.
+- **Tab indicator**: Typing or clicking in the main document or a same-origin iframe of a tab the agent controls pauses the agent there. Chrome shows **You're using this tab, agent paused · Resume**. Let the user resume it; don't try to resume it yourself.
 - **Element, diff-crop, and full-page screenshots**:
   - With `diffCrop: true` (or explicit `region`), UseMac crops to the changed bounding box (`dirtyRect`) using a fast `16×10` tile diff.
   - With `elementId` or `selector` (CLI `--element`/`--selector`), the element is scrolled into view only if it isn't fully visible. An element bigger than the tab's viewport comes back as the part on screen, from its top-left corner, with `truncated: true`.
@@ -104,7 +105,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), `
 | `skill_run` | Deterministically replay a saved skill (`name`, `params`, `app`, `profile`, `tabId`, `stopOnError`, `returnObservation`, `returnDiffOnly`, `observationMode`) under full safety governance. |
 | `skill_list` | List saved skills, optionally filtered by `query`, `target`, `app`, or `url`. |
 | `task_start` | Open and hold the floating live preview across a multi-step task. Returns a `taskId` to pass on every later request; `agent` names you on the preview cards. Can be piggybacked as `taskStart` on any request. |
-| `task_complete` | Show the completion state once, close the floating preview, then close the Chrome tabs this task opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. Can be piggybacked as `taskComplete` on any request. |
+| `task_complete` | Show the task's completion state, close its preview cards, then close eligible Chrome tabs it opened (`keepTabIds`/`keepTabs` to keep them). Returns a `taskSummary`. Can be piggybacked as `taskComplete` on any request. |
 | `report_prepare` | Prepare a problem report the user reviews in UseMac before anything is sent (`reportPrepare`: `summary` required, `title`, `taskId`). Answers at once with `problemReport.status` `awaiting_user_review`. See [section 8](#8-reporting-a-problem). |
 | `debug_capture` | Only for developing UseMac itself: PNGs of UseMac's own windows (live preview, Settings, …) and of the screen around the preview, read-only, after the user turned on Debug capture (`DEBUG_CAPTURE_OFF` otherwise). See [section 9](#9-debug-capture-developing-usemac). |
 
@@ -200,6 +201,8 @@ UseMac uses Apple's native Vision framework (`VNRecognizeTextRequest` on the App
 {"method":"vision_query","visionQuery":{"mode":"verify","query":"No red error banner visible","tabId":42}}
 ```
 
+The fixed live preview centers wide pages horizontally, cropping both sides equally while keeping the top aligned. This only affects the preview, not the page or screenshot bounds.
+
 Call `task_start` / `task_complete` (or piggyback `taskStart` / `taskComplete` on your first and last requests) so the floating preview stays steady and closes cleanly:
 
 ```json
@@ -213,10 +216,12 @@ The response carries a `taskId` (for example `"taskId":"task-1a2b3c4d"`). Put it
 {"method":"task_complete","taskComplete":{"taskId":"task-1a2b3c4d","summary":"Article summarized"}}
 ```
 
-Several agents can work at the same time. The `taskId` is how UseMac knows which tabs are yours:
+Several agents can work at the same time. The `taskId` is how UseMac keeps each task's tabs, native window pins and preview cards separate:
 
 - A tab-scoped browser request without `tabId` goes to the last tab your task opened or named, not to the last tab any agent touched. Without a task it goes where it always did.
-- `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed.
+- Native window pins are scoped to `taskId`; pinning a window in one task doesn't change the target of another. The preview gives different windows of the same app separate cards and uses the task ID when no window ID is available.
+- `task_complete` tracks which native apps each task used, so finishing one task doesn't close another task's native preview cards. It only closes eligible tabs the completing task opened.
+- When Chrome's extension reconnects after a reload, the daemon resends `ownedTabIds` so the extension knows which tabs UseMac still owns.
 - Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task. When it can't tell, it closes nothing that a running task owns. A `taskId` that names no running task (finished, or idle for 30 minutes) belongs to no task.
 - If your task's last tab was closed, a tab-scoped read (`browser_observe`, `browser_extract` except `downloads`, `browser_screenshot`, `vision_query`) runs on your task's previous tab; an action fails with `NO_USEMAC_TAB` instead of moving to another tab.
 - The windows and tabs your task acts in are yours until it finishes. Another running task's action there fails with `TARGET_BUSY` (see below).
@@ -342,7 +347,7 @@ USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 }' --expect-title "Notes" --foreground-fallback
 ```
 
-`act`, `click`, `set`, `type` and `key` take `--foreground`, `--foreground-fallback`, `--expect-title <text>`, `--allow-stale`, `--mode <auto|delta|interactive|full|none>`, and `--diff-crop`. `observe` hides offscreen elements by default (`--no-offscreen` / `--filter-role` / `--filter-text`). Each step line shows its error code, the element it resolved to (`→ @e12`), its effect, `skipped` for optional steps, and `⚠ no visible effect` when it reported ok but nothing changed.
+`act`, `click`, `set`, `type` and `key` take `--foreground`, `--foreground-fallback`, `--expect-title <text>`, `--allow-stale`, `--mode <auto|delta|interactive|full|none>`, and `--diff-crop`. `observe` hides offscreen elements by default (`--include-offscreen` / `--no-offscreen` / `--filter-role` / `--filter-text`). Each step line shows its error code, the element it resolved to (`→ @e12`), its effect, `skipped` for optional steps, and `⚠ no visible effect` when it reported ok but nothing changed.
 
 Chrome, skills, and on-device Apple Vision OCR (`--profile` only when several profiles are connected, `--tab <id>` for an existing tab):
 
@@ -429,7 +434,9 @@ Any step accepts `"optional": true` — if the target is missing or the step fai
 
 ### Read every step result
 
-Each step result has `effect`: `changed`, `none` or `unverified` (waits, reads, and skipped optional steps). `effect: none` means the step reported success but UseMac saw nothing change. Don't assume it worked, and don't just repeat it: observe, then try another way. Reformatted inputs (e.g., currency/date fields where the app changed the value from its prior text) report `effect: changed` with the read-back value in `message`. In Chrome, `browser_act` also reports any `4xx`/`5xx` XHR responses in `networkErrors` and cropped OCR deltas in `visualDeltaOCR`.
+Each step result has `effect`: `changed`, `none` or `unverified` (for example, waits, reads, and skipped optional steps). `effect: none` means UseMac saw nothing change. Don't assume it worked, and don't just repeat it: observe, then try another way. Reformatted inputs (e.g., currency/date fields where the app changed the value from its prior text) report `effect: changed` with the read-back value in `message`. In Chrome, `browser_act` also reports any `4xx`/`5xx` XHR responses in `networkErrors` and cropped OCR deltas in `visualDeltaOCR`.
+
+`browser_act` rechecks click target geometry after reflow. If a DOM target is fully covered, UseMac reports why it skipped the click instead of clicking the covering element. Read the click's `effect` and `warning`: UseMac warns when the page didn't receive the click or a link produced no observable effect. It doesn't automatically click again.
 
 ### Preconditions
 
@@ -445,7 +452,7 @@ The window counts too. Real mouse input only goes out when a window of the targe
 - Clicks at coordinates, `type` and `pressKey` fail with `TARGET_NOT_FRONTMOST`.
 - `setValue` sets the value without focusing the field, so that window never comes forward.
 
-A burst brings the app forward, not a particular window, so steps on a window that stays covered fail the same way.
+A foreground burst brings the target app forward and briefly focuses the pinned window when one is set.
 
 1. Try the background first: `click`/`setValue`/`axAction`/`menuAction` on an `elementId` or `match`.
 2. Pass `"foregroundFallback": true` (opt-in) to let UseMac automatically escalate a `TARGET_NOT_FRONTMOST` / non-responsive step inside the same batch when the user is idle — or rerun just the steps that need it with `"foreground": true` (CLI `--foreground`). UseMac brings the app forward, runs the steps, then gives focus back to the previous app and restores the cursor.
@@ -459,16 +466,19 @@ When an app shows an open panel ("Choose File", "Open…"), don't click through 
 {"method":"act","act":{"app":"Safari","steps":[{"action":"uploadFile","files":["/Users/me/Downloads/report.pdf"]}]}}
 ```
 
-UseMac types the file name into the panel's search field, waits for results, opens the row whose name matches with `AXOpen`, and checks that the panel closed. The `⌘⇧G` (Go to Folder) flow is only a fallback when the app is in front: the panel takes no keys while its app is in the background. The search is Spotlight, which never lists files in `/tmp`, `$TMPDIR` or hidden folders, so for those the step fails right away with `TARGET_NOT_FRONTMOST` in the background. Copy the file to a folder such as `~/Downloads` and upload the copy, or rerun the step with `"foreground": true`. If you already see the row, `{"action":"axAction","match":{"role":"row","text":"report.pdf"},"actionName":"AXOpen"}` does the same. Both count as uploads: they are blocked under `readOnly` and `confirmSensitive`, wait for the user's OK under `ask`, and you confirm the file with the user first. For web pages in Chrome, use `browser_act` `uploadFile`, which sets the file input directly and never opens a panel.
+UseMac types the file name into the panel's search field, waits for results, opens the row whose name matches with `AXOpen`, and checks that the panel closed. If opening the file activates the target app during a background upload, UseMac restores the previous focus. The `⌘⇧G` (Go to Folder) fallback runs only in the foreground. It stops without confirming if it can't find the path field, and waits for the Open button before using it. The search is Spotlight, which never lists files in `/tmp`, `$TMPDIR` or hidden folders, so for those the step fails right away with `TARGET_NOT_FRONTMOST` in the background. Copy the file to a folder such as `~/Downloads` and upload the copy, or rerun the step with `"foreground": true`. If you already see the row, `{"action":"axAction","match":{"role":"row","text":"report.pdf"},"actionName":"AXOpen"}` does the same. Both count as uploads: they are blocked under `readOnly` and `confirmSensitive`, wait for the user's OK under `ask`, and you confirm the file with the user first. For web pages in Chrome, use `browser_act` `uploadFile`, which sets the file input directly and never opens a panel.
 
 ### Restricted Chrome pages (hybrid flow)
 
 When a `browser_*` call returns `RESTRICTED_PAGE`:
 
 1. Prefer opening the page in a new unfocused window that UseMac owns, so the user's tabs never switch: `{"method":"browser_open","browserOpen":{"url":"https://chromewebstore.google.com/","newWindow":true}}` (CLI `--new-window`). Or make the page the active tab of its window: `{"method":"browser_open","browserOpen":{"tabId":123,"url":"","activate":true}}` (CLI `usemac browser open --tab 123 --activate`). Native observe only sees the active tab of each Chrome window.
-2. Observe that window by (part of) its title, since it is not the focused one: `{"method":"observe","observe":{"app":"Google Chrome","window":"Chrome Web Store"}}` (CLI `--window "Chrome Web Store"`). Later `act` calls keep using that window; observe without `window` to go back to the focused one.
+2. Keep the Chrome window visible on screen: Chrome may expose only the toolbar if the window is covered. Observe by (part of) its title: `{"method":"observe","observe":{"app":"Google Chrome","window":"Chrome Web Store"}}` (CLI `--window "Chrome Web Store"`). Later `act` calls with the same `taskId` keep using that window; observe without `window` to go back to the focused one.
 3. `{"method":"act","act":{"app":"Google Chrome","steps":[{"action":"click","match":{"role":"button","title":"Details"}}]}}` (pass `"window"` again if the page title changes).
-4. Go back to `browser_*` as soon as you're on a normal page.
+4. If `observe` only shows the toolbar or `setValue` reports `effect: none`, use native `act` with `foreground: true` (CLI `--foreground`). Use a live `match` if you don't have a page element ID. The burst briefly focuses the pinned window, runs the steps, and restores the prior focus.
+5. Go back to `browser_*` as soon as you're on a normal page.
+
+UseMac's native overlay marks visible Chromium windows only during restricted-page fallback. It clears when the same task returns to the extension, moves to another app, or reports a normal Chromium page.
 
 ### Error codes
 
@@ -526,6 +536,7 @@ When a `browser_*` call returns `RESTRICTED_PAGE`:
 - Never try to answer an approval prompt yourself (clicks, keys, Accessibility actions or scripts on it). Only the user answers it.
 - UseMac never observes or acts on its own windows (Settings, the setup guide). Don't try to reach them; only the user changes UseMac's settings. The one exception is `debug_capture` (section 9): screenshots only, and only after the user turned on Debug capture.
 - The user's app and site rules (by default: password managers, Keychain Access and password-manager web vaults) are off limits. `list_apps` and `browser_tabs` leave those apps and tabs out, and anything that would reach them returns `TARGET_BLOCKED`. Don't reach them another way (another app, a screenshot, a different URL); only the user changes the rules.
+- Site rules (`TargetRules`) also apply to native `observe`, `act`, `screenshot`, `app_menu`, and `vision_query` in Chromium windows, including display captures that contain Chromium windows. With site rules active, calls are blocked if UseMac can't confirm the Chromium site.
 - Never take focus while the user is typing: no foreground burst after `USER_ACTIVE`, no `open -a` without `-g`.
 - Never try to change the execution mode, read the pairing key, or work around the Kill Switch.
 

@@ -1,3 +1,4 @@
+import ApplicationServices
 import Foundation
 import UseMacProtocol
 
@@ -161,8 +162,12 @@ extension UseMacEngineService {
 
     /// The windows a native `act` or mutating `app_menu` works in: the target window of each app it names (the `window`
     /// it pins, else the app's focused window), or the whole app when UseMac can't tell the window.
-    private func leaseWindows(for request: RPCRequest) -> [TaskTabRegistry.WindowLease] {
+    func leaseWindows(
+        for request: RPCRequest,
+        resolvePinnedWindow: (Int32, String) -> AXUIElement? = { WindowResolver.window(pid: $0, titleContains: $1) }
+    ) -> [TaskTabRegistry.WindowLease] {
         var queries: [String?] = []
+        var primaryApp: String?
         var pinnedWindow: String?
         if request.method == .act, let batch = request.act {
             if batch.steps.contains(where: { $0.app == nil }) {
@@ -171,6 +176,7 @@ extension UseMacEngineService {
             for step in batch.steps {
                 if let app = step.app, !queries.contains(app) { queries.append(app) }
             }
+            primaryApp = batch.app
             pinnedWindow = batch.window
         } else if request.method == .appMenu, let menu = request.appMenu,
                   menu.menuPath?.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) == true {
@@ -181,11 +187,12 @@ extension UseMacEngineService {
 
         var leases: [TaskTabRegistry.WindowLease] = []
         for query in queries {
-            guard case .app(let app) = workspaceMonitor.resolveTarget(query: query), app.pid > 0 else { continue }
+            guard case .app(let app) = resolveNativeTarget(query), app.pid > 0 else { continue }
             var windowId = app.windowId
             var title = app.windowTitle
-            if let wanted = pinnedWindow?.trimmingCharacters(in: .whitespacesAndNewlines), !wanted.isEmpty,
-               let element = WindowResolver.window(pid: app.pid, titleContains: wanted) {
+            if query == primaryApp,
+               let wanted = pinnedWindow?.trimmingCharacters(in: .whitespacesAndNewlines), !wanted.isEmpty,
+               let element = resolvePinnedWindow(app.pid, wanted) {
                 windowId = WindowResolver.windowID(of: element).map { UInt32($0) }
                 title = wanted
             }

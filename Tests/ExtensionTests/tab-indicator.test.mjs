@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const { createBackgroundSandbox } = require("./support/background-sandbox.cjs");
-const { createFakePages, PILL_RECT } = require("./support/fake-page.cjs");
+const { createFakePages, FakeDocument, PILL_RECT } = require("./support/fake-page.cjs");
 
 // The border and pill on a tab UseMac controls (#27), drawn through the debugger into the "usemac" isolated world.
 // The fake pages run the real page script (usemacTabIndicatorPage) against a small DOM.
@@ -12,6 +12,7 @@ const VISIBLE = 31;
 const HIDDEN = 32;
 const JPEG = "/9j/4AAQSkZJRgABAQ==";
 const ACTIVE_TEXT = "UseMac is controlling this tab";
+const USER_PAUSED_TEXT = "You're using this tab, agent paused";
 
 let counter = 0;
 const nextId = () => `indicator-${++counter}`;
@@ -59,7 +60,14 @@ async function command(sb, req) {
 
 const observe = (sb, tabId, extra = {}) => command(sb, { command: "observe", tabId, ...extra });
 const stopRequests = (sb) => sb.sent.filter((f) => f.type === "stop_requested");
-const indicator = (sb, tabId) => JSON.parse(sb.eval(`JSON.stringify(state.tabSessions.get(${tabId})?.tabIndicator || null)`));
+const indicator = (sb, tabId) => JSON.parse(sb.eval(
+  `JSON.stringify(state.tabSessions.get(${tabId})?.tabIndicator || null, (key, value) => key.endsWith("Timer") ? undefined : value)`
+));
+
+function holdActWaitStep(sb) {
+  sb.eval("sleepCancellable = () => new Promise((resolve) => { globalThis.releaseActWaitStep = resolve; });");
+  return () => waitFor(() => sb.eval("typeof releaseActWaitStep === 'function'"), "first step to start");
+}
 
 test("a controlled tab the user sees gets the border and the pill, in a closed shadow root outside <body>", async (t) => {
   const { sb, pages } = withSandbox(t);
@@ -352,4 +360,415 @@ test("without renewals the page script hides itself (lease)", async (t) => {
   sb.attached.delete(VISIBLE);
   sb.chrome.debugger.onDetach.emit({ tabId: VISIBLE }, "canceled_by_user");
   await waitFor(() => page.host === null, "the page script to remove it", 2500);
+});
+
+test("trusted input outside the pill pauses the agent and shows Resume next to Stop", async (t) => {
+  const { sb, pages } = withSandbox(t);
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const resume = page.part("resume");
+  assert.equal(resume.hasAttribute("hidden"), true);
+  page.document.body.dispatch("input", { isTrusted: false });
+  page.part("stop").dispatch("pointerdown");
+  assert.equal(indicator(sb, VISIBLE).userPaused, false);
+
+  page.document.body.dispatch("keydown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "user paused pill");
+  assert.match(page.part("frame").className, /user_paused/);
+  assert.equal(resume.textContent, "Resume");
+  assert.equal(resume.hasAttribute("hidden"), false);
+  assert.equal(page.part("stop").hasAttribute("hidden"), false);
+  resume.dispatch("click", { isTrusted: false });
+  resume.dispatch("click", { detail: 0 });
+  assert.equal(indicator(sb, VISIBLE).userPaused, true);
+
+  resume.dispatch("click");
+  await waitFor(() => page.text === ACTIVE_TEXT, "active pill");
+  assert.equal(resume.hasAttribute("hidden"), true);
+  await sb.deliver({ type: "tab_control", state: "ended" });
+  await waitFor(() => page.host === null, "pill removal");
+  for (const type of ["pointerdown", "mousedown", "keydown", "input"]) {
+    assert.equal(page.document.captureListeners.get(type).size, 0, `${type} listener removed`);
+  }
+});
+
+test("browser_act waits between steps until the user clicks Resume", async (t) => {
+  let pressed = 0;
+  const { sb, pages } = withSandbox(t, {
+    fallback: (_, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") pressed++;
+    }
+  });
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const waitForFirstStep = holdActWaitStep(sb);
+  const pending = command(sb, {
+    command: "act", tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "wait", ms: 1 }, { action: "click", x: 100, y: 300 }]
+  });
+  await waitForFirstStep();
+  page.document.body.dispatch("pointerdown");
+  sb.eval("releaseActWaitStep()");
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "second step blocked");
+  assert.equal(page.text, USER_PAUSED_TEXT);
+  assert.equal(pressed, 0);
+
+  page.part("resume").dispatch("click");
+  const response = await pending;
+  assert.equal(response.actionResult.success, true);
+  assert.equal(pressed, 1);
+  assert.equal(indicator(sb, VISIBLE).userPausedWaiters.length, 0);
+});
+
+test("trusted DOM events from CDP input and its grace window do not pause the agent", async (t) => {
+  let trustedInput = 0;
+  const { sb, pages } = withSandbox(t, {
+    fallback(tabId, method, params, pages) {
+      if (method === "Input.insertText" || (method === "Input.dispatchMouseEvent" && params.type === "mousePressed")) {
+        const ind = indicator(sb, VISIBLE);
+        assert.ok((method === "Input.insertText" ? ind.agentKeyboardDepth : ind.agentPointerDepth) > 0);
+        pages.page(tabId).document.body.dispatch(method === "Input.insertText" ? "input" : "pointerdown");
+        trustedInput++;
+      }
+    }
+  });
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const response = await command(sb, {
+    command: "act", tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "click", x: 100, y: 300 }, { action: "type", text: "hello" }]
+  });
+  assert.equal(response.actionResult.success, true, JSON.stringify(response.actionResult.stepResults));
+  assert.equal(trustedInput, 2);
+  const { token, agentKeyboardDepth, agentPointerDepth, suppressKeyboardUntil } = indicator(sb, VISIBLE);
+  assert.equal(agentKeyboardDepth, 0);
+  assert.equal(agentPointerDepth, 0);
+  assert.equal(sb.eval("TAB_INDICATOR_TIMING.agentInputGraceMs"), 80);
+  assert.ok(Date.now() < suppressKeyboardUntil);
+  sb.debuggerEvent(VISIBLE, "Runtime.bindingCalled", {
+    name: "__usemacTabIndicatorStop", executionContextId: page.world.id,
+    payload: JSON.stringify({ token, action: "user_input", eventType: "input" })
+  });
+  assert.equal(indicator(sb, VISIBLE).userPaused, false, "a delayed binding event was also suppressed");
+  await waitFor(() => Date.now() >= suppressKeyboardUntil, "input grace to expire");
+  page.document.body.dispatch("input");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "user input works after grace");
+});
+
+test("WebSocket teardown cancels paused batches before a late Resume", async (t) => {
+  for (const [name, drop] of [
+    ["socket close", "state.ws.onclose()"],
+    ["key mismatch", "enterKeyMismatch(state.ws)"],
+    ["forced reconnect", "connectWS(true)"],
+    ["keepalive replacing a closing socket", "state.ws.readyState = WebSocket.CLOSING; ensureConnected()"]
+  ]) {
+    await t.test(name, async (t) => {
+      let presses = 0;
+      const { sb, pages } = withSandbox(t, {
+        fallback: (_, method, params) => {
+          if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") presses++;
+        }
+      });
+      await observe(sb, VISIBLE);
+      const page = pages.page(VISIBLE);
+      await waitFor(() => page.shown, "the indicator to show");
+      page.document.body.dispatch("keydown");
+      await waitFor(() => page.text === USER_PAUSED_TEXT, "the paused indicator");
+      const { token, contextId } = indicator(sb, VISIBLE);
+      const start = () => sb.deliver({
+        type: "request", command: "act", id: nextId(), tabId: VISIBLE, returnObservation: false,
+        steps: [{ action: "click", x: 100, y: 300 }]
+      });
+      await start();
+      await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "act blocked");
+      const waitingBatch = sb.eval(`state.tabQueues.get(${VISIBLE})`);
+      await start();
+      await waitFor(() => waitingBatch !== sb.eval(`state.tabQueues.get(${VISIBLE})`), "second batch queued");
+
+      sb.eval(drop);
+      assert.equal(indicator(sb, VISIBLE).userPaused, false);
+      assert.equal(indicator(sb, VISIBLE).userPausedWaiters.length, 0);
+      await waitFor(() => !sb.attached.has(VISIBLE) && page.host === null, "cancelled work detached without Resume");
+      assert.equal(presses, 0);
+
+      sb.call("connectWS", true);
+      sb.markReady();
+      await observe(sb, VISIBLE);
+      await waitFor(() => page.shown, "new session's indicator");
+      sb.debuggerEvent(VISIBLE, "Runtime.bindingCalled", {
+        name: "__usemacTabIndicatorStop", executionContextId: contextId,
+        payload: JSON.stringify({ token, action: "resume" })
+      });
+      const fresh = await command(sb, {
+        command: "act", tabId: VISIBLE, returnObservation: false,
+        steps: [{ action: "click", x: 300, y: 300 }]
+      });
+      assert.equal(fresh.actionResult.success, true);
+      assert.equal(presses, 1, "only the new session's click ran");
+    });
+  }
+});
+
+test("hover over the pill does not suppress a human key or pointer event", async (t) => {
+  let receiveHover;
+  const { sb, pages } = withSandbox(t, {
+    fallback: (_, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mouseMoved") receiveHover?.();
+    }
+  });
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const hover = () => command(sb, {
+    command: "act", tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "hover", x: PILL_RECT.left + 10, y: PILL_RECT.top + 10 }]
+  });
+  receiveHover = () => page.document.body.dispatch("keydown");
+  assert.equal((await hover()).actionResult.success, true);
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "human key during hover pauses");
+
+  sb.call("resumeTabIndicatorUserPause", VISIBLE);
+  await waitFor(() => page.text === ACTIVE_TEXT || page.text.startsWith(ACTIVE_TEXT + " ·"), "agent resumed");
+  receiveHover = null;
+  await hover();
+  page.document.body.dispatch("pointerdown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "human pointer after hover pauses");
+});
+
+test("fillForm pauses between fields after a human pointer event", async (t) => {
+  const fields = [];
+  const { sb, pages } = withSandbox(t, {
+    fallback: (tabId, method, params, pages) => {
+      if (method !== "Runtime.evaluate") return;
+      const field = params.expression.match(/const f = (\{"selector":"#\w+","value":"\w+"\});/);
+      if (!field) return;
+      fields.push(JSON.parse(field[1]).selector);
+      if (fields.length === 1) pages.page(tabId).document.body.dispatch("pointerdown");
+      return { result: { value: { found: true, ok: true, kind: "input" } } };
+    }
+  });
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const pending = command(sb, {
+    command: "act", tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "fillForm", fields: [{ selector: "#given", value: "Ada" }, { selector: "#family", value: "Lovelace" }] }]
+  });
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1 && page.text === USER_PAUSED_TEXT, "second field blocked");
+  assert.deepEqual(fields, ["#given"]);
+  page.part("resume").dispatch("click");
+  assert.equal((await pending).actionResult.success, true);
+  assert.deepEqual(fields, ["#given", "#family"]);
+});
+
+test("scrollUntil pauses between iterations after a human key event", async (t) => {
+  let wheels = 0;
+  const { sb, pages } = withSandbox(t, {
+    fallback(tabId, method, params, pages) {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mouseWheel") {
+        wheels++;
+        if (wheels === 1) pages.page(tabId).document.body.dispatch("keydown");
+      }
+      if (method !== "Runtime.evaluate") return;
+      if (params.expression.includes("found: Boolean(hit), id, scrollX: sx, scrollY: sy")) {
+        return { result: { value: { found: wheels === 2, scrollX: 0, scrollY: wheels * 600 } } };
+      }
+      if (params.expression.startsWith("({") && params.expression.includes("scrollY: window.scrollY")) {
+        return { result: { value: { scrollX: 0, scrollY: wheels * 600 } } };
+      }
+    }
+  });
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const pending = command(sb, {
+    command: "act", tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "scrollUntil", selector: "#result" }]
+  });
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1 && page.text === USER_PAUSED_TEXT, "next scroll blocked");
+  assert.equal(wheels, 1);
+  page.part("resume").dispatch("click");
+  assert.equal((await pending).actionResult.success, true);
+  assert.equal(wheels, 2);
+});
+
+test("trusted input in same-origin iframes pauses the agent and listeners are removed", async (t) => {
+  const { sb, pages } = withSandbox(t);
+  const page = pages.page(VISIBLE);
+  const child = new FakeDocument();
+  const iframe = page.document.createElement("iframe");
+  iframe.contentDocument = child;
+  page.document.body.appendChild(iframe);
+  const crossOrigin = page.document.createElement("iframe");
+  Object.defineProperty(crossOrigin, "contentDocument", {
+    get() { throw new Error("Cross-origin frame"); }
+  });
+  page.document.body.appendChild(crossOrigin);
+
+  await observe(sb, VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  child.body.dispatch("keydown", { isTrusted: false });
+  assert.equal(indicator(sb, VISIBLE).userPaused, false);
+  child.body.dispatch("keydown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "input in the iframe pauses the agent");
+  page.part("resume").dispatch("click");
+  await waitFor(() => page.text === ACTIVE_TEXT, "agent resumed");
+  const replacement = new FakeDocument();
+  iframe.contentDocument = replacement;
+  iframe.dispatch("load");
+  replacement.body.dispatch("pointerdown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "input in the new iframe document pauses the agent");
+
+  await sb.deliver({ type: "tab_control", state: "ended" });
+  await waitFor(() => page.host === null, "the indicator to be removed");
+  for (const doc of [page.document, child, replacement]) {
+    for (const type of ["pointerdown", "mousedown", "keydown", "input", "load"]) {
+      assert.equal(doc.captureListeners.get(type).size, 0, `${type} listener removed`);
+    }
+  }
+});
+
+test("browser_open waits for Resume before navigating an existing paused tab", async (t) => {
+  const { sb, pages } = withSandbox(t);
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  page.document.body.dispatch("keydown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "the paused indicator");
+  const url = "https://example.com/next";
+  const pending = command(sb, { command: "open", tabId: VISIBLE, url, stream: false });
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "navigation blocked");
+  assert.equal(sb.callsTo("tabs.update").length, 0);
+  page.part("resume").dispatch("click");
+  const response = await pending;
+  assert.equal(response.createdTab, false);
+  assert.equal(sb.tabs.get(VISIBLE).url, url);
+});
+
+test("browser_open waits for Resume before auto-dismissing an overlay", async (t) => {
+  let presses = 0;
+  const { sb, pages } = withSandbox(t, {
+    fallback: (_, method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") presses++;
+    }
+  });
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  sb.eval(`
+    const originalObserveTab = observeTab;
+    observeTab = async (...args) => {
+      const result = await originalObserveTab(...args);
+      if (!globalThis.releaseOverlayObservation) {
+        await new Promise((resolve) => { globalThis.releaseOverlayObservation = resolve; });
+        result.overlayHighConfidence = true;
+        result.snapshot = { pageState: { blockingOverlay: { closeX: 100, closeY: 300 } } };
+      }
+      return result;
+    };
+  `);
+  const pending = command(sb, {
+    command: "open", tabId: VISIBLE, url: "https://example.com/next", stream: false, autoDismissOverlays: true
+  });
+  await waitFor(() => sb.eval("typeof releaseOverlayObservation === 'function'"), "overlay observation held");
+  page.document.body.dispatch("keydown");
+  sb.eval("releaseOverlayObservation()");
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1 && page.text === USER_PAUSED_TEXT, "overlay click blocked");
+  assert.equal(presses, 0);
+  page.part("resume").dispatch("click");
+  await pending;
+  assert.equal(presses, 1);
+});
+
+test("Stop cancels a waiting browser_act without executing its blocked step", async (t) => {
+  const { sb, pages } = withSandbox(t);
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  page.document.body.dispatch("mousedown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "user paused pill");
+  const pending = sb.request({
+    command: "act", id: nextId(), tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "click", x: 100, y: 300 }]
+  });
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "act blocked");
+  page.part("stop").dispatch("click");
+  assert.deepEqual(stopRequests(sb), [{ type: "stop_requested", tabId: VISIBLE }]);
+  const { response } = await pending;
+  assert.equal(response.error?.code, "CANCELLED");
+  assert.equal(response.actionResult.stepResults[0].mechanism, "cancelled");
+  assert.ok(!sb.callsTo("debugger.sendCommand").some(({ args }) => args[1] === "Input.dispatchMouseEvent"));
+});
+
+test("tab_control stopped and ended clear the pause and release waiters", async (t) => {
+  for (const state of ["stopped", "ended"]) {
+    const { sb, pages } = withSandbox(t);
+    await observe(sb, VISIBLE);
+    const page = pages.page(VISIBLE);
+    await waitFor(() => page.shown, "the indicator to show");
+    page.document.body.dispatch("keydown");
+    const pending = sb.request({
+      command: "act", id: nextId(), tabId: VISIBLE, returnObservation: false, steps: [{ action: "wait", ms: 1 }]
+    });
+    await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "act blocked");
+    if (state === "ended") {
+      await sb.deliver({ type: "tab_control", state, keepTabIds: [VISIBLE] });
+      assert.equal(indicator(sb, VISIBLE).userPausedWaiters.length, 1, "another task still owns the paused tab");
+    }
+    await sb.deliver({ type: "tab_control", state });
+    assert.equal((await pending).response.error?.code, "CANCELLED");
+    const ind = indicator(sb, VISIBLE);
+    assert.equal(ind.userPaused, false);
+    assert.equal(ind.userPausedWaiters.length, 0);
+    await waitFor(() => state === "stopped" ? page.text === "Stopped" : page.host === null, "final pill state");
+  }
+});
+
+test("ending control after user input also blocks the next step of a batch still in flight", async (t) => {
+  const { sb, pages } = withSandbox(t);
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  const waitForFirstStep = holdActWaitStep(sb);
+  const pending = sb.request({
+    command: "act", id: nextId(), tabId: VISIBLE, returnObservation: false,
+    steps: [{ action: "wait", ms: 1 }, { action: "click", x: 100, y: 300 }]
+  });
+  await waitForFirstStep();
+  page.document.body.dispatch("keydown");
+  await waitFor(() => page.text === USER_PAUSED_TEXT, "user paused pill");
+  assert.equal(indicator(sb, VISIBLE).userPausedWaiters.length, 0, "the current step is still running");
+  await sb.deliver({ type: "tab_control", state: "ended" });
+  sb.eval("releaseActWaitStep()");
+  const { response } = await pending;
+  assert.equal(response.error?.code, "CANCELLED");
+  assert.equal(response.actionResult.stepResults[1].mechanism, "cancelled");
+  assert.ok(!sb.callsTo("debugger.sendCommand").some(({ args }) => args[1] === "Input.dispatchMouseEvent"));
+});
+
+test("request cancellation and explicit detach cannot strand a paused action", async (t) => {
+  const { sb, pages } = withSandbox(t);
+  await observe(sb, VISIBLE);
+  const page = pages.page(VISIBLE);
+  await waitFor(() => page.shown, "the indicator to show");
+  page.document.body.dispatch("pointerdown");
+  const start = (id) => sb.request({
+    command: "act", id, tabId: VISIBLE, returnObservation: false, steps: [{ action: "wait", ms: 1 }]
+  });
+  const id = nextId();
+  const first = start(id);
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "first act blocked");
+  await sb.deliver({ type: "cancel", requestId: id });
+  assert.equal((await first).response.error?.code, "CANCELLED");
+  assert.equal(indicator(sb, VISIBLE).userPausedWaiters.length, 0);
+  assert.equal(indicator(sb, VISIBLE).userPaused, true, "request-only cancellation does not resume the tab");
+
+  const second = start(nextId());
+  await waitFor(() => indicator(sb, VISIBLE).userPausedWaiters.length === 1, "another act blocked");
+  await command(sb, { command: "stop_stream", tabId: VISIBLE });
+  assert.equal((await second).response.error?.code, "CANCELLED");
+  assert.equal(page.host, null);
 });

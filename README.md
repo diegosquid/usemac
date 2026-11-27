@@ -3,10 +3,10 @@
 
   <h1>UseMac</h1>
 
-  <p><strong>State-of-the-art computer use, built natively for Mac speed.</strong></p>
+  <p><strong>Let AI agents work in your Mac apps and Chrome tabs while you keep using your Mac.</strong></p>
 
   <p>
-    A native Swift macOS app and background daemon engineered to deliver the highest-performance computer use on Mac — letting AI agents inspect and control real macOS apps and Google Chrome tabs without stealing focus.
+    UseMac is a native, open-source Swift app. Agents can read and act through macOS Accessibility or the Chrome extension, with a live preview and controls for what they can access.
   </p>
 
   <p>
@@ -31,17 +31,17 @@
 
 ## Why UseMac
 
-**GPT Codex** set the state of the art for computer use. UseMac was born from the need to bring that same SOTA computer-use capability natively to macOS — faster, local, open source, and unlocked for **every** AI agent.
+UseMac works with the apps and Chrome profiles you already use. It reads structured UI data when it can and uses screenshots and on-device Apple Vision OCR when it needs to see the screen. The automation engine runs on your Mac; where your agent processes the results depends on the client you connect.
 
-Our mission is simple: **use every native resource available on the Mac to make computer use as smooth as possible.** Instead of spinning up cloud VMs, hijacking your cursor and window focus, or burning thousands of tokens on sluggish screenshot-and-click loops, UseMac taps straight into macOS and Apple Silicon — batched Accessibility APIs, event-driven `AXObserver` / `MutationObserver` waits, direct background menu bar invocation, native screen capture with dirty-rect diff cropping, instant Apple Vision OCR, passive CDP network capture, and Keychain-backed safety controls — giving **Claude Code, Codex, Cursor, Antigravity, or any custom agent** fast, quiet, zero-focus control over the desktop apps and Chrome tabs you already use.
+Most supported actions run in the background. Some native actions and restricted Chrome pages need a visible window or a brief, opt-in switch to the foreground. UseMac waits for you to be idle before sending foreground input.
 
 | Capability | What it gives your agents |
 | :--- | :--- |
 | **Fewer LLM turns, lower token tax** | Piggybacked task lifecycle, `browser_open` with inline `steps` + `autoDismissOverlays`, compound resilient steps (`fillForm`, `scrollUntil`, `assert`, `optional`, `menuAction`), auto-delta observations, reusable `SkillStore` macros, a compact 9-tool MCP schema, and a ≤ 5.5 KB core skill. |
 | **Sub-millisecond local IPC & batched AX** | `0.04 ms` p50 Unix socket round trips with concurrent pipelining, `AXUIElementCopyMultipleAttributeValues` batching, background `AXObserver` wakes, and `app_menu` direct menu invocation ([benchmarks](#benchmarks)). |
-| **Zero-focus background control** | Drive native macOS apps via Accessibility (`@e1..@eN`) and your real signed-in Chrome tabs via a Manifest V3 CDP bridge (`@b1..@bN`) — including OOPIF cross-origin iframes, Shadow DOM, passive XHR/Fetch JSON extraction (`mode: "network"`), parallel `browser_batch`, and silent file uploads with zero Finder dialogs. |
+| **Background app and tab control** | Use Accessibility (`@e1..@eN`) in native apps and a Chrome extension (`@b1..@bN`) for DOM actions, file inputs, captured XHR/Fetch JSON (`mode: "network"`), and parallel `browser_batch` reads. |
 | **Instant Apple Vision OCR + dirty-rect diff/crop** | Zero-setup on-device Apple Vision OCR (`~20 ms` negation-safe `verify`, automatic `@v1..@vN` OCR fusion on AX-blind windows) and `16×10` tile `diffCrop` screenshots — zero Python/MLX downloads or GBs of RAM. |
-| **Multi-agent ready with live HUD** | Run several agents in parallel with per-task tab isolation, automatic window/tab leases, and a quiet corner mini-preview so you stay in your flow. |
+| **Separate tasks, one live preview** | Each task keeps its own window selection and tabs. The preview shows which agent is working where and centers wide pages without resizing the tab. |
 | **Local-first safety controls** | Five execution modes, physical-click-only **Ask** approvals, instant `⇧⌘⎋` Kill Switch, Keychain-sealed safety settings, default credential/password-manager guards, and a redacted local audit log. |
 | **One engine, three transports** | Connect over raw Unix domain socket (NDJSON), a native `stdio` MCP server, or the `usemac` CLI — all governed by the exact same daemon and safety policies. |
 
@@ -77,11 +77,11 @@ flowchart LR
 
 ## Install
 
-Download the latest signed DMG from **[usemac.app](https://usemac.app)** (or [build from source](#build-from-source)):
+Download the stable DMG from **[usemac.app](https://usemac.app)**, see [all GitHub releases](https://github.com/diegosquid/usemac/releases), or [build from source](#build-from-source):
 
 1. **Install the app** — Drag `UseMac.app` into `/Applications` and open it.
 2. **Grant permissions** — Enable **Accessibility** and **Screen Recording** in **UseMac → Settings → General → Permissions**.
-3. **Add & pair the Chrome extension** — Once the Chrome Web Store listing is live, click **Open Web Store** in the setup guide and **Add to Chrome**. Until then, and in beta builds, load the bundled copy in `chrome://extensions`: enable **Developer mode**, click **Load unpacked**, and select `/Applications/UseMac.app/Contents/Resources/chrome-extension`. Then pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup.
+3. **Add & pair the Chrome extension** — In `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select `/Applications/UseMac.app/Contents/Resources/chrome-extension`. If your build offers **Open Web Store** in the setup guide, you can install it there instead. Pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup.
    - *Updating the extension*: After a UseMac update, **Settings → Chrome Extension** flags profiles running an older copy or one loaded from another folder. For an older bundled copy, click **Reload** there, or run `usemac browser reload-extension` (socket method `browser_reload_extension`; fails with `EXTENSION_RELOAD_UNSUPPORTED` on an extension too old to reload itself, `BROWSER_BUSY` while agents are using Chrome, or `EXTENSION_RELOAD_TIMEOUT` if it doesn't reconnect). If the source is `other_folder`, load the bundled folder instead: reloading the external copy does not pick up app updates, even if the versions match.
 4. **Connect your AI agent** — Open **UseMac → Settings → Connect** and paste the setup prompt into your agent, or install the bundled skill directly:
    ```bash
@@ -142,6 +142,7 @@ Every MCP tool carries `annotations` (`readOnlyHint`, `destructiveHint`), return
 USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 "$USEMAC" status
 "$USEMAC" observe --app "Notes" --filter-role button
+"$USEMAC" observe --app "Notes" --include-offscreen
 "$USEMAC" menu --app "Notes" --query "New"
 "$USEMAC" act '{"app":"Notes","observationMode":"auto","steps":[{"action":"type","text":"Meeting notes","preferBackground":true}]}'
 "$USEMAC" browser open "https://example.com" --auto-dismiss
@@ -154,6 +155,8 @@ USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 ```
 
 `usemac --json browser extract downloads` returns the array at `.downloads`; on the socket it is `browserExtract.downloads`, not `jsonResult`.
+
+Chrome click results distinguish a dispatched click from an observed effect. If a click is covered or produces no observable result, read the step's `effect` and `warning` and check the page before trying again. UseMac does not automatically repeat the click.
 
 When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and mutating requests return `DAEMON_REQUIRED`. Passing `--standalone` runs in-process without the app and without its safety controls.
 
@@ -199,7 +202,8 @@ UseMac starts in **Autonomous** until you choose another mode in **Settings → 
   - **Debug capture** (**Settings → General → Developer**, off by default): Strictly for developing UseMac. While on, agents can take read-only PNG screenshots of UseMac's own windows and surrounding screen (`debug_capture`, CLI `usemac debug capture`), but still cannot click or type in them. Only your physical click on **Turn On** enables it; while off, `debug_capture` returns `DEBUG_CAPTURE_OFF`.
   - **Local Apple Vision OCR paths**: `vision_query.imagePath` only accepts files inside your user temporary directory or `/tmp` (`IMAGE_PATH_BLOCKED` otherwise). OCR runs 100% locally via macOS Vision (`VNRecognizeTextRequest`) on the Apple Neural Engine with zero external downloads or background Python workers.
   - **Temporary captures**: Screenshots are saved to a private folder inside your user temporary directory and automatically pruned after 30 minutes.
-- **App and site rules** (**Settings → General → App and site rules**): Block apps (by bundle ID) and sites (by host) so agents never observe, act on, or capture them, or switch to **Allow only listed**. Keychain Access, Passwords, 1Password, Bitwarden, KeePassXC, Dashlane, and their web vaults are blocked by default. Blocked apps and tabs are omitted from `list_apps`, `browser_tabs`, display screenshots, and the live preview, and direct requests return `TARGET_BLOCKED`. Site rules are enforced daemon-side across every `browser_*` call (including each URL in `browser_batch`), and rules can only be edited in the app.
+- **App and site rules** (**Settings → General → App and site rules**): Block apps (by bundle ID) and sites (by host), or switch to **Allow only listed**. Keychain Access, Passwords, 1Password, Bitwarden, KeePassXC, Dashlane, and their web vaults are blocked by default. Site rules also apply when an agent uses native Accessibility, screenshots or Vision on a Chromium window. If rules are active and UseMac cannot confirm the site's identity, it denies access with `TARGET_BLOCKED`. Only you can edit the rules in the app.
+- **Restricted Chrome pages:** UseMac can fall back to native Accessibility on pages like the Chrome Web Store. Keep the target window visible; some steps need an opt-in foreground burst. A border marks the window while the native fallback is active. On ordinary controlled tabs, typing or clicking in the page pauses the agent there until you choose **Resume**.
 - **Chrome pairing & tab isolation**: Each Chrome profile must be paired once with the local `umk_…` key (unpaired requests return `EXTENSION_NOT_PAIRED`, and the key is never exposed via RPC, MCP, or CLI). Without an explicit `tabId`, browser calls target only the task's own last tab (when carrying a `taskId`), the last UseMac tab, or a tab in the `UseMac` tab group (`NO_USEMAC_TAB` otherwise).
 - **Multi-agent leases**: `task_start` (or piggybacked `taskStart`) returns a `taskId` carried on later requests (top-level `taskId`, CLI `--task`/`USEMAC_TASK`, automatic over MCP). A task's requests without `tabId` stay in its own tabs, and `task_complete` closes only tabs opened by that task and returns a `taskSummary`. Windows and tabs a task acts in are leased until completion: another task's action there returns `TARGET_BUSY` (CLI exit code 6), while reads never block and un-scoped requests are never refused. Live preview cards display each task's `agent` name.
 - **Local redacted audit log**: Every observation and action is appended to daily JSONL files in `~/Library/Application Support/UseMac/audit/` (user-readable only, kept 30 days by default in **Settings → General → History**). Typed text, `setValue` values, and `eval` sources are stored only as their character length unless you enable **Record typed text**, and URL credentials and secret-looking query params are stripped. Filter and export (JSONL/CSV) in **Settings → History**, or query via `audit_log` / `usemac audit`.
@@ -270,7 +274,7 @@ node --test Tests/ExtensionTests/*.test.mjs
 ./scripts/bundle-app.sh
 
 # Release preflight checks (requires Developer ID, notarization, and Sparkle key to publish)
-./scripts/release-dmg.sh --check
+./scripts/release-dmg.sh --notarize --update-appcast --check
 ```
 
 `swift test` includes an automated docs-sync test: every RPC method, MCP tool, and error code in the codebase must appear in `.agents/AGENTS.md`, the `usemac` skill (`.agents/skills/usemac/SKILL.md` + `references/REFERENCE.md`), and this README, with matching counts. Before every release, `scripts/smoke.sh` runs a live end-to-end check against the installed app ([docs/SMOKE.md](docs/SMOKE.md)).

@@ -139,16 +139,19 @@ public enum ElementMatcher {
 }
 
 public final class AXIndexer: @unchecked Sendable {
-    private struct CachedAppState {
+    private struct WindowCacheKey: Hashable {
+        let pid: Int32
+        let windowId: UInt32?
+    }
+
+    private struct CachedWindowState {
         var snapshot: WindowSnapshot
-        /// Every element id known for the app (merged across observes), so ids from a deep observe keep
+        /// Every element id known for the window (merged across observes), so ids from a deep observe keep
         /// working after a shallow post-action observe.
         var elementMap: [String: AXUIElement]
         var nodeMap: [String: ElementNode]
         var dirty: Bool
         var lastTimestampMs: Int64
-        /// Window the snapshot was taken from (for the stale-snapshot check).
-        var windowId: UInt32?
         var windowTitle: String?
         /// Web areas and scroll areas of the snapshot, with the range of `snapshot.elements` inside each.
         var scrollContainers: [ScrollContainer] = []
@@ -158,20 +161,10 @@ public final class AXIndexer: @unchecked Sendable {
         var observedMaxElements: Int = 220
     }
 
-    /// Stable ids: the same AX element keeps its `@eN` id for the lifetime of the app's cache.
+    /// Stable ids within a window. Allocation is shared across windows so an id names only one owner.
     private struct IdRegistry {
         var idByElement: [AXUIElement: String] = [:]
-        var nextIndex: Int = 1
-
-        mutating func id(for element: AXUIElement) -> String {
-            if let existing = idByElement[element] {
-                return existing
-            }
-            let id = "@e\(nextIndex)"
-            nextIndex += 1
-            idByElement[element] = id
-            return id
-        }
+        var fallbackId: String?
     }
 
     private struct BatchedNodeAttributes {
@@ -207,10 +200,9 @@ public final class AXIndexer: @unchecked Sendable {
         let includeOffscreen: Bool
         let focusedElement: AXUIElement?
         let viewport: ScreenRect?
-        var registry: IdRegistry
+        let key: WindowCacheKey
         var elements: [ElementNode] = []
         var elementMap: [String: AXUIElement] = [:]
-        var nodeMap: [String: ElementNode] = [:]
         var visited: Set<AXUIElement> = []
         var focusedElementId: String?
         var visibleCount: Int = 0
@@ -240,7 +232,7 @@ public final class AXIndexer: @unchecked Sendable {
     static let diffFrameTolerancePx: Double = 5.0
 
     private static let hotCacheMaxAgeMs: Int64 = 1200
-    /// Above this many remembered ids an app's registry is rebuilt from the latest observe.
+    /// Above this many remembered ids a window's registry is rebuilt from the latest observe.
     private static let maxRememberedIds = 8000
     private static let flattenRoles: Set<String> = [
         "AXGroup",
@@ -328,8 +320,10 @@ public final class AXIndexer: @unchecked Sendable {
     ] as CFArray
 
     private let lock = NSLock()
-    private var cache: [Int32: CachedAppState] = [:]
-    private var registries: [Int32: IdRegistry] = [:]
+    private let resolveWindowId: (Int32) -> UInt32?
+    private var cache: [WindowCacheKey: CachedWindowState] = [:]
+    private var registries: [WindowCacheKey: IdRegistry] = [:]
+    private var nextElementIndex = 1
     private var observers: [Int32: AXObserver] = [:]
     private var changeCounters: [Int32: UInt64] = [:]
     private var changeWaiters: [Int32: [ChangeWaiter]] = [:]
@@ -341,7 +335,33 @@ public final class AXIndexer: @unchecked Sendable {
     private var observerRunLoop: CFRunLoop?
     private var observerThreadStarted = false
 
-    public init() {}
+    public convenience init() {
+        self.init(resolveWindowId: { WindowResolver.targetWindowID(pid: $0) })
+    }
+
+    internal init(resolveWindowId: @escaping (Int32) -> UInt32?) {
+        self.resolveWindowId = resolveWindowId
+    }
+
+    private func currentWindowKey(pid: Int32) -> WindowCacheKey {
+        WindowCacheKey(pid: pid, windowId: resolveWindowId(pid))
+    }
+
+    private func stableId(for element: AXUIElement?, in key: WindowCacheKey) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let existing = element.flatMap { registries[key]?.idByElement[$0] }
+            ?? (element == nil ? registries[key]?.fallbackId : nil)
+        if let existing { return existing }
+        let id = "@e\(nextElementIndex)"
+        nextElementIndex += 1
+        if let element {
+            registries[key, default: IdRegistry()].idByElement[element] = id
+        } else {
+            registries[key, default: IdRegistry()].fallbackId = id
+        }
+        return id
+    }
 
     deinit {
         lock.lock()
@@ -382,10 +402,14 @@ public final class AXIndexer: @unchecked Sendable {
     ) -> WindowSnapshot {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let checkNowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let targetWindowId = app.windowId.flatMap { $0 == 0 ? nil : $0 } ?? resolveWindowId(app.pid)
+        let targetKey = WindowCacheKey(pid: app.pid, windowId: targetWindowId)
+        var describedApp = app
+        describedApp.windowId = targetWindowId
 
         if useCache {
             lock.lock()
-            let cached = cache[app.pid]
+            let cached = cache[targetKey]
             lock.unlock()
 
             if let cached,
@@ -394,7 +418,7 @@ public final class AXIndexer: @unchecked Sendable {
                (!includeOffscreen || cached.includedOffscreen) {
                 let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
                 var snapshot = cached.snapshot
-                snapshot.app = app
+                snapshot.app = describedApp
                 snapshot.fromHotCache = true
                 snapshot.latencyMs = latencyMs
                 if !includeDiff {
@@ -416,8 +440,9 @@ public final class AXIndexer: @unchecked Sendable {
 
         if !accessibilityGranted {
             let fallbackRect = app.windowBounds ?? ScreenRect(x: 0, y: 0, width: 800, height: 600)
+            let id = stableId(for: nil, in: targetKey)
             let fallbackNode = ElementNode(
-                id: "@e1",
+                id: id,
                 role: "AXWindow",
                 title: app.windowTitle ?? app.name,
                 value: nil,
@@ -429,32 +454,26 @@ public final class AXIndexer: @unchecked Sendable {
             )
             let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
             let completedMs = Int64(Date().timeIntervalSince1970 * 1000)
-            let prevSnapshot = previousSnapshot(for: app.pid)
+            let prevSnapshot = previousSnapshot(for: targetKey)
             let diff = includeDiff ? Self.computeDiff(previous: prevSnapshot, current: [fallbackNode]) : nil
 
             let snapshot = WindowSnapshot(
-                app: app,
+                app: describedApp,
                 timestampMs: completedMs,
                 latencyMs: latencyMs,
                 fromHotCache: false,
-                focusedElementId: "@e1",
+                focusedElementId: id,
                 elements: [fallbackNode],
                 diff: diff
             )
 
-            lock.lock()
-            cache[app.pid] = CachedAppState(
-                snapshot: snapshot,
-                elementMap: [:],
-                nodeMap: ["@e1": fallbackNode],
-                dirty: false,
-                lastTimestampMs: completedMs,
-                windowId: nil,
+            storeSnapshot(
+                snapshot,
                 windowTitle: app.windowTitle,
                 includedOffscreen: includeOffscreen,
-                observedMaxElements: maxElements
+                observedMaxElements: maxElements,
+                mergeKnownElements: false
             )
-            lock.unlock()
 
             return filter != nil ? Self.filteringSnapshot(snapshot, with: filter!) : snapshot
         }
@@ -465,14 +484,18 @@ public final class AXIndexer: @unchecked Sendable {
         AXUIElementSetMessagingTimeout(axApp, 0.35)
 
         let focusedElement = copyElementAttribute(axApp, attribute: kAXFocusedUIElementAttribute)
-        var root = rootWindow(of: axApp)
-        var rootFrame = root.flatMap { copyFrame($0) }
-        var rootWindowId = root.flatMap { WindowResolver.windowID(of: $0) }.map { UInt32($0) }
+        let root = rootWindow(of: axApp, windowId: targetWindowId)
+        if root == nil, targetWindowId != nil || WindowResolver.pinnedTitle(pid: app.pid) != nil {
+            // Do not walk the whole app when the selected window has disappeared.
+            return WindowSnapshot(
+                app: describedApp,
+                timestampMs: Int64(Date().timeIntervalSince1970 * 1000),
+                latencyMs: Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+            )
+        }
+        describedApp.windowId = targetWindowId ?? root.flatMap { WindowResolver.windowID(of: $0) }
+        let key = WindowCacheKey(pid: app.pid, windowId: describedApp.windowId)
         var rootTitle = root.flatMap { copyStringAttribute($0, attribute: kAXTitleAttribute) }
-
-        lock.lock()
-        let registry = registries[app.pid] ?? IdRegistry()
-        lock.unlock()
 
         let boundedDepth = max(1, maxDepth)
         let boundedElements = max(1, maxElements)
@@ -482,8 +505,8 @@ public final class AXIndexer: @unchecked Sendable {
             maxOffscreen: boundedElements,
             includeOffscreen: includeOffscreen,
             focusedElement: focusedElement,
-            viewport: rootFrame,
-            registry: registry
+            viewport: root.flatMap { copyFrame($0) },
+            key: key
         )
 
         traverse(element: root ?? axApp, depth: 0, rawDepth: 0, context: &ctx)
@@ -504,22 +527,19 @@ public final class AXIndexer: @unchecked Sendable {
                 if enableErr == .success {
                     Thread.sleep(forTimeInterval: 0.04)
                     let retryFocused = copyElementAttribute(axApp, attribute: kAXFocusedUIElementAttribute) ?? focusedElement
-                    root = rootWindow(of: axApp) ?? root
-                    rootFrame = root.flatMap { copyFrame($0) } ?? rootFrame
-                    rootWindowId = root.flatMap { WindowResolver.windowID(of: $0) }.map { UInt32($0) } ?? rootWindowId
-                    rootTitle = root.flatMap { copyStringAttribute($0, attribute: kAXTitleAttribute) } ?? rootTitle
                     var retryCtx = TraversalContext(
                         maxDepth: boundedDepth,
                         maxElements: boundedElements,
                         maxOffscreen: boundedElements,
                         includeOffscreen: includeOffscreen,
                         focusedElement: retryFocused,
-                        viewport: rootFrame,
-                        registry: ctx.registry
+                        viewport: root.flatMap { copyFrame($0) } ?? ctx.viewport,
+                        key: key
                     )
                     traverse(element: root ?? axApp, depth: 0, rawDepth: 0, context: &retryCtx)
                     if retryCtx.elements.count >= ctx.elements.count {
                         ctx = retryCtx
+                        rootTitle = root.flatMap { copyStringAttribute($0, attribute: kAXTitleAttribute) } ?? rootTitle
                     }
                 }
             }
@@ -527,13 +547,9 @@ public final class AXIndexer: @unchecked Sendable {
 
         let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
         let completedMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let prevSnapshot = previousSnapshot(for: app.pid)
+        let prevSnapshot = previousSnapshot(for: key)
         let diff = includeDiff ? Self.computeDiff(previous: prevSnapshot, current: ctx.elements) : nil
 
-        var describedApp = app
-        if describedApp.windowId == nil {
-            describedApp.windowId = rootWindowId
-        }
         let offscreenCount: Int? = ctx.skippedOffscreenCount > 0 ? ctx.skippedOffscreenCount : nil
         let snapshot = WindowSnapshot(
             app: describedApp,
@@ -546,39 +562,52 @@ public final class AXIndexer: @unchecked Sendable {
             offscreenCount: offscreenCount
         )
 
-        lock.lock()
-        var finalRegistry = ctx.registry
-        var elementMap = cache[app.pid]?.elementMap ?? [:]
-        var nodeMap = cache[app.pid]?.nodeMap ?? [:]
-        elementMap.merge(ctx.elementMap) { _, new in new }
-        nodeMap.merge(ctx.nodeMap) { _, new in new }
-        if finalRegistry.idByElement.count > Self.maxRememberedIds || elementMap.count > Self.maxRememberedIds {
-            // Forget elements not seen in this observe, but keep numbering going so old ids are never reused.
-            var trimmed = IdRegistry()
-            trimmed.nextIndex = finalRegistry.nextIndex
-            for (id, element) in ctx.elementMap {
-                trimmed.idByElement[element] = id
-            }
-            finalRegistry = trimmed
-            elementMap = ctx.elementMap
-            nodeMap = ctx.nodeMap
-        }
-        registries[app.pid] = finalRegistry
-        cache[app.pid] = CachedAppState(
-            snapshot: snapshot,
-            elementMap: elementMap,
-            nodeMap: nodeMap,
-            dirty: false,
-            lastTimestampMs: completedMs,
-            windowId: rootWindowId,
+        storeSnapshot(
+            snapshot,
+            elementMap: ctx.elementMap,
             windowTitle: rootTitle,
             scrollContainers: ctx.scrollContainers,
             includedOffscreen: includeOffscreen,
             observedMaxElements: boundedElements
         )
-        lock.unlock()
 
         return filter != nil ? Self.filteringSnapshot(snapshot, with: filter!) : snapshot
+    }
+
+    internal func storeSnapshot(
+        _ snapshot: WindowSnapshot,
+        elementMap observedElements: [String: AXUIElement] = [:],
+        windowTitle: String?,
+        scrollContainers: [ScrollContainer] = [],
+        includedOffscreen: Bool = false,
+        observedMaxElements: Int = 220,
+        mergeKnownElements: Bool = true
+    ) {
+        let key = WindowCacheKey(pid: snapshot.app.pid, windowId: snapshot.app.windowId)
+        let observedNodes = Dictionary(uniqueKeysWithValues: snapshot.elements.map { ($0.id, $0) })
+        lock.lock()
+        defer { lock.unlock() }
+        var elementMap = mergeKnownElements ? (cache[key]?.elementMap ?? [:]) : [:]
+        var nodeMap = mergeKnownElements ? (cache[key]?.nodeMap ?? [:]) : [:]
+        elementMap.merge(observedElements) { _, new in new }
+        nodeMap.merge(observedNodes) { _, new in new }
+        if (registries[key]?.idByElement.count ?? 0) > Self.maxRememberedIds || elementMap.count > Self.maxRememberedIds {
+            // Forget elements not seen in this observe without reusing any ids.
+            registries[key]?.idByElement = Dictionary(uniqueKeysWithValues: observedElements.map { ($0.value, $0.key) })
+            elementMap = observedElements
+            nodeMap = observedNodes
+        }
+        cache[key] = CachedWindowState(
+            snapshot: snapshot,
+            elementMap: elementMap,
+            nodeMap: nodeMap,
+            dirty: false,
+            lastTimestampMs: snapshot.timestampMs,
+            windowTitle: windowTitle,
+            scrollContainers: scrollContainers,
+            includedOffscreen: includedOffscreen,
+            observedMaxElements: observedMaxElements
+        )
     }
 
     /// Applies an optional server-side `ElementFilter` (`role`, `text`, `viewportOnly`) to element nodes.
@@ -651,23 +680,29 @@ public final class AXIndexer: @unchecked Sendable {
     }
 
     public func element(for id: String, pid: Int32) -> AXUIElement? {
+        let key = currentWindowKey(pid: pid)
         lock.lock()
         defer { lock.unlock() }
-        return cache[pid]?.elementMap[id]
+        return cache[key]?.elementMap[id]
     }
 
     public func node(for id: String, pid: Int32) -> ElementNode? {
+        let key = currentWindowKey(pid: pid)
         lock.lock()
         defer { lock.unlock() }
-        return cache[pid]?.nodeMap[id]
+        return cache[key]?.nodeMap[id]
     }
 
     public func node(for id: String) -> (pid: Int32, node: ElementNode)? {
+        cachedElementOwner(for: id).map { ($0.pid, $0.node) }
+    }
+
+    public func cachedElementOwner(for elementId: String) -> (node: ElementNode, pid: Int32, windowId: UInt32?)? {
         lock.lock()
         defer { lock.unlock() }
-        for (pid, state) in cache {
-            if let node = state.nodeMap[id] {
-                return (pid, node)
+        for (key, state) in cache {
+            if let node = state.nodeMap[elementId] {
+                return (node, key.pid, key.windowId)
             }
         }
         return nil
@@ -676,7 +711,15 @@ public final class AXIndexer: @unchecked Sendable {
     /// Re-reads a known element's attributes now (frame, value, offscreen) in 1 batched Mach IPC instead of
     /// trusting the snapshot. Returns nil when the id is unknown or the element no longer exists.
     public func liveNode(for id: String, pid: Int32) -> (element: AXUIElement, node: ElementNode)? {
-        guard let element = element(for: id, pid: pid) else { return nil }
+        let key = currentWindowKey(pid: pid)
+        lock.lock()
+        let cachedElement = cache[key]?.elementMap[id]
+        lock.unlock()
+        guard let element = cachedElement, let node = refreshNode(for: id, element: element, in: key) else { return nil }
+        return (element, node)
+    }
+
+    private func refreshNode(for id: String, element: AXUIElement, in key: WindowCacheKey) -> ElementNode? {
         guard let attrs = copyBatchedAttributes(element, includeChildren: false, includeVisibleChildren: false) else {
             return nil
         }
@@ -687,24 +730,31 @@ public final class AXIndexer: @unchecked Sendable {
             attrs: attrs,
             actions: actions,
             focusedElement: nil,
-            viewport: currentViewport(pid: pid)
+            viewport: currentViewport(for: key)
         )
         lock.lock()
-        cache[pid]?.nodeMap[id] = node
-        lock.unlock()
-        return (element, node)
+        defer { lock.unlock() }
+        guard cache[key]?.elementMap[id] == element else { return nil }
+        cache[key]?.nodeMap[id] = node
+        return node
     }
 
     /// Registers an element found outside an observe (e.g. by `match`) and returns its stable id and node.
     public func register(element: AXUIElement, pid: Int32) -> (id: String, node: ElementNode)? {
+        let key = currentWindowKey(pid: pid)
+        if let ownerWindow = copyElementAttribute(element, attribute: kAXWindowAttribute),
+           let ownerWindowId = WindowResolver.windowID(of: ownerWindow),
+           key.windowId != ownerWindowId {
+            return nil
+        }
+        return register(element: element, in: key, viewport: currentViewport(for: key))
+    }
+
+    private func register(element: AXUIElement, in key: WindowCacheKey, viewport: ScreenRect?) -> (id: String, node: ElementNode)? {
         guard let attrs = copyBatchedAttributes(element, includeChildren: false, includeVisibleChildren: false) else {
             return nil
         }
-        lock.lock()
-        var registry = registries[pid] ?? IdRegistry()
-        let id = registry.id(for: element)
-        registries[pid] = registry
-        lock.unlock()
+        let id = stableId(for: element, in: key)
         let actions = copyActionNames(element)
         let node = makeNode(
             id: id,
@@ -712,20 +762,21 @@ public final class AXIndexer: @unchecked Sendable {
             attrs: attrs,
             actions: actions,
             focusedElement: nil,
-            viewport: currentViewport(pid: pid)
+            viewport: viewport
         )
         lock.lock()
-        if cache[pid] != nil {
-            cache[pid]?.elementMap[id] = element
-            cache[pid]?.nodeMap[id] = node
+        if cache[key] != nil {
+            cache[key]?.elementMap[id] = element
+            cache[key]?.nodeMap[id] = node
         } else {
-            cache[pid] = CachedAppState(
-                snapshot: WindowSnapshot(app: AppDescriptor(pid: pid, name: ""), timestampMs: 0, latencyMs: 0),
+            cache[key] = CachedWindowState(
+                snapshot: WindowSnapshot(
+                    app: AppDescriptor(pid: key.pid, name: "", windowId: key.windowId), timestampMs: 0, latencyMs: 0
+                ),
                 elementMap: [id: element],
                 nodeMap: [id: node],
                 dirty: true,
                 lastTimestampMs: 0,
-                windowId: nil,
                 windowTitle: nil
             )
         }
@@ -744,16 +795,18 @@ public final class AXIndexer: @unchecked Sendable {
     ) -> [(id: String, element: AXUIElement, node: ElementNode)] {
         guard !match.isEmpty else { return [] }
         let boundedLimit = max(1, limit)
+        let key = currentWindowKey(pid: pid)
 
         // 1. Fast path: check clean, fresh cache before touching live AX tree.
-        if let cachedHits = findInCleanCache(pid: pid, match: match, limit: boundedLimit) {
+        if let cachedHits = findInCleanCache(key: key, match: match, limit: boundedLimit) {
             return cachedHits
         }
 
         ensureObserver(for: pid)
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.35)
-        guard let root = rootWindow(of: axApp) else { return [] }
+        guard let root = rootWindow(of: axApp, windowId: key.windowId) else { return [] }
+        let rootKey = WindowCacheKey(pid: pid, windowId: key.windowId ?? WindowResolver.windowID(of: root))
 
         let needsTitleOrDesc = (match.title?.isEmpty == false) || (match.text?.isEmpty == false)
         let needsValue = (match.value?.isEmpty == false) || (match.text?.isEmpty == false)
@@ -807,20 +860,31 @@ public final class AXIndexer: @unchecked Sendable {
         }
         walk(root, depth: 0)
 
+        let viewport = copyFrame(root)
         return hits.compactMap { element in
-            guard let registered = register(element: element, pid: pid) else { return nil }
+            guard let registered = register(element: element, in: rootKey, viewport: viewport) else { return nil }
             return (registered.id, element, registered.node)
         }
     }
 
-    private func findInCleanCache(
+    internal func findInCleanCache(
         pid: Int32,
         match: ElementMatch,
-        limit: Int
+        limit: Int,
+        refreshNode: @escaping (AXUIElement, ElementNode) -> ElementNode?
+    ) -> [(id: String, element: AXUIElement, node: ElementNode)]? {
+        findInCleanCache(key: currentWindowKey(pid: pid), match: match, limit: limit, refreshNode: refreshNode)
+    }
+
+    private func findInCleanCache(
+        key: WindowCacheKey,
+        match: ElementMatch,
+        limit: Int,
+        refreshNode: ((AXUIElement, ElementNode) -> ElementNode?)? = nil
     ) -> [(id: String, element: AXUIElement, node: ElementNode)]? {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         lock.lock()
-        guard let state = cache[pid],
+        guard let state = cache[key],
               !state.dirty,
               (nowMs - state.lastTimestampMs) < Self.hotCacheMaxAgeMs else {
             lock.unlock()
@@ -841,16 +905,22 @@ public final class AXIndexer: @unchecked Sendable {
                 value: node.value,
                 match: match
             ) else { continue }
-            guard elementMap[node.id] != nil else { continue }
+            guard let element = elementMap[node.id] else { continue }
             // Confirm element is still alive before returning from cache.
-            if let live = liveNode(for: node.id, pid: pid) {
-                results.append((node.id, live.element, live.node))
+            let live: ElementNode?
+            if let refreshNode {
+                live = refreshNode(element, node)
+            } else {
+                live = self.refreshNode(for: node.id, element: element, in: key)
+            }
+            if let live {
+                results.append((node.id, element, live))
                 if results.count >= limit {
                     return results
                 }
             } else {
                 // Element went stale despite clean flag; fall back to live walk.
-                invalidate(pid: pid)
+                invalidate(pid: key.pid)
                 return nil
             }
         }
@@ -862,26 +932,29 @@ public final class AXIndexer: @unchecked Sendable {
 
     /// Elements from the last observe of `pid` (used to probe whether a scroll moved anything).
     public func latestNodes(pid: Int32) -> [ElementNode] {
+        let key = currentWindowKey(pid: pid)
         lock.lock()
         defer { lock.unlock() }
-        return cache[pid]?.snapshot.elements ?? []
+        return cache[key]?.snapshot.elements ?? []
     }
 
     /// Elements from the last observe of `pid` with the web areas and scroll areas they sit in (indexes into
     /// `nodes`), read together so they always match.
     public func latestScrollLayout(pid: Int32) -> (nodes: [ElementNode], containers: [ScrollContainer]) {
+        let key = currentWindowKey(pid: pid)
         lock.lock()
         defer { lock.unlock() }
-        guard let state = cache[pid] else { return ([], []) }
+        guard let state = cache[key] else { return ([], []) }
         return (state.snapshot.elements, state.scrollContainers)
     }
 
     /// Window and title the last observe of `pid` was taken from.
     public func snapshotContext(pid: Int32) -> SnapshotContext? {
+        let key = currentWindowKey(pid: pid)
         lock.lock()
         defer { lock.unlock() }
-        guard let state = cache[pid] else { return nil }
-        return SnapshotContext(windowId: state.windowId, windowTitle: state.windowTitle)
+        guard let state = cache[key] else { return nil }
+        return SnapshotContext(windowId: key.windowId, windowTitle: state.windowTitle)
     }
 
     /// The app's current focused window id and title (for the stale-snapshot check).
@@ -1014,20 +1087,20 @@ public final class AXIndexer: @unchecked Sendable {
 
     public func invalidate(pid: Int32? = nil) {
         lock.lock()
-        if let pid {
-            cache[pid]?.dirty = true
-        } else {
-            for key in cache.keys {
-                cache[key]?.dirty = true
-            }
-        }
+        markDirtyLocked(pid: pid)
         lock.unlock()
+    }
+
+    private func markDirtyLocked(pid: Int32?) {
+        for key in cache.keys where pid == nil || key.pid == pid {
+            cache[key]?.dirty = true
+        }
     }
 
     internal func recordChange(pid: Int32) {
         var woken: [ChangeWaiter] = []
         lock.lock()
-        cache[pid]?.dirty = true
+        markDirtyLocked(pid: pid)
         let nextGen = (changeCounters[pid] ?? 0) &+ 1
         changeCounters[pid] = nextGen
         if let list = changeWaiters[pid] {
@@ -1056,13 +1129,10 @@ public final class AXIndexer: @unchecked Sendable {
     internal func markDirtyAll() {
         var woken: [ChangeWaiter] = []
         lock.lock()
-        for key in cache.keys {
-            cache[key]?.dirty = true
-            changeCounters[key, default: 0] &+= 1
-        }
-        for pid in Array(changeWaiters.keys) {
-            let nextGen = (changeCounters[pid] ?? 0) &+ 1
-            changeCounters[pid] = nextGen
+        markDirtyLocked(pid: nil)
+        let changedPids = Set(cache.keys.map(\.pid)).union(changeWaiters.keys)
+        for pid in changedPids {
+            changeCounters[pid, default: 0] &+= 1
             if let list = changeWaiters.removeValue(forKey: pid) {
                 woken.append(contentsOf: list)
             }
@@ -1075,31 +1145,35 @@ public final class AXIndexer: @unchecked Sendable {
         }
     }
 
-    private func previousSnapshot(for pid: Int32) -> WindowSnapshot? {
+    private func previousSnapshot(for key: WindowCacheKey) -> WindowSnapshot? {
         lock.lock()
         defer { lock.unlock() }
-        return cache[pid]?.snapshot
+        return cache[key]?.snapshot
     }
 
-    private func rootWindow(of axApp: AXUIElement) -> AXUIElement? {
+    private func rootWindow(of axApp: AXUIElement, windowId: UInt32? = nil) -> AXUIElement? {
         var pid: pid_t = 0
         if AXUIElementGetPid(axApp, &pid) == .success, let pinned = WindowResolver.pinnedTitle(pid: pid) {
             // A pinned window that is gone must not silently fall back to another window.
-            return WindowResolver.window(pid: pid, titleContains: pinned)
+            guard let pinnedWindow = WindowResolver.window(pid: pid, titleContains: pinned),
+                  windowId == nil || WindowResolver.windowID(of: pinnedWindow) == windowId else {
+                return nil
+            }
+            return pinnedWindow
         }
-        if let focusedWindow = copyElementAttribute(axApp, attribute: kAXFocusedWindowAttribute) {
+        if let focusedWindow = copyElementAttribute(axApp, attribute: kAXFocusedWindowAttribute),
+           windowId == nil || WindowResolver.windowID(of: focusedWindow) == windowId {
             return focusedWindow
         }
-        if let windows = copyElementArrayAttribute(axApp, attribute: kAXWindowsAttribute), let first = windows.first {
-            return first
-        }
-        return nil
+        let windows = copyElementArrayAttribute(axApp, attribute: kAXWindowsAttribute) ?? []
+        guard let windowId else { return windows.first }
+        return windows.first { WindowResolver.windowID(of: $0) == windowId }
     }
 
-    private func currentViewport(pid: Int32) -> ScreenRect? {
-        let axApp = AXUIElementCreateApplication(pid)
+    private func currentViewport(for key: WindowCacheKey) -> ScreenRect? {
+        let axApp = AXUIElementCreateApplication(key.pid)
         AXUIElementSetMessagingTimeout(axApp, 0.35)
-        return rootWindow(of: axApp).flatMap { copyFrame($0) }
+        return rootWindow(of: axApp, windowId: key.windowId).flatMap { copyFrame($0) }
     }
 
     private func ensureObserverRunLoop() -> CFRunLoop? {
@@ -1223,7 +1297,7 @@ public final class AXIndexer: @unchecked Sendable {
                     ? (context.includeOffscreen && meaningful && context.offscreenCount < context.maxOffscreen)
                     : true
                 if include {
-                    let id = context.registry.id(for: element)
+                    let id = stableId(for: element, in: context.key)
                     let node = makeNode(
                         id: id,
                         element: element,
@@ -1234,7 +1308,6 @@ public final class AXIndexer: @unchecked Sendable {
                     )
                     context.elements.append(node)
                     context.elementMap[id] = element
-                    context.nodeMap[id] = node
                     if offscreen {
                         context.offscreenCount += 1
                     } else {
@@ -1319,12 +1392,20 @@ public final class AXIndexer: @unchecked Sendable {
         let isFocusedAttr = attrs.focused ?? false
         let isFocusedRef = focusedElement.map { CFEqual(element, $0) } ?? false
         let offscreen = Self.isOffscreen(frame: attrs.frame, viewport: viewport)
+        let roleDescription: String? = {
+            // Preserve labels for untitled native buttons such as macOS traffic-light close/minimize/zoom controls.
+            guard attrs.nonEmptyTitle == nil, attrs.role == "AXButton" else { return nil }
+            guard let raw = copyStringAttribute(element, attribute: kAXRoleDescriptionAttribute)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { return nil }
+            return raw
+        }()
         return ElementNode(
             id: id,
             role: attrs.role,
             title: attrs.nonEmptyTitle,
             value: attrs.clippedValue,
-            roleDescription: nil,
+            roleDescription: roleDescription,
             enabled: attrs.enabled ?? true,
             focused: isFocusedAttr || isFocusedRef,
             frame: attrs.frame ?? ScreenRect(x: 0, y: 0, width: 0, height: 0),

@@ -110,6 +110,26 @@ final class TaskTabRegistryTests: XCTestCase {
         XCTAssertEqual(registry.runningTaskCount, 0)
     }
 
+    func testExpiringATaskClearsOnlyItsWindowPins() {
+        let registry = TaskTabRegistry()
+        let stale = registry.start(now: t0)
+        let freshTime = t0.addingTimeInterval(TaskTabRegistry.idleExpiry - 1)
+        let fresh = registry.start(now: freshTime)
+        let pid: Int32 = 101
+        WindowResolver.pin(pid: pid, title: "Stale window", taskId: stale)
+        WindowResolver.pin(pid: pid, title: "Fresh window", taskId: fresh)
+        defer {
+            WindowResolver.clearPins(forTaskId: stale)
+            WindowResolver.clearPins(forTaskId: fresh)
+        }
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: pid, taskId: stale), "Stale window")
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: pid, taskId: fresh), "Fresh window")
+
+        XCTAssertNil(registry.resolve(taskId: stale, tabId: nil, now: freshTime.addingTimeInterval(1)))
+        XCTAssertNil(WindowResolver.pinnedTitle(pid: pid, taskId: stale))
+        XCTAssertEqual(WindowResolver.pinnedTitle(pid: pid, taskId: fresh), "Fresh window")
+    }
+
     func testForgetTabDropsItFromItsTask() {
         let registry = TaskTabRegistry()
         let a = registry.start(now: t0)
@@ -117,5 +137,122 @@ final class TaskTabRegistryTests: XCTestCase {
         registry.recordOpenedTab(4, taskId: a, now: t0)
         registry.forgetTab(4)
         XCTAssertNil(registry.resolve(taskId: nil, tabId: 4, now: t0))
+    }
+
+    func testCompletionIncludesOnlyAppsRecordedOrClaimedByThatTask() {
+        let registry = TaskTabRegistry()
+        let a = registry.start(now: t0)
+        let b = registry.start(now: t0)
+        registry.recordApp(101, taskId: a, now: t0)
+        registry.recordApp(101, taskId: a, now: t0)
+        registry.recordApp(0, taskId: a, now: t0)
+        registry.recordApp(201, taskId: b, now: t0)
+        registry.recordApp(301, taskId: nil, now: t0)
+        registry.recordApp(401, taskId: "unknown", now: t0)
+
+        let request = RPCRequest(method: .observe)
+        let scopeA = TaskTabRegistry.Scope(request: request, taskId: a, filledTabId: nil)
+        let scopeB = TaskTabRegistry.Scope(request: request, taskId: b, filledTabId: nil)
+        let window = TaskTabRegistry.WindowLease(pid: 102, windowId: 1, label: "Window")
+        let invalidWindow = TaskTabRegistry.WindowLease(pid: 0, windowId: 2, label: "Unknown window")
+        XCTAssertNil(registry.claim(scopeA, windows: [window, invalidWindow], tabs: [], now: t0))
+        XCTAssertEqual(registry.claim(scopeB, windows: [window], tabs: [], now: t0)?.taskId, a)
+
+        XCTAssertEqual(registry.complete(taskId: a, tabId: nil, now: t0).ownAppPids, [101, 102])
+        XCTAssertEqual(registry.complete(taskId: b, tabId: nil, now: t0).ownAppPids, [201])
+    }
+
+    func testRecordingAnAppRefreshesTheOnlyRunningTask() {
+        let registry = TaskTabRegistry()
+        let task = registry.start(now: t0)
+        let expiry = TaskTabRegistry.idleExpiry
+        registry.recordApp(101, taskId: nil, now: t0.addingTimeInterval(expiry - 1))
+
+        let done = registry.complete(taskId: nil, tabId: nil, now: t0.addingTimeInterval(expiry + 1))
+        XCTAssertEqual(done.taskId, task)
+        XCTAssertEqual(done.ownAppPids, [101])
+    }
+
+    func testCompletionDistinguishesNoKnownAppsFromNoRunningTask() {
+        let registry = TaskTabRegistry()
+        let a = registry.start(now: t0)
+        let b = registry.start(now: t0)
+        registry.recordApp(101, taskId: b, now: t0)
+
+        XCTAssertEqual(registry.complete(taskId: nil, tabId: nil, now: t0).ownAppPids, [])
+        XCTAssertEqual(registry.complete(taskId: a, tabId: nil, now: t0).ownAppPids, [])
+        XCTAssertEqual(registry.complete(taskId: a, tabId: nil, now: t0).ownAppPids, [])
+        XCTAssertEqual(registry.complete(taskId: b, tabId: nil, now: t0).ownAppPids, [101])
+        XCTAssertNil(registry.complete(taskId: nil, tabId: nil, now: t0).ownAppPids)
+    }
+
+    func testOwnedTabsFilterByProfileAfterRecentHistoryEvictsTabs() {
+        let registry = TaskTabRegistry()
+        let a = registry.start(now: t0)
+        let b = registry.start(now: t0)
+        registry.recordOpenedTab(1, taskId: a, profile: " Work ", now: t0)
+        registry.recordOpenedTab(1, taskId: a, profile: " ", now: t0)
+        registry.recordOpenedTab(2, taskId: a, now: t0)
+        registry.recordOpenedTab(2, taskId: b, now: t0)
+        for tab in (3...20).reversed() {
+            registry.recordOpenedTab(tab, taskId: a, profile: "Personal", now: t0)
+        }
+        let scope = TaskTabRegistry.Scope(request: RPCRequest(method: .observe), taskId: a, filledTabId: nil)
+        XCTAssertNil(registry.claim(scope, windows: [], tabs: [21], now: t0))
+        XCTAssertTrue(registry.protectedTabIds(now: t0).contains(21))
+
+        XCTAssertEqual(registry.ownedTabIds(now: t0), Array(1...20))
+        XCTAssertEqual(registry.ownedTabIds(forProfile: " \n", now: t0), Array(1...20))
+        XCTAssertEqual(registry.ownedTabIds(forProfile: " wOrK \n", now: t0), [1])
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "Personal", now: t0), Array(3...20))
+
+        registry.forgetTab(1)
+        XCTAssertEqual(registry.ownedTabIds(now: t0), Array(2...20))
+        registry.recordOpenedTab(1, taskId: a, now: t0)
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "Work", now: t0), [])
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "Personal", now: t0), Array(3...20))
+    }
+
+    func testOwnedTabsWithoutProfilesAreNotRestoredToNamedProfiles() {
+        let registry = TaskTabRegistry()
+        let task = registry.start(now: t0)
+        registry.recordOpenedTab(1, taskId: task, profile: "Work", now: t0)
+        registry.recordOpenedTab(2, taskId: task, now: t0)
+
+        XCTAssertEqual(registry.ownedTabIds(forProfile: nil, now: t0), [1, 2])
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "work", now: t0), [1])
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "Personal", now: t0), [])
+    }
+
+    func testOwnedTabsExcludeExpiredAndCompletedTasks() {
+        let registry = TaskTabRegistry()
+        let a = registry.start(now: t0)
+        let b = registry.start(now: t0)
+        let later = t0.addingTimeInterval(TaskTabRegistry.idleExpiry - 1)
+        registry.recordOpenedTab(1, taskId: a, profile: "Work", now: t0)
+        registry.recordOpenedTab(2, taskId: b, profile: "Work", now: later)
+
+        let afterExpiry = later.addingTimeInterval(2)
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "Work", now: afterExpiry), [2])
+        _ = registry.complete(taskId: b, tabId: nil, keepTabs: true, now: afterExpiry)
+        XCTAssertEqual(registry.ownedTabIds(forProfile: "Work", now: afterExpiry), [])
+    }
+
+    func testPendingBrowserOpenCountsOverlappingOpensWithoutUnderflow() {
+        let registry = TaskTabRegistry()
+        XCTAssertFalse(registry.hasPendingBrowserOpen)
+        registry.endBrowserOpen()
+        registry.beginBrowserOpen()
+        XCTAssertTrue(registry.hasPendingBrowserOpen)
+        registry.beginBrowserOpen()
+        registry.endBrowserOpen()
+        XCTAssertTrue(registry.hasPendingBrowserOpen)
+        registry.endBrowserOpen()
+        registry.endBrowserOpen()
+        XCTAssertFalse(registry.hasPendingBrowserOpen)
+        registry.beginBrowserOpen()
+        XCTAssertTrue(registry.hasPendingBrowserOpen)
+        registry.endBrowserOpen()
+        XCTAssertFalse(registry.hasPendingBrowserOpen)
     }
 }

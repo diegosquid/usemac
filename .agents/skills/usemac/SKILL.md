@@ -46,7 +46,7 @@ Pass `taskId` on multi-turn calls so omitted `tabId`s stay in your tab, leases i
    - `diffCrop: true` on `screenshot`/`browser_screenshot`/`act`/`browser_act` returns only `dirtyRect`.
 4. **Compile macros (`skill_save`/`skill_run`/`skill_list`):** Save recurring `{{param}}` flows once and replay deterministically (`usemac_skill`).
 5. **Instant Apple Vision OCR (`vision_query`/`usemac_vision`):** Zero-setup OCR (`ocr`, `verify`, `locate`, `diagnose`, `ask`, `describe` — no MLX install). Inline `verify` checks DOM/AX first, then negation-safe OCR. AX-blind windows auto-fuse `@v1..@vN` OCR nodes. Reserve screenshots (`returnImageContent: true`) for charts/design.
-6. **Restricted Chrome (`RESTRICTED_PAGE`):** Open with `newWindow: true` (or `activate: true`), then native `observe`/`act` on `app: "Google Chrome"` + `window`.
+6. **Restricted Chrome (`RESTRICTED_PAGE`):** `newWindow: true` or `activate: true`; keep window on screen. Native `observe`/`act` on `app: "Google Chrome"` + `window`; act with `foreground: true` for toolbar-only or `setValue` no effect.
 
 ## 3. Safety & Reference
 

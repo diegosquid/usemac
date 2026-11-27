@@ -58,8 +58,8 @@ public struct ActivityHUDView: View {
 private final class LiveVideoContainerView: NSView {
     let videoLayer = CALayer()
 
-    /// The size of what the frames show (the page or the window). The picture fills the card from its top-left
-    /// corner at this aspect, and what does not fit is cut off (LivePreviewGeometry.displayedRect).
+    /// The size of what the frames show (the page or the window). The picture fills the card at this aspect,
+    /// centered horizontally and aligned to the top, with any overflow cropped.
     var sourceSize: CGSize = .zero {
         didSet {
             if sourceSize != oldValue { needsLayout = true }
@@ -99,8 +99,8 @@ private final class LiveVideoContainerView: NSView {
         if shown.isEmpty {
             videoLayer.frame = bounds
         } else {
-            // This view is not flipped, so its layer's origin is the bottom-left corner: keep the picture's top
-            // edge on the card's top edge and let the bottom run past it.
+            // The layer uses a bottom-left origin. Keep the centered x offset and convert y to align the
+            // picture's top edge with the card's top edge.
             videoLayer.frame = CGRect(
                 x: shown.minX,
                 y: bounds.height - shown.maxY,
@@ -895,8 +895,6 @@ private struct FramelessLivePiPCard: View {
             previewSize: previewSize,
             tolerance: tolerance
         ) {
-            let relX = (point.x - source.minX) / source.width
-            let relY = (point.y - source.minY) / source.height
             let px = mapped.x
             let py = mapped.y
 
@@ -948,8 +946,8 @@ private struct FramelessLivePiPCard: View {
 
                 if let label = appState.virtualAgentLabel, !label.isEmpty {
                     let displayLabel = label.count > 22 ? String(label.prefix(21)) + "…" : label
-                    let flipLeft = relX > 0.62
-                    let flipUp = relY > 0.80
+                    let flipLeft = previewSize.width > 0 ? (px / previewSize.width) > 0.62 : false
+                    let flipUp = previewSize.height > 0 ? (py / previewSize.height) > 0.80 : false
                     ZStack(alignment: flipLeft ? .topTrailing : .topLeading) {
                         Text(displayLabel)
                             .font(.system(size: 8.0, weight: .medium, design: .rounded))

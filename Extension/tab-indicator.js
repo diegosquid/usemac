@@ -7,7 +7,7 @@
 //   Only the pill takes pointer events. The page script below puts the host back if the page removes it.
 // - The page script holds a lease: without a renewal from the extension (debugger gone, extension restarted) it
 //   hides itself, through a CSS animation even if its JavaScript is gone.
-// - Stop accepts only trusted pointer clicks and reports through a CDP binding that exists only in that world.
+// - Stop and Resume accept only trusted pointer clicks. They share an isolated-world binding with user input.
 // - The agent never sees it: observe's DOM walk cannot enter a closed shadow root and the host is outside <body>,
 //   agent screenshots hide it while they capture, frames that show it are flagged so the app's vision does not
 //   reuse them, and the pill stops taking pointer events while the agent's own pointer passes over it.
@@ -21,6 +21,7 @@ const TAB_INDICATOR_TIMING = {
   stepLingerMs: 2500, // a step label stays this long after the agent's last step
   stoppedLingerMs: 4000, // how long "Stopped" stays before the indicator goes away
   pointerGraceMs: 1000, // the pill ignores pointers this long after the agent's pointer was over it
+  agentInputGraceMs: 80, // CDP input can arrive as trusted DOM events even after the command returns
   cdpTimeoutMs: 1500
 };
 const TAB_INDICATOR_POINTER_MARGIN = 8;
@@ -28,6 +29,11 @@ const TAB_INDICATOR_POINTER_METHODS = new Set([
   "Input.dispatchMouseEvent",
   "Input.dispatchDragEvent",
   "Input.dispatchTouchEvent"
+]);
+const tabIndicatorKeyboardMethods = new Set([
+  "Input.dispatchKeyEvent",
+  "Input.insertText",
+  "DOM.setFileInputFiles" // Chromium dispatches trusted input/change for this DOM command too
 ]);
 
 let tabIndicatorHeartbeat = null;
@@ -37,7 +43,7 @@ let tabIndicatorHeartbeat = null;
 // self-contained: it is sent as source text. Returns { mounted, shown, pill: {x, y, width, height} | null }.
 function usemacTabIndicatorPage(cmd) {
   const KEY = "__usemacTabIndicator";
-  const VERSION = 1;
+  const VERSION = 3;
   let ctl = globalThis[KEY];
   if (!ctl || ctl.version !== VERSION) {
     if (ctl && typeof ctl.destroy === "function") {
@@ -80,11 +86,15 @@ function usemacTabIndicatorPage(cmd) {
         pointer-events: auto; user-select: none; -webkit-user-select: none; cursor: default; }
       .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #fff; }
       .text { overflow: hidden; text-overflow: ellipsis; }
-      .stop { all: unset; flex: none; box-sizing: border-box; height: 22px; padding: 0 10px; border-radius: 11px;
+      .stop, .resume { all: unset; flex: none; box-sizing: border-box; height: 22px; padding: 0 10px; border-radius: 11px;
         background: #fff; color: #174ea6; cursor: pointer;
         font: 600 12px/22px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
       .stop:hover { background: #e8f0fe; }
-      .stop[hidden] { display: none; }
+      .stop[hidden], .resume[hidden] { display: none; }
+      .frame.user_paused .edge { background: #d97706; box-shadow: 0 0 14px 4px rgba(217, 119, 6, 0.35); }
+      .frame.user_paused .pill { background: #b45309; }
+      .resume { color: #92400e; }
+      .resume:hover { background: #fef3c7; }
       .frame.stopped .edge { background: #80868b; box-shadow: none; }
       .frame.stopped .pill { background: #3c4043; padding-right: 12px; }
       .frame.stopped .dot { background: #f28b82; }
@@ -97,6 +107,7 @@ function usemacTabIndicatorPage(cmd) {
     let pillEl = null;
     let textEl = null;
     let stopEl = null;
+    let resumeEl = null;
     let observer = null;
     let leaseTimer = null;
     let leaseFlip = false;
@@ -108,6 +119,8 @@ function usemacTabIndicatorPage(cmd) {
     let step = "";
     let token = "";
     let binding = "";
+    const userInputEvents = ["pointerdown", "mousedown", "keydown", "input"];
+    const inputDocuments = new Set();
     const readds = [];
 
     function build() {
@@ -134,8 +147,14 @@ function usemacTabIndicatorPage(cmd) {
       stopEl.setAttribute("type", "button");
       stopEl.setAttribute("tabindex", "-1");
       stopEl.textContent = "Stop";
+      resumeEl = doc.createElement("button");
+      resumeEl.className = "resume";
+      resumeEl.setAttribute("type", "button");
+      resumeEl.setAttribute("tabindex", "-1");
+      resumeEl.textContent = "Resume";
       pillEl.appendChild(dot);
       pillEl.appendChild(textEl);
+      pillEl.appendChild(resumeEl);
       pillEl.appendChild(stopEl);
       frameEl.appendChild(pillEl);
       shadow.appendChild(style);
@@ -153,12 +172,54 @@ function usemacTabIndicatorPage(cmd) {
       event.preventDefault();
       // A real pointer click only: not a script (isTrusted), not a keyboard or accessibility press (detail 0).
       if (!event.isTrusted || !(event.detail >= 1)) return;
-      if (inert || captureHidden || !shown || mode !== "active") return;
-      if (event.target !== stopEl) return;
+      if (inert || captureHidden || !shown) return;
+      if (event.target === stopEl && (mode === "active" || mode === "user_paused")) {
+        reportAction("stop");
+      } else if (event.target === resumeEl && mode === "user_paused") {
+        reportAction("resume");
+      }
+    }
+
+    function onUserInput(event) {
+      if (!event.isTrusted || !shown || mode !== "active" || captureHidden || doc.visibilityState === "hidden") return;
+      if (event.target === host || pillEl.contains(event.target) || event.composedPath?.().includes(host)) return;
+      reportAction("user_input", event.type);
+    }
+
+    function onFrameLoad(event) {
+      if (event.target?.localName === "iframe") syncInputDocuments();
+    }
+
+    function syncInputDocuments() {
+      const current = new Set([doc]);
+      for (const inputDoc of current) {
+        for (const iframe of inputDoc.querySelectorAll("iframe")) {
+          try {
+            const child = iframe.contentDocument;
+            if (child) current.add(child);
+          } catch (_) {}
+        }
+        if (inputDocuments.has(inputDoc)) continue;
+        for (const type of userInputEvents) inputDoc.addEventListener(type, onUserInput, true);
+        inputDoc.addEventListener("load", onFrameLoad, true);
+        inputDocuments.add(inputDoc);
+      }
+      for (const inputDoc of inputDocuments) {
+        if (!current.has(inputDoc)) unwatchInputDocument(inputDoc);
+      }
+    }
+
+    function unwatchInputDocument(inputDoc) {
+      for (const type of userInputEvents) inputDoc.removeEventListener(type, onUserInput, true);
+      inputDoc.removeEventListener("load", onFrameLoad, true);
+      inputDocuments.delete(inputDoc);
+    }
+
+    function reportAction(action, eventType) {
       const report = globalThis[binding];
       if (typeof report === "function") {
         try {
-          report(JSON.stringify({ token }));
+          report(JSON.stringify({ token, action, eventType }));
         } catch (_) {}
       }
     }
@@ -174,6 +235,7 @@ function usemacTabIndicatorPage(cmd) {
         parent.appendChild(host);
       }
       watch();
+      syncInputDocuments();
     }
 
     // Put the host back when the page removes it (or replaces <html>), but do not fight a page that keeps doing it.
@@ -211,11 +273,12 @@ function usemacTabIndicatorPage(cmd) {
       }
       const frameClass = "frame " + mode + (inert ? " inert" : "");
       if (frameEl.className !== frameClass) frameEl.className = frameClass;
-      const text =
-        mode === "stopped" ? "Stopped" : step ? "UseMac is controlling this tab · " + step : "UseMac is controlling this tab";
+      let text = step ? "UseMac is controlling this tab · " + step : "UseMac is controlling this tab";
+      if (mode === "stopped") text = "Stopped";
+      if (mode === "user_paused") text = "You're using this tab, agent paused";
       if (textEl.textContent !== text) textEl.textContent = text;
-      if (mode === "active") stopEl.removeAttribute("hidden");
-      else stopEl.setAttribute("hidden", "");
+      stopEl.toggleAttribute("hidden", mode === "stopped");
+      resumeEl.toggleAttribute("hidden", mode !== "user_paused");
     }
 
     // Restarting the CSS lease animation means switching between two identical keyframes (no reflow needed).
@@ -235,6 +298,7 @@ function usemacTabIndicatorPage(cmd) {
       leaseTimer = null;
       if (observer) observer.disconnect();
       observer = null;
+      for (const inputDoc of inputDocuments) unwatchInputDocument(inputDoc);
       if (host) host.remove();
     }
 
@@ -270,7 +334,7 @@ function usemacTabIndicatorPage(cmd) {
         case "render":
           token = String(command.token || "");
           binding = String(command.binding || "");
-          mode = command.mode === "stopped" ? "stopped" : "active";
+          mode = command.mode === "stopped" || command.mode === "user_paused" ? command.mode : "active";
           step = String(command.step || "").slice(0, 80);
           shown = Boolean(command.show);
           wanted = true;
@@ -307,7 +371,7 @@ function usemacTabIndicatorPage(cmd) {
 const TAB_INDICATOR_PAGE_SOURCE = usemacTabIndicatorPage.toString();
 // Tiny dispatcher used once TAB_INDICATOR_PAGE_SOURCE has bootstrapped __usemacTabIndicator in a contextId.
 const TAB_INDICATOR_FAST_CALL_SOURCE =
-  "function(cmd){const c=globalThis.__usemacTabIndicator;return c&&c.version===1?c.apply(cmd||{}):{__usemacUnbootstrapped:true};}";
+  "function(cmd){const c=globalThis.__usemacTabIndicator;return c&&c.version===3?c.apply(cmd||{}):{__usemacUnbootstrapped:true};}";
 
 // --- Extension side -------------------------------------------------------------------------------------------------
 
@@ -318,6 +382,12 @@ function tabIndicatorState(session) {
     session.tabIndicator = {
       controlled: false, // an agent command used this tab since its control last ended
       stopped: false, // the kill switch or Pause stopped the agent: "Stopped" for a few seconds
+      userPaused: false,
+      userPausedWaiters: [],
+      agentPointerDepth: 0,
+      suppressPointerUntil: 0,
+      agentKeyboardDepth: 0,
+      suppressKeyboardUntil: 0,
       step: null,
       stepTimer: null,
       stoppedTimer: null,
@@ -337,6 +407,79 @@ function tabIndicatorState(session) {
     };
   }
   return session.tabIndicator;
+}
+
+function beginTabIndicatorAgentInput(tabId, kind = "all") {
+  const ind = state.tabSessions.get(tabId)?.tabIndicator;
+  if (!ind) return null;
+  if (kind !== "keyboard") ind.agentPointerDepth += 1;
+  if (kind !== "pointer") ind.agentKeyboardDepth += 1;
+  return ind;
+}
+
+function endTabIndicatorAgentInput(tabId, kind = "all", ind = state.tabSessions.get(tabId)?.tabIndicator) {
+  if (!ind || state.tabSessions.get(tabId)?.tabIndicator !== ind) return;
+  const until = Date.now() + TAB_INDICATOR_TIMING.agentInputGraceMs;
+  if (kind !== "keyboard") {
+    ind.agentPointerDepth -= 1;
+    ind.suppressPointerUntil = until;
+  }
+  if (kind !== "pointer") {
+    ind.agentKeyboardDepth -= 1;
+    ind.suppressKeyboardUntil = until;
+  }
+}
+
+function clearTabIndicatorUserPause(ind, cancelled = false) {
+  ind.userPaused = false;
+  for (const finish of ind.userPausedWaiters.splice(0)) finish(cancelled);
+}
+
+function clearAllTabIndicatorUserPauses(cancelled = false) {
+  for (const [tabId, { tabIndicator: ind }] of state.tabSessions) {
+    if (!ind || (!ind.userPaused && ind.userPausedWaiters.length === 0)) continue;
+    clearTabIndicatorUserPause(ind, cancelled);
+    scheduleTabIndicatorRender(tabId);
+  }
+}
+
+function cancelTabIndicatorUserPause(tabId, ind) {
+  if (!ind?.userPaused) return;
+  // The running step may not have reached the pause gate yet. Cancel its token as well as any current waiters.
+  state.tabCancelGeneration.set(tabId, getTabCancelGen(tabId) + 1);
+  clearTabIndicatorUserPause(ind, true);
+}
+
+function resumeTabIndicatorUserPause(tabId) {
+  const ind = state.tabSessions.get(tabId)?.tabIndicator;
+  if (!ind?.userPaused) return;
+  clearTabIndicatorUserPause(ind);
+  scheduleTabIndicatorRender(tabId);
+}
+
+async function waitIfTabUserPaused(tabId, cancelToken) {
+  const ind = state.tabSessions.get(tabId)?.tabIndicator;
+  while (ind?.userPaused && !isCancelled(tabId, cancelToken)) {
+    let finish;
+    let cancelTimer;
+    try {
+      const stopped = await new Promise((resolve) => {
+        finish = resolve;
+        ind.userPausedWaiters.push(finish);
+        if (cancelToken) {
+          cancelTimer = setInterval(() => {
+            if (isCancelled(tabId, cancelToken)) finish(true);
+          }, CANCEL_POLL_SLICE_MS);
+        }
+      });
+      if (stopped) throw CANCELLED_ERROR;
+    } finally {
+      clearInterval(cancelTimer);
+      const index = ind.userPausedWaiters.indexOf(finish);
+      if (index !== -1) ind.userPausedWaiters.splice(index, 1);
+    }
+  }
+  if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
 }
 
 function clearTabIndicatorTimers(ind) {
@@ -385,6 +528,7 @@ function handleTabControlMessage(msg) {
       const ind = session.tabIndicator;
       if (!ind?.controlled) continue;
       ind.stopped = true;
+      cancelTabIndicatorUserPause(tabId, ind);
       ind.step = null;
       if (ind.stoppedTimer) clearTimeout(ind.stoppedTimer);
       ind.stoppedTimer = setTimeout(() => {
@@ -405,6 +549,7 @@ function handleTabControlMessage(msg) {
       if (!ind || keep.has(tabId) || (!ind.controlled && !ind.stopped)) continue;
       ind.controlled = false;
       ind.stopped = false;
+      cancelTabIndicatorUserPause(tabId, ind);
       ind.step = null;
       clearTabIndicatorTimers(ind);
       scheduleTabIndicatorRender(tabId);
@@ -456,7 +601,7 @@ async function renderTabIndicatorNow(tabId, session) {
     const result = await callTabIndicatorPage(tabId, session, {
       op: "render",
       show: visible,
-      mode: ind.stopped ? "stopped" : "active",
+      mode: ind.stopped ? "stopped" : ind.userPaused ? "user_paused" : "active",
       step: ind.stopped ? "" : ind.step || "",
       lease: ind.stopped ? TAB_INDICATOR_TIMING.stoppedLingerMs : TAB_INDICATOR_TIMING.leaseMs,
       binding: TAB_INDICATOR_BINDING,
@@ -623,6 +768,7 @@ async function tabIndicatorBeforeDetach(tabId, session) {
   ind.mounted = false;
   ind.shown = false;
   ind.pill = null;
+  clearTabIndicatorUserPause(ind, true);
   updateTabIndicatorHeartbeat();
 }
 
@@ -678,14 +824,35 @@ function tabIndicatorFrameFlag(tabId) {
 
 function handleTabIndicatorBinding(tabId, session, params) {
   const ind = session.tabIndicator;
-  if (ind.contextId != null && params.executionContextId != null && params.executionContextId !== ind.contextId) return;
+  if (ind.contextId == null || params.executionContextId !== ind.contextId) return;
   let payload = null;
   try {
     payload = JSON.parse(params.payload);
   } catch (_) {}
   if (!payload || payload.token !== ind.token) return;
-  if (!ind.controlled || ind.stopped || !ind.shown || ind.inert) return;
-  sendWS({ type: "stop_requested", tabId });
+  if (!ind.controlled || ind.stopped || !ind.shown) return;
+  if (payload.action === "user_input") {
+    if (ind.userPaused) return;
+    const { eventType } = payload;
+    const now = Date.now();
+    if (eventType === "pointerdown" || eventType === "mousedown") {
+      if (ind.agentPointerDepth > 0 || now < ind.suppressPointerUntil) return;
+    } else if (eventType === "keydown" || eventType === "input") {
+      if (ind.agentKeyboardDepth > 0 || now < ind.suppressKeyboardUntil) return;
+    } else {
+      return;
+    }
+    ind.userPaused = true;
+    scheduleTabIndicatorRender(tabId);
+  } else if (ind.inert) {
+    return;
+  } else if (payload.action === "resume") {
+    resumeTabIndicatorUserPause(tabId);
+  } else if (payload.action === "stop" || payload.action == null) {
+    sendWS({ type: "stop_requested", tabId });
+    // Cancel the waiting batch and keep queued work paused until the daemon acknowledges Stop.
+    for (const finish of ind.userPausedWaiters.splice(0)) finish(true);
+  }
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {

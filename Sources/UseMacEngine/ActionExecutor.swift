@@ -41,7 +41,8 @@ public final class ActionExecutor: @unchecked Sendable {
         _ request: BatchActionRequest,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)? = nil,
         onLiveActivity: (@Sendable (LiveActivityItem) -> Void)? = nil,
-        preResolvedTarget: AppDescriptor? = nil
+        preResolvedTarget: AppDescriptor? = nil,
+        siteRuleGuard: (@Sendable (AppDescriptor) async -> String?)? = nil
     ) async -> (result: BatchActionResult, resolvedApp: AppDescriptor?) {
         let batchStartNs = DispatchTime.now().uptimeNanoseconds
         let requestTarget: AppQueryMatch
@@ -86,7 +87,8 @@ public final class ActionExecutor: @unchecked Sendable {
             windowTitle: currentApp?.windowTitle,
             windowBounds: currentApp?.windowBounds,
             title: "Running \(request.steps.count) step\(request.steps.count == 1 ? "" : "s")…",
-            isInProgress: true
+            isInProgress: true,
+            windowId: currentApp?.windowId
         ))
 
         defer {
@@ -130,7 +132,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 mechanism: refusal.mechanism,
                 latencyMs: 0,
                 success: false,
-                isInProgress: false
+                isInProgress: false,
+                windowId: currentApp?.windowId
             ))
             return finish(false)
         }
@@ -151,7 +154,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     subtitle: "\(currentApp?.name ?? "The app") is in front for a moment",
                     mechanism: "foreground-burst",
                     success: true,
-                    isInProgress: true
+                    isInProgress: true,
+                    windowId: currentApp?.windowId
                 ))
             case .failure(let refusal):
                 stepResults.append(ActionStepResult(
@@ -170,6 +174,23 @@ public final class ActionExecutor: @unchecked Sendable {
         let lastEffectIndex = request.steps.lastIndex(where: { Self.checksEffect($0.action) })
         var allSucceeded = true
         var hadMutatingSuccess = false
+
+        func runStep(_ step: ActionStep, measureEffect: Bool) async -> StepOutcome {
+            if let siteRuleGuard, let target = currentApp, isChromiumApp(target) {
+                let effectiveStepApp = WorkspaceMonitor.withTargetWindow(target)
+                currentApp = effectiveStepApp
+                if let message = await siteRuleGuard(effectiveStepApp) {
+                    return StepOutcome(success: false, mechanism: "target-rules", message: message, errorCode: TargetRules.errorCode)
+                }
+            }
+            return await executeStep(
+                step,
+                targetApp: currentApp,
+                measureEffect: measureEffect,
+                onOverlayEvent: onOverlayEvent,
+                siteRuleGuard: siteRuleGuard
+            )
+        }
 
         for (index, step) in request.steps.enumerated() {
             if let blockReason = killSwitch.isBlocked(
@@ -205,7 +226,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     mechanism: "blocked",
                     latencyMs: 0,
                     success: false,
-                    isInProgress: false
+                    isInProgress: false,
+                    windowId: currentApp?.windowId
                 ))
                 if request.stopOnError {
                     break
@@ -234,12 +256,7 @@ public final class ActionExecutor: @unchecked Sendable {
                 // The user (or another app) took the front during the burst: stop sending real input.
                 outcome = notFrontmostOutcome(targetApp: currentApp, input: "input")
             } else {
-                outcome = await executeStep(
-                    step,
-                    targetApp: currentApp,
-                    measureEffect: shouldMeasureEffect,
-                    onOverlayEvent: onOverlayEvent
-                )
+                outcome = await runStep(step, measureEffect: shouldMeasureEffect)
             }
 
             // Opt-in foregroundFallback: escalate inside the same batch ONLY when background input was
@@ -266,16 +283,12 @@ public final class ActionExecutor: @unchecked Sendable {
                             subtitle: "\(target.name) needed focus for this step",
                             mechanism: "foreground-fallback",
                             success: true,
-                            isInProgress: true
+                            isInProgress: true,
+                            windowId: target.windowId
                         ))
                         var fgStep = step
                         fgStep.preferBackground = false
-                        outcome = await executeStep(
-                            fgStep,
-                            targetApp: currentApp,
-                            measureEffect: true,
-                            onOverlayEvent: onOverlayEvent
-                        )
+                        outcome = await runStep(fgStep, measureEffect: true)
                     case .failure(let refusal):
                         outcome.message = "\(outcome.message ?? "Background action failed.") Foreground fallback unavailable: \(refusal.message)"
                     }
@@ -368,7 +381,8 @@ public final class ActionExecutor: @unchecked Sendable {
                 mechanism: outcome.mechanism,
                 latencyMs: stepLatencyMs,
                 success: outcome.success,
-                isInProgress: true
+                isInProgress: true,
+                windowId: currentApp?.windowId
             ))
 
             if !outcome.success {
@@ -473,6 +487,8 @@ public final class ActionExecutor: @unchecked Sendable {
     private struct ForegroundBurst {
         let targetPid: pid_t
         let previousApp: NSRunningApplication?
+        let previousWindow: AXUIElement?
+        let borrowedWindowId: CGWindowID?
         let savedCursor: CGPoint?
     }
 
@@ -740,19 +756,26 @@ public final class ActionExecutor: @unchecked Sendable {
 
     // MARK: - Foreground burst
 
+    static func remainingBudgetMs(nowNs: UInt64, deadlineNs: UInt64) -> Int {
+        guard nowNs < deadlineNs else { return 0 }
+        return Int((deadlineNs - nowNs) / 1_000_000)
+    }
+
     private func beginForegroundBurst(targetApp: AppDescriptor?, waitForIdleMs: Int? = nil) async -> Result<ForegroundBurst, Refusal> {
         guard let app = targetApp, app.pid > 0,
               let running = NSRunningApplication(processIdentifier: app.pid), !running.isTerminated else {
             return .failure(Refusal(mechanism: "foreground-burst", errorCode: "APP_NOT_FOUND", message: "A foreground burst needs a running target app."))
         }
-        let idleWaitBudgetMs = max(0, waitForIdleMs ?? 2000)
+        let idleWaitBudgetMs = min(max(0, waitForIdleMs ?? 2000), 60_000)
         var idle = WindowResolver.secondsSinceUserInput()
         if idle < Self.userIdleRequiredSeconds && !idleIsFromOwnInput(idle) && idleWaitBudgetMs > 0 {
             let deadlineNs = DispatchTime.now().uptimeNanoseconds + UInt64(idleWaitBudgetMs) * 1_000_000
-            while DispatchTime.now().uptimeNanoseconds < deadlineNs {
+            while true {
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                let remainingMs = Self.remainingBudgetMs(nowNs: nowNs, deadlineNs: deadlineNs)
+                guard remainingMs > 0 else { break }
                 let toIdleMs = Int(max(40, (Self.userIdleRequiredSeconds - idle) * 1000.0))
-                let remainingMs = Int((deadlineNs - DispatchTime.now().uptimeNanoseconds) / 1_000_000)
-                let sliceMs = min(150, min(toIdleMs, max(1, remainingMs)))
+                let sliceMs = min(150, toIdleMs, remainingMs)
                 try? await Task.sleep(nanoseconds: UInt64(sliceMs) * 1_000_000)
                 idle = WindowResolver.secondsSinceUserInput()
                 if idle >= Self.userIdleRequiredSeconds || idleIsFromOwnInput(idle) {
@@ -783,9 +806,30 @@ public final class ActionExecutor: @unchecked Sendable {
             }
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
+        var previousWindow: AXUIElement?
+        var borrowedWindowId: CGWindowID?
+        if let pinned = WindowResolver.pinnedTitle(pid: app.pid),
+           let pinnedWindow = WindowResolver.window(pid: app.pid, titleContains: pinned),
+           let pinnedID = WindowResolver.windowID(of: pinnedWindow),
+           InputRouting.focusedWindowId(pid: app.pid) != pinnedID {
+            let axApp = AXUIElementCreateApplication(app.pid)
+            if let focusedWindow = Self.axElement(axApp, kAXFocusedWindowAttribute),
+               !CFEqual(focusedWindow, pinnedWindow) {
+                previousWindow = focusedWindow
+            }
+            Self.raiseAXWindow(pinnedWindow)
+            borrowedWindowId = pinnedID
+            let deadline = ContinuousClock.now + .milliseconds(300)
+            while ContinuousClock.now < deadline, WindowResolver.isFrontmost(pid: app.pid),
+                  InputRouting.focusedWindowId(pid: app.pid) != pinnedID {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+        }
         return .success(ForegroundBurst(
             targetPid: app.pid,
             previousApp: previous?.processIdentifier == app.pid ? nil : previous,
+            previousWindow: previousWindow,
+            borrowedWindowId: borrowedWindowId,
             savedCursor: cursor
         ))
     }
@@ -874,11 +918,34 @@ public final class ActionExecutor: @unchecked Sendable {
         }
     }
 
+    static func shouldRestorePreviousWindow(
+        appIsFrontmost: Bool,
+        borrowedWindowId: CGWindowID?,
+        currentFocusedWindowId: CGWindowID?,
+        secondsSinceUserInput: Double,
+        ownInputRecent: Bool
+    ) -> Bool {
+        appIsFrontmost
+            && (borrowedWindowId == nil || currentFocusedWindowId == borrowedWindowId)
+            && (secondsSinceUserInput >= userIdleRequiredSeconds || ownInputRecent)
+    }
+
     private func endForegroundBurst(_ burst: ForegroundBurst) async {
         if let cursor = burst.savedCursor {
             _ = CGWarpMouseCursorPosition(cursor)
         }
-        // Give the screen back only if the target is still in front (the user may already have moved on).
+        if let previousWindow = burst.previousWindow {
+            let idle = WindowResolver.secondsSinceUserInput()
+            if Self.shouldRestorePreviousWindow(
+                appIsFrontmost: WindowResolver.isFrontmost(pid: burst.targetPid),
+                borrowedWindowId: burst.borrowedWindowId,
+                currentFocusedWindowId: InputRouting.focusedWindowId(pid: burst.targetPid),
+                secondsSinceUserInput: idle,
+                ownInputRecent: idleIsFromOwnInput(idle)
+            ) {
+                Self.raiseAXWindow(previousWindow)
+            }
+        }
         if let previous = burst.previousApp, !previous.isTerminated, WindowResolver.isFrontmost(pid: burst.targetPid) {
             _ = previous.activate(options: [])
         }
@@ -1008,7 +1075,7 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Real keys go to the focused (key) window of the app in front. Refuses when that is not the window UseMac
     /// works in, e.g. a window it opened that sits behind the user's own window of the same app.
-    private func keyWindowGuard(_ targetApp: AppDescriptor?, input: String) -> StepOutcome? {
+    private func keyWindowGuard(_ targetApp: AppDescriptor?, input: String, pickerReceiver: AXUIElement? = nil) -> StepOutcome? {
         guard let pid = targetApp?.pid, pid > 0, let target = pinnedWindowId(targetApp) else { return nil }
         let keysReach = InputRouting.keysReachTarget(
             appIsFrontmost: WindowResolver.isFrontmost(pid: pid),
@@ -1016,6 +1083,12 @@ public final class ActionExecutor: @unchecked Sendable {
             focusedWindowId: InputRouting.focusedWindowId(pid: pid)
         )
         if keysReach { return nil }
+        // A picker opened by the pinned window can take keys in its own AX window.
+        if let pickerReceiver,
+           let focusedWindow = Self.axElement(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute),
+           Self.isHosted(in: focusedWindow, element: pickerReceiver) {
+            return nil
+        }
         let app = targetApp?.name ?? "the target app"
         return StepOutcome(
             success: false,
@@ -1031,7 +1104,8 @@ public final class ActionExecutor: @unchecked Sendable {
         _ step: ActionStep,
         targetApp: AppDescriptor?,
         measureEffect shouldMeasureEffect: Bool = true,
-        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
+        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?,
+        siteRuleGuard: (@Sendable (AppDescriptor) async -> String?)?
     ) async -> StepOutcome {
         switch step.action {
         case .target:
@@ -1064,7 +1138,7 @@ public final class ActionExecutor: @unchecked Sendable {
             return await performFillForm(step: step, targetApp: targetApp, onOverlayEvent: onOverlayEvent)
 
         case .menuAction:
-            return performMenuAction(step: step, targetApp: targetApp)
+            return await performMenuAction(step: step, targetApp: targetApp, siteRuleGuard: siteRuleGuard)
 
         default:
             break
@@ -1163,6 +1237,16 @@ public final class ActionExecutor: @unchecked Sendable {
         }
     }
 
+    static func openURLRuleRefusal(normalizedURL: String, handlerBundleId: String?, rules: TargetRules) -> String? {
+        if rules.blocksURL(normalizedURL) {
+            return TargetRules.blockedSiteMessage(host: TargetRules.host(ofURL: normalizedURL))
+        }
+        if let handlerBundleId, rules.blocksApp(bundleId: handlerBundleId) {
+            return "The default app for this URL (\(handlerBundleId)) is blocked by UseMac target rules. \(TargetRules.stopHint)"
+        }
+        return nil
+    }
+
     private func performOpenURL(step: ActionStep) async -> StepOutcome {
         let normalizedURL: String
         switch NavigationPolicy.validate(step.url ?? step.text) {
@@ -1173,6 +1257,13 @@ public final class ActionExecutor: @unchecked Sendable {
         }
         guard let parsedURL = URL(string: normalizedURL) else {
             return StepOutcome(success: false, mechanism: "open-url", message: "Invalid URL.", errorCode: "INVALID_REQUEST")
+        }
+        let handlerBundleId = NSWorkspace.shared.urlForApplication(toOpen: parsedURL)
+            .flatMap { Bundle(url: $0)?.bundleIdentifier }
+        if let message = Self.openURLRuleRefusal(
+            normalizedURL: normalizedURL, handlerBundleId: handlerBundleId, rules: TargetRulesStore.shared.rules
+        ) {
+            return StepOutcome(success: false, mechanism: "target-rules", message: message, errorCode: TargetRules.errorCode)
         }
         let config = NSWorkspace.OpenConfiguration()
         config.activates = (step.preferBackground == false)
@@ -1730,7 +1821,8 @@ public final class ActionExecutor: @unchecked Sendable {
                     before: beforeValue,
                     readBack: readBack,
                     isToggle: isToggle,
-                    isSecure: isSecure
+                    isSecure: isSecure,
+                    isChromiumBackground: bgPid != nil && isChromiumApp(targetApp)
                 )
                 return StepOutcome(
                     success: true,
@@ -1774,7 +1866,8 @@ public final class ActionExecutor: @unchecked Sendable {
         before: String?,
         readBack: String?,
         isToggle: Bool,
-        isSecure: Bool
+        isSecure: Bool,
+        isChromiumBackground: Bool = false
     ) -> (effect: ActionEffect, message: String?, warning: String?) {
         if isToggle || isSecure {
             return (.changed, nil, nil)
@@ -1795,6 +1888,13 @@ public final class ActionExecutor: @unchecked Sendable {
                 nil
             )
         }
+        if isChromiumBackground {
+            return (
+                ActionEffect.none,
+                nil,
+                "The field still reads back \"\(readBack.prefix(60))\" instead of the text you set: web fields in background Chrome/Chromium windows (such as RESTRICTED_PAGE windows) often ignore AXValue without focus. Retry this batch with \"foreground\": true."
+            )
+        }
         return (
             ActionEffect.none,
             nil,
@@ -1812,7 +1912,8 @@ public final class ActionExecutor: @unchecked Sendable {
         step: ActionStep,
         resolved: ResolvedElement,
         targetApp: AppDescriptor?,
-        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
+        onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?,
+        pickerReceiver: AXUIElement? = nil
     ) -> StepOutcome {
         let text = step.text ?? ""
         let bgPid = backgroundPid(for: step, targetApp: targetApp)
@@ -1822,7 +1923,7 @@ public final class ActionExecutor: @unchecked Sendable {
             ? resolvePoint(step: step, node: resolved.node, targetApp: targetApp)
             : nil
         if bgPid == nil, let refused = frontmostGuard(targetApp, input: "typing", at: resolvePoint(step: step, node: resolved.node, targetApp: targetApp))
-            ?? keyWindowGuard(targetApp, input: "typing")
+            ?? keyWindowGuard(targetApp, input: "typing", pickerReceiver: pickerReceiver)
             ?? clickPoint.flatMap({ pointerRefusal(targetApp, at: $0, input: "clicks") }) {
             return refused
         }
@@ -1849,7 +1950,12 @@ public final class ActionExecutor: @unchecked Sendable {
         )
     }
 
-    private func performPressKey(step: ActionStep, resolved: ResolvedElement, targetApp: AppDescriptor?) -> StepOutcome {
+    private func performPressKey(
+        step: ActionStep,
+        resolved: ResolvedElement,
+        targetApp: AppDescriptor?,
+        pickerReceiver: AXUIElement? = nil
+    ) -> StepOutcome {
         guard let keyName = step.key?.trimmingCharacters(in: .whitespacesAndNewlines),
               let keyCode = NativeKeyMap.keyCode(for: step.key) else {
             return StepOutcome(
@@ -1872,7 +1978,8 @@ public final class ActionExecutor: @unchecked Sendable {
             warning = "AXConfirm failed on \(resolved.node?.id ?? "the element"); sent a key event instead."
         }
 
-        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "key presses") ?? keyWindowGuard(targetApp, input: "key presses") {
+        if bgPid == nil, let refused = frontmostGuard(targetApp, input: "key presses")
+            ?? keyWindowGuard(targetApp, input: "key presses", pickerReceiver: pickerReceiver) {
             return refused
         }
 
@@ -2073,15 +2180,37 @@ public final class ActionExecutor: @unchecked Sendable {
         targetApp: AppDescriptor?,
         onOverlayEvent: (@Sendable (OverlayVisualEvent) -> Void)?
     ) async -> StepOutcome? {
-        let layout = axIndexer.latestScrollLayout(pid: pid)
-        let elementIndex = elementId.flatMap { id in layout.nodes.firstIndex(where: { $0.id == id }) }
-        guard let index = ScrollFallback.nextOffscreenIndex(
+        var layout = axIndexer.latestScrollLayout(pid: pid)
+        var elementIndex = elementId.flatMap { id in layout.nodes.firstIndex(where: { $0.id == id }) }
+        var index = ScrollFallback.nextOffscreenIndex(
             nodes: layout.nodes,
             containers: layout.containers,
             at: point,
             down: down,
             elementIndex: elementIndex
-        ) else { return nil }
+        )
+        if index == nil, !layout.nodes.contains(where: { $0.offscreen == true }), let app = targetApp {
+            // Default observes omit offscreen elements; index them on demand before giving up on the fallback.
+            _ = axIndexer.observe(
+                app: app,
+                maxDepth: 40,
+                maxElements: 600,
+                useCache: false,
+                includeDiff: false,
+                accessibilityGranted: true,
+                includeOffscreen: true
+            )
+            layout = axIndexer.latestScrollLayout(pid: pid)
+            elementIndex = elementId.flatMap { id in layout.nodes.firstIndex(where: { $0.id == id }) }
+            index = ScrollFallback.nextOffscreenIndex(
+                nodes: layout.nodes,
+                containers: layout.containers,
+                at: point,
+                down: down,
+                elementIndex: elementIndex
+            )
+        }
+        guard let index else { return nil }
         let candidate = layout.nodes[index]
         guard let element = axIndexer.element(for: candidate.id, pid: pid) else { return nil }
         guard AXUIElementPerformAction(element, "AXScrollToVisible" as CFString) == .success else { return nil }
@@ -2734,7 +2863,11 @@ public final class ActionExecutor: @unchecked Sendable {
         return false
     }
 
-    private func performMenuAction(step: ActionStep, targetApp: AppDescriptor?) -> StepOutcome {
+    private func performMenuAction(
+        step: ActionStep,
+        targetApp: AppDescriptor?,
+        siteRuleGuard: (@Sendable (AppDescriptor) async -> String?)?
+    ) async -> StepOutcome {
         guard let targetApp, targetApp.pid > 0 else {
             return StepOutcome(
                 success: false,
@@ -2751,7 +2884,44 @@ public final class ActionExecutor: @unchecked Sendable {
                 errorCode: "INVALID_REQUEST"
             )
         }
-        let inv = MenuBarController.invoke(pid: targetApp.pid, appName: targetApp.name, path: menuPath)
+        let pid = targetApp.pid
+        let hasPin = WindowResolver.pinnedTitle(pid: pid) != nil
+        let chromiumGuard = isChromiumApp(targetApp) ? siteRuleGuard : nil
+        let focusedWindowId = (hasPin || chromiumGuard != nil) ? InputRouting.focusedWindowId(pid: pid) : nil
+        if hasPin {
+            let pinnedId = pinnedWindowId(WorkspaceMonitor.withTargetWindow(targetApp))
+            guard let pinnedId, focusedWindowId == pinnedId else {
+                return StepOutcome(
+                    success: false,
+                    mechanism: "ax-menu-action",
+                    message: "Menus act on \(targetApp.name)'s key window, not the pinned window. Make the pinned window the key window before using menuAction.",
+                    errorCode: "TARGET_NOT_FRONTMOST"
+                )
+            }
+        }
+        if let chromiumGuard {
+            let axApp = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(axApp, 0.35)
+            let focusedWindow = Self.axElement(axApp, kAXFocusedWindowAttribute)
+            var focusedApp = targetApp
+            focusedApp.windowId = focusedWindowId
+            focusedApp.windowTitle = focusedWindow.flatMap { Self.axString($0, kAXTitleAttribute) }
+            focusedApp.windowBounds = focusedWindow.flatMap(Self.axFrame).map {
+                .init(x: $0.minX, y: $0.minY, width: $0.width, height: $0.height)
+            }
+            if let message = await chromiumGuard(focusedApp) {
+                return StepOutcome(success: false, mechanism: "target-rules", message: message, errorCode: TargetRules.errorCode)
+            }
+            guard InputRouting.focusedWindowId(pid: pid) == focusedWindowId else {
+                return StepOutcome(
+                    success: false,
+                    mechanism: "ax-menu-action",
+                    message: "\(targetApp.name)'s key window changed while checking the site. No menu action was sent.",
+                    errorCode: "TARGET_NOT_FRONTMOST"
+                )
+            }
+        }
+        let inv = MenuBarController.invoke(pid: pid, appName: targetApp.name, path: menuPath)
         return StepOutcome(
             success: inv.success,
             mechanism: "ax-menu-action",
@@ -2783,6 +2953,8 @@ public final class ActionExecutor: @unchecked Sendable {
         guard let pid = targetApp?.pid, pid > 0 else {
             return StepOutcome(success: false, mechanism: "nsopenpanel", message: "uploadFile needs a target app.", errorCode: "APP_NOT_FOUND")
         }
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let previousFrontApp = frontApp?.processIdentifier == pid ? nil : frontApp
 
         // Open the picker first when a trigger (button or drop zone) was given.
         if resolved.element != nil || (step.x != nil && step.y != nil) {
@@ -2814,10 +2986,18 @@ public final class ActionExecutor: @unchecked Sendable {
             )
         }
 
+        let appName = targetApp?.name ?? "the app"
+        func selected(_ mechanism: String) async -> StepOutcome {
+            let warning = await restoreFocusAfterBackgroundUploadIfNeeded(
+                targetPid: pid, targetAppName: appName, previousApp: previousFrontApp
+            )
+            return StepOutcome(success: true, mechanism: mechanism, message: "Selected \(fileName).\(extra)", effect: .changed, warning: warning)
+        }
+
         // 1. Walk the folders like a person would (sidebar → folders → file), selecting rows and pressing Open.
         //    Deterministic and independent of Spotlight.
         if await navigateAndPick(panel: panel, file: file, pid: pid) {
-            return StepOutcome(success: true, mechanism: "nsopenpanel-navigate", message: "Selected \(fileName).\(extra)", effect: .changed)
+            return await selected("nsopenpanel-navigate")
         }
 
         // Spotlight never lists files in /tmp, $TMPDIR or hidden folders, and Go to Folder takes no keys in the
@@ -2849,7 +3029,7 @@ public final class ActionExecutor: @unchecked Sendable {
             let deadline = DispatchTime.now().uptimeNanoseconds + 10_000_000_000
             while DispatchTime.now().uptimeNanoseconds < deadline {
                 if pressedOpen, findOpenPanel(pid: pid) == nil {
-                    return StepOutcome(success: true, mechanism: "nsopenpanel-search-select", message: "Selected \(fileName).\(extra)", effect: .changed)
+                    return await selected("nsopenpanel-search-select")
                 }
                 let rows = openableRows(in: panel.root, named: fileName)
                 let exact = rows.filter { Self.rowURL($0)?.standardizedFileURL.path == targetPath }
@@ -2863,7 +3043,7 @@ public final class ActionExecutor: @unchecked Sendable {
                         _ = AXUIElementPerformAction(candidate, "AXOpen" as CFString)
                         try? await Task.sleep(nanoseconds: 600_000_000)
                         if pressedOpen == false, findOpenPanel(pid: pid) == nil {
-                            return StepOutcome(success: true, mechanism: "nsopenpanel-search-axopen", message: "Selected \(fileName).\(extra)", effect: .changed)
+                            return await selected("nsopenpanel-search-axopen")
                         }
                     }
                     lastCandidate = candidate
@@ -2873,11 +3053,12 @@ public final class ActionExecutor: @unchecked Sendable {
                     }
                     if let open = findOpenPanel(pid: pid)?.defaultButton ?? panel.defaultButton,
                        Self.axBool(rowElement, kAXSelectedAttribute) == true,
-                       Self.axBool(open, kAXEnabledAttribute) != false,
-                       AXUIElementPerformAction(open, kAXPressAction as CFString) == .success {
-                        pressedOpen = true
-                        if await waitForPanelToClose(pid: pid) {
-                            return StepOutcome(success: true, mechanism: "nsopenpanel-search-select", message: "Selected \(fileName).\(extra)", effect: .changed)
+                       Self.axBool(open, kAXEnabledAttribute) != false {
+                        if AXUIElementPerformAction(open, kAXPressAction as CFString) == .success {
+                            pressedOpen = true
+                            if await waitForPanelToClose(pid: pid) {
+                                return await selected("nsopenpanel-search-select")
+                            }
                         }
                     }
                 }
@@ -2889,15 +3070,18 @@ public final class ActionExecutor: @unchecked Sendable {
                 if let candidate = lastCandidate, Self.axActions(candidate).contains("AXOpen"),
                    AXUIElementPerformAction(candidate, "AXOpen" as CFString) == .success,
                    await waitForPanelToClose(pid: pid) {
-                    return StepOutcome(success: true, mechanism: "nsopenpanel-search-axopen", message: "Selected \(fileName).\(extra)", effect: .changed)
+                    return await selected("nsopenpanel-search-axopen")
                 }
-                return StepOutcome(
-                    success: false,
-                    mechanism: "nsopenpanel-search",
-                    message: "Found \(fileName) in the picker but could not confirm it in the background (Open stayed disabled). Rerun this step in a batch with \"foreground\": true.",
-                    errorCode: "UPLOAD_FAILED"
-                )
-            } else if !WindowResolver.isFrontmost(pid: pid) {
+            }
+            if !OpenPanelReach.shouldAttemptGoToFolderAfterSearchFailure(isFrontmost: WindowResolver.isFrontmost(pid: pid)) {
+                if sawRow {
+                    return StepOutcome(
+                        success: false,
+                        mechanism: "nsopenpanel-search",
+                        message: "Found \(fileName) in the picker but could not confirm it in the background (Open stayed disabled). Rerun this step in a batch with \"foreground\": true.",
+                        errorCode: "UPLOAD_FAILED"
+                    )
+                }
                 return StepOutcome(
                     success: false,
                     mechanism: "nsopenpanel-search",
@@ -2910,29 +3094,205 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         // Last resort: ⌘⇧G with real keys, only when the app is in front.
+        var outcome = await pickViaGoToFolder(panel: panel, file: file, fileName: fileName, extra: extra, pid: pid, targetApp: targetApp)
+        if outcome.success {
+            outcome.warning = await restoreFocusAfterBackgroundUploadIfNeeded(
+                targetPid: pid, targetAppName: appName, previousApp: previousFrontApp
+            )
+        }
+        return outcome
+    }
+
+    private func restoreFocusAfterBackgroundUploadIfNeeded(
+        targetPid: Int32,
+        targetAppName: String,
+        previousApp: NSRunningApplication?
+    ) async -> String? {
+        guard let previousApp, !previousApp.isTerminated else { return nil }
+        // Document apps can activate shortly after the open panel disappears.
+        for attempt in 0..<3 {
+            if WindowResolver.isFrontmost(pid: targetPid) {
+                let idle = WindowResolver.secondsSinceUserInput()
+                guard !previousApp.isTerminated, OpenPanelReach.shouldRestoreFocusAfterBackgroundUpload(
+                    previousPid: previousApp.processIdentifier,
+                    targetPid: targetPid,
+                    targetBecameFrontmost: true,
+                    secondsSinceUserInput: idle,
+                    ownInputRecent: idleIsFromOwnInput(idle)
+                ) else { return nil }
+                _ = await waitForApplicationActivation(pid: previousApp.processIdentifier, timeoutMs: 400) {
+                    if WindowResolver.isFrontmost(pid: targetPid) {
+                        _ = previousApp.activate(options: [])
+                    }
+                }
+                return WindowResolver.isFrontmost(pid: targetPid)
+                    ? "Opening the document brought \(targetAppName) to the front and focus could not be returned automatically."
+                    : nil
+            }
+            if attempt < 2 {
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+        }
+        return nil
+    }
+
+    private func pickViaGoToFolder(
+        panel: OpenPanelParts,
+        file: String,
+        fileName: String,
+        extra: String,
+        pid: Int32,
+        targetApp: AppDescriptor?
+    ) async -> StepOutcome {
         if let refused = frontmostGuard(targetApp, input: "keys to the file picker") {
             return refused
         }
+        let panelRoot = findOpenPanel(pid: pid)?.root ?? panel.root
         let frontmost = ResolvedElement(pid: pid)
-        _ = performPressKey(step: ActionStep(action: .pressKey, key: "g", modifiers: ["cmd", "shift"], preferBackground: false), resolved: frontmost, targetApp: targetApp)
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        let typed = performType(step: ActionStep(action: .type, text: file, preferBackground: false), resolved: frontmost, targetApp: targetApp, onOverlayEvent: nil)
-        guard typed.success else {
-            return StepOutcome(success: false, mechanism: "nsopenpanel-goto", message: typed.message ?? "Failed to type path in Go to Folder", errorCode: typed.errorCode)
+
+        func press(_ key: String, modifiers: [String] = [], in receiver: AXUIElement) -> StepOutcome {
+            performPressKey(
+                step: ActionStep(action: .pressKey, key: key, modifiers: modifiers, preferBackground: false),
+                resolved: frontmost, targetApp: targetApp, pickerReceiver: receiver
+            )
         }
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        let returnKey = ActionStep(action: .pressKey, key: "return", preferBackground: false)
-        _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        _ = performPressKey(step: returnKey, resolved: frontmost, targetApp: targetApp)
-        let closed = await waitForPanelToClose(pid: pid)
-        return StepOutcome(
-            success: closed,
-            mechanism: "nsopenpanel-goto",
-            message: closed ? "Selected \(fileName) via ⌘⇧G.\(extra)" : "The picker is still open after ⌘⇧G.",
-            errorCode: closed ? nil : "UPLOAD_FAILED",
-            effect: closed ? .changed : ActionEffect.none
-        )
+        func result(closed: Bool, detectedField: Bool, failure: StepOutcome? = nil) -> StepOutcome {
+            StepOutcome(
+                success: closed,
+                mechanism: "nsopenpanel-goto",
+                message: closed ? "Selected \(fileName) via ⌘⇧G.\(extra)"
+                    : failure?.message ?? OpenPanelReach.goToFolderFailureMessage(fileName: fileName, detectedField: detectedField),
+                errorCode: closed ? nil : failure?.errorCode ?? "UPLOAD_FAILED",
+                effect: closed ? .changed : ActionEffect.none
+            )
+        }
+        Self.raiseAXWindow(panelRoot)
+        try? await Task.sleep(for: .milliseconds(80))
+        var field = findGoToFolderField(in: panelRoot, pid: pid)
+        if field == nil {
+            let shortcut = press("g", modifiers: ["cmd", "shift"], in: panelRoot)
+            guard shortcut.success else { return result(closed: false, detectedField: false, failure: shortcut) }
+            let started = ContinuousClock.now
+            let retryAt = started + .milliseconds(600)
+            let deadline = started + .milliseconds(1200)
+            var retried = false
+            while ContinuousClock.now < deadline, field == nil {
+                field = findGoToFolderField(in: panelRoot, pid: pid)
+                if field == nil, !retried, ContinuousClock.now >= retryAt {
+                    retried = true
+                    Self.raiseAXWindow(panelRoot)
+                    try? await Task.sleep(for: .milliseconds(80))
+                    field = findGoToFolderField(in: panelRoot, pid: pid)
+                    if field != nil { break }
+                    let retry = press("g", modifiers: ["cmd", "shift"], in: panelRoot)
+                    guard retry.success else { return result(closed: false, detectedField: false, failure: retry) }
+                }
+                if field == nil { try? await Task.sleep(for: .milliseconds(80)) }
+            }
+        }
+
+        guard let field else { return result(closed: false, detectedField: false) }
+        if let refused = frontmostGuard(targetApp, input: "the Go to Folder path") {
+            return refused
+        }
+        _ = AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, file as CFTypeRef)
+        if Self.axString(field, kAXValueAttribute) != file {
+            let selectAll = press("a", modifiers: ["cmd"], in: field)
+            guard selectAll.success else { return result(closed: false, detectedField: true, failure: selectAll) }
+            let typed = performType(
+                step: ActionStep(action: .type, text: file, preferBackground: false),
+                resolved: frontmost, targetApp: targetApp, onOverlayEvent: nil, pickerReceiver: field
+            )
+            guard typed.success else { return result(closed: false, detectedField: true, failure: typed) }
+        }
+
+        try? await Task.sleep(for: .milliseconds(150))
+        let navigate = press("return", in: field)
+        guard navigate.success else { return result(closed: false, detectedField: true, failure: navigate) }
+
+        let navigationStarted = ContinuousClock.now
+        let retryAt = navigationStarted + .milliseconds(800)
+        let navigationDeadline = navigationStarted + .seconds(2)
+        var retried = false
+        while let openField = findGoToFolderField(in: panelRoot, pid: pid) {
+            guard ContinuousClock.now < navigationDeadline else { return result(closed: false, detectedField: true) }
+            if !retried, ContinuousClock.now >= retryAt {
+                retried = true
+                let retry = press("return", in: openField)
+                guard retry.success else { return result(closed: false, detectedField: true, failure: retry) }
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        repeat {
+            guard let currentPanel = findOpenPanel(pid: pid) else { return result(closed: true, detectedField: true) }
+            if let open = currentPanel.defaultButton, Self.axBool(open, kAXEnabledAttribute) != false {
+                if AXUIElementPerformAction(open, kAXPressAction as CFString) != .success {
+                    let confirm = press("return", in: currentPanel.root)
+                    guard confirm.success else { return result(closed: false, detectedField: true, failure: confirm) }
+                }
+                let closed = await waitForPanelToClose(pid: pid)
+                return result(closed: closed, detectedField: true)
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        } while ContinuousClock.now < deadline
+        return result(closed: false, detectedField: true)
+    }
+
+    private func findGoToFolderField(in panelRoot: AXUIElement, pid: Int32) -> AXUIElement? {
+        func field(in root: AXUIElement) -> AXUIElement? {
+            var queue = [(element: root, depth: 0, inGoToFolderContainer: false)]
+            var index = 0
+            while index < queue.count {
+                let (element, depth, inContainer) = queue[index]
+                index += 1
+                let role = Self.axString(element, kAXRoleAttribute)
+                // Neither list rows nor the browser's web content can contain the path field.
+                switch role {
+                case "AXRow", "AXOutline", "AXTable", "AXBrowser", "AXWebArea":
+                    continue
+                default:
+                    break
+                }
+                let inGoToFolderContainer = inContainer
+                    || ((role == "AXSheet" || role == "AXPopover") && !CFEqual(element, panelRoot))
+                if inGoToFolderContainer, role == "AXComboBox" || role == "AXTextField",
+                   OpenPanelReach.isGoToFolderFieldCandidate(
+                       role: role,
+                       subrole: Self.axString(element, kAXSubroleAttribute),
+                       inFileRow: false,
+                       isSearchField: false
+                   ) {
+                    return element
+                }
+                if depth < 6 {
+                    queue.append(contentsOf: Self.axChildren(element).map { ($0, depth + 1, inGoToFolderContainer) })
+                }
+            }
+            return nil
+        }
+
+        if let pathField = field(in: panelRoot) { return pathField }
+
+        // Some panels expose Go to Folder under the app's focused or auxiliary window instead.
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.35)
+        let focused = Self.axElement(axApp, kAXFocusedWindowAttribute)
+        if let focused, !CFEqual(focused, panelRoot), let pathField = field(in: focused) {
+            return pathField
+        }
+        for window in Self.axChildren(axApp, attribute: kAXWindowsAttribute)
+            where !CFEqual(window, panelRoot) && focused.map({ !CFEqual(window, $0) }) != false {
+            let role = Self.axString(window, kAXRoleAttribute)
+            let subrole = Self.axString(window, kAXSubroleAttribute)
+            if role == "AXSheet" || role == "AXPopover" || subrole == "AXDialog",
+               let pathField = field(in: window) {
+                return pathField
+            }
+        }
+        return nil
     }
 
     private struct OpenPanelParts {
@@ -2954,6 +3314,11 @@ public final class ActionExecutor: @unchecked Sendable {
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.35)
         var candidates: [AXUIElement] = []
+        if let pinned = WindowResolver.pinnedTitle(pid: pid),
+           let window = WindowResolver.window(pid: pid, titleContains: pinned) {
+            candidates.append(window)
+            candidates.append(contentsOf: Self.axChildren(window).filter { Self.axString($0, kAXRoleAttribute) == "AXSheet" })
+        }
         if let focused = Self.axElement(axApp, kAXFocusedWindowAttribute) {
             candidates.append(focused)
             candidates.append(contentsOf: Self.axChildren(focused).filter { Self.axString($0, kAXRoleAttribute) == "AXSheet" })
@@ -3002,7 +3367,11 @@ public final class ActionExecutor: @unchecked Sendable {
 
     /// Selects the deepest sidebar location that contains `file`, then opens each folder below it and finally
     /// the file, by selecting list rows and pressing the panel's Open button. Returns true when the panel closed.
-    private func navigateAndPick(panel: OpenPanelParts, file: String, pid: Int32) async -> Bool {
+    private func navigateAndPick(
+        panel: OpenPanelParts,
+        file: String,
+        pid: Int32
+    ) async -> Bool {
         guard panel.defaultButton != nil else { return false }
         // The panel rebuilds its controls while it loads, so look the Open button up fresh each time.
         func openButton() -> AXUIElement? {
@@ -3203,6 +3572,24 @@ public final class ActionExecutor: @unchecked Sendable {
 
     // MARK: - Small AX helpers
 
+    private static func raiseAXWindow(_ window: AXUIElement) {
+        _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+
+    private static func isHosted(in window: AXUIElement, element: AXUIElement) -> Bool {
+        if CFEqual(element, window) { return true }
+        if let host = axElement(element, kAXWindowAttribute), CFEqual(host, window) { return true }
+        var current = element
+        for _ in 0..<8 {
+            guard let parent = axElement(current, kAXParentAttribute) else { return false }
+            if CFEqual(parent, window) { return true }
+            if CFEqual(parent, current) { return false }
+            current = parent
+        }
+        return false
+    }
+
     static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
@@ -3389,16 +3776,7 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private func isChromiumApp(_ app: AppDescriptor?) -> Bool {
-        guard let app else { return false }
-        let bid = (app.bundleId ?? "").lowercased()
-        let name = app.name.lowercased()
-        return bid.contains("chrome")
-            || bid.contains("chromium")
-            || bid.contains("brave")
-            || bid.contains("thebrowser")
-            || name.contains("chrome")
-            || name.contains("brave")
-            || name.contains("arc")
+        NativeBrowserSiteRules.isChromiumApp(bundleId: app?.bundleId, name: app?.name)
     }
 
     /// AppKit routes mouse and wheel events to a window by these fields; events posted straight to a pid

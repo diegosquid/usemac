@@ -11,13 +11,14 @@ final class LivePreviewGeometryTests: XCTestCase {
 
     // MARK: Mapping
 
-    func testDisplayedRectFillsFromTheTopLeft() {
-        // Wider than the preview: fills the height, the right side is cut off.
+    func testDisplayedRectCentersWideSourcesAndKeepsTheTopAligned() {
+        // Wider than the preview: fills the height and crops both sides equally.
         let wide = LivePreviewGeometry.displayedRect(sourceSize: source.size, in: preview)
-        XCTAssertEqual(wide.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(wide.minX, -37.778, accuracy: 0.001)
         XCTAssertEqual(wide.minY, 0, accuracy: 0.001)
         XCTAssertEqual(wide.height, 200, accuracy: 0.001)
         XCTAssertEqual(wide.width, 355.556, accuracy: 0.001)
+        XCTAssertEqual(wide.midX, preview.width / 2, accuracy: 0.001)
 
         // Taller than the preview: fills the width, the bottom is cut off.
         let tall = LivePreviewGeometry.displayedRect(sourceSize: CGSize(width: 800, height: 1600), in: preview)
@@ -29,48 +30,80 @@ final class LivePreviewGeometryTests: XCTestCase {
         XCTAssertEqual(LivePreviewGeometry.displayedRect(sourceSize: .zero, in: preview), .zero)
     }
 
+    func testDisplayedRectFitsMatchingAspectRatio() {
+        let shown = LivePreviewGeometry.displayedRect(
+            sourceSize: CGSize(width: 1440, height: 900),
+            in: CGSize(width: 280, height: 175)
+        )
+        XCTAssertEqual(shown.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(shown.minY, 0, accuracy: 0.001)
+        XCTAssertEqual(shown.width, 280, accuracy: 0.001)
+        XCTAssertEqual(shown.height, 175, accuracy: 0.001)
+    }
+
     func testPointMapsIntoPreview() throws {
         let center = try XCTUnwrap(LivePreviewGeometry.previewPoint(CGPoint(x: 900, y: 500), sourceBounds: source, previewSize: preview))
-        XCTAssertEqual(center.x, 177.778, accuracy: 0.001)
+        XCTAssertEqual(center.x, 140, accuracy: 0.001)
         XCTAssertEqual(center.y, 100, accuracy: 0.001)
 
-        let topLeft = try XCTUnwrap(LivePreviewGeometry.previewPoint(CGPoint(x: 100, y: 50), sourceBounds: source, previewSize: preview))
-        XCTAssertEqual(topLeft.x, 0, accuracy: 0.001)
-        XCTAssertEqual(topLeft.y, 0, accuracy: 0.001)
+        let nearLeft = try XCTUnwrap(LivePreviewGeometry.previewPoint(CGPoint(x: 271, y: 50), sourceBounds: source, previewSize: preview))
+        XCTAssertEqual(nearLeft.x, 0.222, accuracy: 0.001)
+        XCTAssertEqual(nearLeft.y, 0, accuracy: 0.001)
+
+        let nearRight = try XCTUnwrap(LivePreviewGeometry.previewPoint(CGPoint(x: 1529, y: 50), sourceBounds: source, previewSize: preview))
+        XCTAssertEqual(nearRight.x, 279.778, accuracy: 0.001)
+        XCTAssertEqual(nearRight.y, 0, accuracy: 0.001)
     }
 
     func testPointInTheCroppedPartIsDropped() {
-        // Inside the window, but in the strip cut off on the right.
+        // Inside the window, but in one of the cropped side strips.
+        XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 100, y: 50), sourceBounds: source, previewSize: preview))
+        XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 150, y: 500), sourceBounds: source, previewSize: preview))
         XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 1650, y: 500), sourceBounds: source, previewSize: preview))
     }
 
     func testPointOutsideThePreviewedWindowIsDropped() {
         XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 1800, y: 500), sourceBounds: source, previewSize: preview))
         XCTAssertNil(LivePreviewGeometry.previewPoint(CGPoint(x: 50, y: 500), sourceBounds: source, previewSize: preview))
-        // The legacy 5% slack still applies when asked for.
+        // With no crop, the legacy 5% slack still admits a point just outside the source.
         XCTAssertNotNil(LivePreviewGeometry.previewPoint(
             CGPoint(x: 60, y: 500),
             sourceBounds: source,
-            previewSize: preview,
+            previewSize: CGSize(width: 320, height: 180),
             tolerance: 0.05
         ))
     }
 
     func testRectIsClippedToTheSourceAndThePreview() throws {
         // Runs past the preview's right edge: only the part on the preview maps.
-        let mapped = try XCTUnwrap(LivePreviewGeometry.previewRect(
-            CGRect(x: 1000, y: 500, width: 400, height: 100),
+        let right = try XCTUnwrap(LivePreviewGeometry.previewRect(
+            CGRect(x: 1400, y: 500, width: 200, height: 100),
             sourceBounds: source,
             previewSize: preview
         ))
-        XCTAssertEqual(mapped.minX, 200, accuracy: 0.001)
-        XCTAssertEqual(mapped.width, 80, accuracy: 0.001)
-        XCTAssertEqual(mapped.minY, 100, accuracy: 0.001)
-        XCTAssertEqual(mapped.height, 22.222, accuracy: 0.001)
+        XCTAssertEqual(right.minX, 251.111, accuracy: 0.001)
+        XCTAssertEqual(right.maxX, 280, accuracy: 0.001)
+        XCTAssertEqual(right.minY, 100, accuracy: 0.001)
+        XCTAssertEqual(right.height, 22.222, accuracy: 0.001)
 
-        // In the window but entirely in the cropped strip.
+        let left = try XCTUnwrap(LivePreviewGeometry.previewRect(
+            CGRect(x: 200, y: 500, width: 150, height: 100),
+            sourceBounds: source,
+            previewSize: preview
+        ))
+        XCTAssertEqual(left.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(left.width, 17.778, accuracy: 0.001)
+        XCTAssertEqual(left.minY, 100, accuracy: 0.001)
+        XCTAssertEqual(left.height, 22.222, accuracy: 0.001)
+
+        // In the window but entirely in a cropped side strip.
         XCTAssertNil(LivePreviewGeometry.previewRect(
-            CGRect(x: 1500, y: 500, width: 100, height: 100),
+            CGRect(x: 150, y: 500, width: 100, height: 100),
+            sourceBounds: source,
+            previewSize: preview
+        ))
+        XCTAssertNil(LivePreviewGeometry.previewRect(
+            CGRect(x: 1550, y: 500, width: 100, height: 100),
             sourceBounds: source,
             previewSize: preview
         ))

@@ -17,6 +17,14 @@ function withSandbox(t, options) {
   return sandbox;
 }
 
+function assertNativeForegroundGuidance(message) {
+  assert.match(message, /requires the Google Chrome window to be visible on screen/);
+  assert.match(message, /background.*omit the AXWebArea/);
+  assert.match(message, /observe shows only the browser toolbar or setValue returns effect: "none", use "foreground": true/);
+  assert.match(message, /restore the previous focus/);
+  assert.match(message, /To leave the page, call browser_open with this tabId and another URL/);
+}
+
 // --- URL classification ------------------------------------------------------------------------------------------
 
 test("restrictedPageReason flags browser-internal schemes and lets web pages through", (t) => {
@@ -135,6 +143,7 @@ test("observe, extract, screenshot and act on a Web Store tab answer RESTRICTED_
     assert.ok(msg.includes(`browser_open {"tabId":101,"url":"","activate":true}`), msg);
     assert.ok(msg.includes(`"newWindow":true`), msg);
     assert.ok(msg.includes(`native observe/act with app "Google Chrome"`), msg);
+    assertNativeForegroundGuidance(msg);
   }
 
   assert.equal(sb.callsTo("debugger.attach").length, 0);
@@ -271,6 +280,7 @@ test("open with tabId, empty url and activate only activates the tab, without fo
   assert.equal(response.snapshot.agentFeedback.trigger, "restricted_page");
   assert.match(response.snapshot.agentFeedback.suggestedAction, /now the active tab of its window/);
   assert.match(response.snapshot.agentFeedback.suggestedAction, /app "Google Chrome"/);
+  assertNativeForegroundGuidance(response.snapshot.agentFeedback.suggestedAction);
 
   assert.deepEqual(sb.callsTo("tabs.update").map((c) => c.args), [[802, { active: true }]]);
   assert.equal(sb.tabs.get(802).active, true);
@@ -373,6 +383,7 @@ test("open of a restricted URL in a new tab works and tracks the tab as the UseM
   assert.deepEqual(created[0].args[0], { windowId: 1, url: NEW_STORE_URL, active: false });
   // Opened in the background, so the guidance says how to activate it.
   assert.ok(response.snapshot.agentFeedback.suggestedAction.includes(`browser_open {"tabId":${response.tabId},"url":"","activate":true}`));
+  assertNativeForegroundGuidance(response.snapshot.agentFeedback.suggestedAction);
   assert.equal(sb.tabs.get(response.tabId).groupId !== -1, true, "grouped into UseMac");
   assert.equal(sb.eval("state.lastTabId"), response.tabId);
   assert.equal(sb.callsTo("debugger.attach").length, 0);

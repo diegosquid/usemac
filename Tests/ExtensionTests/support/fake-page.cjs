@@ -14,6 +14,19 @@ class FakeNode {
     this.parentNode = null;
     this.childNodes = [];
     this.observers = [];
+    this.listeners = new Map();
+    this.captureListeners = new Map();
+  }
+
+  addEventListener(type, fn, capture = false) {
+    const listeners = capture ? this.captureListeners : this.listeners;
+    if (!listeners.has(type)) listeners.set(type, new Set());
+    listeners.get(type).add(fn);
+  }
+
+  removeEventListener(type, fn, capture = false) {
+    const listeners = capture ? this.captureListeners : this.listeners;
+    listeners.get(type)?.delete(fn);
   }
 
   get isConnected() {
@@ -97,12 +110,15 @@ class FakeElement extends FakeNode {
     super(doc);
     this.tagName = String(tag).toUpperCase();
     this.attributes = new Map();
-    this.listeners = new Map();
     this.style = new FakeStyle(this);
     this.text = "";
     this.shadow = null;
     this.popoverOpen = false;
     this.rect = { left: 0, top: 0, width: 0, height: 0 };
+  }
+
+  get localName() {
+    return this.tagName.toLowerCase();
   }
 
   setAttribute(name, value) {
@@ -119,6 +135,12 @@ class FakeElement extends FakeNode {
 
   hasAttribute(name) {
     return this.attributes.has(name);
+  }
+
+  toggleAttribute(name, enabled) {
+    if (enabled) this.setAttribute(name, "");
+    else this.removeAttribute(name);
+    return enabled;
   }
 
   get className() {
@@ -165,20 +187,18 @@ class FakeElement extends FakeNode {
     return child;
   }
 
-  addEventListener(type, fn) {
-    if (!this.listeners.has(type)) this.listeners.set(type, []);
-    this.listeners.get(type).push(fn);
-  }
-
   /** Dispatches up the shadow-including ancestor chain, like a real event (stopPropagation stops it). */
   dispatch(type, init = {}) {
     let stopped = false;
     let defaultPrevented = false;
+    const path = [];
+    for (let node = this; node; node = node.parentNode || node.hostElement || null) path.push(node);
     const event = {
       type,
       target: this,
       isTrusted: init.isTrusted !== false,
       detail: init.detail ?? 1,
+      composedPath: () => path,
       stopPropagation() {
         stopped = true;
       },
@@ -186,10 +206,13 @@ class FakeElement extends FakeNode {
         defaultPrevented = true;
       }
     };
-    let node = this;
-    while (node && !stopped) {
+    for (const node of path.slice().reverse()) {
+      if (stopped) break;
+      for (const fn of node.captureListeners.get(type) || []) fn(event);
+    }
+    for (const node of path) {
+      if (stopped) break;
       for (const fn of node.listeners?.get(type) || []) fn(event);
-      node = node.parentNode || node.hostElement || null;
     }
     return { reachedPage: !stopped, defaultPrevented };
   }

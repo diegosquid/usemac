@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
@@ -8,7 +9,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     private let socketPath: String
     private let permissionManager = PermissionManager()
     let killSwitch = KillSwitch()
-    let workspaceMonitor = WorkspaceMonitor()
+    let workspaceMonitor: WorkspaceMonitor
+    let resolveNativeTarget: @Sendable (String?) -> AppQueryMatch
     /// Which running task owns which Chrome tabs UseMac opened (see TaskTabRegistry).
     let taskTabs = TaskTabRegistry()
     private let axIndexer = AXIndexer()
@@ -97,7 +99,25 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         }
     }
 
-    public init(
+    public convenience init(
+        socketPath: String = UseMacDefaults.defaultSocketPath,
+        extensionPort: UInt16 = UseMacDefaults.defaultExtensionPort,
+        bridgeKeyDirectory: URL? = nil,
+        auditStore: AuditLogStore? = nil,
+        skillStore: SkillStore = SkillStore()
+    ) {
+        self.init(
+            observeTargetResolver: nil,
+            socketPath: socketPath,
+            extensionPort: extensionPort,
+            bridgeKeyDirectory: bridgeKeyDirectory,
+            auditStore: auditStore,
+            skillStore: skillStore
+        )
+    }
+
+    init(
+        observeTargetResolver: (@Sendable (String?) -> AppQueryMatch)?,
         socketPath: String = UseMacDefaults.defaultSocketPath,
         extensionPort: UInt16 = UseMacDefaults.defaultExtensionPort,
         bridgeKeyDirectory: URL? = nil,
@@ -105,6 +125,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         skillStore: SkillStore = SkillStore()
     ) {
         self.socketPath = socketPath
+        let workspaceMonitor = WorkspaceMonitor()
+        self.workspaceMonitor = workspaceMonitor
+        self.resolveNativeTarget = observeTargetResolver ?? { workspaceMonitor.resolveTarget(query: $0) }
         self.localVision = LocalVisionEngine()
         self.skillStore = skillStore
         self.auditStore = auditStore
@@ -128,6 +151,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         }
         self.chromeBridge.onTabStreamEnded = { [weak self] profile, tabId, reason in
             self?.tabStreamEnded(profile: profile, tabId: tabId, reason: reason)
+        }
+        self.chromeBridge.setOwnedTabIdsProvider { [taskTabs] key in
+            taskTabs.ownedTabIds(forProfile: key)
         }
     }
 
@@ -183,7 +209,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 )
                 break
             }
-            let observeTarget = workspaceMonitor.resolveTarget(query: params.app)
+            let observeTarget = resolveNativeTarget(params.app)
             if observeTarget == .useMac {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: params.app, activityTitle: "Observe blocked")
                 break
@@ -228,6 +254,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
             let app = WorkspaceMonitor.withTargetWindow(resolvedObserveApp)
+            if let blocked = await NativeBrowserSiteRules.blockedMessage(for: app, chromeBridge: chromeBridge) {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Observe blocked", message: blocked)
+                break
+            }
+            taskTabs.recordApp(app.pid, taskId: TaskActivityContext.taskId ?? request.namedTaskId)
 
             let perms = currentPermissions(promptAccessibility: false)
             let includeOffscreen = params.includeOffscreen ?? false
@@ -246,16 +277,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     app: params.app,
                     includeBase64: params.returnImageContent ?? false
                 )
+                let currentTaskId = TaskActivityContext.taskId
                 async let axTask: WindowSnapshot = Task.detached(priority: .userInitiated) {
-                    axIndexer.observe(
-                        app: app,
-                        maxDepth: maxDepth,
-                        maxElements: maxElements,
-                        useCache: useCache,
-                        includeDiff: includeDiff,
-                        accessibilityGranted: perms.accessibilityGranted,
-                        includeOffscreen: includeOffscreen
-                    )
+                    WindowResolver.withTaskPinScope(currentTaskId) {
+                        axIndexer.observe(
+                            app: app,
+                            maxDepth: maxDepth,
+                            maxElements: maxElements,
+                            useCache: useCache,
+                            includeDiff: includeDiff,
+                            accessibilityGranted: perms.accessibilityGranted,
+                            includeOffscreen: includeOffscreen
+                        )
+                    }
                 }.value
                 async let shotTask: ScreenshotResult? = try? screenCapturer.capture(shotReq, targetApp: app, streamer: liveStreamer)
                 snapshot = await axTask
@@ -331,7 +365,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 latencyMs: snapshot.latencyMs,
                 success: true,
                 isInProgress: false,
-                targetGuessed: workspaceMonitor.isGuessedTarget(requestApp: params.app) ? true : nil
+                targetGuessed: workspaceMonitor.isGuessedTarget(requestApp: params.app) ? true : nil,
+                windowId: snapshot.app.windowId ?? app.windowId,
+                isRestrictedPageFallback: nativeRestrictedPageFlag(for: app)
             ))
             response = .success(id: request.id, latencyMs: latencyMs, snapshot: snapshot, screenshot: capturedShot)
 
@@ -364,28 +400,40 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 response = targetBlockedResponse(request: request, startNs: startNs, targetApp: actReq.app, activityTitle: "Action blocked", message: blocked)
                 break
             }
-
-            let overlay = onOverlayEvent
-            // Work on a guessed target (no app named, none paired: the app in front) is marked so the live preview
-            // never shows the user's own app.
-            let targetGuessed = workspaceMonitor.isGuessedTarget(requestApp: actReq.app, stepApps: actReq.steps.map(\.app))
-            let liveActivity: (@Sendable (LiveActivityItem) -> Void)?
-            if targetGuessed, let forward = onLiveActivity {
-                liveActivity = { item in
-                    var marked = item
-                    marked.targetGuessed = true
-                    forward(marked)
-                }
-            } else {
-                liveActivity = onLiveActivity
+            let initialApp = workspaceMonitor.resolveApp(query: actReq.app)
+            if let blocked = await nativeActionSiteRefusal(actReq, defaultApp: initialApp, request: request, startNs: startNs) {
+                response = blocked
+                break
             }
+
             if let refusal = await approvalRefusal(for: request, startNs: startNs) {
                 response = refusal
                 break
             }
 
-            // Resolve any `@vN` OCR-fused element references strictly against the effective step app, window, and generation.
+            // Neither the app nor its active browser tab is guaranteed to survive an approval prompt unchanged.
             let preResolvedApp = workspaceMonitor.resolveApp(query: actReq.app)
+            if let blocked = await nativeActionSiteRefusal(actReq, defaultApp: preResolvedApp, request: request, startNs: startNs) {
+                response = blocked
+                break
+            }
+
+            let overlay = onOverlayEvent
+            // Work on a guessed target (no app named, none paired: the app in front) is marked so the live preview
+            // never shows the user's own app.
+            let targetGuessed = workspaceMonitor.isGuessedTarget(requestApp: actReq.app, stepApps: actReq.steps.map(\.app))
+            let forward = onLiveActivity
+            let taskId = TaskActivityContext.taskId ?? request.namedTaskId
+            let liveActivity: @Sendable (LiveActivityItem) -> Void = { [taskTabs] item in
+                if item.kind == .actionStep, let pid = item.appPid {
+                    taskTabs.recordApp(pid, taskId: taskId)
+                }
+                var activity = item
+                if targetGuessed { activity.targetGuessed = true }
+                forward?(activity)
+            }
+
+            // Resolve any `@vN` OCR-fused element references strictly against the effective step app, window, and generation.
             let effectiveActReq = resolveOCRElementTargets(in: actReq, defaultApp: preResolvedApp)
 
             let actPerms = currentPermissions(promptAccessibility: false)
@@ -394,21 +442,69 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             }()
             var capturedBeforeCG = beforeNativeCG
             if actReq.diffCrop == true, actPerms.screenRecordingGranted, let preApp = preResolvedApp {
-                capturedBeforeCG = await screenCapturer.capturePreviewCGImage(
-                    targetApp: preApp,
-                    maxDimension: 1280,
-                    streamer: liveStreamer
-                )?.image
+                capturedBeforeCG = await withActionWindow(actReq.window, app: preApp) { app in
+                    await screenCapturer.capturePreviewCGImage(
+                        targetApp: app,
+                        maxDimension: 1280,
+                        streamer: liveStreamer
+                    )?.image
+                }
             }
 
             let (actResult, resolvedApp) = await actionExecutor.executeBatch(
                 effectiveActReq,
                 onOverlayEvent: overlay,
-                onLiveActivity: liveActivity
+                onLiveActivity: liveActivity,
+                preResolvedTarget: preResolvedApp,
+                siteRuleGuard: { [chromeBridge] app in
+                    await NativeBrowserSiteRules.blockedMessage(for: app, chromeBridge: chromeBridge)
+                }
             )
             incrementActionCount(by: actResult.stepResults.count)
 
             let targetApp = resolvedApp ?? preResolvedApp ?? workspaceMonitor.resolveApp(query: actReq.app)
+            if let pid = targetApp?.pid {
+                taskTabs.recordApp(pid, taskId: taskId)
+            }
+            if actHasMutating {
+                if let mutatedPid = targetApp?.pid ?? preResolvedApp?.pid {
+                    invalidateOCRNodes(forPid: mutatedPid)
+                }
+                for stepApp in actReq.steps.compactMap(\.app) {
+                    if let stepPid = workspaceMonitor.resolveApp(query: stepApp)?.pid {
+                        invalidateOCRNodes(forPid: stepPid)
+                    }
+                }
+            }
+
+            // A step can navigate into a denied site. Keep step outcomes, but never read the resulting page.
+            let executedSteps = BatchActionResult(
+                success: actResult.success,
+                totalLatencyMs: actResult.totalLatencyMs,
+                stepResults: actResult.stepResults
+            )
+            if let blockedStep = actResult.stepResults.first(where: { $0.errorCode == TargetRules.errorCode }) {
+                response = targetBlockedResponse(
+                    request: request,
+                    startNs: startNs,
+                    targetApp: targetApp?.name ?? actReq.app,
+                    activityTitle: "Action blocked",
+                    message: blockedStep.message ?? "The action target is blocked by the app and site rules.",
+                    actionResult: executedSteps
+                )
+                break
+            }
+            if let blocked = await nativeActionSiteRefusal(
+                actReq,
+                defaultApp: preResolvedApp,
+                finalApp: targetApp,
+                request: request,
+                startNs: startNs,
+                actionResult: executedSteps
+            ) {
+                response = blocked
+                break
+            }
             let shouldObserve = actReq.returnObservation && actReq.observationMode != ObservationMode.none
             var observation: WindowSnapshot?
             var actionScreenshot: ScreenshotResult?
@@ -520,17 +616,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
             }
 
-            if actHasMutating {
-                if let mutatedPid = targetApp?.pid ?? preResolvedApp?.pid {
-                    invalidateOCRNodes(forPid: mutatedPid)
-                }
-                for stepApp in actReq.steps.compactMap(\.app) {
-                    if let stepPid = workspaceMonitor.resolveApp(query: stepApp)?.pid {
-                        invalidateOCRNodes(forPid: stepPid)
-                    }
-                }
-            }
-
             let finalResult = BatchActionResult(
                 success: actResult.success,
                 totalLatencyMs: actResult.totalLatencyMs,
@@ -572,7 +657,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 latencyMs: actResult.totalLatencyMs,
                 success: actResult.success,
                 isInProgress: false,
-                targetGuessed: targetGuessed ? true : nil
+                targetGuessed: targetGuessed ? true : nil,
+                windowId: activityApp?.windowId ?? targetApp?.windowId,
+                isRestrictedPageFallback: nativeRestrictedPageFlag(for: activityApp)
             ))
             response = .success(id: request.id, latencyMs: latencyMs, snapshot: observation, actionResult: finalResult, screenshot: actionScreenshot)
 
@@ -589,14 +676,31 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
             // A whole-display capture (no app) is a read and may show UseMac; a capture of UseMac itself is not.
-            let screenshotTarget = workspaceMonitor.resolveTarget(query: req.app)
+            let screenshotTarget = resolveNativeTarget(req.app)
             if screenshotTarget == .useMac {
                 response = selfTargetResponse(request: request, startNs: startNs, targetApp: req.app, activityTitle: "Screenshot blocked")
+                break
+            }
+            if screenshotTarget == .notFound, req.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                let latencyMs = elapsedMs(since: startNs)
+                appendAudit(method: request.method.rawValue, targetApp: req.app, summary: "App not found", latencyMs: latencyMs, success: false)
+                response = .failure(id: request.id, code: "APP_NOT_FOUND", message: "No matching target application found", latencyMs: latencyMs)
                 break
             }
             if case .app(let app) = screenshotTarget, let blocked = TargetRulesStore.shared.blockedMessage(for: app) {
                 response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Screenshot blocked", message: blocked)
                 break
+            }
+            let targetApp: AppDescriptor?
+            if case .app(let app) = screenshotTarget {
+                if let blocked = await NativeBrowserSiteRules.blockedMessage(for: app, chromeBridge: chromeBridge) {
+                    response = targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "Screenshot blocked", message: blocked)
+                    break
+                }
+                taskTabs.recordApp(app.pid, taskId: TaskActivityContext.taskId ?? request.namedTaskId)
+                targetApp = app
+            } else {
+                targetApp = nil
             }
             guard permissionManager.isScreenRecordingGranted() else {
                 let latencyMs = elapsedMs(since: startNs)
@@ -610,10 +714,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
-            var targetApp: AppDescriptor?
-            if case .app(let app) = screenshotTarget {
-                targetApp = app
-            }
             do {
                 let rawResult = try await screenCapturer.capture(req, targetApp: targetApp, streamer: liveStreamer)
                 let targetKey = targetApp.map { "native:\($0.pid)" } ?? "native:display"
@@ -653,7 +753,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     latencyMs: result.latencyMs,
                     success: true,
                     isInProgress: false,
-                    targetGuessed: workspaceMonitor.isGuessedTarget(requestApp: req.app) ? true : nil
+                    targetGuessed: workspaceMonitor.isGuessedTarget(requestApp: req.app) ? true : nil,
+                    windowId: targetApp?.windowId
                 ))
                 response = .success(id: request.id, latencyMs: latencyMs, screenshot: result)
             } catch {
@@ -756,7 +857,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
             let durationMs = request.durationMs ?? 1500
-            if let rect = highlightCachedElement(elementId, durationMs: durationMs) {
+            switch await performCachedHighlight(elementId, durationMs: durationMs) {
+            case .highlighted(let rect):
                 let latencyMs = elapsedMs(since: startNs)
                 appendAudit(method: request.method.rawValue, targetApp: nil, summary: "Highlighted \(elementId) at (\(Int(rect.x)),\(Int(rect.y)))", latencyMs: latencyMs, success: true)
                 emitLiveActivity(LiveActivityItem(
@@ -769,7 +871,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     isInProgress: false
                 ))
                 response = .success(id: request.id, latencyMs: latencyMs)
-            } else {
+            case .blocked(let message):
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: nil, activityTitle: "Highlight blocked", message: message)
+            case .notFound:
                 let latencyMs = elapsedMs(since: startNs)
                 response = .failure(id: request.id, code: "ELEMENT_NOT_FOUND", message: "Cached element \(elementId) not found", latencyMs: latencyMs)
             }
@@ -979,15 +1083,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 wireOpenParams.autoDismissOverlays = nil
             }
 
-            let bridgeResp = await chromeBridge.open(wireOpenParams)
+            let bridgeResp = await openBrowserTab(wireOpenParams, taskId: request.namedTaskId ?? TaskActivityContext.taskId)
             let resolvedProfile = bridgeResp.profileName ?? params.profile ?? "Browser"
             let resolvedLabel = "Chrome (\(resolvedProfile))"
             if bridgeResp.ok {
-                // A tab UseMac created belongs to the request's task, so another task finishing never closes it.
-                if params.tabId == nil, let openedTabId = bridgeResp.tabId {
-                    taskTabs.recordOpenedTab(openedTabId, taskId: request.namedTaskId, profile: params.profile)
-                }
-
                 var finalSnapshot = bridgeResp.snapshot ?? bridgeResp.actionResult?.observation
                 var finalActionResult = bridgeResp.actionResult
                 var finalScreenshot = bridgeResp.screenshot
@@ -1785,7 +1884,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
             }()
             let resolved = await resolveVisionInputImage(params: params)
-            guard let input = resolved else {
+            if case .blocked(let message) = resolved {
+                response = targetBlockedResponse(request: request, startNs: startNs, targetApp: visionTargetLabel, activityTitle: "Vision query blocked", message: message)
+                break
+            }
+            guard case .image(let input) = resolved else {
                 let latencyMs = elapsedMs(since: startNs)
                 response = .failure(
                     id: request.id,
@@ -1930,6 +2033,114 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         return response
     }
 
+    private func nativeActionSiteRefusal(
+        _ act: BatchActionRequest,
+        defaultApp: AppDescriptor?,
+        finalApp: AppDescriptor? = nil,
+        request: RPCRequest,
+        startNs: UInt64,
+        actionResult: BatchActionResult? = nil
+    ) async -> RPCResponse? {
+        let rules = TargetRulesStore.shared.rules
+        guard rules.hasSiteRules else { return nil }
+
+        var apps: [AppDescriptor] = []
+        // Even a batch with only explicit step apps can borrow the default window or read it back.
+        if let defaultApp, act.foreground == true || act.diffCrop == true || act.returnObservation
+            || act.includeScreenshot || act.returnImageContent == true || act.verify?.isEmpty == false
+            || act.steps.contains(where: { $0.app?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false }) {
+            apps.append(defaultApp)
+        }
+        var stepQueries = Set<String>()
+        for step in act.steps {
+            let query = step.app?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            // A target step without an app can switch to the workspace fallback, not just the current step app.
+            guard (!query.isEmpty || step.action == .target), stepQueries.insert(query).inserted,
+                  let app = workspaceMonitor.resolveApp(query: query) else { continue }
+            apps.append(app)
+        }
+
+        var checkedPids = Set<Int32>()
+        for app in apps where NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name) {
+            guard checkedPids.insert(app.pid).inserted else { continue }
+            let window = app.pid == defaultApp?.pid ? act.window : nil
+            let blocked = await withActionWindow(window, app: app) { target in
+                let currentTarget = finalApp != nil && window == nil
+                    ? currentNativeWindow(for: target, titleFallback: target.windowTitle)
+                    : target
+                return await NativeBrowserSiteRules.blockedMessage(for: currentTarget, rules: rules, chromeBridge: chromeBridge)
+            }
+            if let blocked {
+                return targetBlockedResponse(
+                    request: request, startNs: startNs, targetApp: app.name, activityTitle: "Action blocked",
+                    message: blocked, actionResult: actionResult
+                )
+            }
+        }
+
+        // Check the app used for the return artifacts last, after any bridge lookups for the other apps.
+        if let finalApp,
+           let blocked = await NativeBrowserSiteRules.blockedMessage(for: finalApp, rules: rules, chromeBridge: chromeBridge) {
+            return targetBlockedResponse(
+                request: request, startNs: startNs, targetApp: finalApp.name, activityTitle: "Action blocked",
+                message: blocked, actionResult: actionResult
+            )
+        }
+        return nil
+    }
+
+    private func nativeRestrictedPageFlag(for app: AppDescriptor?) -> Bool? {
+        guard let app, NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name) else {
+            return nil
+        }
+        let url = NativeBrowserSiteRules.axWebAreaURL(pid: app.pid, windowTitle: app.windowTitle)
+        return NativeBrowserSiteRules.isRestrictedBrowserURL(url)
+    }
+
+    /// Resolves an explicit window (or the key window for an empty title) without changing the live task pin.
+    private func withActionWindow<T>(_ window: String?, app: AppDescriptor, operation: (AppDescriptor) async -> T) async -> T {
+        guard let window else { return await operation(app) }
+        let temporaryScope = UUID().uuidString
+        defer { WindowResolver.clearPins(forTaskId: temporaryScope) }
+        return await TaskActivityContext.$taskId.withValue(temporaryScope) {
+            WindowResolver.pin(pid: app.pid, title: window)
+            return await operation(currentNativeWindow(for: app, titleFallback: window))
+        }
+    }
+
+    private func currentNativeWindow(for app: AppDescriptor, titleFallback: String? = nil) -> AppDescriptor {
+        var target = app
+        target.windowId = nil
+        target.windowBounds = nil
+        let title = titleFallback?.trimmingCharacters(in: .whitespacesAndNewlines)
+        target.windowTitle = title?.isEmpty == false ? title : nil
+        if let element = WindowResolver.focusedWindow(pid: app.pid)?.element {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &value) == .success,
+               let actualTitle = value as? String, !actualTitle.isEmpty {
+                target.windowTitle = actualTitle
+            }
+        }
+        return WorkspaceMonitor.withTargetWindow(target)
+    }
+
+    /// Keep the open pending until its ownership is visible to a concurrent cleanup or reconnect.
+    private func openBrowserTab(
+        _ params: BrowserOpenParams,
+        taskId: String?,
+        recordOwnership: Bool = true
+    ) async -> ChromeExtensionBridge.BridgeResponse {
+        let createdFallback = params.tabId == nil && (params.newTab != false || params.newWindow == true)
+        taskTabs.beginBrowserOpen()
+        defer { taskTabs.endBrowserOpen() }
+        let response = await chromeBridge.open(params)
+        let didCreateTab = response.createdTab ?? (response.ok && createdFallback)
+        if recordOwnership, didCreateTab, let tabId = response.tabId {
+            taskTabs.recordOpenedTab(tabId, taskId: taskId, profile: response.ownershipKey ?? response.profileName ?? params.profile)
+        }
+        return response
+    }
+
     /// Closes the Chrome tabs UseMac opened during the task once the completion animation has played, so the
     /// user's tab strip does not fill up with agent tabs. The extension never closes tabs the user had open,
     /// the tab the user is looking at, or tabs with a running download.
@@ -1945,27 +2156,40 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if delayNs > 0 {
                 try? await Task.sleep(nanoseconds: delayNs)
             }
-            // Built now, not at task_complete: a tab another task opened in the meantime stays open, also with
-            // extensions that predate closeTabIds and go by keepTabIds alone.
-            let keep = Set(keepTabIds).union(taskTabs.protectedTabIds()).sorted()
+            if closeTabIds == nil {
+                for _ in 0..<15 {
+                    guard taskTabs.hasPendingBrowserOpen else { break }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                guard !taskTabs.hasPendingBrowserOpen else { return }
+            }
             for name in profiles {
+                // The previous profile's response could have taken long enough for a new open to start.
+                if closeTabIds == nil && taskTabs.hasPendingBrowserOpen { return }
+                let keep = Set(keepTabIds).union(taskTabs.protectedTabIds()).sorted()
                 _ = await chromeBridge.closeOwnedTabs(profile: name, keepTabIds: keep, closeTabIds: closeTabIds)
             }
         }
     }
 
-    private func resolveVisionInputImage(
-        params: VisionQueryParams
-    ) async -> (path: String, width: Double, height: Double, tabId: Int?, profileName: String?, title: String?)? {
+    private typealias VisionInputImage = (path: String, width: Double, height: Double, tabId: Int?, profileName: String?, title: String?)
+
+    private enum VisionInputResolution {
+        case image(VisionInputImage)
+        case blocked(String)
+        case unavailable
+    }
+
+    private func resolveVisionInputImage(params: VisionQueryParams) async -> VisionInputResolution {
         if let rawExplicit = params.imagePath?.trimmingCharacters(in: .whitespacesAndNewlines), !rawExplicit.isEmpty {
             let expanded = (rawExplicit as NSString).expandingTildeInPath
             let explicit = URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path
             if FileManager.default.fileExists(atPath: explicit) {
                 if let data = try? Data(contentsOf: URL(fileURLWithPath: explicit)),
                    let cg = LocalVisionEngine.decodeCGImage(fromJPEG: data) {
-                    return (explicit, Double(cg.width), Double(cg.height), params.tabId, params.profile, nil)
+                    return .image((explicit, Double(cg.width), Double(cg.height), params.tabId, params.profile, nil))
                 }
-                return (explicit, 1280, 800, params.tabId, params.profile, nil)
+                return .image((explicit, 1280, 800, params.tabId, params.profile, nil))
             }
         }
 
@@ -1984,14 +2208,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     returnImageContent: false
                 ))
                 if cropResp.ok, let shot = cropResp.screenshot {
-                    return (
+                    return .image((
                         shot.path,
                         Double(shot.width),
                         Double(shot.height),
                         cropResp.tabId ?? params.tabId,
                         cropResp.profileName ?? params.profile,
                         cropResp.title
-                    )
+                    ))
                 }
             }
 
@@ -2003,14 +2227,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                 let path = (dir as NSString).appendingPathComponent("vision-browser-\(cached.tabId ?? 0)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
                 if (try? cached.jpegData.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil {
-                    return (
+                    return .image((
                         path,
                         Double(cached.viewportWidth),
                         Double(cached.viewportHeight),
                         cached.tabId,
                         cached.profileName,
                         cached.title
-                    )
+                    ))
                 }
             }
 
@@ -2023,14 +2247,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 returnImageContent: false
             ))
             if freshResp.ok, let shot = freshResp.screenshot {
-                return (
+                return .image((
                     shot.path,
                     Double(shot.width),
                     Double(shot.height),
                     freshResp.tabId ?? params.tabId,
                     freshResp.profileName ?? params.profile,
                     freshResp.title
-                )
+                ))
             }
 
             // Fallback to slightly older cached frame if fresh capture wasn't possible
@@ -2039,20 +2263,29 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                 let path = (dir as NSString).appendingPathComponent("vision-browser-\(cached.tabId ?? 0)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
                 if (try? cached.jpegData.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil {
-                    return (
+                    return .image((
                         path,
                         Double(cached.viewportWidth),
                         Double(cached.viewportHeight),
                         cached.tabId,
                         cached.profileName,
                         cached.title
-                    )
+                    ))
                 }
             }
         }
 
         // Fallback to native app screenshot
-        let targetApp = workspaceMonitor.resolveApp(query: params.app)
+        let targetApp: AppDescriptor?
+        switch resolveNativeTarget(params.app) {
+        case .app(let app):
+            if let blocked = await NativeBrowserSiteRules.blockedMessage(for: app, chromeBridge: chromeBridge) {
+                return .blocked(blocked)
+            }
+            targetApp = app
+        case .useMac, .notFound:
+            targetApp = nil
+        }
         let shotReq = ScreenshotRequest(
             app: params.app,
             maxDimension: 1280,
@@ -2062,9 +2295,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         if let shot = try? await screenCapturer.capture(shotReq, targetApp: targetApp, streamer: liveStreamer) {
             let w = targetApp?.windowBounds?.width ?? Double(shot.width)
             let h = targetApp?.windowBounds?.height ?? Double(shot.height)
-            return (shot.path, w, h, nil, nil, targetApp?.windowTitle ?? targetApp?.name)
+            return .image((shot.path, w, h, nil, nil, targetApp?.windowTitle ?? targetApp?.name))
         }
-        return nil
+        return .unavailable
     }
 
     public func currentPermissions(promptAccessibility: Bool = false) -> PermissionStatus {
@@ -2200,42 +2433,59 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         notifyStateChanged()
     }
 
+    private enum CachedHighlightResult {
+        case highlighted(ScreenRect)
+        case blocked(String)
+        case notFound
+    }
+
     @discardableResult
-    public func highlightCachedElement(_ elementId: String, durationMs: Int = 1500) -> ScreenRect? {
-        var foundNode: ElementNode?
-        var owner: Int32?
-        if let targetApp = workspaceMonitor.resolveApp(query: nil) {
-            if let node = axIndexer.node(for: elementId, pid: targetApp.pid) {
-                foundNode = node
-                owner = targetApp.pid
-            } else if elementId.hasPrefix("@v"),
-                      let node = lookupOCRNode(
-                        elementId,
-                        pid: targetApp.pid,
-                        windowId: targetApp.windowId,
-                        generation: axIndexer.currentGeneration(pid: targetApp.pid)
-                      ) {
-                foundNode = node
-                owner = targetApp.pid
+    public func highlightCachedElement(_ elementId: String, durationMs: Int = 1500) async -> ScreenRect? {
+        guard case .highlighted(let rect) = await performCachedHighlight(elementId, durationMs: durationMs) else { return nil }
+        return rect
+    }
+
+    private func performCachedHighlight(_ elementId: String, durationMs: Int) async -> CachedHighlightResult {
+        let owner: (node: ElementNode, pid: Int32, windowId: UInt32?)
+        if elementId.hasPrefix("@v") {
+            guard let app = workspaceMonitor.resolveApp(query: nil),
+                  let node = lookupOCRNode(
+                    elementId, pid: app.pid, windowId: app.windowId, generation: axIndexer.currentGeneration(pid: app.pid)
+                  ) else { return .notFound }
+            owner = (node, app.pid, app.windowId)
+        } else {
+            guard let cached = axIndexer.cachedElementOwner(for: elementId) else { return .notFound }
+            owner = cached
+        }
+
+        let runningApp = NSRunningApplication(processIdentifier: owner.pid)
+        let app = AppDescriptor(pid: owner.pid, name: runningApp?.localizedName ?? "", bundleId: runningApp?.bundleIdentifier)
+        if TargetRulesStore.shared.blocksProcess(pid: owner.pid) {
+            let message = TargetRulesStore.shared.blockedMessage(for: app) ?? "The element's app is blocked by the app and site rules."
+            return .blocked(message)
+        }
+        if TargetRulesStore.shared.rules.hasSiteRules {
+            guard runningApp != nil else { return .notFound }
+            if NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name) {
+                let target = currentNativeWindow(for: app)
+                guard let windowId = owner.windowId, target.windowId == windowId else {
+                    return .blocked(TargetRules.unconfirmedSiteMessage(reason: "the cached element's window is no longer the browser target"))
+                }
+                if let message = await NativeBrowserSiteRules.blockedMessage(for: target, chromeBridge: chromeBridge) {
+                    return .blocked(message)
+                }
             }
-        }
-        if foundNode == nil, !elementId.hasPrefix("@v"), let cached = axIndexer.node(for: elementId) {
-            foundNode = cached.node
-            owner = cached.pid
-        }
-        guard let node = foundNode else {
-            return nil
         }
 
         onOverlayEvent?(.highlightElement(
-            rect: node.frame,
-            label: node.id,
-            role: node.role,
+            rect: owner.node.frame,
+            label: owner.node.id,
+            role: owner.node.role,
             durationMs: durationMs,
-            pid: owner,
-            windowId: owner.flatMap { WindowResolver.targetWindowID(pid: $0) }.map { UInt32($0) }
+            pid: owner.pid,
+            windowId: owner.windowId
         ))
-        return node.frame
+        return .highlighted(owner.node.frame)
     }
 
     public func currentStatus() -> DaemonStatus {
@@ -2391,7 +2641,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         startNs: UInt64,
         targetApp: String?,
         activityTitle: String,
-        message: String
+        message: String,
+        actionResult: BatchActionResult? = nil
     ) -> RPCResponse {
         let latencyMs = elapsedMs(since: startNs)
         appendAudit(
@@ -2409,7 +2660,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             success: false,
             isInProgress: false
         ))
-        return .failure(id: request.id, code: TargetRules.errorCode, message: message, latencyMs: latencyMs)
+        var response = RPCResponse.failure(id: request.id, code: TargetRules.errorCode, message: message, latencyMs: latencyMs)
+        response.actionResult = actionResult
+        return response
     }
 
     /// Refusal for a request that names UseMac itself: agents never observe or act on its own windows.
@@ -2593,6 +2846,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             ? params.summary!.trimmingCharacters(in: .whitespacesAndNewlines)
             : "Working…"
         let taskId = taskTabs.start(taskId: params.taskId ?? explicitTaskId, agent: params.agent)
+        if let pid = resolvedApp?.pid {
+            taskTabs.recordApp(pid, taskId: taskId)
+        }
         let agent = TaskActivityContext.agentName ?? taskTabs.agent(of: taskId)
         appendAudit(
             method: RPCMethod.taskStart.rawValue,
@@ -2643,6 +2899,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             return nil
         }()
         approvals.endTask(completion.taskId)
+        WindowResolver.clearPins(forTaskId: completion.taskId)
         let resolvedApp = params.app.flatMap { workspaceMonitor.resolveApp(query: $0) }
         let targetName = resolvedProfile.map { "Chrome (\($0))" } ?? resolvedApp?.name ?? params.app ?? "Agent"
         let summaryText = (params.summary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -2669,9 +2926,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             browserTabId: effectiveTabId,
             browserProfile: resolvedProfile,
             taskTabIds: completion.ownTabIds.map { Array($0).sorted() },
+            taskAppPids: completion.ownAppPids.map { Array($0).sorted() },
             taskId: completion.taskId
         ))
-        if params.keepTabs != true {
+        if params.keepTabs != true, completion.taskId == nil || completion.ownTabIds?.isEmpty != true {
             let ownTabs = completion.taskId != nil ? completion.ownTabIds.map { Array($0).sorted() } : nil
             scheduleOwnedTabCleanup(profile: params.profile ?? fallbackProfile, keepTabIds: params.keepTabIds ?? [], closeTabIds: ownTabs)
         }
@@ -2704,11 +2962,35 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         if case .app(let app) = target, let blocked = TargetRulesStore.shared.blockedMessage(for: app) {
             return targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "App menu blocked", message: blocked)
         }
-        guard case .app(let app) = target else {
+        guard case .app(let resolvedApp) = target else {
             let latencyMs = elapsedMs(since: startNs)
             appendAudit(method: request.method.rawValue, targetApp: params.app, summary: "App not found", latencyMs: latencyMs, success: false)
             return .failure(id: request.id, code: "APP_NOT_FOUND", message: "No matching target application found", latencyMs: latencyMs)
         }
+        let app = WorkspaceMonitor.withTargetWindow(resolvedApp)
+        if let blocked = await NativeBrowserSiteRules.blockedMessage(for: app, chromeBridge: chromeBridge) {
+            return targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "App menu blocked", message: blocked)
+        }
+        let pinnedTitle = WindowResolver.pinnedTitle(pid: app.pid)
+        let governedBrowser = TargetRulesStore.shared.rules.hasSiteRules
+            && NativeBrowserSiteRules.isChromiumApp(bundleId: app.bundleId, name: app.name)
+        let focusedId = pinnedTitle != nil || governedBrowser ? InputRouting.focusedWindowId(pid: app.pid) : nil
+        if isInvoke, let pinnedTitle {
+            let pinnedId = WindowResolver.window(pid: app.pid, titleContains: pinnedTitle).flatMap { WindowResolver.windowID(of: $0) }
+            guard let pinnedId, pinnedId == focusedId else {
+                let latencyMs = elapsedMs(since: startNs)
+                let message = "App menus act on the focused window, not the task's pinned window."
+                appendAudit(method: request.method.rawValue, targetApp: app.name, summary: message, latencyMs: latencyMs, success: false)
+                return .failure(id: request.id, code: "TARGET_NOT_FRONTMOST", message: message, latencyMs: latencyMs)
+            }
+        }
+        if governedBrowser, focusedId == nil || focusedId != app.windowId,
+           let blocked = await withActionWindow("", app: app, operation: { focusedApp in
+               await NativeBrowserSiteRules.blockedMessage(for: focusedApp, chromeBridge: chromeBridge)
+           }) {
+            return targetBlockedResponse(request: request, startNs: startNs, targetApp: app.name, activityTitle: "App menu blocked", message: blocked)
+        }
+        taskTabs.recordApp(app.pid, taskId: TaskActivityContext.taskId ?? request.namedTaskId)
 
         guard currentPermissions(promptAccessibility: false).accessibilityGranted else {
             let latencyMs = elapsedMs(since: startNs)
@@ -2737,7 +3019,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     mechanism: "ax-menu",
                     latencyMs: latencyMs,
                     success: true,
-                    isInProgress: false
+                    isInProgress: false,
+                    windowId: app.windowId
                 ))
                 return .success(
                     id: request.id,
@@ -2805,7 +3088,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             )
         }
 
-        let taskId = request.namedTaskId
+        let taskId = request.namedTaskId ?? TaskActivityContext.taskId
         let rules = TargetRulesStore.shared.rules
         let profile = params.profile
         let maxElements = params.maxElements
@@ -2813,7 +3096,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         let deferDismissForSiteRules = rules.hasSiteRules && autoDismiss == true
         let closeAfter = params.closeAfter == true
         let bridge = self.chromeBridge
-        let taskTabs = self.taskTabs
 
         var indexedResults: [(Int, BrowserBatchItemResult, Int?)] = []
         indexedResults.reserveCapacity(params.urls.count)
@@ -2857,7 +3139,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                         ), nil)
                     }
 
-                    let openResp = await bridge.open(BrowserOpenParams(
+                    let openResp = await self.openBrowserTab(BrowserOpenParams(
                         url: normalizedUrl,
                         profile: profile,
                         newTab: true,
@@ -2865,7 +3147,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                         taskId: taskId,
                         autoDismissOverlays: deferDismissForSiteRules ? nil : autoDismiss,
                         observationMode: (batchMode == "extract" && !deferDismissForSiteRules) ? ObservationMode.none : nil
-                    ))
+                    ), taskId: taskId, recordOwnership: !closeAfter)
                     guard openResp.ok, let openedTabId = openResp.tabId else {
                         let code = openResp.error?.code ?? "BROWSER_OPEN_FAILED"
                         let message = openResp.error?.message ?? "Failed to open URL"
@@ -2878,9 +3160,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                         ), openResp.tabId)
                     }
 
-                    if !closeAfter {
-                        taskTabs.recordOpenedTab(openedTabId, taskId: taskId, profile: profile)
-                    }
                     let resolvedProf = openResp.profileName ?? profile
                     var effectiveSnapshot = openResp.snapshot
 
@@ -3324,7 +3603,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         }
 
         // Tier 2 fallback via resolved capture image when no in-memory JPEG is available.
-        if let input = await resolveVisionInputImage(params: visionParams) {
+        if case .image(let input) = await resolveVisionInputImage(params: visionParams) {
             return await localVision.query(
                 mode: "verify",
                 query: assertion,

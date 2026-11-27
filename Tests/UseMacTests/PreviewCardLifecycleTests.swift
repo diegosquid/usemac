@@ -121,6 +121,46 @@ final class PreviewCardLifecycleTests: XCTestCase {
         XCTAssertTrue(finishes(isBrowser: true, tab: nil, finishedTabs: [11]))
     }
 
+    func testOwnedAppPidsFinishOnlyNativeCardsOfTheCompletedTask() {
+        let finishedAppPids: Set<Int32> = [300, 302]
+        for pid: Int32? in [300, 301, 302, nil] {
+            XCTAssertEqual(
+                PreviewCardLifecycle.taskCompleteFinishes(
+                    isBrowser: false, browserTabId: nil, appPid: pid,
+                    finishedTabIds: [11], finishedTabId: nil, finishedAppPid: nil,
+                    finishedAppPids: finishedAppPids
+                ),
+                pid == 300 || pid == 302
+            )
+        }
+    }
+
+    func testEmptyAppOwnershipDoesNotFallBackToFinishingEveryNativeCard() {
+        XCTAssertFalse(PreviewCardLifecycle.taskCompleteFinishes(
+            isBrowser: false, browserTabId: nil, appPid: 300,
+            finishedTabIds: [], finishedTabId: nil, finishedAppPid: nil, finishedAppPids: []
+        ))
+        XCTAssertTrue(PreviewCardLifecycle.taskCompleteFinishes(
+            isBrowser: false, browserTabId: nil, appPid: 300,
+            finishedTabIds: [], finishedTabId: nil, finishedAppPid: nil, finishedAppPids: nil
+        ))
+    }
+
+    func testExplicitAppTakesPrecedenceOverAppOwnershipWithoutAffectingTabs() {
+        XCTAssertTrue(PreviewCardLifecycle.taskCompleteFinishes(
+            isBrowser: false, browserTabId: nil, appPid: 300,
+            finishedTabIds: [11], finishedTabId: nil, finishedAppPid: 300, finishedAppPids: [301]
+        ))
+        XCTAssertFalse(PreviewCardLifecycle.taskCompleteFinishes(
+            isBrowser: false, browserTabId: nil, appPid: 301,
+            finishedTabIds: [11], finishedTabId: nil, finishedAppPid: 300, finishedAppPids: [301]
+        ))
+        XCTAssertTrue(PreviewCardLifecycle.taskCompleteFinishes(
+            isBrowser: true, browserTabId: 11, appPid: 301,
+            finishedTabIds: [11], finishedTabId: nil, finishedAppPid: 300, finishedAppPids: []
+        ))
+    }
+
     // MARK: Stills
 
     func testBackgroundNativeCardGetsAStill() {

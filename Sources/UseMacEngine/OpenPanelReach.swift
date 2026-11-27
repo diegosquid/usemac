@@ -41,4 +41,36 @@ enum OpenPanelReach {
             + "only takes keys with the app in front. Copy the file to a folder such as ~/Downloads and upload the copy, or "
             + "rerun this step in a batch with \"foreground\": true (UseMac types the path with ⌘⇧G and gives focus back)."
     }
+
+    static func shouldRestoreFocusAfterBackgroundUpload(
+        previousPid: Int32?,
+        targetPid: Int32,
+        targetBecameFrontmost: Bool,
+        secondsSinceUserInput: Double,
+        ownInputRecent: Bool
+    ) -> Bool {
+        guard let previousPid, previousPid != targetPid, targetBecameFrontmost else { return false }
+        return secondsSinceUserInput >= ActionExecutor.userIdleRequiredSeconds || ownInputRecent
+    }
+
+    static func isGoToFolderFieldCandidate(
+        role: String?,
+        subrole: String?,
+        inFileRow: Bool,
+        isSearchField: Bool
+    ) -> Bool {
+        guard !inFileRow, !isSearchField, subrole != "AXSearchField" else { return false }
+        return role == "AXComboBox" || role == "AXTextField"
+    }
+
+    static func shouldAttemptGoToFolderAfterSearchFailure(isFrontmost: Bool) -> Bool {
+        isFrontmost
+    }
+
+    static func goToFolderFailureMessage(fileName: String, detectedField: Bool) -> String {
+        if detectedField {
+            return "Go to Folder appeared, but the file picker stayed open without confirming \(fileName)."
+        }
+        return "Could not detect the Go to Folder path field after ⌘⇧G, so UseMac stopped without confirming the picker. Copy \(fileName) to a folder such as ~/Downloads and upload the copy."
+    }
 }

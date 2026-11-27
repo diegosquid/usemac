@@ -37,6 +37,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         /// `close_owned_tabs`: tabs UseMac closed, and tabs it kept open with the reason.
         public let closedTabs: [OwnedTabOutcome]?
         public let keptTabs: [OwnedTabOutcome]?
+        /// Stable extension instance identity, falling back to the session's profile name for older extensions.
+        public var ownershipKey: String? = nil
+        /// Whether an open command created a tab rather than navigating an existing one.
+        public var createdTab: Bool? = nil
 
         public init(
             ok: Bool,
@@ -53,7 +57,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             windowId: Int? = nil,
             restricted: Bool? = nil,
             closedTabs: [OwnedTabOutcome]? = nil,
-            keptTabs: [OwnedTabOutcome]? = nil
+            keptTabs: [OwnedTabOutcome]? = nil,
+            ownershipKey: String? = nil,
+            createdTab: Bool? = nil
         ) {
             self.ok = ok
             self.tabId = tabId
@@ -70,6 +76,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             self.restricted = restricted
             self.closedTabs = closedTabs
             self.keptTabs = keptTabs
+            self.ownershipKey = ownershipKey
+            self.createdTab = createdTab
         }
     }
 
@@ -98,7 +106,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         var streamingTitle: String?
         let acceptedAt = Date()
         var extensionId: String?
+        var instanceId: String?
         var health: ChromeExtensionHealth?
+
+        var ownershipKey: String { instanceId ?? profileName }
 
         init(id: String, connection: NWConnection) {
             self.id = id
@@ -226,12 +237,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let extensionVersion: String?
         /// `chrome.runtime.id`. Extensions that send it also accept `reload_extension`.
         let extensionId: String?
+        let extensionInstanceId: String?
         let profileName: String?
         let clientNonce: String?
         let hasKey: Bool?
 
         private enum CodingKeys: String, CodingKey {
-            case `protocol`, extensionVersion, extensionId, profileName, clientNonce, hasKey
+            case `protocol`, extensionVersion, extensionId, extensionInstanceId, profileName, clientNonce, hasKey
         }
 
         init(from decoder: Decoder) throws {
@@ -240,6 +252,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             self.extensionVersion = try c.decodeIfPresent(String.self, forKey: .extensionVersion)
             // Optional and informational: a malformed value must never cost the extension its handshake.
             self.extensionId = try? c.decodeIfPresent(String.self, forKey: .extensionId)
+            self.extensionInstanceId = try? c.decodeIfPresent(String.self, forKey: .extensionInstanceId)
             self.profileName = try c.decodeIfPresent(String.self, forKey: .profileName)
             self.clientNonce = try c.decodeIfPresent(String.self, forKey: .clientNonce)
             self.hasKey = try c.decodeIfPresent(Bool.self, forKey: .hasKey)
@@ -316,6 +329,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let error: RPCErrorPayload?
         let windowId: Int?
         let restricted: Bool?
+        let createdTab: Bool?
         let closedTabs: [OwnedTabOutcome]?
         let keptTabs: [OwnedTabOutcome]?
     }
@@ -393,6 +407,12 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let type = "ready"
         /// Omitted when nil. What the app knows about this extension, for the extension popup.
         var extensionStatus: ReadyExtensionStatus? = nil
+        var ownedTabIds: [Int]? = nil
+    }
+
+    private struct SyncOwnedTabsWireMessage: Encodable {
+        let type = "sync_owned_tabs"
+        let tabIds: [Int]
     }
 
     private struct ReadyExtensionStatus: Encodable {
@@ -592,6 +612,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var _onBrowserStreamStopped: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)?
     private var _onBrowserStreamPaused: (@Sendable (_ profileName: String, _ tabId: Int) -> Void)?
     private var _onProfilesChanged: (@Sendable ([BrowserProfileStatus]) -> Void)?
+    private var _ownedTabIdsProvider: (@Sendable (String) -> [Int])?
     private var _onPairingStateChanged: (@Sendable () -> Void)?
     private var _onTabStreamEnded: (@Sendable (_ profileName: String, _ tabId: Int, _ reason: String?) -> Void)?
 
@@ -705,6 +726,24 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             lock.lock()
             _onPairingStateChanged = newValue
             lock.unlock()
+        }
+    }
+
+    public func setOwnedTabIdsProvider(_ provider: (@Sendable (String) -> [Int])?) {
+        lock.lock()
+        _ownedTabIdsProvider = provider
+        lock.unlock()
+    }
+
+    /// Restores owned tabs on the named profile; never falls back to an unrelated session.
+    public func sendOwnedTabsSync(profile: String, tabIds: [Int]) {
+        lock.lock()
+        let connection = readySessionsLocked().first {
+            $0.profileName.caseInsensitiveCompare(profile) == .orderedSame
+        }?.connection
+        lock.unlock()
+        if let connection {
+            sendEncodable(SyncOwnedTabsWireMessage(tabIds: tabIds), on: connection)
         }
     }
 
@@ -1756,6 +1795,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
             session.profileName = trimmed.isEmpty ? "Chrome" : trimmed
         }
+        let instanceId = payload.extensionInstanceId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.instanceId = instanceId?.isEmpty == false ? instanceId : nil
         if let version = payload.extensionVersion?.trimmingCharacters(in: .whitespacesAndNewlines), !version.isEmpty {
             session.extensionVersion = version
         }
@@ -1853,12 +1894,17 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         session.authState = .ready
         let snapshot = readySessionsLocked().map(\.status)
         let profilesHandler = _onProfilesChanged
-        let readyMessage = ReadyWireMessage(extensionStatus: session.health.map {
+        let provider = _ownedTabIdsProvider
+        let ownershipKey = session.ownershipKey
+        var readyMessage = ReadyWireMessage(extensionStatus: session.health.map {
             ReadyExtensionStatus(source: $0.source.rawValue, bundledVersion: $0.bundledVersion, outdated: $0.outdated, reloadable: $0.reloadable, note: $0.note)
         })
         lock.unlock()
 
         timeoutTask.cancel()
+        if let owned = provider?(ownershipKey), !owned.isEmpty {
+            readyMessage.ownedTabIds = owned
+        }
         sendEncodable(readyMessage, on: connection)
         profilesHandler?(snapshot)
     }
@@ -1870,6 +1916,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             return
         }
 
+        let previousName = session.profileName
         var changed = false
         if let rawName = payload.profileName {
             let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1903,8 +1950,15 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
         let snapshot = changed ? readySessionsLocked().map(\.status) : []
         let profilesHandler = changed ? _onProfilesChanged : nil
+        let resolvedName = session.profileName
+        let ownershipKey = session.ownershipKey
+        let connection = session.connection
+        let provider = resolvedName != previousName ? _ownedTabIdsProvider : nil
         lock.unlock()
 
+        if let owned = provider?(ownershipKey), !owned.isEmpty {
+            sendEncodable(SyncOwnedTabsWireMessage(tabIds: owned), on: connection)
+        }
         if changed {
             profilesHandler?(snapshot)
         }
@@ -2041,6 +2095,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             return
         }
         let sessionProfileKey = (payload.profileName?.isEmpty == false ? payload.profileName! : session.profileName).lowercased()
+        let ownershipKey = session.ownershipKey
         if downloadsExtract == nil {
             if let listedTabs = payload.tabs {
                 var map = tabUrlsByProfile[sessionProfileKey] ?? [:]
@@ -2172,7 +2227,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             windowId: payload.windowId,
             restricted: payload.restricted,
             closedTabs: payload.closedTabs,
-            keptTabs: payload.keptTabs
+            keptTabs: payload.keptTabs,
+            ownershipKey: ownershipKey,
+            createdTab: payload.createdTab
         )
         completePendingRequest(id: payload.id, sessionId: sessionId, response: response)
     }

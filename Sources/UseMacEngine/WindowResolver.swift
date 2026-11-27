@@ -37,22 +37,54 @@ public enum WindowResolver {
 
     // MARK: Window pin
 
+    private struct PinKey: Hashable {
+        let taskId: String?
+        let pid: pid_t
+    }
+
     private static let pinLock = NSLock()
-    nonisolated(unsafe) private static var pinnedTitles: [pid_t: String] = [:]
+    nonisolated(unsafe) private static var pinnedTitles: [PinKey: String] = [:]
 
     /// Pins `pid`'s target window to the one whose title contains `title` (nil or empty clears the pin).
     /// Observe/act use it to work in a window that is not focused, e.g. a Chrome window UseMac opened.
     public static func pin(pid: pid_t, title: String?) {
+        pin(pid: pid, title: title, taskId: TaskActivityContext.taskId)
+    }
+
+    public static func pin(pid: pid_t, title: String?, taskId: String?) {
+        let key = PinKey(taskId: normalizedTaskId(taskId), pid: pid)
         let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         pinLock.lock()
-        pinnedTitles[pid] = trimmed.isEmpty ? nil : trimmed
+        pinnedTitles[key] = trimmed.isEmpty ? nil : trimmed
         pinLock.unlock()
     }
 
     public static func pinnedTitle(pid: pid_t) -> String? {
+        pinnedTitle(pid: pid, taskId: TaskActivityContext.taskId)
+    }
+
+    public static func pinnedTitle(pid: pid_t, taskId: String?) -> String? {
+        let key = PinKey(taskId: normalizedTaskId(taskId), pid: pid)
         pinLock.lock()
         defer { pinLock.unlock() }
-        return pinnedTitles[pid]
+        return pinnedTitles[key]
+    }
+
+    public static func clearPins(forTaskId taskId: String?) {
+        guard let taskId = normalizedTaskId(taskId) else { return }
+        pinLock.lock()
+        defer { pinLock.unlock() }
+        pinnedTitles = pinnedTitles.filter { $0.key.taskId != taskId }
+    }
+
+    /// Runs `operation` with `TaskActivityContext.$taskId` bound, so detached work inherits the caller's window pin.
+    public static func withTaskPinScope<T>(_ taskId: String?, operation: () -> T) -> T {
+        TaskActivityContext.$taskId.withValue(taskId, operation: operation)
+    }
+
+    private static func normalizedTaskId(_ taskId: String?) -> String? {
+        guard let trimmed = taskId?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return trimmed
     }
 
     /// The window of `pid` whose title contains `title` (case- and accent-insensitive), if any.

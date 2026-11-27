@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UseMacEngine
 import UseMacProtocol
 
 public final class AgentOverlayPanel: NSPanel {
@@ -29,6 +30,7 @@ public final class AgentOverlayCoordinator {
     private let appState: AppState
     private var panels: [AgentOverlayPanel] = []
     private var screenObserver: NSObjectProtocol?
+    private var activeSpaceObserver: NSObjectProtocol?
 
     public init(appState: AppState) {
         self.appState = appState
@@ -40,7 +42,17 @@ public final class AgentOverlayCoordinator {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.appState.clearRestrictedWindowOverlay()
                 self?.rebuildPanels()
+            }
+        }
+        activeSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.appState.clearRestrictedWindowOverlay()
             }
         }
     }
@@ -48,6 +60,9 @@ public final class AgentOverlayCoordinator {
     deinit {
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
+        }
+        if let activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activeSpaceObserver)
         }
     }
 
@@ -104,6 +119,12 @@ public struct AgentOverlayView: View {
         ZStack(alignment: .topLeading) {
             // The panels sit above every app on every Space, so only draw where the target window is really
             // visible. Otherwise the HUD preview shows the highlight on the window itself.
+            if let restricted = appState.restrictedWindowOverlay,
+               restricted.isVisibleOnScreen,
+               rectIntersectsScreen(restricted.frame) {
+                restrictedWindowFrame(for: restricted)
+            }
+
             if let rect = appState.highlightedRect,
                appState.highlightTarget?.isVisibleOnScreen ?? true,
                rectIntersectsScreen(rect) {
@@ -116,8 +137,43 @@ public struct AgentOverlayView: View {
             }
         }
         .frame(width: screenFrame.width, height: screenFrame.height, alignment: .topLeading)
+        .clipped()
         .allowsHitTesting(false)
         .animation(.easeOut(duration: 0.14), value: appState.highlightedRect)
+    }
+
+    private func restrictedWindowFrame(for state: RestrictedWindowOverlayState) -> some View {
+        let rect = state.frame
+        let localX = rect.x - Double(screenFrame.origin.x)
+        let localY = rect.y - screenCGTopY
+        let blue = Color(red: 0.102, green: 0.451, blue: 0.910)
+        let label = "UseMac is controlling this window"
+        let pillText = state.step.flatMap { $0.isEmpty ? nil : "\(label) · \($0)" } ?? label
+
+        return RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(blue, lineWidth: 3)
+            .shadow(color: blue.opacity(0.42), radius: 8)
+            .frame(width: rect.width, height: rect.height)
+            .overlay(alignment: .top) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(.white)
+                        .frame(width: 7, height: 7)
+                    Text(pillText)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 28)
+                .background(blue, in: Capsule(style: .continuous))
+                .shadow(color: .black.opacity(0.2), radius: 5, y: 2)
+                .frame(width: rect.width - 16)
+                .padding(.top, 10)
+            }
+            .clipped()
+            .offset(x: localX, y: localY)
+            .allowsHitTesting(false)
     }
 
     @ViewBuilder

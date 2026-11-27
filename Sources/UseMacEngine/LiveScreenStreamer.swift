@@ -902,18 +902,20 @@ public final class LiveScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegat
 // MARK: - Preview geometry (pure, used by the HUD preview overlay)
 
 /// Maps global screen coordinates (top-left origin, the space AX frames and `sourceBounds` use) into the
-/// live preview. The preview has a fixed size and never asks the page or window to change: the source fills it from
-/// its top-left corner, and whatever does not fit (on the right or at the bottom) is cut off.
+/// live preview. The preview has a fixed size and never asks the page or window to change: the source fills it
+/// centered horizontally and aligned to the top, with overflow cropped equally on the sides or at the bottom.
 public enum LivePreviewGeometry {
-    /// Rect the whole source occupies in a preview of `previewSize`, in preview points with y down. It starts at the
-    /// preview's top-left corner and is at least as large as the preview on both axes; the part past the preview's
-    /// edges is cropped.
+    /// Rect the whole source occupies in a preview of `previewSize`, in preview points with y down. It is
+    /// centered horizontally, starts at the preview's top edge, and fills the preview on both axes.
     public static func displayedRect(sourceSize: CGSize, in previewSize: CGSize) -> CGRect {
         guard sourceSize.width > 0, sourceSize.height > 0, previewSize.width > 0, previewSize.height > 0 else {
             return .zero
         }
         let scale = max(previewSize.width / sourceSize.width, previewSize.height / sourceSize.height)
-        return CGRect(x: 0, y: 0, width: sourceSize.width * scale, height: sourceSize.height * scale)
+        let width = sourceSize.width * scale
+        let height = sourceSize.height * scale
+        let x = (previewSize.width - width) / 2
+        return CGRect(x: x, y: 0, width: width, height: height)
     }
 
     /// Preview position of a global point, or nil when it falls outside the source by more than `tolerance` (a
