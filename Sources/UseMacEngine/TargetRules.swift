@@ -186,7 +186,13 @@ public struct TargetRules: Codable, Equatable, Sendable {
 
     /// Host and effective port of an absolute URL (Chrome's tab URLs, a normalized browser_open URL).
     static func site(ofURL raw: String) -> Site? {
-        guard let url = URL(string: raw), let rawHost = url.host, let host = normalizedHost(rawHost) else {
+        let isBlob = raw.prefix(5).lowercased() == "blob:"
+        let address = isBlob ? String(raw.dropFirst(5)) : raw
+        if isBlob {
+            let prefix = address.prefix(8).lowercased()
+            guard ["http://", "https://", "ws://", "wss://"].contains(where: prefix.hasPrefix) else { return nil }
+        }
+        guard let url = URL(string: address), let rawHost = url.host, let host = normalizedHost(rawHost) else {
             return nil
         }
         var port = url.port
@@ -198,6 +204,31 @@ public struct TargetRules: Codable, Equatable, Sendable {
             }
         }
         return Site(host: host, port: port)
+    }
+
+    /// Public download URLs never contain credentials, query strings, or fragments.
+    /// Blob URLs reveal only the web origin, not the object identifier.
+    static func sanitizeDownloadURL(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isBlob = trimmed.prefix(5).lowercased() == "blob:"
+        let address = isBlob ? String(trimmed.dropFirst(5)) : trimmed
+        let prefix = address.prefix(8).lowercased()
+        guard prefix.hasPrefix("http://") || prefix.hasPrefix("https://"),
+              var components = URLComponents(string: address),
+              let host = components.host, normalizedHost(host) != nil else { return nil }
+
+        components.scheme = components.scheme?.lowercased()
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        if isBlob {
+            components.path = ""
+            return components.string.map { "blob:" + $0 }
+        }
+        if components.path.isEmpty { components.path = "/" }
+        return components.string
     }
 
     static func parseSitePattern(_ raw: String) -> SitePattern? {

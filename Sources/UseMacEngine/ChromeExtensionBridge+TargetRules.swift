@@ -23,7 +23,7 @@ extension ChromeExtensionBridge {
 
     /// TARGET_BLOCKED before anything is sent, or nil to send the command. Blocked when Chrome itself is denied,
     /// when `url` (a page to open) is on a blocked site, or when the tab the command would run on is.
-    /// `checksTab` false skips the tab lookup (a command that opens a new tab).
+    /// `checksTab` false skips the tab lookup (a command that opens a new tab or lists profile downloads).
     ///
     /// With site rules this fails closed: when the lookup times out or fails, or the tab's URL is not known yet,
     /// the command is refused too, since checking the result's URL afterwards is too late for an act. Without any
@@ -116,13 +116,19 @@ extension ChromeExtensionBridge {
     }
 
     /// The refusal that replaces a result whose page is on a blocked site, or nil to pass it on.
-    static func targetRulesResultRefusal(url: String?, tabId: Int?, profileName: String?) -> BridgeResponse? {
-        let rules = TargetRulesStore.shared.rules
+    static func targetRulesResultRefusal(url: String?, tabId: Int?, profileName: String?, rules: TargetRules) -> BridgeResponse? {
         if rules.blocksBrowser {
             return targetBlockedResponse(TargetRules.blockedBrowserMessage, tabId: tabId, profileName: profileName)
         }
         guard rules.blocksURL(url) else { return nil }
         return targetBlockedResponse(TargetRules.blockedSiteMessage(host: nil, afterResult: true), tabId: tabId, profileName: profileName)
+    }
+
+    /// A download may cross sites between its initiating page, original URL and final URL.
+    static func targetRulesPermitDownload(urls: [String?], rules: TargetRules) -> Bool {
+        guard rules.hasSiteRules else { return true }
+        guard !urls.contains(where: rules.blocksURL) else { return false }
+        return rules.mode != .allow || urls.contains { TargetRules.sanitizeDownloadURL($0) != nil }
     }
 
     /// True when a stream frame (or cached frame) shows a page the rules block.

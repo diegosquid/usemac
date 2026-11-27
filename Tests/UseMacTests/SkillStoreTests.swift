@@ -278,32 +278,37 @@ final class SkillStoreTests: XCTestCase {
 
     // MARK: - Concurrency
 
-    func testConcurrentSavesReadsAndRecordRunsAreThreadSafe() throws {
+    func testConcurrentSavesReadsAndRecordRunsAreThreadSafe() async throws {
         let store = SkillStore(storageURL: storageURL)
         let iterations = 40
-        let group = DispatchGroup()
-        let queue = DispatchQueue(label: "test.skillstore.concurrent", attributes: .concurrent)
+        let workers = 4
 
-        for i in 0..<iterations {
-            group.enter()
-            queue.async {
-                defer { group.leave() }
-                let name = "skill-\(i)"
-                _ = try? store.save(SkillSaveParams(
-                    name: name,
-                    target: "browser",
-                    steps: [ActionStep(action: .click, selector: "#btn-\(i)")]
-                ))
-                _ = store.get(name: name)
-                _ = store.recordRun(name: name, success: i % 2 == 0)
-                _ = store.list()
+        // These operations write a whole snapshot under a lock. Keep concurrent callers without starting
+        // 40 blocking jobs or measuring how quickly the runner schedules and finishes them.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for worker in 0..<workers {
+                group.addTask {
+                    for i in stride(from: worker, to: iterations, by: workers) {
+                        let name = "skill-\(i)"
+                        let saved = try store.save(SkillSaveParams(
+                            name: name,
+                            target: "browser",
+                            steps: [ActionStep(action: .click, selector: "#btn-\(i)")]
+                        ))
+                        XCTAssertEqual(store.get(name: name), saved)
+                        let run = try XCTUnwrap(store.recordRun(name: name, success: i % 2 == 0))
+                        XCTAssertEqual(run.runCount, 1)
+                        XCTAssertTrue(store.list().contains { $0.name == name })
+                    }
+                }
             }
+            try await group.waitForAll()
         }
 
-        XCTAssertEqual(group.wait(timeout: .now() + 15), .success)
-        XCTAssertEqual(store.list().count, iterations)
-
+        let records = store.list()
+        XCTAssertEqual(records.count, iterations)
+        XCTAssertTrue(records.allSatisfy { $0.runCount == 1 })
         let reopened = SkillStore(storageURL: storageURL)
-        XCTAssertEqual(reopened.list().count, iterations)
+        XCTAssertEqual(reopened.list(), records)
     }
 }

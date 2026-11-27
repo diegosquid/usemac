@@ -1137,3 +1137,126 @@ test("networkRing clears across top-frame navigation and per-request cancel leav
   assert.equal(sb.attached.has(TAB), true);
   assert.equal(sb.attached.has(TAB + 1), true);
 });
+
+const NETWORK_PAGE = "https://app.example.com/dashboard";
+
+async function withNetworkTab(t, cdp) {
+  const sb = createBackgroundSandbox({
+    tabs: [{ id: TAB, url: NETWORK_PAGE, active: true }],
+    cdp: (tabId, method, params) => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "top", loaderId: "loader-1" } } };
+      return cdp?.(tabId, method, params);
+    }
+  });
+  t.after(() => sb.dispose());
+  const { response } = await sb.request({ type: "request", id: nextId(), command: "observe", tabId: TAB });
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  return sb;
+}
+
+function networkRequest(sb, requestId, url, loaderId = "loader-1") {
+  sb.debuggerEvent(TAB, "Network.requestWillBeSent", { requestId, loaderId, type: "Fetch", request: { url, method: "POST" } });
+}
+
+function networkResponse(sb, requestId, url, loaderId = "loader-1") {
+  sb.debuggerEvent(TAB, "Network.responseReceived", {
+    requestId, loaderId, type: "Fetch", response: { url, status: 200, mimeType: "application/json" }
+  });
+}
+
+async function extractNetwork(sb) {
+  const { response } = await sb.request({ type: "request", id: nextId(), command: "extract", tabId: TAB, mode: "network" });
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  return JSON.parse(response.extractResult.jsonResult);
+}
+
+test("a SPA URL update preserves network responses, pending POST methods and loading failures", async (t) => {
+  const sb = await withNetworkTab(t, (tabId, method) =>
+    method === "Network.getResponseBody" ? { body: "{}" } : undefined);
+  const cachedUrl = "https://app.example.com/api/cached";
+  const pendingUrl = "https://app.example.com/api/pending";
+  const failingUrl = "https://app.example.com/api/failing";
+  networkRequest(sb, "cached", cachedUrl);
+  networkResponse(sb, "cached", cachedUrl);
+  sb.debuggerEvent(TAB, "Network.loadingFinished", { requestId: "cached" });
+  networkRequest(sb, "pending", pendingUrl);
+  networkRequest(sb, "failing", failingUrl);
+  const before = sb.eval(`state.tabSessions.get(${TAB}).documentId`);
+
+  const tab = sb.tabs.get(TAB);
+  tab.url = "https://app.example.com/reports?period=weekly";
+  sb.events.tabsUpdated.emit(TAB, { url: tab.url }, tab);
+  networkResponse(sb, "pending", pendingUrl);
+  sb.debuggerEvent(TAB, "Network.loadingFailed", { requestId: "failing", errorText: "net::ERR_FAILED" });
+
+  assert.equal(sb.eval(`state.tabSessions.get(${TAB}).documentId`), before);
+  assert.deepEqual((await extractNetwork(sb)).map(({ url, method }) => [url, method]), [
+    [pendingUrl, "POST"], [cachedUrl, "POST"]
+  ]);
+  assert.deepEqual(JSON.parse(sb.eval(`JSON.stringify(state.tabSessions.get(${TAB}).networkErrors.map(({ url, method, statusText }) => [url, method, statusText]))`)), [
+    [failingUrl, "POST", "net::ERR_FAILED"]
+  ]);
+  assert.ok(sb.sent.some((frame) => frame.type === "tab_url" && frame.url === tab.url));
+});
+
+test("a late response from the previous loader cannot reenter networkRing after a top-frame commit", async (t) => {
+  const sb = await withNetworkTab(t, (tabId, method) =>
+    method === "Network.getResponseBody" ? { body: "{}" } : undefined);
+  const oldUrl = "https://app.example.com/api/old";
+  const newUrl = "https://app.example.com/api/new";
+  networkRequest(sb, "old", oldUrl);
+  const before = sb.eval(`state.tabSessions.get(${TAB}).documentId`);
+  sb.debuggerEvent(TAB, "Page.frameNavigated", {
+    frame: { id: "top", loaderId: "loader-2", url: "https://app.example.com/new-document" }
+  });
+  networkResponse(sb, "old", oldUrl);
+  networkRequest(sb, "new", newUrl, "loader-2");
+  networkResponse(sb, "new", newUrl, "loader-2");
+
+  assert.equal(sb.eval(`state.tabSessions.get(${TAB}).documentId`), before + 1);
+  assert.deepEqual((await extractNetwork(sb)).map(({ url, method }) => [url, method]), [[newUrl, "POST"]]);
+});
+
+test("network extraction retries a failed body read after Network.loadingFinished", async (t) => {
+  let readable = false;
+  const sb = await withNetworkTab(t, (tabId, method) => {
+    if (method !== "Network.getResponseBody") return;
+    if (!readable) throw new Error("Response body is not ready");
+    return { body: '{"finished":true}' };
+  });
+  const url = "https://app.example.com/api/slow";
+  networkRequest(sb, "slow", url);
+  networkResponse(sb, "slow", url);
+
+  assert.equal((await extractNetwork(sb))[0].body, null);
+  assert.equal(sb.eval(`state.tabSessions.get(${TAB}).networkRing[0].bodyLoaded`), false);
+  readable = true;
+  sb.debuggerEvent(TAB, "Network.loadingFinished", { requestId: "slow" });
+  assert.deepEqual((await extractNetwork(sb))[0].body, { finished: true });
+  assert.deepEqual((await extractNetwork(sb))[0].body, { finished: true });
+  assert.equal(sb.callsTo("debugger.sendCommand").filter(({ args }) => args[1] === "Network.getResponseBody").length, 2);
+});
+
+test("network extraction discards in-flight body results when the document commits a new loader", async (t) => {
+  let startRead;
+  let finishRead;
+  const readStarted = new Promise((resolve) => { startRead = resolve; });
+  const sb = await withNetworkTab(t, (tabId, method) => {
+    if (method !== "Network.getResponseBody") return;
+    return new Promise((resolve) => {
+      finishRead = resolve;
+      startRead();
+    });
+  });
+  const url = "https://app.example.com/api/old";
+  networkRequest(sb, "old", url);
+  networkResponse(sb, "old", url);
+
+  const pending = extractNetwork(sb);
+  await Promise.race([readStarted, pending.then(() => assert.fail("Expected an in-flight body read"))]);
+  sb.debuggerEvent(TAB, "Page.frameNavigated", {
+    frame: { id: "top", loaderId: "loader-2", url: "https://app.example.com/new-document" }
+  });
+  finishRead({ body: '{"fromOldDocument":true}' });
+  assert.deepEqual(await pending, []);
+});

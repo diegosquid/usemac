@@ -27,7 +27,7 @@ Booleans on `act` and `browser_act` default to `stopOnError: true`, `returnObser
 | `browser_tabs` | Open Chrome tabs (`tabId`, `title`, `url`, `active`, `restricted`, `usemac`), optional `profile` and substring `query` (omits blocked sites). |
 | `browser_open` | Open a URL in a new background tab, navigate an existing `tabId`, activate a tab (`activate: true`), or open an unfocused window (`newWindow: true`). Supports `autoDismissOverlays: true`, inline `steps` (open + act in one turn), `returnDiffOnly`, and `observationMode`. Returns the settled snapshot directly. |
 | `browser_observe` | Chrome DOM (`@b1..@bN` stable across observes via WeakMap; traverses OOPIFs, child iframes, and open Shadow DOM), viewport-first sorting, `offscreenCount`, `filter`, `maxElements`, `includeText`, `includeTables`, `includeScreenshot`, `returnImageContent`, `tablesSummary`, `webMcpTools`. |
-| `browser_extract` | Extract structured data: `mode` = `"auto"`, `"tables"` (`scanHorizontal`, `scanVertical`), `"kpis"`, `"text"`, `"network"` (passive CDP XHR/Fetch ring buffer with `urlFilter`), `"downloads"` (session downloads), or `"eval"` (`expression`, optional `frameIndex`; `autonomous` mode or `ask` once allowed). |
+| `browser_extract` | Extract structured data: `mode` = `"auto"`, `"tables"` (`scanHorizontal`, `scanVertical`), `"kpis"`, `"text"`, `"network"` (passive CDP XHR/Fetch ring buffer with `urlFilter`), `"downloads"` (recent Chrome profile downloads), or `"eval"` (`expression`, optional `frameIndex`; `autonomous` mode or `ask` once allowed). |
 | `browser_screenshot` | JPEG of a Chrome tab, element (`elementId`/`selector`), `region`, `diffCrop: true`, or stitched `fullPage` (up to 16384 CSS px, 40 captures, 12 s; sets `truncated: true` if clipped). Never resizes the tab; `viewportWidth`/`viewportHeight` only cap output image dimensions. |
 | `browser_act` | DOM action steps in a Chrome tab (`match`, `optional`, `assert`, `scrollUntil`, `fillForm`, `waitFor` via `MutationObserver`, `uploadFile`, `readOnly`, `verify`, `observationMode`, `returnDiffOnly`, `diffCrop`, `returnImageContent`). Surfaces `networkErrors` (4xx/5xx XHRs), `dirtyRect`, and `visualDeltaOCR`. |
 | `browser_batch` | Open and `observe` or `extract` multiple `urls` in parallel Chrome background tabs (`mode`, `extractMode`, `maxElements`, `autoDismissOverlays`, `closeAfter`), enforcing site rules per URL. |
@@ -42,10 +42,30 @@ Booleans on `act` and `browser_act` default to `stopOnError: true`, `returnObser
 | `report_prepare` | Prepare a redacted problem report for the user to review in UseMac before anything is sent (`summary`, optional `title`, `taskId`). |
 | `debug_capture` | Developing UseMac only: read-only PNG capture of UseMac's own windows and surrounding context once Debug capture is enabled in Settings (`DEBUG_CAPTURE_OFF` otherwise). |
 
+### Browser extract results
+
+The socket wraps results under `browserExtract`. In that object, `auto` returns `text` and any `tablesMarkdown`; `tables` returns `tablesMarkdown` when tables are found plus row and column counts; `text` and `kpis` return `text`. Only `network` and `eval` return a string in `jsonResult`.
+
+`downloads` returns the `browserExtract.downloads` array, or `"downloads":[]` when nothing matches. It queries Chrome downloads from the past 24 hours for the selected profile, not a tab or UseMac session. Use `profile` to select a Chrome profile when needed; do not combine this mode with `browser_batch` or MCP `urls`. UseMac filters items through `TargetRules` and sanitizes returned URLs (no credentials, query strings, or fragments).
+
+Request (NDJSON):
+
+```json
+{"method":"browser_extract","browserExtract":{"mode":"downloads"}}
+```
+
+Example response (abridged):
+
+```json
+{"ok":true,"browserExtract":{"mode":"downloads","downloads":[{"id":938,"filename":"/Users/example/Downloads/app.js","url":"https://cdn.example/app.js","state":"complete","bytesReceived":1972462,"totalBytes":1972462,"mime":"text/javascript","startTime":"2026-11-27T01:02:18.023Z"}]}}
+```
+
+CLI JSON (`"$USEMAC" --json browser extract downloads`) returns the result object directly, so read `.downloads` at the root. MCP returns a formatted text list.
+
 ### Piggybacked Task Lifecycle & Multi-Agent Leases
 
 - Pass `"taskStart": {"summary": "...", "agent": "..."}` on your first request to start a task without a separate RPC turn; pass `"taskComplete": {"taskId": "...", "summary": "..."}` on your final request to finish cleanly.
-- Carry `taskId` at the top level of every intermediate request: browser calls without `tabId` route to your task's own last tab, `task_complete` closes only your task's tabs, and windows/tabs your task acts in are leased until completion (or 30 idle minutes). Another task's action on a leased target fails immediately with `TARGET_BUSY`; reads never block.
+- Carry `taskId` at the top level of every intermediate request: tab-scoped browser calls without `tabId` route to your task's own last tab, `task_complete` closes only your task's tabs, and windows/tabs your task acts in are leased until completion (or 30 idle minutes). Another task's action on a leased target fails immediately with `TARGET_BUSY`; reads never block.
 - While **Paused** or with the **Kill Switch** (`⇧⌘⎋`) active, only `ping`, `status`, `audit_log`, `browser_status`, `vision_status`, `task_start`, and `task_complete` answer (`report_prepare` also works while Paused, not under Kill Switch). Everything else returns `POLICY_BLOCKED`.
 
 ### Ask Mode
@@ -84,6 +104,7 @@ USEMAC="{{USEMAC_BIN}}"
 "$USEMAC" browser open "https://example.com" [--auto-dismiss] [--new-window | --activate]
 "$USEMAC" browser batch "https://a.example" "https://b.example" [--mode extract]
 "$USEMAC" browser extract network --url-filter "/api/"
+"$USEMAC" --json browser extract downloads
 "$USEMAC" browser extract tables --scan-horizontal --scan-vertical
 "$USEMAC" skill list | save | run <name>
 "$USEMAC" vision verify "Success banner is visible" [--app "Notes" | --tab <id>]
@@ -121,9 +142,12 @@ Exit codes: `0` success; `1` command/RPC failure; `2` invalid usage/JSON; `3` `D
 
 Any step accepts `"optional": true` (failure/not-found records `{success: true, skipped: true}` and continues). Every step returns `effect` (`changed` / `none` / `unverified`), `warning`, `errorCode`, and `resolvedElementId`.
 
+`actionResult.stepResults[i].downloadPath` is an absolute local path. It appears only if a download correlated with the step's tab and action completes during the same `browser_act` (for example, a `click` followed by a `wait`). If it is absent for an asynchronous download, query `browser_extract` in `downloads` mode instead of clicking again.
+
 ### Chrome Rules & Hybrid Restricted Flow
 
 - **Pairing**: copy `umk_…` from **UseMac → Settings → General → Chrome Extension** into the extension popup once per profile (`EXTENSION_NOT_PAIRED` until paired; key is never exposed over IPC).
+- **Extension source**: In `browser_status`, `extensionSource: "other_folder"` means Chrome loaded an unpacked copy outside the app bundle, even if `extensionOutdated: false` and the versions match. Reloading the existing copy only reads that folder again. To receive bundled updates, load the extension from `/Applications/UseMac.app/Contents/Resources/chrome-extension` in `chrome://extensions`.
 - **Tab size**: UseMac never resizes tabs. `browser_screenshot` scales captures to fit `viewportWidth`/`viewportHeight` while keeping aspect ratio (`deviceScaleFactor` is ignored).
 - **Hybrid flow (`RESTRICTED_PAGE`)**: open with `browser_open` `newWindow: true` (or `tabId` + `url: ""` + `activate: true`), then call native `observe` / `act` with `app: "Google Chrome"` and `window: "<title substring>"`; return to `browser_*` on normal pages.
 

@@ -50,7 +50,8 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), `
 - **Pairing**: each Chrome profile must be paired once. The user copies the `umk_…` key from **UseMac → Settings → General → Chrome Extension** (**Copy key**) and pastes it into the extension popup. Until then browser calls return `EXTENSION_NOT_PAIRED`. The key is never exposed through the socket, MCP or CLI.
 - **Profiles**: `profile` is optional when only one Chrome profile is connected. With several, read the exact names from `browser_status` and pass `"profile": "Work"` (matched by profile name).
 - **Extension version**: each `browser_status` profile reports `extensionOutdated` (Chrome runs an older extension than the app ships, `bundledExtensionVersion`), `extensionSource` (`app`, `web_store`, `other_folder`: loaded from another folder, app updates won't reach it, or `unknown`) and a one-line `extensionNote`. When a fix "doesn't work" and the extension is outdated, tell the user: **Settings → Chrome Extension → Reload**, or `browser_reload_extension` if they ask you to. Reloading stops every agent's browser work in that profile.
-- **Tabs**: without `tabId`, a browser call of a task (see `task_start` / piggybacked `taskStart`) goes to the last tab that task opened or named, so it never lands in another agent's tab. Without a task it uses the last tab UseMac used or a tab in the `UseMac` tab group; if there is none it returns `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
+- **Extension source mismatch**: Even if the versions match and `extensionOutdated: false`, `extensionSource: "other_folder"` means the user must load the extension from the app bundle to receive bundled updates; reloading the current copy does not change its source.
+- **Tabs**: for tab-scoped calls without `tabId`, a task (see `task_start` / piggybacked `taskStart`) uses the last tab it opened or named, so it never lands in another agent's tab. Without a task the call uses the last tab UseMac used or a tab in the `UseMac` tab group; if there is none it returns `NO_USEMAC_TAB`. Open a background tab with `browser_open`, or list the user's tabs with `browser_tabs` and pass a `tabId`.
 - **URLs**: `browser_open`, `browser_batch`, and `openURL`/`navigate` steps accept only `http://`, `https://` and `about:blank`. A URL without a scheme gets `https://`; anything else returns `URL_BLOCKED`.
 - **Tab size**: UseMac never resizes a tab. Pages are observed and captured at the size Chrome gives them, background tabs included, and `@bN` coordinates use that size. On `browser_screenshot`, `viewportWidth`/`viewportHeight` (CLI `--width`/`--height`) are the largest image size: a bigger capture is scaled down to fit, keeping its aspect ratio. `browser_observe` ignores them, and `deviceScaleFactor` (CLI `--scale`) is ignored everywhere.
 - **Element, diff-crop, and full-page screenshots**:
@@ -92,7 +93,7 @@ Whenever you automate **Google Chrome**, use the `browser_*` methods (socket), `
 | `browser_tabs` | Open Chrome tabs (`tabId`, `title`, `url`, `active`, `restricted`, `usemac`), optional substring filter. Leaves out tabs on sites the user's rules block. |
 | `browser_open` | Open a URL in a new background tab, navigate an existing `tabId`, make a tab active (`activate`), or open a new unfocused window (`newWindow`). Supports `autoDismissOverlays: true`, inline `steps` (open + act in one turn), `returnDiffOnly`, and `observationMode`. Returns the settled snapshot directly. |
 | `browser_observe` | Chrome tab DOM (`@b1..@bN` stable across observes across cross-origin iframes and Shadow DOM), viewport-first sorting, `offscreenCount`, server-side `filter`, tables (`tablesSummary`), readable text, overlays, and WebMCP tool discovery (`webMcpTools`). |
-| `browser_extract` | Tables and grids (`scanHorizontal`, `scanVertical`), KPIs, text, captured XHR/Fetch JSON (`mode: "network"`, `urlFilter`), session `downloads`, or JavaScript `eval` (`expression`, optional `frameIndex`; `autonomous` mode, or `ask` once the user allows it). |
+| `browser_extract` | Tables and grids (`scanHorizontal`, `scanVertical`), KPIs, text, captured XHR/Fetch JSON (`mode: "network"`, `urlFilter`), recent Chrome profile `downloads`, or JavaScript `eval` (`expression`, optional `frameIndex`; `autonomous` mode, or `ask` once the user allows it). |
 | `browser_screenshot` | JPEG of a Chrome tab, an element, a `region`, a `diffCrop: true` dirty region, or the whole page (stitched), saved to a private temp folder (pruned after 30 minutes). |
 | `browser_act` | DOM action steps in a Chrome tab (`match`, `optional`, `assert`, `scrollUntil`, `fillForm`, `waitFor` via `MutationObserver`, `uploadFile`), with `readOnly`, `observationMode`, `returnDiffOnly`, `diffCrop`, inline `verify`, or post-action screenshot. Reports `networkErrors` (4xx/5xx XHRs), `dirtyRect`, and `visualDeltaOCR`. |
 | `browser_batch` | Open and `observe` or `extract` multiple `urls` in parallel Chrome background tabs (`mode`, `extractMode`, `maxElements`, `autoDismissOverlays`, `closeAfter`), enforcing site rules per URL. |
@@ -167,7 +168,17 @@ Open and extract multiple URLs in parallel background tabs:
 {"method":"browser_batch","browserBatch":{"urls":["https://a.example","https://b.example"],"mode":"extract","extractMode":"tables","autoDismissOverlays":true,"closeAfter":true}}
 ```
 
-`browser_extract` modes `auto`, `tables`, `text`, `kpis`, and `network` only read. `downloads` lists downloads started during the UseMac session. `eval` runs arbitrary JavaScript in the page (optional `frameIndex`), works only in `autonomous` mode (and in `ask` mode once the user allows it), and the history records each expression's length, not its source.
+List recent downloads for a Chrome profile without targeting a tab:
+
+```json
+{"method":"browser_extract","browserExtract":{"mode":"downloads"}}
+```
+
+`downloads` returns the `browserExtract.downloads` array (empty if nothing matches): Chrome downloads from the past 24 hours, filtered by `TargetRules`, with sanitized URLs. It is profile-wide and cannot be used with `browser_batch` or MCP `urls`. Only `network` and `eval` return a string in `browserExtract.jsonResult`.
+
+In `browserExtract`, `tables` returns any `tablesMarkdown` plus row and column counts, `text` and `kpis` return `text`, and `auto` returns both text and table results. All modes except `eval` only read. `eval` runs arbitrary JavaScript in the page (optional `frameIndex`), works only in `autonomous` mode (and in `ask` mode once the user allows it), and the history records each expression's length, not its source.
+
+`actionResult.stepResults[].downloadPath` is an absolute local path set only when a download correlated with the tab and step completes during `browser_act` (for example, `click` then `wait`). If it is absent for an asynchronous download, query `browser_extract` in `downloads` mode instead of clicking again.
 
 A browser `setValue` must name its field with `elementId`, `match`, `selector`, or `x`/`y`. Without one the batch fails with `INVALID_REQUEST` before anything runs. To type into the field that has focus, use `type`.
 
@@ -204,10 +215,10 @@ The response carries a `taskId` (for example `"taskId":"task-1a2b3c4d"`). Put it
 
 Several agents can work at the same time. The `taskId` is how UseMac knows which tabs are yours:
 
-- A browser request without `tabId` goes to the last tab your task opened or named, not to the last tab any agent touched. Without a task it goes where it always did.
+- A tab-scoped browser request without `tabId` goes to the last tab your task opened or named, not to the last tab any agent touched. Without a task it goes where it always did.
 - `task_complete` only closes the tabs your task opened and only marks your preview cards as done. Tabs another running task opened are never closed.
 - Without a `taskId`, UseMac goes by the tab you name (`tabId`) or, when only one task is running, that task. When it can't tell, it closes nothing that a running task owns. A `taskId` that names no running task (finished, or idle for 30 minutes) belongs to no task.
-- If your task's last tab was closed, a read (`browser_observe`, `browser_extract`, `browser_screenshot`, `vision_query`) runs on your task's previous tab; an action fails with `NO_USEMAC_TAB` instead of moving to another tab.
+- If your task's last tab was closed, a tab-scoped read (`browser_observe`, `browser_extract` except `downloads`, `browser_screenshot`, `vision_query`) runs on your task's previous tab; an action fails with `NO_USEMAC_TAB` instead of moving to another tab.
 - The windows and tabs your task acts in are yours until it finishes. Another running task's action there fails with `TARGET_BUSY` (see below).
 - Pass `"agent":"<your name>"` to `task_start` (CLI `--agent`; MCP uses the client's name) so the user sees which agent works on each preview card.
 

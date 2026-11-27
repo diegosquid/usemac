@@ -82,7 +82,7 @@ Download the latest signed DMG from **[usemac.app](https://usemac.app)** (or [bu
 1. **Install the app** — Drag `UseMac.app` into `/Applications` and open it.
 2. **Grant permissions** — Enable **Accessibility** and **Screen Recording** in **UseMac → Settings → General → Permissions**.
 3. **Add & pair the Chrome extension** — Once the Chrome Web Store listing is live, click **Open Web Store** in the setup guide and **Add to Chrome**. Until then, and in beta builds, load the bundled copy in `chrome://extensions`: enable **Developer mode**, click **Load unpacked**, and select `/Applications/UseMac.app/Contents/Resources/chrome-extension`. Then pair each Chrome profile once: open **UseMac → Settings → General → Chrome Extension**, click **Copy key**, and paste the `umk_…` key into the extension popup.
-   - *Updating the extension*: After a UseMac update, **Settings → Chrome Extension** flags any profile still running an older copy (or one loaded from another folder, which app updates never reach). Click **Reload** there, or run `usemac browser reload-extension` (socket method `browser_reload_extension`; fails with `EXTENSION_RELOAD_UNSUPPORTED` on an extension too old to reload itself, `BROWSER_BUSY` while agents are using Chrome, or `EXTENSION_RELOAD_TIMEOUT` if it doesn't reconnect).
+   - *Updating the extension*: After a UseMac update, **Settings → Chrome Extension** flags profiles running an older copy or one loaded from another folder. For an older bundled copy, click **Reload** there, or run `usemac browser reload-extension` (socket method `browser_reload_extension`; fails with `EXTENSION_RELOAD_UNSUPPORTED` on an extension too old to reload itself, `BROWSER_BUSY` while agents are using Chrome, or `EXTENSION_RELOAD_TIMEOUT` if it doesn't reconnect). If the source is `other_folder`, load the bundled folder instead: reloading the external copy does not pick up app updates, even if the versions match.
 4. **Connect your AI agent** — Open **UseMac → Settings → Connect** and paste the setup prompt into your agent, or install the bundled skill directly:
    ```bash
    /Applications/UseMac.app/Contents/Helpers/usemac install-skill
@@ -146,11 +146,14 @@ USEMAC="/Applications/UseMac.app/Contents/Helpers/usemac"
 "$USEMAC" act '{"app":"Notes","observationMode":"auto","steps":[{"action":"type","text":"Meeting notes","preferBackground":true}]}'
 "$USEMAC" browser open "https://example.com" --auto-dismiss
 "$USEMAC" browser extract network --url-filter "/api/"
+"$USEMAC" --json browser extract downloads
 "$USEMAC" skill list
 "$USEMAC" audit --since 2h
 "$USEMAC" install-skill
 "$USEMAC" debug capture --window preview --context   # developing UseMac only, once Debug capture is on
 ```
+
+`usemac --json browser extract downloads` returns the array at `.downloads`; on the socket it is `browserExtract.downloads`, not `jsonResult`.
 
 When `UseMac.app` is closed, the CLI and MCP server run in read-only mode and mutating requests return `DAEMON_REQUIRED`. Passing `--standalone` runs in-process without the app and without its safety controls.
 

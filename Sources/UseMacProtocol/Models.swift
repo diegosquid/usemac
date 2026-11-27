@@ -1287,6 +1287,7 @@ public struct BrowserDownloadInfo: Codable, Equatable, Identifiable, Sendable {
     public var totalBytes: Int?
     public var mime: String?
     public var startTime: String?
+    public var error: String?
 
     public init(
         id: Int,
@@ -1296,7 +1297,8 @@ public struct BrowserDownloadInfo: Codable, Equatable, Identifiable, Sendable {
         bytesReceived: Int? = nil,
         totalBytes: Int? = nil,
         mime: String? = nil,
-        startTime: String? = nil
+        startTime: String? = nil,
+        error: String? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -1306,6 +1308,35 @@ public struct BrowserDownloadInfo: Codable, Equatable, Identifiable, Sendable {
         self.totalBytes = totalBytes
         self.mime = mime
         self.startTime = startTime
+        self.error = error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        filename = try c.decode(String.self, forKey: .filename)
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        state = try c.decode(String.self, forKey: .state)
+        bytesReceived = try c.decodeIfPresent(Int.self, forKey: .bytesReceived).flatMap { $0 >= 0 ? $0 : nil }
+        totalBytes = try c.decodeIfPresent(Int.self, forKey: .totalBytes).flatMap { $0 >= 0 ? $0 : nil }
+        mime = try c.decodeIfPresent(String.self, forKey: .mime)
+        startTime = try c.decodeIfPresent(String.self, forKey: .startTime)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    package var formattedStatus: String {
+        var status = "[\(state)] \(filename)"
+        if let totalBytes, totalBytes >= 0 {
+            if let bytesReceived, bytesReceived >= 0 {
+                status += " (\(bytesReceived)/\(totalBytes) bytes)"
+            } else {
+                status += " (\(totalBytes) bytes)"
+            }
+        }
+        if let reason = error?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            status += " — error: \(reason)"
+        }
+        return status
     }
 }
 
@@ -1320,6 +1351,9 @@ public struct BrowserExtractParams: Codable, Equatable, Sendable {
     public var urlFilter: String?
     public var scanVertical: Bool?
     public var frameIndex: Int?
+
+    public var normalizedMode: String { mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+    public var isDownloads: Bool { normalizedMode == "downloads" }
 
     public init(
         profile: String? = nil,

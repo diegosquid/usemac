@@ -27,6 +27,11 @@ const DEFAULT_SCREENSHOT_MAX_WIDTH = 1280;
 const DEFAULT_SCREENSHOT_MAX_HEIGHT = 800;
 const NETWORK_RING_MAX = 25;
 const NETWORK_ERRORS_MAX = 50;
+const DOWNLOAD_CACHE_MAX = 40;
+const DOWNLOAD_HISTORY_MS = 24 * 60 * 60 * 1000;
+const PAGE_DOWNLOAD_MAX = 30;
+const PAGE_DOWNLOAD_TTL_MS = 15000;
+const PAGE_DOWNLOAD_MATCH_MS = 2000;
 const PREVIEW_DEBOUNCE_MS = 80;
 const PING_INTERVAL_MS = 20000;
 const MAX_RECONNECT_DELAY_MS = 30000;
@@ -62,106 +67,198 @@ const state = {
   tabCancelGeneration: new Map(), // tabId -> number
   cancelledRequestIds: new Set(), // bounded set of requestIds cancelled individually on timeout
   lastTabId: null,
-  lastDownloadId: null,
-  lastDownloadAt: 0,
-  lastDownloadFilename: "",
   downloads: new Map(), // id -> download meta
+  downloadTabById: new Map(),
+  refreshingDownloads: new Map(),
+  downloadSearchesInFlight: 0,
+  erasedDownloads: new Set(), // tombstones only while a search can still return the erased item
+  downloadCreationSequence: 0,
+  pendingPageDownloads: [],
+  activeDownloadClicks: new Set(),
   openQueue: Promise.resolve()
 };
 
-function recordDownloadMeta(item) {
-  if (!item || item.id == null) return;
-  const prev = state.downloads.get(item.id) || {};
-  const next = {
+function downloadBytes(value) {
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function normalizeDownload(item) {
+  return {
     id: item.id,
-    filename: item.filename || prev.filename || "",
-    url: item.finalUrl || item.url || prev.url || "",
-    state: item.state || prev.state || "in_progress",
-    bytesReceived: item.bytesReceived ?? prev.bytesReceived ?? null,
-    totalBytes: item.totalBytes ?? prev.totalBytes ?? null,
-    mime: item.mime || prev.mime || null,
-    startTime: item.startTime || prev.startTime || null
+    filename: item.filename || "",
+    url: item.finalUrl || item.url || null,
+    originalUrl: item.url || null,
+    finalUrl: item.finalUrl || null,
+    referrer: item.referrer || null,
+    state: item.state || "in_progress",
+    bytesReceived: downloadBytes(item.bytesReceived),
+    totalBytes: downloadBytes(item.totalBytes),
+    mime: item.mime || null,
+    startTime: item.startTime || null,
+    error: item.error || null,
+    progressStale: false
   };
-  state.downloads.set(item.id, next);
-  if (state.downloads.size > 40) {
-    const firstKey = state.downloads.keys().next().value;
-    if (firstKey != null) state.downloads.delete(firstKey);
+}
+
+function cacheDownload(download) {
+  state.downloads.delete(download.id);
+  state.downloads.set(download.id, download);
+  if (state.downloads.size > DOWNLOAD_CACHE_MAX) {
+    const oldest = state.downloads.values().next().value;
+    if (oldest.state !== "in_progress") state.downloadTabById.delete(oldest.id);
+    state.downloads.delete(oldest.id);
   }
-  return next;
 }
 
-if (chrome.downloads?.onCreated) {
-  chrome.downloads.onCreated.addListener((item) => {
-    state.lastDownloadId = item?.id ?? null;
-    state.lastDownloadAt = Date.now();
-    state.lastDownloadFilename = item?.filename || item?.url || "";
-    recordDownloadMeta(item);
-  });
-}
-
-if (chrome.downloads?.onChanged) {
-  chrome.downloads.onChanged.addListener((delta) => {
-    if (!delta || delta.id == null) return;
-    const prev = state.downloads.get(delta.id) || { id: delta.id, filename: "", state: "in_progress" };
-    if (delta.filename?.current) {
-      prev.filename = delta.filename.current;
-      if (state.lastDownloadId === delta.id) {
-        state.lastDownloadFilename = delta.filename.current;
+async function searchDownloads(query, updateCache = true) {
+  const before = new Map(state.downloads);
+  state.downloadSearchesInFlight += 1;
+  try {
+    const items = await chrome.downloads.search(query);
+    const results = [];
+    for (const item of items) {
+      if (item?.id == null || state.erasedDownloads.has(item.id)) continue;
+      const current = state.downloads.get(item.id);
+      const snapshot = normalizeDownload(item);
+      // A search may have started before a newer delta (including a terminal state).
+      if (current && current.state !== "in_progress" && snapshot.state === "in_progress") {
+        results.push(current);
+        continue;
       }
+      if (current) {
+        const previous = before.get(item.id);
+        if (current !== previous) {
+          const snapshotState = snapshot.state;
+          for (const field of ["filename", "state", "mime", "totalBytes", "finalUrl", "originalUrl", "error"]) {
+            if (current[field] !== previous?.[field]) snapshot[field] = current[field];
+          }
+          snapshot.url = snapshot.finalUrl || snapshot.originalUrl;
+          if (snapshot.state !== snapshotState) {
+            snapshot.bytesReceived = current.bytesReceived;
+            snapshot.progressStale = current.progressStale;
+          }
+        }
+        snapshot.createdAt = current.createdAt;
+        snapshot.creationSequence = current.creationSequence;
+      }
+      if (updateCache) cacheDownload(snapshot);
+      results.push(snapshot);
     }
-    if (delta.state?.current) {
-      prev.state = delta.state.current;
-    }
-    if (delta.mime?.current) {
-      prev.mime = delta.mime.current;
-    }
-    if (delta.totalBytes?.current != null) {
-      prev.totalBytes = delta.totalBytes.current;
-    }
-    state.downloads.set(delta.id, prev);
-  });
+    return results;
+  } finally {
+    state.downloadSearchesInFlight -= 1;
+    if (state.downloadSearchesInFlight === 0) state.erasedDownloads.clear();
+  }
 }
 
-function getRecordedDownloads(limit = 20) {
+function refreshDownload(id, forTerminal = false) {
+  if (!chrome.downloads?.search) return Promise.resolve(null);
+  const pending = state.refreshingDownloads.get(id);
+  if (pending) {
+    if (forTerminal && !pending.forTerminal) pending.needsTerminalRefresh = true;
+    return pending.promise;
+  }
+  const refresh = { forTerminal, needsTerminalRefresh: false };
+  refresh.promise = searchDownloads({ id })
+    .catch(() => null)
+    .finally(() => {
+      state.refreshingDownloads.delete(id);
+      // Polling may have captured an in-progress snapshot just before the completion delta.
+      if (refresh.needsTerminalRefresh && state.downloads.get(id)?.progressStale) refreshDownload(id, true);
+    });
+  state.refreshingDownloads.set(id, refresh);
+  return refresh.promise;
+}
+
+function prunePageDownloads(now) {
+  state.pendingPageDownloads = state.pendingPageDownloads.filter((entry) => now - entry.at <= PAGE_DOWNLOAD_TTL_MS);
+}
+
+chrome.downloads?.onCreated?.addListener((item) => {
+  if (item?.id == null) return;
+  const createdAt = Date.now();
+  prunePageDownloads(createdAt);
+  const matches = state.pendingPageDownloads.filter((entry) =>
+    entry.url && (entry.url === item.url || entry.url === item.finalUrl) &&
+    Math.abs(entry.at - createdAt) <= PAGE_DOWNLOAD_MATCH_MS
+  );
+  if (matches.length === 1) {
+    state.downloadTabById.set(item.id, matches[0].tabId);
+    state.pendingPageDownloads.splice(state.pendingPageDownloads.indexOf(matches[0]), 1);
+  }
+  cacheDownload({
+    ...normalizeDownload(item),
+    createdAt,
+    creationSequence: ++state.downloadCreationSequence
+  });
+});
+
+chrome.downloads?.onChanged?.addListener((delta) => {
+  if (delta?.id == null || state.erasedDownloads.has(delta.id)) return;
+  const next = { ...(state.downloads.get(delta.id) || normalizeDownload(delta)) };
+  if (delta.filename) next.filename = delta.filename.current || "";
+  if (delta.state?.current) next.state = delta.state.current;
+  if (delta.mime) next.mime = delta.mime.current || null;
+  if (delta.totalBytes) next.totalBytes = downloadBytes(delta.totalBytes.current);
+  if (delta.url) next.originalUrl = delta.url.current || null;
+  if (delta.finalUrl) next.finalUrl = delta.finalUrl.current || null;
+  next.url = next.finalUrl || next.originalUrl;
+  if (delta.error) next.error = delta.error.current || null;
+
+  const terminal = delta.state?.current === "complete" || delta.state?.current === "interrupted";
+  if (terminal) next.progressStale = true;
+  cacheDownload(next);
+  if (terminal) refreshDownload(delta.id, true);
+});
+
+chrome.downloads?.onErased?.addListener((id) => {
+  state.downloads.delete(id);
+  state.downloadTabById.delete(id);
+  if (state.downloadSearchesInFlight > 0) state.erasedDownloads.add(id);
+});
+
+async function listRecentDownloads(limit = 20) {
   const cap = clamp(Number(limit) || 20, 1, 20);
+  const cutoff = Date.now() - DOWNLOAD_HISTORY_MS;
+  if (chrome.downloads?.search) {
+    const query = { orderBy: ["-startTime"], limit: cap };
+    try {
+      await searchDownloads({ ...query, startedAfter: new Date(cutoff).toISOString() });
+    } catch (_) {
+      // Older API stand-ins may not accept startedAfter. Keep the time filter below either way.
+      try { await searchDownloads(query); } catch (_) {}
+    }
+  }
+  const startMs = (download) => Date.parse(download.startTime) || 0;
   return Array.from(state.downloads.values())
-    .slice(-cap)
-    .reverse()
+    .filter((download) => !download.startTime || startMs(download) >= cutoff)
+    .sort((a, b) => startMs(b) - startMs(a) || b.id - a.id)
+    .slice(0, cap)
     .map((it) => ({
       id: it.id,
-      filename: it.filename || "",
-      url: it.url || null,
-      state: it.state || "unknown",
-      bytesReceived: Number.isFinite(it.bytesReceived) ? it.bytesReceived : null,
-      totalBytes: Number.isFinite(it.totalBytes) ? it.totalBytes : null,
-      mime: it.mime || null,
-      startTime: it.startTime || null
+      filename: it.filename,
+      url: it.url,
+      originalUrl: it.originalUrl,
+      referrer: it.referrer,
+      state: it.state,
+      bytesReceived: it.progressStale ? null : it.bytesReceived,
+      totalBytes: it.totalBytes,
+      mime: it.mime,
+      startTime: it.startTime,
+      error: it.error
     }));
 }
 
-async function waitForDownloadCompletion(downloadId, timeoutMs = 4500) {
+async function waitForDownloadCompletion(downloadId, timeoutMs, tabId, cancelToken) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (chrome.downloads?.search && downloadId != null) {
-      try {
-        const items = await chrome.downloads.search({ id: downloadId });
-        const item = items?.[0];
-        if (item) {
-          const meta = recordDownloadMeta(item);
-          if (item.state === "complete" || item.state === "interrupted") {
-            return meta;
-          }
-        }
-      } catch (_) {}
-    } else if (downloadId != null) {
-      const cached = state.downloads.get(downloadId);
-      if (cached && (cached.state === "complete" || cached.state === "interrupted")) {
-        return cached;
-      }
-    }
-    await sleep(160);
+  while (true) {
+    if (isCancelled(tabId, cancelToken)) throw CANCELLED_ERROR;
+    const cached = state.downloads.get(downloadId);
+    const remaining = deadline - Date.now();
+    if (!cached || cached.state !== "in_progress" || remaining <= 0) return cached || null;
+    refreshDownload(downloadId);
+    await sleepCancellable(Math.min(160, remaining), tabId, cancelToken);
   }
-  return downloadId != null ? state.downloads.get(downloadId) || null : null;
 }
 
 function sleep(ms) {
@@ -1173,6 +1270,7 @@ async function ensureAttached(tabId) {
     refreshLiveViewport(tabId, session, tab)
   ]);
 
+  session.topLoaderId ||= frameTreeRes?.frameTree?.frame?.loaderId || null;
   session.visibleToUser = visible;
   // Wait briefly for OOPIF Target.attachedToTarget events ONLY when Page.getFrameTree actually reports child frames.
   if (Array.isArray(frameTreeRes?.frameTree?.childFrames) && frameTreeRes.frameTree.childFrames.length > 0) {
@@ -1207,6 +1305,18 @@ async function ensureStreaming(tabId) {
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source || source.tabId == null) {
+    return;
+  }
+  if (method === "Page.downloadWillBegin") {
+    const at = Date.now();
+    prunePageDownloads(at);
+    state.pendingPageDownloads.push({
+      tabId: source.tabId,
+      url: params?.url || "",
+      suggestedFilename: params?.suggestedFilename || "",
+      at
+    });
+    if (state.pendingPageDownloads.length > PAGE_DOWNLOAD_MAX) state.pendingPageDownloads.shift();
     return;
   }
   const session = state.tabSessions.get(source.tabId);
@@ -1295,11 +1405,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === "Page.frameNavigated" && !source.sessionId && params?.frame && !params.frame.parentId) {
     session.navigating = false;
     const nextLoaderId = params.frame.loaderId || null;
-    if (!nextLoaderId || nextLoaderId !== session.topLoaderId) {
+    if (nextLoaderId && nextLoaderId !== session.topLoaderId) {
+      // Without an initial loader, a frame event for the URL we already attached to only establishes a baseline.
+      if (session.topLoaderId || (params.frame.url && session.url && params.frame.url !== session.url)) {
+        session.documentId += 1;
+        session.networkRing = [];
+        session.networkPending.clear();
+      }
       session.topLoaderId = nextLoaderId;
-      session.documentId = (session.documentId || 0) + 1;
-      session.networkRing = [];
-      session.networkPending.clear();
     }
     if (params.frame.url) session.url = params.frame.url;
     sendWS({
@@ -1320,6 +1433,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         url: reqUrl,
         method: params?.request?.method || "GET",
         resourceType: reqType,
+        loaderId: params?.loaderId || null,
+        documentId: session.documentId,
         timestampMs: Date.now()
       });
       if (session.networkPending.size > 200) {
@@ -1332,6 +1447,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === "Network.responseReceived" && !source.sessionId) {
     const reqId = params?.requestId;
     const pending = reqId ? session.networkPending.get(reqId) : null;
+    const loaderId = params?.loaderId || pending?.loaderId || null;
+    if (pending && pending.documentId !== session.documentId) return;
+    if (!pending && session.topLoaderId && loaderId && loaderId !== session.topLoaderId) return;
     const reqType = params?.type || pending?.resourceType || "";
     const resp = params?.response || {};
     const status = Number(resp.status) || 0;
@@ -1370,6 +1488,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           requestId: reqId,
           documentId: session.documentId,
           timestampMs: now,
+          finished: false,
           bodyLoaded: false,
           body: null
         });
@@ -1381,7 +1500,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
   if (method === "Network.loadingFinished" && !source.sessionId) {
-    if (params?.requestId) session.networkPending.delete(params.requestId);
+    if (params?.requestId) {
+      const entry = session.networkRing.findLast((entry) => entry.requestId === params.requestId);
+      if (entry) entry.finished = true;
+      session.networkPending.delete(params.requestId);
+    }
     return;
   }
   if (method === "Network.loadingFailed" && !source.sessionId) {
@@ -1467,14 +1590,7 @@ chrome.tabs.onCreated?.addListener((tab) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const session = state.tabSessions.get(tabId);
   if (session && (changeInfo.url || changeInfo.title || tab)) {
-    const prevUrl = session.url || "";
-    const nextUrl = tab?.url || changeInfo.url || session.url;
-    if (changeInfo.url && prevUrl && nextUrl.split("#")[0] !== prevUrl.split("#")[0]) {
-      session.documentId = (session.documentId || 0) + 1;
-      session.networkRing = [];
-      session.networkPending.clear();
-    }
-    session.url = nextUrl;
+    session.url = tab?.url || changeInfo.url || session.url;
     session.title = tab?.title || changeInfo.title || session.title;
   }
   if (session && changeInfo?.status === "loading") {
@@ -5070,7 +5186,48 @@ async function executeFillFormStep(tabId, step, cancelToken = null) {
   };
 }
 
-async function executeActionStep(tabId, step, cancelToken = null) {
+function beginDownloadClick(tabId, tabUrl) {
+  const click = {
+    tabId,
+    origin: httpDownloadOrigin(tabUrl),
+    startedAt: Date.now(),
+    creationSequence: state.downloadCreationSequence,
+    allowOriginFallback: true
+  };
+  for (const other of state.activeDownloadClicks) {
+    if (other.tabId === tabId) continue;
+    click.allowOriginFallback = false;
+    other.allowOriginFallback = false;
+  }
+  state.activeDownloadClicks.add(click);
+  return click;
+}
+
+function clickDownloads(click, endSequence = Infinity) {
+  const associated = [];
+  const sameOrigin = [];
+  for (const download of state.downloads.values()) {
+    if (download.createdAt == null || download.createdAt < click.startedAt ||
+        download.creationSequence <= click.creationSequence || download.creationSequence > endSequence) continue;
+    const associatedTab = state.downloadTabById.get(download.id);
+    if (associatedTab === click.tabId) {
+      associated.push(download);
+    } else if (associatedTab == null && click.allowOriginFallback && downloadMatchesOrigin(download, click.origin)) {
+      sameOrigin.push(download);
+    }
+  }
+  return associated.concat(sameOrigin);
+}
+
+function isValidLocalDownloadPath(path) {
+  return typeof path === "string" && /^(?:\/(?!\/)|~\/|[A-Za-z]:\\)/.test(path);
+}
+
+function completedDownloadPath(download) {
+  return download?.state === "complete" && isValidLocalDownloadPath(download.filename) ? download.filename : null;
+}
+
+async function executeActionStep(tabId, step, cancelToken = null, batchClicks = null) {
   const action = step.action;
 
   if (action === "openURL" || action === "navigate") {
@@ -5125,44 +5282,55 @@ async function executeActionStep(tabId, step, cancelToken = null) {
           : target.label
             ? `Clicking ${target.label}`
             : "Clicking";
-    const clickStartAt = Date.now();
     const session = getOrCreateTabSession(tabId);
     const beforeUrl = session.url || "";
     session.navigating = false;
     const pt = await moveCursorSmoothly(tabId, target.x, target.y, label);
     emitCursor(tabId, pt.x, pt.y, "click", label);
 
-    if (action === "click") {
-      await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
-    } else if (action === "doubleClick") {
-      await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
-      await dispatchMouseClick(tabId, pt.x, pt.y, "left", 2);
-    } else {
-      await dispatchMouseClick(tabId, pt.x, pt.y, "right", 1);
-    }
+    const click = beginDownloadClick(tabId, beforeUrl);
+    batchClicks?.push(click);
+    const resolvedElementId = target.elementId || null;
+    try {
+      if (action === "click") {
+        await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
+      } else if (action === "doubleClick") {
+        await dispatchMouseClick(tabId, pt.x, pt.y, "left", 1);
+        await dispatchMouseClick(tabId, pt.x, pt.y, "left", 2);
+      } else {
+        await dispatchMouseClick(tabId, pt.x, pt.y, "right", 1);
+      }
 
-    // Event-driven post-click settle: double-rAF (~16-33ms) + navigation/download detection instead of blind 140ms sleep.
-    await waitForAnimationFrames(tabId, 40);
-    if (state.lastDownloadAt >= clickStartAt) {
-      const dl = await waitForDownloadCompletion(state.lastDownloadId, 4500);
-      const path = dl?.filename || state.lastDownloadFilename || null;
-      return {
-        mechanism: "cdp-mouse (download)",
-        message: path ? `Download ${dl?.state || "started"}: ${path}` : "Download started",
-        downloadPath: path,
-        resolvedElementId: target.elementId || null
-      };
+      // Ordinary clicks only pay the existing double-rAF settle; poll only for an observed, eligible download.
+      await waitForAnimationFrames(tabId, 40);
+      const [download] = clickDownloads(click);
+      if (download) {
+        const finalDownload = await waitForDownloadCompletion(download.id, 4500, tabId, cancelToken);
+        const downloadPath = completedDownloadPath(finalDownload);
+        const status = finalDownload?.state || "unavailable";
+        const error = finalDownload?.error;
+        const detail = downloadPath ? `: ${downloadPath}`
+          : status === "interrupted" && /^[A-Z][A-Z0-9_]*$/.test(error || "") ? ` (${error})` : "";
+        return {
+          mechanism: "cdp-mouse (download)",
+          message: `Download ${status}${detail}`,
+          downloadPath,
+          resolvedElementId
+        };
+      }
+      const afterTab = await refreshTabMeta(tabId);
+      if (session.navigating || (afterTab && (afterTab.status === "loading" || (beforeUrl && afterTab.url && afterTab.url !== beforeUrl)))) {
+        await waitForTabLoad(tabId, 3200);
+        return {
+          mechanism: "cdp-mouse (navigated)",
+          message: afterTab?.url || session.url || null,
+          resolvedElementId
+        };
+      }
+      return { mechanism: "cdp-mouse", message: null, resolvedElementId };
+    } finally {
+      if (!batchClicks) state.activeDownloadClicks.delete(click);
     }
-    const afterTab = await refreshTabMeta(tabId);
-    if (session.navigating || (afterTab && (afterTab.status === "loading" || (beforeUrl && afterTab.url && afterTab.url !== beforeUrl)))) {
-      await waitForTabLoad(tabId, 3200);
-      return {
-        mechanism: "cdp-mouse (navigated)",
-        message: afterTab?.url || session.url || null,
-        resolvedElementId: target.elementId || null
-      };
-    }
-    return { mechanism: "cdp-mouse", message: null, resolvedElementId: target.elementId || null };
   }
 
   if (action === "hover") {
@@ -6196,9 +6364,10 @@ async function extractTablesWithVerticalScan(tabId, scopeSelector = null, maxCha
 
 async function extractNetworkResponses(tabId, { urlFilter = null, maxChars = 16000 } = {}) {
   const session = getOrCreateTabSession(tabId);
+  const docIdAtStart = session.documentId;
   const filterLower = typeof urlFilter === "string" ? urlFilter.trim().toLowerCase() : "";
   const matching = (session.networkRing || [])
-    .filter((entry) => entry.documentId == null || entry.documentId === session.documentId)
+    .filter((entry) => entry.documentId == null || entry.documentId === docIdAtStart)
     .filter((entry) => !filterLower || String(entry.url || "").toLowerCase().includes(filterLower))
     .slice()
     .reverse(); // newest first
@@ -6206,7 +6375,9 @@ async function extractNetworkResponses(tabId, { urlFilter = null, maxChars = 160
   const items = [];
   let approxLen = 2; // "[]"
   for (const entry of matching) {
+    if (session.documentId !== docIdAtStart) break;
     if (!entry.bodyLoaded && entry.requestId) {
+      const wasFinished = entry.finished === true;
       try {
         const res = await sendCDP(tabId, "Network.getResponseBody", { requestId: entry.requestId });
         let rawBody = res?.body ?? null;
@@ -6222,10 +6393,12 @@ async function extractNetworkResponses(tabId, { urlFilter = null, maxChars = 160
         } else {
           entry.body = rawBody;
         }
+        entry.bodyLoaded = true;
       } catch (_) {
-        entry.body = null;
+        // A request can finish while getResponseBody is in flight. If it wasn't finished when
+        // we asked, try again on the next extract rather than memoizing a premature failure.
+        entry.bodyLoaded = wasFinished;
       }
-      entry.bodyLoaded = true;
     }
 
     const record = {
@@ -6258,6 +6431,7 @@ async function extractNetworkResponses(tabId, { urlFilter = null, maxChars = 160
     approxLen += serialized.length + 1;
   }
 
+  if (session.documentId !== docIdAtStart) return { jsonResult: "[]", count: 0 };
   return {
     jsonResult: JSON.stringify(items).slice(0, maxChars),
     count: items.length
@@ -6348,22 +6522,22 @@ async function extractKpisAcrossFrames(tabId, scopeSelector, maxChars, childFram
 
 async function handleExtractCommand(req, preResolvedTab = null) {
   const start = performance.now();
-  const mode = String(req.mode || "auto").toLowerCase();
+  const mode = String(req.mode || "auto").trim().toLowerCase();
   const maxChars = clamp(Number(req.maxChars) || 16000, 500, 64000);
 
   if (mode === "downloads") {
-    const downloads = getRecordedDownloads(20);
+    const downloads = await listRecentDownloads(20);
     return {
       type: "response",
       id: req.id,
       ok: true,
-      tabId: req.tabId ?? state.lastTabId ?? null,
+      tabId: null,
       profileName: state.profileName,
       url: null,
       title: null,
       extractResult: {
         mode: "downloads",
-        tabId: req.tabId ?? state.lastTabId ?? null,
+        tabId: null,
         url: null,
         title: null,
         latencyMs: Math.round((performance.now() - start) * 100) / 100,
@@ -7091,21 +7265,34 @@ async function forgetOwnedTab(tabId) {
   }
 }
 
-function hasRunningDownloadFrom(tabUrl, busyDownloadUrls) {
-  if (!tabUrl || busyDownloadUrls.size === 0) return false;
-  let origin;
+function httpDownloadOrigin(url) {
+  if (!url) return null;
   try {
-    origin = new URL(tabUrl).origin;
+    const origin = new URL(url).origin;
+    return /^https?:\/\//.test(origin) ? origin : null;
   } catch (_) {
-    return false;
+    return null;
   }
-  return Array.from(busyDownloadUrls).some((u) => {
-    try {
-      return new URL(u).origin === origin;
-    } catch (_) {
-      return false;
-    }
-  });
+}
+
+function downloadMatchesOrigin(download, origin) {
+  return Boolean(origin) && [download.referrer, download.originalUrl, download.finalUrl, download.url]
+    .some((url) => httpDownloadOrigin(url) === origin);
+}
+
+async function queryActiveDownloads() {
+  if (!chrome.downloads?.search) return Array.from(state.downloads.values());
+  try {
+    return await searchDownloads({ state: "in_progress" }, false);
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasRunningDownloadFrom(tab, activeDownloads) {
+  const origin = httpDownloadOrigin(tab.url);
+  return activeDownloads.some((download) => download.state === "in_progress" &&
+    (state.downloadTabById.get(download.id) === tab.id || downloadMatchesOrigin(download, origin)));
 }
 
 // Closes the tabs UseMac opened, except: tabs listed in keepTabIds, the tab the user is looking at (active in
@@ -7122,12 +7309,7 @@ async function handleCloseOwnedTabsCommand(req) {
     const focused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
     if (focused?.focused) focusedWindowId = focused.id;
   } catch (_) {}
-  const busyDownloadUrls = new Set(
-    Array.from(state.downloads.values())
-      .filter((d) => (d.state || "in_progress") === "in_progress")
-      .map((d) => d.url)
-      .filter(Boolean)
-  );
+  const activeDownloads = await queryActiveDownloads();
 
   for (const tabId of owned) {
     const tab = await getTabOrNull(tabId);
@@ -7139,8 +7321,12 @@ async function handleCloseOwnedTabsCommand(req) {
     let reason = null;
     if (keep.has(tabId)) reason = "asked to keep";
     else if (tab.active && tab.windowId === focusedWindowId) reason = "the user is looking at it";
-    else if (hasRunningDownloadFrom(tab.url, busyDownloadUrls)) {
-      reason = "a download is still running";
+    else if (!activeDownloads) reason = "download status unavailable";
+    else {
+      // onCreated/onChanged can arrive while tabs.get is pending; don't yield again before removing.
+      const observed = new Map(activeDownloads.map((download) => [download.id, download]));
+      for (const download of state.downloads.values()) observed.set(download.id, download);
+      if (hasRunningDownloadFrom(tab, Array.from(observed.values()))) reason = "a download is still running";
     }
     if (reason) {
       kept.push({ tabId, title: tab.title || "", reason });
@@ -7226,65 +7412,13 @@ async function runActionStepsPipeline(tabId, steps, { stopOnError = true, cancel
   let allSucceeded = true;
   let cancelled = false;
 
-  for (let i = 0; i < steps.length; i++) {
-    if (isCancelled(tabId, cancelToken)) {
-      allSucceeded = false;
-      cancelled = true;
-      for (let j = i; j < steps.length; j++) {
-        stepResults.push({
-          index: j,
-          action: steps[j]?.action,
-          success: false,
-          mechanism: "cancelled",
-          latencyMs: 0,
-          message: CANCELLED_MESSAGE
-        });
-      }
-      break;
-    }
-
-    const step = steps[i];
-    const stepStart = performance.now();
-    resetIdleTimer(tabId);
-
-    try {
-      if (stepNeedsDebugger(step)) {
-        const blocked = await restrictedPageErrorIfDetached(tabId);
-        if (blocked) throw blocked;
-      }
-      const outcome = await executeActionStep(tabId, step, cancelToken);
-      const entry = {
-        index: i,
-        action: step.action,
-        success: true,
-        mechanism: outcome.mechanism,
-        latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-        message: outcome.message ?? null,
-        scrollDeltaX: outcome.scrollDeltaX ?? null,
-        scrollDeltaY: outcome.scrollDeltaY ?? null,
-        blockedWarning: outcome.blockedWarning ?? null,
-        downloadPath: outcome.downloadPath ?? null
-      };
-      if (outcome.resolvedElementId) {
-        entry.resolvedElementId = outcome.resolvedElementId;
-      }
-      stepResults.push(entry);
-    } catch (err) {
-      if (err?.code === "URL_BLOCKED") {
-        throw err;
-      }
-      if (err?.code === "CANCELLED" || isCancelled(tabId, cancelToken)) {
+  const clicks = [];
+  try {
+    for (let i = 0; i < steps.length; i++) {
+      if (isCancelled(tabId, cancelToken)) {
         allSucceeded = false;
         cancelled = true;
-        stepResults.push({
-          index: i,
-          action: step.action,
-          success: false,
-          mechanism: "cancelled",
-          latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-          message: CANCELLED_MESSAGE
-        });
-        for (let j = i + 1; j < steps.length; j++) {
+        for (let j = i; j < steps.length; j++) {
           stepResults.push({
             index: j,
             action: steps[j]?.action,
@@ -7296,42 +7430,129 @@ async function runActionStepsPipeline(tabId, steps, { stopOnError = true, cancel
         }
         break;
       }
-      // A step that navigated onto a restricted page makes Chrome detach the debugger; say so instead of
-      // reporting "Debugger is not attached" for the next step.
-      let mapped = await toRestrictedPageErrorIfNeeded(err, tabId);
-      if (mapped?.code !== "RESTRICTED_PAGE" && stepNeedsDebugger(step)) {
-        mapped = (await restrictedPageErrorIfDetached(tabId)) || mapped;
-      }
-      const restricted = mapped?.code === "RESTRICTED_PAGE";
 
-      // Resilient optional step: skip cleanly and continue unless blocked by security/restriction.
-      if (step?.optional === true && !restricted) {
-        stepResults.push({
+      const step = steps[i];
+      const stepStart = performance.now();
+      resetIdleTimer(tabId);
+
+      try {
+        if (stepNeedsDebugger(step)) {
+          const blocked = await restrictedPageErrorIfDetached(tabId);
+          if (blocked) throw blocked;
+        }
+        const previousClickCount = clicks.length;
+        const outcome = await executeActionStep(tabId, step, cancelToken, clicks);
+        const entry = {
           index: i,
           action: step.action,
           success: true,
-          skipped: true,
-          mechanism: "optional-skipped",
+          mechanism: outcome.mechanism,
           latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-          message: err?.message || String(err)
-        });
-        continue;
-      }
+          message: outcome.message ?? null,
+          scrollDeltaX: outcome.scrollDeltaX ?? null,
+          scrollDeltaY: outcome.scrollDeltaY ?? null,
+          blockedWarning: outcome.blockedWarning ?? null,
+          downloadPath: outcome.downloadPath ?? null
+        };
+        if (outcome.resolvedElementId) {
+          entry.resolvedElementId = outcome.resolvedElementId;
+        }
+        stepResults.push(entry);
+        if (clicks.length > previousClickCount) {
+          const click = clicks[clicks.length - 1];
+          click.stepIndex = i;
+          click.hasDownload = Boolean(entry.downloadPath);
+        }
+      } catch (err) {
+        if (err?.code === "URL_BLOCKED") {
+          throw err;
+        }
+        if (err?.code === "CANCELLED" || isCancelled(tabId, cancelToken)) {
+          allSucceeded = false;
+          cancelled = true;
+          stepResults.push({
+            index: i,
+            action: step.action,
+            success: false,
+            mechanism: "cancelled",
+            latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+            message: CANCELLED_MESSAGE
+          });
+          for (let j = i + 1; j < steps.length; j++) {
+            stepResults.push({
+              index: j,
+              action: steps[j]?.action,
+              success: false,
+              mechanism: "cancelled",
+              latencyMs: 0,
+              message: CANCELLED_MESSAGE
+            });
+          }
+          break;
+        }
+        // A step that navigated onto a restricted page makes Chrome detach the debugger; say so instead of
+        // reporting "Debugger is not attached" for the next step.
+        let mapped = await toRestrictedPageErrorIfNeeded(err, tabId);
+        if (mapped?.code !== "RESTRICTED_PAGE" && stepNeedsDebugger(step)) {
+          mapped = (await restrictedPageErrorIfDetached(tabId)) || mapped;
+        }
+        const restricted = mapped?.code === "RESTRICTED_PAGE";
 
-      allSucceeded = false;
-      stepResults.push({
-        index: i,
-        action: step.action,
-        success: false,
-        mechanism: restricted ? "restricted-page" : "cdp-error",
-        latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
-        message: restricted ? mapped.message : (err?.message || String(err)),
-        errorCode: restricted ? "RESTRICTED_PAGE" : (typeof err?.code === "string" ? err.code : null)
-      });
-      if (stopOnError) {
+        // Resilient optional step: skip cleanly and continue unless blocked by security/restriction.
+        if (step?.optional === true && !restricted) {
+          stepResults.push({
+            index: i,
+            action: step.action,
+            success: true,
+            skipped: true,
+            mechanism: "optional-skipped",
+            latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+            message: err?.message || String(err)
+          });
+          continue;
+        }
+
+        allSucceeded = false;
+        stepResults.push({
+          index: i,
+          action: step.action,
+          success: false,
+          mechanism: restricted ? "restricted-page" : "cdp-error",
+          latencyMs: Math.round((performance.now() - stepStart) * 100) / 100,
+          message: restricted ? mapped.message : (err?.message || String(err)),
+          errorCode: restricted ? "RESTRICTED_PAGE" : (typeof err?.code === "string" ? err.code : null)
+        });
+        if (stopOnError) {
+          break;
+        }
+      }
+    }
+
+    // Match downloads that began during an existing wait to the preceding click, without adding another wait.
+    for (let i = 0; i < clicks.length && !isCancelled(tabId, cancelToken); i++) {
+      const click = clicks[i];
+      if (click.stepIndex == null || click.hasDownload) continue;
+      const endSequence = clicks[i + 1]?.creationSequence;
+      for (const download of clickDownloads(click, endSequence)) {
+        if (download.state !== "complete") continue;
+        let path = completedDownloadPath(download);
+        if (!download.filename) {
+          await refreshDownload(download.id);
+          if (isCancelled(tabId, cancelToken)) break;
+          const refreshed = clickDownloads(click, endSequence).find((d) => d.id === download.id);
+          path = completedDownloadPath(refreshed);
+        }
+        if (!path) continue;
+        const entry = stepResults[click.stepIndex];
+        const navigationNote = entry.mechanism === "cdp-mouse (navigated)" && entry.message;
+        entry.mechanism = "cdp-mouse (download)";
+        entry.downloadPath = path;
+        entry.message = navigationNote ? `Navigated to ${navigationNote} · Download complete: ${path}` : `Download complete: ${path}`;
         break;
       }
     }
+  } finally {
+    for (const click of clicks) state.activeDownloadClicks.delete(click);
   }
 
   return { stepResults, allSucceeded, cancelled };
@@ -7890,7 +8111,7 @@ function dispatchDaemonRequest(req) {
     handleDaemonRequest(req);
     return;
   }
-  if (req.command === "tabs" || req.command === "close_owned_tabs" || (req.command === "extract" && String(req.mode || "").toLowerCase() === "downloads")) {
+  if (req.command === "tabs" || req.command === "close_owned_tabs" || (req.command === "extract" && String(req.mode || "auto").trim().toLowerCase() === "downloads")) {
     handleDaemonRequest(req);
     return;
   }
@@ -7931,7 +8152,7 @@ function dispatchDaemonRequest(req) {
   (async () => {
     try {
       const tab = await resolveTargetTab(req.tabId);
-      const cancelToken = createCancelToken(tab.id, reqGlobalGen, reqTabGen != null ? reqTabGen : getTabCancelGen(tab.id));
+      const cancelToken = createCancelToken(tab.id, reqGlobalGen, reqTabGen != null ? reqTabGen : getTabCancelGen(tab.id), req.id);
       if (isCancelled(tab.id, cancelToken)) {
         sendCancelledResponse(req, tab.id);
         return;

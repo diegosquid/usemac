@@ -1191,8 +1191,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
         case .browserExtract:
             let params = request.browserExtract ?? BrowserExtractParams()
-            let normalizedMode = params.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let isEvalMode = (normalizedMode == "eval")
+            let isEvalMode = (params.normalizedMode == "eval")
             if let blockReason = killSwitch.isBlocked(forSensitiveAction: isEvalMode, isMutatingAction: isEvalMode) {
                 response = blockedPolicyResponse(
                     request: request,
@@ -1214,9 +1213,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let resolvedLabel = "Chrome (\(resolvedProfile))"
 
             if bridgeResp.ok, let extracted = bridgeResp.extractResult {
+                let resultMode = extracted.mode.lowercased()
+                let isDownloads = resultMode == "downloads"
                 let auditSummary: String
+                var subtitle = extracted.rowCount.map { "\($0) rows · \(extracted.columnCount ?? 0) cols" } ?? "chrome-extract"
                 if isEvalMode {
                     auditSummary = AuditRedactor.evalSummary(params.expression ?? "")
+                } else if isDownloads {
+                    let count = extracted.downloads?.count ?? 0
+                    subtitle = "\(count) \(count == 1 ? "download" : "downloads")"
+                    auditSummary = "Extracted downloads (\(subtitle))"
+                } else if resultMode == "network" {
+                    let count = extracted.rowCount ?? 0
+                    subtitle = "\(count) \(count == 1 ? "response" : "responses")"
+                    auditSummary = "Extracted network (\(subtitle))"
                 } else {
                     auditSummary = "Extracted \(extracted.mode) (\(extracted.rowCount ?? 0) rows, \(extracted.columnCount ?? 0) cols)"
                 }
@@ -1232,19 +1242,19 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                     appName: resolvedLabel,
                     windowTitle: bridgeResp.title ?? extracted.title,
                     title: "Extracted \(extracted.mode) data",
-                    subtitle: extracted.rowCount.map { "\($0) rows · \(extracted.columnCount ?? 0) cols" } ?? "chrome-extract",
+                    subtitle: subtitle,
                     mechanism: "chrome-extract",
                     latencyMs: extracted.latencyMs,
                     success: true,
                     isInProgress: false,
-                    browserTabId: bridgeResp.tabId ?? params.tabId,
+                    browserTabId: isDownloads ? nil : (bridgeResp.tabId ?? params.tabId),
                     browserProfile: resolvedProfile
                 ))
                 response = .success(
                     id: request.id,
                     latencyMs: latencyMs,
                     browserExtract: extracted,
-                    browserTabId: bridgeResp.tabId ?? extracted.tabId,
+                    browserTabId: isDownloads ? nil : (bridgeResp.tabId ?? extracted.tabId),
                     browserUrl: bridgeResp.url ?? extracted.url,
                     browserTitle: bridgeResp.title ?? extracted.title
                 )
@@ -2759,6 +2769,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
 
         let batchMode = (params.mode ?? "observe").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let extractMode = (params.extractMode ?? "auto").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if extractMode == "downloads" {
+            return .failure(
+                id: request.id,
+                code: "INVALID_ARGUMENT",
+                message: "Downloads are listed per Chrome profile. Use browser_extract with mode=\"downloads\" instead of browser_batch.",
+                latencyMs: elapsedMs(since: startNs)
+            )
+        }
         let isEvalMode = (batchMode == "extract" && extractMode == "eval")
         let isMutatingBatch = isEvalMode || params.autoDismissOverlays == true
 
