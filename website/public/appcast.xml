@@ -6,6 +6,32 @@
     <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 0.11.0</title>
+      <sparkle:version>67</sparkle:version>
+      <sparkle:shortVersionString>0.11.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 27 Nov 2026 18:46:19 GMT</pubDate>
+      <description><![CDATA[
+        <h3>What's New in UseMac 0.11.0</h3>
+        <ul>
+          <li><strong>Connect agents from Settings.</strong> Quick Setup configures UseMac for Claude Code, Claude Desktop, Cursor, Codex, and Antigravity, with a backup of existing settings.</li>
+          <li><strong>Set rules per app or site.</strong> Choose Allow, Ask, Read-only, or Block. Your existing rules are kept.</li>
+          <li><strong>Drag and save.</strong> Agents can drag in Chrome and native apps, and save to a specified path in a native Save dialog.</li>
+          <li><strong>Handle Chrome dialogs.</strong> Alerts, confirmations, prompts, and leave-page dialogs no longer leave an action waiting indefinitely.</li>
+          <li><strong>Wait for a busy tab or window.</strong> Agents can queue for a target that's in use.</li>
+        </ul>
+        <p>For a Chrome extension loaded from the app bundle, use <strong>Settings → Chrome Extension → Reload</strong> after updating. If you loaded the extension from another folder, updating the app does not update that copy.</p>
+        <p>See the <a href="https://github.com/diegosquid/usemac/blob/main/CHANGELOG.md">full changelog</a>.</p>
+      ]]></description>
+      <enclosure
+        url="https://usemac.app/downloads/usemac-0.11.0-arm64.dmg"
+        sparkle:edSignature="THzenRum2ES/zaK24aD7/6q56z6kQnRJ3OAXDcNwXy0Ukt8lTKz7hP1PsfEv0Xk08fuPOmPPwJlCqA0MxOpFCA=="
+        length="11261184"
+        type="application/octet-stream"
+        sparkle:os="macos"
+      />
+    </item>
+    <item>
       <title>Version 0.10.0</title>
       <sparkle:version>66</sparkle:version>
       <sparkle:shortVersionString>0.10.0</sparkle:shortVersionString>
