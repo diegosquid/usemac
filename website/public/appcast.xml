@@ -6,6 +6,32 @@
     <description>Official automatic updates for UseMac (macOS 15+ Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 0.10.0</title>
+      <sparkle:version>66</sparkle:version>
+      <sparkle:shortVersionString>0.10.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 27 Nov 2026 15:05:04 GMT</pubDate>
+      <description><![CDATA[
+                <h3>What's New in UseMac 0.10.0</h3>
+                <ul>
+                  <li><strong>Work in the background.</strong> Agents can use native app menus, open and read several Chrome pages, and save repeatable workflows. Apple Vision OCR runs on your Mac without a separate model download.</li>
+                  <li><strong>Keep tasks separate.</strong> Each task keeps its own window selection and tabs. History groups actions by session, and the live preview shows who is working where and centers wide pages without resizing the tab.</li>
+                  <li><strong>Stay in control.</strong> Site rules apply even when agents use native Accessibility in Chrome. Typing or clicking in an agent-controlled page pauses it there, and visible windows show a border when an agent uses the native fallback on a restricted page.</li>
+                  <li><strong>More reliable clicks and downloads.</strong> Covered controls aren't clicked, and agents are told when a link click produces no observable result. Downloads keep their tab open until the transfer ends; finishing a task no longer leaves another saved UseMac tab group.</li>
+                  <li><strong>Better native file handling.</strong> When an app comes forward after a background file selection, UseMac restores the previous focus. The Go to Folder fallback waits for the right field and button before continuing.</li>
+                </ul>
+                <p>After updating, reload the UseMac Browser Bridge from Settings → Chrome Extension. If you loaded the extension from another folder, switch to the bundled copy at /Applications/UseMac.app/Contents/Resources/chrome-extension so future updates can reach it.</p>
+                <p>Some restricted Chrome pages still need a visible window or a brief foreground step. See the <a href="https://github.com/diegosquid/usemac/blob/main/CHANGELOG.md">full changelog</a> or <a href="https://github.com/diegosquid/usemac/issues">report a problem</a>.</p>
+      ]]></description>
+      <enclosure
+        url="https://usemac.app/downloads/usemac-0.10.0-arm64.dmg"
+        sparkle:edSignature="HVEBOPKSrVu8QNZojoCuIgiXA5bsyP/4GdZp+Aph9pgM/Z5cr46SqPkW6P9REa/AXODSGnykdzRwGhX8RFVjDw=="
+        length="10633374"
+        type="application/octet-stream"
+        sparkle:os="macos"
+      />
+    </item>
+    <item>
       <title>Version 0.9.0-beta.1</title>
       <sparkle:version>65</sparkle:version>
       <sparkle:shortVersionString>0.9.0-beta.1</sparkle:shortVersionString>

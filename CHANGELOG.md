@@ -6,6 +6,10 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-27
+
+The stable Apple Silicon download is signed with Developer ID and notarized by Apple. If you are upgrading from 0.5.0, install the new DMG manually: the previous stable download did not include the Sparkle update key.
+
 ### Added
 
 - **Chrome work indicators (#57):** the native overlay marks visible Chromium windows only while the agent uses native fallback on a restricted page. Typing or clicking in the main document or a same-origin iframe of an agent-controlled tab pauses the agent there and shows a Resume control.
