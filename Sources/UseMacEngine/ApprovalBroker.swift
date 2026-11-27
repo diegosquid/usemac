@@ -1,7 +1,7 @@
 import Foundation
 import UseMacProtocol
 
-/// The kinds of sensitive step Ask mode holds for the user. A task grant covers kinds, never uploads.
+/// The kinds of request held for the user. A task grant covers kinds, never uploads.
 public enum ApprovalKind: String, Sendable, Hashable, CaseIterable {
     /// A key press with ⌘ or ⌃.
     case shortcut
@@ -9,6 +9,8 @@ public enum ApprovalKind: String, Sendable, Hashable, CaseIterable {
     case upload
     /// `browser_extract` in `eval` mode.
     case script
+    /// A mutation on a target governed by an Ask rule.
+    case targetRule
 
     /// What "Allow for this task" lets through, for the prompt's caption.
     public var pluralNoun: String {
@@ -16,6 +18,7 @@ public enum ApprovalKind: String, Sendable, Hashable, CaseIterable {
         case .shortcut: return "⌘/⌃ shortcuts"
         case .upload: return "uploads"
         case .script: return "page scripts"
+        case .targetRule: return "actions in this target"
         }
     }
 }
@@ -47,7 +50,7 @@ public struct ApprovalPrompt: Sendable, Equatable, Identifiable {
     }
 }
 
-/// Holds sensitive requests in Ask mode until the user answers in the HUD, one prompt on screen at a time.
+/// Holds requests until the user answers in the HUD, one prompt on screen at a time.
 ///
 /// Nothing reaches `decide` from outside the app: there is no RPC method or MCP tool for it, and it takes a
 /// `PhysicalClick`, which only `ApprovalInputCheck.verifyClick` makes from a click the window server says no
@@ -86,8 +89,7 @@ public final class ApprovalBroker: @unchecked Sendable {
         public var steps: [String]
         public var kinds: Set<ApprovalKind>
         public var taskId: String?
-        /// What a task grant is tied to (the app, or the Chrome profile), so allowing ⌘S in TextEdit doesn't allow
-        /// it everywhere.
+        /// The identity the grant is tied to: an app, Chrome profile, or a specific app/site target.
         public var grantTarget: String
         public var agentName: String?
 
@@ -110,6 +112,7 @@ public final class ApprovalBroker: @unchecked Sendable {
     private struct Entry {
         var prompt: ApprovalPrompt
         var grantTarget: String
+        var cancelReason: @Sendable () -> String?
         var continuation: CheckedContinuation<Outcome, Never>?
     }
 
@@ -171,6 +174,7 @@ public final class ApprovalBroker: @unchecked Sendable {
         now: Date = Date(),
         cancelReason: @escaping @Sendable () -> String? = { nil }
     ) async -> Outcome {
+        if let reason = cancelReason() { return .cancelled(reason: reason) }
         if let taskId = request.taskId, coveredByGrant(taskId: taskId, kinds: request.kinds, target: request.grantTarget) {
             return .allowedByTaskGrant(taskId: taskId)
         }
@@ -190,7 +194,9 @@ public final class ApprovalBroker: @unchecked Sendable {
         let id = prompt.id
         let outcome = await withCheckedContinuation { (continuation: CheckedContinuation<Outcome, Never>) in
             lock.lock()
-            entries.append(Entry(prompt: prompt, grantTarget: request.grantTarget, continuation: continuation))
+            entries.append(Entry(
+                prompt: prompt, grantTarget: request.grantTarget, cancelReason: cancelReason, continuation: continuation
+            ))
             let notify = _onChange
             lock.unlock()
             notify?()
@@ -223,6 +229,11 @@ public final class ApprovalBroker: @unchecked Sendable {
             outcome = .allowedForTask(taskId: taskId)
         }
         lock.unlock()
+        // The mode can change in the interval before the watchdog polls again.
+        if let reason = head.cancelReason() {
+            finish(id: promptId, outcome: .cancelled(reason: reason))
+            return false
+        }
         return finish(id: promptId, outcome: outcome)
     }
 

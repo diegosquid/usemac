@@ -3,8 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UseMacEngine
 
-/// Settings → App and site rules: the apps and sites agents never observe, act on or capture, and the optional
-/// allow-only mode. The rules are edited only here; nothing on the socket, MCP or CLI changes them.
+/// Settings → App and site rules. The rules are edited only here; nothing on the socket, MCP or CLI changes them.
 struct TargetRulesGroupView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var rules: TargetRules = TargetRulesStore.shared.rules
@@ -12,10 +11,15 @@ struct TargetRulesGroupView: View {
     @State private var deniedSiteDraft = ""
     @State private var allowedAppDraft = ""
     @State private var allowedSiteDraft = ""
+    @State private var readOnlyAppDraft = ""
+    @State private var readOnlySiteDraft = ""
+    @State private var askAppDraft = ""
+    @State private var askSiteDraft = ""
     @State private var draftError: DraftField?
 
     private enum DraftField: Equatable {
         case deniedApp, deniedSite, allowedApp, allowedSite
+        case readOnlyApp, readOnlySite, askApp, askSite
     }
 
     var body: some View {
@@ -27,7 +31,7 @@ struct TargetRulesGroupView: View {
                 .font(.system(size: 11.5, weight: .regular))
                 .foregroundStyle(.secondary)
                 .buttonStyle(.plain)
-                .help("Block the built-in password managers and Keychain Access again, and use Block listed")
+                .help("Restore Block listed with the built-in blocks and clear custom rules")
             }
         } content: {
             modeRow
@@ -59,7 +63,7 @@ struct TargetRulesGroupView: View {
                 InsetDivider(leading: 18)
                 appList(
                     title: "Allowed apps",
-                    subtitle: "The only apps agents can use. Blocked apps stay blocked.",
+                    subtitle: "Apps agents can use without an extra restriction. More restrictive rules take precedence.",
                     patterns: rules.allowedApps,
                     draft: $allowedAppDraft,
                     field: .allowedApp,
@@ -71,7 +75,7 @@ struct TargetRulesGroupView: View {
                 InsetDivider(leading: 18)
                 siteList(
                     title: "Allowed sites",
-                    subtitle: "The only sites agents can use in Chrome, with their subdomains. Blocked sites stay blocked.",
+                    subtitle: "Sites agents can use without an extra restriction. More restrictive rules take precedence.",
                     patterns: rules.allowedSites,
                     draft: $allowedSiteDraft,
                     field: .allowedSite,
@@ -79,6 +83,7 @@ struct TargetRulesGroupView: View {
                     add: { pattern in update { $0.allowedSites.append(pattern) } }
                 )
             }
+            governedLists
         }
         .onReceive(NotificationCenter.default.publisher(for: TargetRulesStore.didChangeNotification)) { _ in
             rules = TargetRulesStore.shared.rules
@@ -93,8 +98,8 @@ struct TargetRulesGroupView: View {
                 Text("Mode")
                     .font(.system(size: 13.5, weight: .medium))
                 Text(rules.mode == .allow
-                    ? "Agents can use only the apps and sites you allow. Requests for anything else fail."
-                    : "Agents can use every app and site except the ones you block.")
+                    ? "Agents can use only targets listed under Allow, Read-only or Ask. Blocked targets stay blocked."
+                    : "Unlisted apps and sites are allowed. Listed targets follow the most restrictive rule.")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -115,6 +120,55 @@ struct TargetRulesGroupView: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - Read-only and Ask
+
+    private var governedLists: some View {
+        Group {
+            InsetDivider(leading: 18)
+            appList(
+                title: "Read-only apps",
+                subtitle: "Agents can observe and capture, but mutating actions are blocked.",
+                patterns: rules.readOnlyApps,
+                draft: $readOnlyAppDraft,
+                field: .readOnlyApp,
+                prompt: "Set Read-only",
+                remove: { pattern in update { $0.readOnlyApps.removeAll { $0 == pattern } } },
+                add: { pattern in update { $0.readOnlyApps.append(pattern) } }
+            )
+            InsetDivider(leading: 18)
+            siteList(
+                title: "Read-only sites",
+                subtitle: "Agents can observe and capture, but mutating actions are blocked.",
+                patterns: rules.readOnlySites,
+                draft: $readOnlySiteDraft,
+                field: .readOnlySite,
+                remove: { pattern in update { $0.readOnlySites.removeAll { $0 == pattern } } },
+                add: { pattern in update { $0.readOnlySites.append(pattern) } }
+            )
+            InsetDivider(leading: 18)
+            appList(
+                title: "Ask before acting — apps",
+                subtitle: "Mutating actions wait for your approval in the HUD, even in Autonomous mode.",
+                patterns: rules.askApps,
+                draft: $askAppDraft,
+                field: .askApp,
+                prompt: "Require Approval",
+                remove: { pattern in update { $0.askApps.removeAll { $0 == pattern } } },
+                add: { pattern in update { $0.askApps.append(pattern) } }
+            )
+            InsetDivider(leading: 18)
+            siteList(
+                title: "Ask before acting — sites",
+                subtitle: "Mutating actions wait for your approval in the HUD, even in Autonomous mode.",
+                patterns: rules.askSites,
+                draft: $askSiteDraft,
+                field: .askSite,
+                remove: { pattern in update { $0.askSites.removeAll { $0 == pattern } } },
+                add: { pattern in update { $0.askSites.append(pattern) } }
+            )
+        }
     }
 
     // MARK: - Apps
@@ -201,7 +255,7 @@ struct TargetRulesGroupView: View {
         panel.canChooseDirectories = false
         panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
         panel.prompt = prompt
-        panel.message = "Choose the apps to \(prompt.lowercased())."
+        panel.message = "Choose apps for this rule."
         guard panel.runModal() == .OK else { return [] }
         return panel.urls.compactMap { Bundle(url: $0)?.bundleIdentifier }
     }

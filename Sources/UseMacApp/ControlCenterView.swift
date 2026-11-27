@@ -930,18 +930,22 @@ public struct ControlCenterView: View {
     private var connectSection: some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 24) {
-                HStack(alignment: .center) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Connect")
-                            .font(.system(size: 20, weight: .semibold))
-                            .tracking(-0.4)
-                        Text("Copy and paste straight into your agent — it installs the skill and connects itself.")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-                    }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Connect")
+                        .font(.system(size: 20, weight: .semibold))
+                        .tracking(-0.4)
+                    Text("Connect an installed client or copy a setup prompt.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
 
+                AgentConnectSetupGroup(appState: appState)
+
+                HStack {
+                    Text("Integration Method")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.secondary)
                     Spacer(minLength: 16)
-
                     CodexSegmentedControl(
                         selection: $integrationTab,
                         options: IntegrationTab.allCases.map {
@@ -949,6 +953,7 @@ public struct ControlCenterView: View {
                         }
                     )
                 }
+                .padding(.horizontal, 4)
 
                 switch integrationTab {
                 case .socket:

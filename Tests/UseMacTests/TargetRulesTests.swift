@@ -59,6 +59,59 @@ final class TargetRulesTests: XCTestCase {
         XCTAssertTrue(rules.blocksApp(bundleId: nil), "an app without a bundle ID cannot be allowed")
     }
 
+    func testAppAndSitePoliciesUseTheMostRestrictiveMatchInBothModes() {
+        for mode in TargetRules.Mode.allCases {
+            let rules = TargetRules(
+                mode: mode,
+                deniedApps: ["com.example.block"], deniedSites: [".block.example"],
+                allowedApps: ["com.example.*"], allowedSites: ["example"],
+                askApps: ["com.example.ask", "com.example.read", "com.example.block", "com.ask.only"],
+                askSites: ["ask.example", "read.example", "block.example", "example.net"],
+                readOnlyApps: ["com.example.read", "com.example.block", "com.read.only"],
+                readOnlySites: ["read.example", "block.example", "example.org"]
+            )
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "COM.EXAMPLE.BLOCK"), .block)
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "com.example.read"), .readOnly)
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "com.example.ask"), .ask)
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "com.example.allow"), .allow)
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "com.ask.only"), .ask)
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "com.read.only"), .readOnly)
+            XCTAssertEqual(rules.effectiveAppPolicy(bundleId: "com.unlisted"), mode == .allow ? .block : .allow)
+
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://block.example/"), .block)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://sub.block.example/"), .readOnly)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://read.example/"), .readOnly)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://ask.example/"), .ask)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://allow.example/"), .allow)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://example.net/"), .ask)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://example.org/"), .readOnly)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "https://other.net/"), mode == .allow ? .block : .allow)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: "about:blank"), .allow)
+            XCTAssertEqual(rules.effectiveSitePolicy(url: ""), .allow)
+        }
+        XCTAssertFalse(TargetRules(askSites: ["ask.example"]).hasSiteRules)
+        XCTAssertTrue(TargetRules(askSites: ["ask.example"]).hasGovernedSiteRules)
+        XCTAssertTrue(TargetRules(readOnlySites: ["read.example"]).hasGovernedSiteRules)
+    }
+
+    func testOldRulesJSONDecodesAndNewListsNormalize() throws {
+        let json = #"{"mode":"deny","deniedApps":[],"deniedSites":[],"allowedApps":[],"allowedSites":[]}"#
+        let oldRules = try JSONDecoder().decode(TargetRules.self, from: Data(json.utf8))
+        XCTAssertEqual(oldRules, TargetRules())
+
+        let rules = TargetRules(
+            askApps: [" COM.EXAMPLE.* ", "com.example.*", "*"],
+            askSites: ["https://ASK.Example/path", "ask.example"],
+            readOnlyApps: [" com.example.app ", "com.example.app"],
+            readOnlySites: ["https://READ.example/path", "read.example"]
+        ).normalized()
+        XCTAssertEqual(rules.askApps, ["COM.EXAMPLE.*"])
+        XCTAssertEqual(rules.askSites, ["ask.example"])
+        XCTAssertEqual(rules.readOnlyApps, ["com.example.app"])
+        XCTAssertEqual(rules.readOnlySites, ["read.example"])
+        XCTAssertEqual(try JSONDecoder().decode(TargetRules.self, from: JSONEncoder().encode(rules)), rules)
+    }
+
     func testDenyingChromeBlocksTheBrowserTools() {
         XCTAssertTrue(TargetRules(deniedApps: ["com.google.Chrome"]).blocksBrowser)
         XCTAssertTrue(TargetRules(deniedApps: ["com.google.*"]).blocksBrowser)
@@ -206,8 +259,8 @@ final class TargetRulesTests: XCTestCase {
 
     // MARK: - Engine guards
 
-    private func makeService() -> UseMacEngineService {
-        UseMacEngineService(socketPath: "/tmp/usemac-rules-\(UUID().uuidString.prefix(8)).sock", extensionPort: 0)
+    private func makeService(bridgeKeyDirectory: URL? = nil) -> UseMacEngineService {
+        UseMacEngineService(socketPath: "/tmp/usemac-rules-\(UUID().uuidString.prefix(8)).sock", extensionPort: 0, bridgeKeyDirectory: bridgeKeyDirectory)
     }
 
     /// Finder runs in every GUI session; the native guards are checked against it.
@@ -250,6 +303,32 @@ final class TargetRulesTests: XCTestCase {
 
         let audit = service.recentAuditEntries(limit: 50)
         XCTAssertTrue(audit.contains { $0.summary == "Blocked by the app and site rules" && !$0.success })
+    }
+
+    func testAskAppHoldsNonSensitiveStepsInAutonomousModeAndRedactsTypedText() async throws {
+        let app = try runningFinder()
+        let bundleId = try XCTUnwrap(app.bundleId)
+        use(TargetRules(askApps: [bundleId]))
+        let service = makeService()
+        service.setGovernancePolicy(.autonomous)
+
+        async let result = service.handle(RPCRequest(method: .act, act: BatchActionRequest(
+            app: bundleId, steps: [ActionStep(action: .type, text: "private text")]
+        )))
+        let shown = await waitForBridgeCondition { service.approvals.currentPrompt != nil }
+        XCTAssertTrue(shown)
+        let prompt = try XCTUnwrap(service.approvals.currentPrompt)
+        XCTAssertEqual(prompt.kinds, [.targetRule])
+        XCTAssertTrue(prompt.target.contains(app.name))
+        XCTAssertTrue(prompt.steps.joined().contains("12 chars"))
+        XCTAssertFalse(prompt.steps.joined().contains("private text"))
+
+        // Moving between non-blocking modes doesn't cancel a prompt required by a target.
+        service.setGovernancePolicy(.confirmSensitive)
+        let click = ApprovalInputCheck.PhysicalClick(sourcePid: 0, downTime: 1, upTime: 1.1)
+        XCTAssertTrue(service.approvals.decide(promptId: prompt.id, decision: .deny, click: click))
+        let refusal = await result
+        XCTAssertEqual(refusal.error?.code, "APPROVAL_DENIED")
     }
 
     func testExecutorRefusesABatchOnABlockedApp() async throws {
@@ -433,15 +512,149 @@ final class TargetRulesTests: XCTestCase {
         XCTAssertNil(bridge.latestFrame(tabId: 6))
     }
 
+    func testReadOnlySiteRefusesMutationPreflightButStillAllowsObserve() async throws {
+        use(TargetRules(readOnlySites: ["read.example"]))
+        try await withMockExtension(profile: "Read Only", respond: { command, _ in
+            command == "tabs"
+                ? ["ok": true, "tabId": 7, "tabs": [["tabId": 7, "title": "Read", "url": "https://read.example/", "active": true, "usemac": true]]]
+                : ["ok": true, "tabId": 7, "url": "https://read.example/"]
+        }) { bridge, commands in
+            let direct = await bridge.targetRulesPreflight(
+                profile: "Read Only", tabId: nil, url: "https://read.example/", checksTab: false, isMutating: true
+            )
+            XCTAssertEqual(direct?.error?.code, "POLICY_BLOCKED")
+            XCTAssertEqual(direct?.error?.hint, TargetRules.stopHint)
+            XCTAssertEqual(commands.all, [])
+
+            let lookup = await bridge.targetRulesPreflight(profile: "Read Only", tabId: nil, isMutating: true)
+            XCTAssertEqual(lookup?.error?.code, "POLICY_BLOCKED")
+            XCTAssertEqual(lookup?.tabId, 7)
+            XCTAssertEqual(lookup?.profileName, "Read Only")
+            XCTAssertEqual(commands.all, ["tabs"])
+
+            let observe = await bridge.observe(BrowserObserveParams(profile: "Read Only", tabId: 7))
+            XCTAssertTrue(observe.ok)
+            XCTAssertEqual(commands.all, ["tabs", "observe"])
+        }
+    }
+
+    func testAskSiteHoldsBrowserMutationsInAutonomousModeButNotObservation() async throws {
+        use(TargetRules(askSites: ["ask.example"]))
+        let keyDir = makeTemporaryBridgeKeyDirectory()
+        defer { try? FileManager.default.removeItem(at: keyDir) }
+        let service = makeService(bridgeKeyDirectory: keyDir)
+        service.setGovernancePolicy(.autonomous)
+        try await withMockExtension(profile: "Ask Site", bridge: service.chromeBridge, respond: { command, _ in
+            command == "tabs"
+                ? ["ok": true, "tabId": 7, "tabs": [["tabId": 7, "title": "Ask", "url": "https://ask.example/", "active": true, "usemac": true]]]
+                : ["ok": true, "tabId": 7, "url": "https://ask.example/"]
+        }) { bridge, commands in
+            let read = await bridge.observe(BrowserObserveParams(profile: "Ask Site", tabId: 7))
+            XCTAssertTrue(read.ok)
+            XCTAssertNil(service.approvals.currentPrompt)
+            commands.reset()
+
+            let request = RPCRequest(method: .browserAct, browserAct: BrowserActParams(
+                profile: "Ask Site", tabId: 7, steps: [ActionStep(action: .click, elementId: "@b1")]
+            ))
+            async let result = service.handle(request)
+            let shown = await waitForBridgeCondition { service.approvals.currentPrompt != nil }
+            XCTAssertTrue(shown)
+            let prompt = try XCTUnwrap(service.approvals.currentPrompt)
+            XCTAssertEqual(prompt.kinds, [.targetRule])
+            XCTAssertTrue(prompt.target.contains("ask.example"))
+            XCTAssertTrue(prompt.steps.joined().contains("click"))
+            XCTAssertEqual(commands.all, ["tabs"])
+
+            let click = ApprovalInputCheck.PhysicalClick(sourcePid: 0, downTime: 1, upTime: 1.1)
+            XCTAssertTrue(service.approvals.decide(promptId: prompt.id, decision: .deny, click: click))
+            let refusal = await result
+            XCTAssertEqual(refusal.error?.code, "APPROVAL_DENIED")
+            XCTAssertEqual(commands.all, ["tabs"])
+
+            let unknown = await bridge.resolveGovernedTabSitePolicy(profile: "Ask Site", tabId: 999)
+            XCTAssertEqual(unknown.failure?.error?.code, TargetRules.errorCode)
+        }
+    }
+
+    func testAskBrowserOpenUsesTheDestinationWhenCreatingATab() async throws {
+        use(TargetRules(askSites: ["ask.example"]))
+        let service = makeService()
+        service.setGovernancePolicy(.autonomous)
+        let request = RPCRequest(method: .browserOpen, browserOpen: BrowserOpenParams(
+            url: "https://ask.example/", autoDismissOverlays: true
+        ))
+        async let result = service.approvalRefusal(for: request, startNs: DispatchTime.now().uptimeNanoseconds)
+        // No extension is connected: an explicit new tab only needs the supplied destination to ask.
+        let shown = await waitForBridgeCondition { service.approvals.currentPrompt != nil }
+        XCTAssertTrue(shown)
+        let prompt = try XCTUnwrap(service.approvals.currentPrompt)
+        XCTAssertEqual(prompt.kinds, [.targetRule])
+        XCTAssertEqual(prompt.steps, ["Dismiss browser overlays"])
+        XCTAssertTrue(prompt.target.contains("new tab"))
+        XCTAssertTrue(prompt.target.contains("ask.example"))
+
+        let click = ApprovalInputCheck.PhysicalClick(sourcePid: 0, downTime: 1, upTime: 1.1)
+        XCTAssertTrue(service.approvals.decide(promptId: prompt.id, decision: .deny, click: click))
+        let refusal = await result
+        XCTAssertEqual(refusal?.error?.code, "APPROVAL_DENIED")
+    }
+
+    func testAskTargetCanAllowForTaskButNeverWhenThereIsAnUpload() async throws {
+        let broker = ApprovalBroker()
+        let ask = ApprovalBroker.Request(
+            method: "act", target: "TextEdit", steps: ["type (12 chars)"], kinds: [.targetRule],
+            taskId: "task-a", grantTarget: "app:com.apple.textedit"
+        )
+        let click = ApprovalInputCheck.PhysicalClick(sourcePid: 0, downTime: 1, upTime: 1.1)
+        async let result = broker.requestApproval(ask)
+        let shown = await waitForBridgeCondition { broker.currentPrompt != nil }
+        XCTAssertTrue(shown)
+        let prompt = try XCTUnwrap(broker.currentPrompt)
+        XCTAssertTrue(prompt.canAllowForTask)
+        XCTAssertTrue(broker.decide(promptId: prompt.id, decision: .allowForTask, click: click))
+        let first = await result
+        XCTAssertEqual(first, .allowedForTask(taskId: "task-a"))
+        let granted = await broker.requestApproval(ask)
+        XCTAssertEqual(granted, .allowedByTaskGrant(taskId: "task-a"))
+
+        var upload = ask
+        upload.kinds.insert(.upload)
+        let uploadRequest = upload
+        async let uploadResult = broker.requestApproval(uploadRequest)
+        let uploadShown = await waitForBridgeCondition { broker.currentPrompt != nil }
+        XCTAssertTrue(uploadShown)
+        let uploadPrompt = try XCTUnwrap(broker.currentPrompt)
+        XCTAssertFalse(uploadPrompt.canAllowForTask)
+        XCTAssertFalse(broker.decide(promptId: uploadPrompt.id, decision: .allowForTask, click: click))
+        XCTAssertTrue(broker.decide(promptId: uploadPrompt.id, decision: .deny, click: click))
+        let denied = await uploadResult
+        XCTAssertEqual(denied, .denied)
+    }
+
+    func testNativeBrowserProbeAppliesReadOnlyAndAskAndFailsClosedWhenUnknown() {
+        let rules = TargetRules(askSites: ["ask.example", "read.example"], readOnlySites: ["read.example"])
+        let read = NativeBrowserSiteRules.decision(rules: rules, probe: .init(axURL: "https://read.example"))
+        XCTAssertEqual(read.policy, .readOnly)
+        XCTAssertNil(read.unconfirmedMessage)
+        let ask = NativeBrowserSiteRules.decision(rules: rules, probe: .init(bridgeURL: "https://ask.example"))
+        XCTAssertEqual(ask.policy, .ask)
+        XCTAssertEqual(ask.site?.host, "ask.example")
+        let unknown = NativeBrowserSiteRules.decision(rules: rules, probe: .init(bridgeAmbiguous: true))
+        XCTAssertEqual(unknown.policy, .block)
+        XCTAssertNotNil(unknown.unconfirmedMessage)
+    }
+
     /// A connected bridge whose mock extension answers each request with `respond` (nil: no answer at all).
     private func withMockExtension(
         profile: String,
+        bridge existingBridge: ChromeExtensionBridge? = nil,
         respond: @escaping @Sendable (_ command: String, _ request: [String: Any]) -> [String: Any]?,
         _ body: (ChromeExtensionBridge, CommandLog) async throws -> Void
     ) async throws {
         let keyDir = makeTemporaryBridgeKeyDirectory()
         defer { try? FileManager.default.removeItem(at: keyDir) }
-        let bridge = ChromeExtensionBridge(port: 0, pairingStore: BridgePairingStore(directory: keyDir))
+        let bridge = existingBridge ?? ChromeExtensionBridge(port: 0, pairingStore: BridgePairingStore(directory: keyDir))
         bridge.baseCommandTimeoutSeconds = 0.15
         bridge.start()
         defer { bridge.stop() }

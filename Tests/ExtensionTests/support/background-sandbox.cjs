@@ -352,11 +352,13 @@ function createBackgroundSandbox(options = {}) {
         attached.delete(tabId);
       },
       sendCommand: async ({ tabId }, method, params) => {
-        record("debugger.sendCommand", tabId, method);
+        record("debugger.sendCommand", tabId, method, params);
         if (!attached.has(tabId)) {
           throw new Error(`Debugger is not attached to the tab with id: ${tabId}.`);
         }
-        const result = options.cdp ? options.cdp(tabId, method, params) : undefined;
+        const result = options.cdp ? await options.cdp(tabId, method, params) : undefined;
+        const replace = method === "Runtime.evaluate" && /^location\.replace\((.*)\)$/.exec(params?.expression);
+        if (replace && !result?.exceptionDetails) navigate(getTabOrThrow(tabId), JSON.parse(replace[1]));
         return result === undefined ? {} : result;
       }
     }
@@ -406,8 +408,10 @@ function createBackgroundSandbox(options = {}) {
   };
   context.self = context;
   vm.createContext(context);
-  context.importScripts = (file) => {
-    vm.runInContext(fs.readFileSync(path.join(extensionDir, file), "utf8"), context, { filename: file });
+  context.importScripts = (...files) => {
+    for (const file of files) {
+      vm.runInContext(fs.readFileSync(path.join(extensionDir, file), "utf8"), context, { filename: file });
+    }
   };
   vm.runInContext(fs.readFileSync(path.join(extensionDir, "background.js"), "utf8"), context, {
     filename: "background.js"
@@ -447,7 +451,7 @@ function createBackgroundSandbox(options = {}) {
       }
     },
 
-    /** Calls a top-level function of background.js; plain values come back as outer-realm JSON clones. */
+    /** Calls a top-level worker function; plain values come back as outer-realm JSON clones. */
     call(name, ...args) {
       return context[name](...args);
     },

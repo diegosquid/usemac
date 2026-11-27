@@ -102,14 +102,34 @@ public enum NativeBrowserSiteRules {
     /// Returns a refusal when the window's site is blocked or cannot be confirmed.
     public static func evaluate(rules: TargetRules, probe: ProbeResult, blockedCandidateFound: Bool = false) -> String? {
         guard rules.hasSiteRules else { return nil }
-        if rules.blocksBrowser { return TargetRules.blockedBrowserMessage }
+        return decision(rules: rules, probe: probe, blockedCandidateFound: blockedCandidateFound).blockedMessage
+    }
 
+    struct WindowSiteDecision {
+        var policy: TargetRules.AccessPolicy = .allow
+        var site: TargetRules.Site?
+        var unconfirmedMessage: String?
+        var blockedMessage: String?
+    }
+
+    static func decision(rules: TargetRules, probe: ProbeResult, blockedCandidateFound: Bool = false) -> WindowSiteDecision {
+        if rules.blocksBrowser {
+            return WindowSiteDecision(policy: .block, blockedMessage: TargetRules.blockedBrowserMessage)
+        }
         let axURL = validURL(probe.axURL)
         let bridgeURL = validURL(probe.bridgeURL)
-        if rules.blocksURL(axURL) || rules.blocksURL(bridgeURL) || blockedCandidateFound {
-            return TargetRules.blockedSiteMessage(host: nil)
+        let axPolicy = rules.effectiveSitePolicy(url: axURL)
+        let bridgePolicy = rules.effectiveSitePolicy(url: bridgeURL)
+        let policy = axPolicy.combined(with: bridgePolicy)
+        if policy == .block || blockedCandidateFound {
+            let url = axPolicy == .block ? axURL : bridgeURL
+            let site = url.flatMap(TargetRules.site(ofURL:))
+            return WindowSiteDecision(policy: .block, site: site, blockedMessage: TargetRules.blockedSiteMessage(host: nil))
         }
-        if axURL != nil || (bridgeURL != nil && !probe.bridgeAmbiguous) { return nil }
+        if axURL != nil || (bridgeURL != nil && !probe.bridgeAmbiguous) {
+            let url = axPolicy == policy ? axURL ?? bridgeURL : bridgeURL
+            return WindowSiteDecision(policy: policy, site: url.flatMap(TargetRules.site(ofURL:)))
+        }
 
         let reason: String
         if probe.bridgeAmbiguous {
@@ -121,7 +141,8 @@ public enum NativeBrowserSiteRules {
         } else {
             reason = "the window's active tab URL is not known yet"
         }
-        return TargetRules.unconfirmedSiteMessage(reason: reason)
+        let message = TargetRules.unconfirmedSiteMessage(reason: reason)
+        return WindowSiteDecision(policy: .block, unconfirmedMessage: message, blockedMessage: message)
     }
 
     /// Reads the active document URL from the window's accessibility tree, not from browser chrome text.
@@ -165,20 +186,55 @@ public enum NativeBrowserSiteRules {
         rules: TargetRules = TargetRulesStore.shared.rules,
         chromeBridge: ChromeExtensionBridge? = nil
     ) async -> String? {
-        guard isChromiumApp(bundleId: app.bundleId, name: app.name), rules.hasSiteRules else { return nil }
-        if rules.blocksBrowser { return TargetRules.blockedBrowserMessage }
+        guard rules.hasSiteRules else { return nil }
+        return await windowSiteDecision(for: app, rules: rules, chromeBridge: chromeBridge).blockedMessage
+    }
+
+    /// Refuses native mutations on blocked, unconfirmed or Read-only Chromium sites.
+    public static func mutatingPolicyRefusal(
+        for app: AppDescriptor,
+        rules: TargetRules = TargetRulesStore.shared.rules,
+        chromeBridge: ChromeExtensionBridge? = nil
+    ) async -> (code: String, message: String)? {
+        let result = await windowSiteDecision(for: app, rules: rules, chromeBridge: chromeBridge)
+        if let message = result.blockedMessage {
+            return (TargetRules.errorCode, message)
+        }
+        if result.policy == .readOnly {
+            return ("POLICY_BLOCKED", TargetRules.readOnlySiteMessage(host: result.site?.host))
+        }
+        return nil
+    }
+
+    /// Resolves the active document's site policy for native Chromium automation.
+    public static func effectiveWindowSitePolicy(
+        for app: AppDescriptor,
+        rules: TargetRules = TargetRulesStore.shared.rules,
+        chromeBridge: ChromeExtensionBridge? = nil
+    ) async -> (policy: TargetRules.AccessPolicy, host: String?, unconfirmedMessage: String?) {
+        let result = await windowSiteDecision(for: app, rules: rules, chromeBridge: chromeBridge)
+        return (result.policy, result.site?.host, result.unconfirmedMessage)
+    }
+
+    static func windowSiteDecision(
+        for app: AppDescriptor, rules: TargetRules, chromeBridge: ChromeExtensionBridge?
+    ) async -> WindowSiteDecision {
+        guard isChromiumApp(bundleId: app.bundleId, name: app.name), rules.hasGovernedSiteRules else {
+            return WindowSiteDecision()
+        }
+        if rules.blocksBrowser { return decision(rules: rules, probe: ProbeResult()) }
 
         let axURL = axWebAreaURL(pid: app.pid, windowTitle: app.windowTitle)
         var probe = ProbeResult(axURL: axURL)
-        guard axURL == nil, let chromeBridge else { return evaluate(rules: rules, probe: probe) }
+        guard axURL == nil, let chromeBridge else { return decision(rules: rules, probe: probe) }
 
         let profiles = chromeBridge.connectedProfiles()
-        guard !profiles.isEmpty else { return evaluate(rules: rules, probe: probe) }
+        guard !profiles.isEmpty else { return decision(rules: rules, probe: probe) }
         probe.bridgeAvailable = true
 
         guard Set(profiles.map { $0.profileName.lowercased() }).count == profiles.count else {
             probe.bridgeFailureReason = "multiple Chrome profiles share the same name"
-            return evaluate(rules: rules, probe: probe)
+            return decision(rules: rules, probe: probe)
         }
         let profileQueries: [String?] = profiles.count == 1 ? [nil] : profiles.map { $0.profileName }
 
@@ -201,7 +257,7 @@ public enum NativeBrowserSiteRules {
         // A partial list can identify a blocked candidate but cannot confirm a unique allowed tab.
         if probe.bridgeFailureReason == nil { probe.bridgeURL = match.url }
         probe.bridgeAmbiguous = match.ambiguous
-        return evaluate(rules: rules, probe: probe, blockedCandidateFound: match.blockedCandidateFound)
+        return decision(rules: rules, probe: probe, blockedCandidateFound: match.blockedCandidateFound)
     }
 
     private static func nonempty(_ raw: String?) -> String? {

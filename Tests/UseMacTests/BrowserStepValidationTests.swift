@@ -53,4 +53,45 @@ final class BrowserStepValidationTests: XCTestCase {
         ]
         XCTAssertNil(BrowserStepValidation.targetlessSetValueMessage(in: steps))
     }
+
+    func testDragAcceptsEachBrowserTargetShape() {
+        XCTAssertNil(BrowserStepValidation.invalidStepMessage(in: [
+            ActionStep(action: .drag, elementId: "@b1", toElementId: "@b2"),
+            ActionStep(action: .drag, selector: "#source", toSelector: "#destination"),
+            ActionStep(action: .drag, match: ElementMatch(title: "Source"), toMatch: ElementMatch(role: "button")),
+            ActionStep(action: .drag, x: 0, y: 50, toX: 100, toY: 0)
+        ]))
+    }
+
+    func testDragRequiresBothEndpoints() {
+        let blank = ElementMatch(role: " \n", exact: true, index: 1)
+        XCTAssertEqual(BrowserStepValidation.invalidStepMessage(in: [
+            ActionStep(action: .wait),
+            ActionStep(action: .drag, elementId: " ", x: 1, match: blank, toSelector: "#destination")
+        ]), "drag at step index 1 requires a source: pass elementId, selector, match, or both x and y.")
+        XCTAssertEqual(BrowserStepValidation.invalidStepMessage(in: [
+            ActionStep(action: .drag, selector: "#source", toSelector: " ", toMatch: blank, toY: 1)
+        ]), "drag at step index 0 requires a destination: pass toElementId, toSelector, toMatch, or both toX and toY.")
+    }
+
+    func testSaveFileIsNativeOnly() {
+        XCTAssertEqual(BrowserStepValidation.invalidStepMessage(in: [
+            ActionStep(action: .click, selector: "#download"),
+            ActionStep(action: .saveFile, files: ["/Users/me/Downloads/report.pdf"])
+        ]), "saveFile at step index 1 is only for native macOS Save panels (act). In Chrome, click the download control and inspect stepResults[].downloadPath or browser_extract mode=\"downloads\".")
+    }
+
+    func testTargetlessSetValueStillTakesPrecedence() {
+        let steps = [ActionStep(action: .drag), ActionStep(action: .setValue, text: "value")]
+        XCTAssertTrue(BrowserStepValidation.invalidStepMessage(in: steps)?.hasPrefix("setValue at step index 1") == true)
+    }
+
+    func testDialogActionIsOptionalAndCaseInsensitive() {
+        for action in [nil, "accept", "AcCePt", "dismiss", "DISMISS"] {
+            XCTAssertNil(BrowserStepValidation.invalidDialogActionMessage(action))
+        }
+        for action in ["", " accept ", "always"] {
+            XCTAssertEqual(BrowserStepValidation.invalidDialogActionMessage(action), "dialogAction must be \"accept\" or \"dismiss\".")
+        }
+    }
 }

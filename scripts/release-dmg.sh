@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-VERSION="${USEMAC_VERSION:-0.10.0}"
-BUILD_NUMBER="${USEMAC_BUILD_NUMBER:-66}"
+VERSION="${USEMAC_VERSION:-0.11.0}"
+BUILD_NUMBER="${USEMAC_BUILD_NUMBER:-67}"
 NOTARIZE="0"
 SKIP_NOTARIZE="0"
 UPDATE_APPCAST="0"
@@ -75,6 +75,7 @@ find_sign_update() {
 DEV_ID=""
 SIGN_UPDATE=""
 RELEASE_NOTES_FILE="$ROOT_DIR/docs/release-notes/${VERSION}.html"
+CASK_FILE="$ROOT_DIR/Casks/usemac.rb"
 
 if [[ -z "${USEMAC_SPARKLE_PUBLIC_KEY:-}" && -f "$SCRIPT_DIR/sparkle-public-key.txt" ]]; then
   USEMAC_SPARKLE_PUBLIC_KEY="$(tr -d '[:space:]' < "$SCRIPT_DIR/sparkle-public-key.txt")"
@@ -104,6 +105,10 @@ fi
 
 if [[ "$LOCAL_DEV" != "1" ]]; then
   PREFLIGHT_ERRORS=()
+
+  if [[ -f "$CASK_FILE" ]] && ! python3 "$SCRIPT_DIR/update-homebrew-cask.py" "$CASK_FILE" --check >/dev/null; then
+    PREFLIGHT_ERRORS+=("Homebrew cask validation failed")
+  fi
 
   if [[ -n "${USEMAC_SIGN_IDENTITY:-}" ]]; then
     if [[ "$USEMAC_SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
@@ -165,6 +170,10 @@ if [[ "$LOCAL_DEV" != "1" ]]; then
   fi
 else
   if [[ "$CHECK_ONLY" == "1" ]]; then
+    if [[ -f "$CASK_FILE" ]] && ! python3 "$SCRIPT_DIR/update-homebrew-cask.py" "$CASK_FILE" --check >/dev/null; then
+      echo "local preflight: Homebrew cask validation failed" >&2
+      exit 1
+    fi
     echo "Local dev preflight OK."
     exit 0
   fi
@@ -240,6 +249,12 @@ if [[ "$LOCAL_DEV" != "1" && "$NOTARIZE" == "1" ]]; then
 
   mkdir -p "$ROOT_DIR/website/public/downloads"
   cp "$DMG_PATH" "$ROOT_DIR/website/public/downloads/${DMG_NAME}"
+  if [[ "$VERSION" != *-* ]]; then
+    if [[ -f "$CASK_FILE" ]]; then
+      python3 "$SCRIPT_DIR/update-homebrew-cask.py" "$CASK_FILE" --version "$VERSION" --sha256 "$DMG_SHA256"
+    fi
+    printf '%s  %s\n' "$DMG_SHA256" "$DMG_NAME" > "$ROOT_DIR/dist/usemac-${VERSION}-SHA256SUMS.txt"
+  fi
   printf '/downloads/usemac-latest-arm64.dmg /downloads/%s 302\n' "$DMG_NAME" > "$ROOT_DIR/website/public/_redirects"
   echo "Published ${DMG_NAME} and updated website/public/_redirects."
 elif [[ "$LOCAL_DEV" != "1" && "$SKIP_NOTARIZE" == "1" ]]; then

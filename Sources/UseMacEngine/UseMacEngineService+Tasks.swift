@@ -86,7 +86,7 @@ extension UseMacEngineService {
             return await handleScopedSkillRun(request, initialScope: initialScope)
         }
         var scope = initialScope
-        if let busy = leaseConflict(scope) {
+        if let busy = await acquireLeaseOrBusy(scope) {
             let refused = targetBusyResponse(request: scope.request, busy: busy)
             taskTabs.record(scope, response: refused)
             return refused
@@ -123,8 +123,10 @@ extension UseMacEngineService {
             taskTabs.record(initialScope, response: errorResponse)
             return errorResponse
         case .success(let prepared):
-            let expandedScope = taskTabs.scope(prepared.delegatedRequest)
-            if let busy = leaseConflict(expandedScope) {
+            var delegated = prepared.delegatedRequest
+            if delegated.waitForLeaseMs == nil { delegated.waitForLeaseMs = request.effectiveWaitForLeaseMs }
+            let expandedScope = taskTabs.scope(delegated)
+            if let busy = await acquireLeaseOrBusy(expandedScope) {
                 let refused = targetBusyResponse(request: expandedScope.request, busy: busy)
                 taskTabs.record(expandedScope, response: refused)
                 return refused
@@ -152,12 +154,64 @@ extension UseMacEngineService {
 
     /// Leases the window or tab an acting request works in for its task, or says which running task holds it. Reads
     /// never wait, requests of no task are never refused, and a Kill Switch or pause answers POLICY_BLOCKED first.
-    private func leaseConflict(_ scope: TaskTabRegistry.Scope) -> TaskTabRegistry.Busy? {
+    private func leaseConflict(
+        _ scope: TaskTabRegistry.Scope, queue: Bool, wait: TaskTabRegistry.LeaseWait? = nil
+    ) -> (busy: TaskTabRegistry.Busy?, wait: TaskTabRegistry.LeaseWait?) {
         let request = scope.request
         guard request.actsOnTarget, taskTabs.hasRunningTasks,
               scope.taskId != nil || request.namedTaskId != nil,
-              !isKillSwitchTripped(), getGovernancePolicy() != .paused else { return nil }
-        return taskTabs.claim(scope, windows: leaseWindows(for: request), tabs: request.namedTabId.map { [$0] } ?? [])
+              !leaseWaitingBlocked else { return (nil, nil) }
+        let windows = leaseWindows(for: request)
+        let tabs = request.namedTabId.map { [$0] } ?? []
+        guard !leaseWaitingBlocked else { return (nil, nil) }
+        if queue {
+            return taskTabs.claimWithWait(scope, windows: windows, tabs: tabs, wait: wait)
+        }
+        return (taskTabs.claim(scope, windows: windows, tabs: tabs), nil)
+    }
+
+    private var leaseWaitingBlocked: Bool {
+        isKillSwitchTripped() || getGovernancePolicy() == .paused
+    }
+
+    private func acquireLeaseOrBusy(_ scope: TaskTabRegistry.Scope) async -> TaskTabRegistry.Busy? {
+        let budgetMs = scope.request.effectiveWaitForLeaseMs
+        let initial = leaseConflict(scope, queue: budgetMs > 0)
+        guard var busy = initial.busy, let wait = initial.wait else { return initial.busy }
+        let deadline = ContinuousClock.now + .milliseconds(budgetMs)
+        emitLiveActivity(LiveActivityItem(
+            kind: .actionStart,
+            title: "Waiting for \(busy.target)…",
+            subtitle: "In use by \(busy.agent ?? busy.taskId)",
+            isInProgress: true,
+            agentName: TaskActivityContext.agentName,
+            taskId: TaskActivityContext.taskId
+        ))
+        // Registry events wake this request as soon as a lease changes. The clock also wakes it
+        // to see policy changes and idle expiry even when no other request touches the registry.
+        let ticker = Task {
+            while !Task.isCancelled {
+                let next = min(deadline, ContinuousClock.now + .milliseconds(50))
+                do { try await Task.sleep(until: next) } catch { break }
+                wait.signal.yield(())
+                if next == deadline { break }
+            }
+        }
+        defer {
+            ticker.cancel()
+            taskTabs.finishLeaseWait(wait)
+        }
+        var signals = wait.signals.makeAsyncIterator()
+        repeat {
+            // Let the regular request path produce the official policy refusal.
+            if leaseWaitingBlocked { return nil }
+            if Task.isCancelled { return busy }
+            guard let conflict = leaseConflict(scope, queue: true, wait: wait).busy,
+                  !leaseWaitingBlocked else { return nil }
+            busy = conflict
+            if ContinuousClock.now >= deadline { return busy }
+        } while await signals.next() != nil
+        return leaseWaitingBlocked ? nil : busy
     }
 
     /// The windows a native `act` or mutating `app_menu` works in: the target window of each app it names (the `window`

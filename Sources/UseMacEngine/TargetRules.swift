@@ -3,8 +3,8 @@ import Foundation
 import UseMacProtocol
 
 /// The user's app and site rules (Settings → App and site rules): apps, by bundle ID, and sites, by host pattern,
-/// that agents never observe, act on or capture. Requests that would reach them fail with TARGET_BLOCKED, the
-/// live preview never streams them, and `list_apps` / `browser_tabs` leave them out.
+/// that agents can use, must ask before acting on, can only read, or may never touch. Blocked targets fail with
+/// TARGET_BLOCKED, the live preview never streams them, and `list_apps` / `browser_tabs` leave them out.
 ///
 /// Only the user edits the rules, in UseMac's Settings. No socket, MCP or CLI method changes them.
 public struct TargetRules: Codable, Equatable, Sendable {
@@ -15,6 +15,21 @@ public struct TargetRules: Codable, Equatable, Sendable {
         case allow
     }
 
+    public enum AccessPolicy: String, Codable, CaseIterable, Sendable {
+        case allow
+        case ask
+        case readOnly
+        case block
+
+        /// The more restrictive policy across all targets a request can reach.
+        func combined(with other: Self) -> Self {
+            if self == .block || other == .block { return .block }
+            if self == .readOnly || other == .readOnly { return .readOnly }
+            if self == .ask || other == .ask { return .ask }
+            return .allow
+        }
+    }
+
     public var mode: Mode
     /// Bundle IDs. A trailing `*` matches any bundle ID that starts with the rest (`com.1password.*`).
     public var deniedApps: [String]
@@ -23,19 +38,46 @@ public struct TargetRules: Codable, Equatable, Sendable {
     public var deniedSites: [String]
     public var allowedApps: [String]
     public var allowedSites: [String]
+    public var askApps: [String]
+    public var askSites: [String]
+    public var readOnlyApps: [String]
+    public var readOnlySites: [String]
 
     public init(
         mode: Mode = .deny,
         deniedApps: [String] = [],
         deniedSites: [String] = [],
         allowedApps: [String] = [],
-        allowedSites: [String] = []
+        allowedSites: [String] = [],
+        askApps: [String] = [],
+        askSites: [String] = [],
+        readOnlyApps: [String] = [],
+        readOnlySites: [String] = []
     ) {
         self.mode = mode
         self.deniedApps = deniedApps
         self.deniedSites = deniedSites
         self.allowedApps = allowedApps
         self.allowedSites = allowedSites
+        self.askApps = askApps
+        self.askSites = askSites
+        self.readOnlyApps = readOnlyApps
+        self.readOnlySites = readOnlySites
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            mode: try values.decode(Mode.self, forKey: .mode),
+            deniedApps: try values.decode([String].self, forKey: .deniedApps),
+            deniedSites: try values.decode([String].self, forKey: .deniedSites),
+            allowedApps: try values.decode([String].self, forKey: .allowedApps),
+            allowedSites: try values.decode([String].self, forKey: .allowedSites),
+            askApps: try values.decodeIfPresent([String].self, forKey: .askApps) ?? [],
+            askSites: try values.decodeIfPresent([String].self, forKey: .askSites) ?? [],
+            readOnlyApps: try values.decodeIfPresent([String].self, forKey: .readOnlyApps) ?? [],
+            readOnlySites: try values.decodeIfPresent([String].self, forKey: .readOnlySites) ?? []
+        )
     }
 
     // MARK: - Defaults
@@ -101,6 +143,17 @@ public struct TargetRules: Codable, Equatable, Sendable {
         return "\(subject) is blocked by the user's UseMac rules, \(outcome). \(stopHint)"
     }
 
+    public static func readOnlyAppMessage(_ appName: String?) -> String {
+        let name = appName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subject = (name?.isEmpty == false) ? name! : "This app"
+        return "\(subject) is set to Read-only in the user's UseMac rules, so mutating actions are blocked (observe and screenshot still work). \(stopHint)"
+    }
+
+    public static func readOnlySiteMessage(host: String?) -> String {
+        let subject = host.map { "This site (\($0))" } ?? "This tab's site"
+        return "\(subject) is set to Read-only in the user's UseMac rules, so mutating browser actions are blocked (observe, extract and screenshot still work). \(stopHint)"
+    }
+
     /// The site rules could not be checked for the tab a command would run on, so it was refused.
     public static func unconfirmedSiteMessage(reason: String) -> String {
         "UseMac couldn't confirm this tab's site against the user's rules (\(reason)), so nothing ran. Retry once; if it fails again, stop and tell the user."
@@ -118,7 +171,7 @@ public struct TargetRules: Codable, Equatable, Sendable {
             return true
         }
         guard mode == .allow else { return false }
-        return id.isEmpty || !allowedApps.contains(where: { Self.appPattern($0, matches: id) })
+        return id.isEmpty || !(allowedApps + readOnlyApps + askApps).contains { Self.appPattern($0, matches: id) }
     }
 
     /// True when Chrome itself is denied, which blocks every browser tool. Allow mode does not need Chrome listed:
@@ -138,12 +191,36 @@ public struct TargetRules: Codable, Equatable, Sendable {
         }
         guard mode == .allow else { return false }
         guard let site else { return true }
-        return !allowedSites.contains(where: { Self.sitePattern($0, matches: site) })
+        return !(allowedSites + readOnlySites + askSites).contains { Self.sitePattern($0, matches: site) }
+    }
+
+    public func effectiveAppPolicy(bundleId: String?) -> AccessPolicy {
+        if blocksApp(bundleId: bundleId) { return .block }
+        let id = (bundleId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return .allow }
+        if readOnlyApps.contains(where: { Self.appPattern($0, matches: id) }) { return .readOnly }
+        if askApps.contains(where: { Self.appPattern($0, matches: id) }) { return .ask }
+        return .allow
+    }
+
+    public func effectiveSitePolicy(url: String?) -> AccessPolicy {
+        if blocksURL(url) { return .block }
+        guard let site = Self.site(ofURL: (url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return .allow
+        }
+        if readOnlySites.contains(where: { Self.sitePattern($0, matches: site) }) { return .readOnly }
+        if askSites.contains(where: { Self.sitePattern($0, matches: site) }) { return .ask }
+        return .allow
     }
 
     /// True when some page could be blocked, so a browser command has to look up its tab's URL first.
     public var hasSiteRules: Bool {
         mode == .allow || !deniedSites.isEmpty || blocksBrowser
+    }
+
+    /// True when a mutating request must know its site's policy before it runs.
+    public var hasGovernedSiteRules: Bool {
+        hasSiteRules || !readOnlySites.isEmpty || !askSites.isEmpty
     }
 
     /// The host shown in a refusal, or nil for a URL without one.
@@ -323,7 +400,11 @@ public struct TargetRules: Codable, Equatable, Sendable {
             deniedApps: clean(deniedApps, Self.normalizedAppPattern),
             deniedSites: clean(deniedSites, Self.normalizedSitePattern),
             allowedApps: clean(allowedApps, Self.normalizedAppPattern),
-            allowedSites: clean(allowedSites, Self.normalizedSitePattern)
+            allowedSites: clean(allowedSites, Self.normalizedSitePattern),
+            askApps: clean(askApps, Self.normalizedAppPattern),
+            askSites: clean(askSites, Self.normalizedSitePattern),
+            readOnlyApps: clean(readOnlyApps, Self.normalizedAppPattern),
+            readOnlySites: clean(readOnlySites, Self.normalizedSitePattern)
         )
     }
 
@@ -354,6 +435,10 @@ public final class TargetRulesStore: @unchecked Sendable {
         static let deniedSites = "usemac.rules.deniedSites"
         static let allowedApps = "usemac.rules.allowedApps"
         static let allowedSites = "usemac.rules.allowedSites"
+        static let askApps = "usemac.rules.askApps"
+        static let askSites = "usemac.rules.askSites"
+        static let readOnlyApps = "usemac.rules.readOnlyApps"
+        static let readOnlySites = "usemac.rules.readOnlySites"
     }
 
     private let lock = NSLock()
@@ -400,7 +485,11 @@ public final class TargetRulesStore: @unchecked Sendable {
             deniedApps: defaults.stringArray(forKey: Keys.deniedApps) ?? base.deniedApps,
             deniedSites: defaults.stringArray(forKey: Keys.deniedSites) ?? base.deniedSites,
             allowedApps: defaults.stringArray(forKey: Keys.allowedApps) ?? base.allowedApps,
-            allowedSites: defaults.stringArray(forKey: Keys.allowedSites) ?? base.allowedSites
+            allowedSites: defaults.stringArray(forKey: Keys.allowedSites) ?? base.allowedSites,
+            askApps: defaults.stringArray(forKey: Keys.askApps) ?? [],
+            askSites: defaults.stringArray(forKey: Keys.askSites) ?? [],
+            readOnlyApps: defaults.stringArray(forKey: Keys.readOnlyApps) ?? [],
+            readOnlySites: defaults.stringArray(forKey: Keys.readOnlySites) ?? []
         ).normalized()
     }
 
@@ -435,5 +524,24 @@ public final class TargetRulesStore: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    public func readOnlyMessage(for app: AppDescriptor?) -> String? {
+        guard let app, rules.effectiveAppPolicy(bundleId: app.bundleId) == .readOnly else { return nil }
+        return TargetRules.readOnlyAppMessage(app.name)
+    }
+
+    public func readOnlyMessage(forQueries queries: [String?], in monitor: WorkspaceMonitor) -> String? {
+        for query in queries {
+            if let message = readOnlyMessage(for: monitor.namedApp(query)) {
+                return message
+            }
+        }
+        return nil
+    }
+
+    public func requiresAsk(for app: AppDescriptor?) -> Bool {
+        guard let app else { return false }
+        return rules.effectiveAppPolicy(bundleId: app.bundleId) == .ask
     }
 }

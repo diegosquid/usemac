@@ -6,6 +6,25 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-27
+
+### Added
+
+- **Quick Setup:** connect Claude Code, Claude Desktop, Cursor, Codex, and Antigravity from UseMac Settings. UseMac backs up existing client configurations before updating them.
+- **App and site rules:** choose Allow, Ask, Read-only, or Block per target. UseMac keeps existing rules when upgrading.
+- **Drag and save:** drag inside native apps or Chrome, and save to an explicit path in a native Save dialog. Existing files are not replaced unless the caller opts in.
+- **Chrome dialogs:** handle alerts, confirmations, prompts, and before-unload dialogs. Agents can supply an answer when appropriate and read what Chrome did.
+- **Tab and window leases:** agents can wait in order for a busy target instead of starting a retry loop.
+- **Homebrew:** a repository cask for the signed Apple Silicon DMG and the bundled CLI.
+
+### Changed
+
+- Split the largest Chrome extension and Swift sources into smaller modules without changing the existing command names.
+
+### Fixed
+
+- Chrome opens new scriptable tabs without adding the temporary blank page to their navigation history.
+
 ## [0.10.0] - 2026-11-27
 
 The stable Apple Silicon download is signed with Developer ID and notarized by Apple. If you are upgrading from 0.5.0, install the new DMG manually: the previous stable download did not include the Sparkle update key.
@@ -364,7 +383,9 @@ First public release.
 - Live preview HUD, on-device vision (Apple Vision OCR and a local MLX model) and a first-run setup guide.
 - Sparkle 2 updates and a drag-to-Applications DMG.
 
-[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.9.0-beta.1...HEAD
+[Unreleased]: https://github.com/diegosquid/usemac/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/diegosquid/usemac/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/diegosquid/usemac/compare/v0.9.0-beta.1...v0.10.0
 [0.9.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.8.0-beta.1...v0.9.0-beta.1
 [0.8.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.7.0-beta.1...v0.8.0-beta.1
 [0.7.0-beta.1]: https://github.com/diegosquid/usemac/compare/v0.6.0-beta.3...v0.7.0-beta.1

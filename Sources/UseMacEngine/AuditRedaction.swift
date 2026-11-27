@@ -32,6 +32,12 @@ extension RPCRequest {
         if let expression = browserExtract?.expression {
             secrets.append(expression)
         }
+        if let prompt = browserAct?.dialogPromptText {
+            secrets.append(prompt)
+        }
+        if let openPrompt = browserOpen?.dialogPromptText {
+            secrets.append(openPrompt)
+        }
         return secrets
     }
 }
@@ -77,7 +83,7 @@ public enum AuditRedactor {
         case .openURL, .navigate:
             guard let url = step.url ?? step.text, !url.isEmpty else { return name }
             return "\(name) \(redactURL(url))"
-        case .uploadFile:
+        case .uploadFile, .saveFile:
             let count = step.files?.count ?? 0
             return "\(name) (\(count) file\(count == 1 ? "" : "s"))"
         case .axAction:

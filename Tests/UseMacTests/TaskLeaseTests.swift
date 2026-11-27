@@ -169,7 +169,9 @@ final class TaskLeaseTests: XCTestCase {
         return try XCTUnwrap(response.taskId)
     }
 
-    func testAnotherTasksBrowserActionIsRefusedAndItsReadsAreNot() async throws {
+    private func withLeaseBrowser(
+        _ body: (UseMacEngineService, Recorder) async throws -> Void
+    ) async throws {
         let keyDir = makeTemporaryBridgeKeyDirectory()
         defer { try? FileManager.default.removeItem(at: keyDir) }
         let engine = UseMacEngineService(
@@ -207,41 +209,147 @@ final class TaskLeaseTests: XCTestCase {
         }
         defer { responder.cancel() }
 
-        let a = try await startTask(engine, agent: "A")
-        let b = try await startTask(engine, agent: "B")
+        try await body(engine, recorder)
+    }
+
+    private func openTab(on engine: UseMacEngineService, ownedBy task: String) async throws -> Int {
         let opened = await engine.handle(RPCRequest(
             method: .browserOpen,
             browserOpen: BrowserOpenParams(url: "http://127.0.0.1:9/", stream: false),
-            taskId: a
+            taskId: task
         ))
-        let tabA = try XCTUnwrap(opened.browserTabId)
-        XCTAssertTrue(recorder.allItems.contains { $0.agentName == "A" && $0.browserTabId == tabA }, "A's card is labeled A")
+        return try XCTUnwrap(opened.browserTabId)
+    }
 
-        let clickByB = RPCRequest(
+    private func clickRequest(task: String, tab: Int, waitMs: Int? = nil) -> RPCRequest {
+        RPCRequest(
             method: .browserAct,
-            browserAct: BrowserActParams(tabId: tabA, steps: [ActionStep(action: .click)]),
-            taskId: b
+            browserAct: BrowserActParams(tabId: tab, steps: [ActionStep(action: .click)]),
+            taskId: task,
+            waitForLeaseMs: waitMs
         )
-        let refused = await engine.handle(clickByB)
-        XCTAssertEqual(refused.error?.code, "TARGET_BUSY")
-        XCTAssertTrue(refused.error?.message.contains("A (\(a))") ?? false, refused.error?.message ?? "")
-        XCTAssertEqual(recorder.count("act"), 0, "nothing reached the tab")
-        XCTAssertTrue(recorder.allItems.contains { $0.agentName == "B" && $0.kind == .policyOrSafety })
+    }
 
-        let readByB = await engine.handle(RPCRequest(
-            method: .browserExtract,
-            browserExtract: BrowserExtractParams(tabId: tabA, mode: "text"),
-            taskId: b
-        ))
-        XCTAssertTrue(readByB.ok, "reads never wait: \(String(describing: readByB.error))")
+    private func completeRequest(task: String) -> RPCRequest {
+        RPCRequest(method: .taskComplete, taskComplete: TaskCompleteParams(keepTabs: true), taskId: task)
+    }
 
-        _ = await engine.handle(RPCRequest(method: .taskComplete, taskComplete: TaskCompleteParams(keepTabs: true), taskId: a))
-        let retried = await engine.handle(clickByB)
-        XCTAssertTrue(retried.ok, "free once A is done: \(String(describing: retried.error))")
-        XCTAssertEqual(recorder.count("act"), 1)
+    private func waitForLeaseActivity(_ recorder: Recorder, task: String) async {
+        let waiting = await waitForBridgeCondition(intervalMs: 5) {
+            recorder.allItems.contains { $0.taskId == task && $0.kind == .actionStart && $0.title.hasPrefix("Waiting for ") }
+        }
+        XCTAssertTrue(waiting, "The request should enter the lease queue.")
+    }
 
-        let doneB = await engine.handle(RPCRequest(method: .taskComplete, taskComplete: TaskCompleteParams(keepTabs: true), taskId: b))
-        XCTAssertEqual(doneB.taskSummary?.blocked, 1)
-        XCTAssertEqual(doneB.taskSummary?.agent, "B")
+    func testAnotherTasksBrowserActionIsRefusedAndItsReadsAreNot() async throws {
+        try await withLeaseBrowser { engine, recorder in
+            let a = try await startTask(engine, agent: "A")
+            let b = try await startTask(engine, agent: "B")
+            let tabA = try await openTab(on: engine, ownedBy: a)
+            XCTAssertTrue(recorder.allItems.contains { $0.agentName == "A" && $0.browserTabId == tabA }, "A's card is labeled A")
+
+            let clickByB = clickRequest(task: b, tab: tabA)
+            let refused = await engine.handle(clickByB)
+            XCTAssertEqual(refused.error?.code, "TARGET_BUSY")
+            XCTAssertTrue(refused.error?.message.contains("A (\(a))") ?? false, refused.error?.message ?? "")
+            XCTAssertEqual(recorder.count("act"), 0, "nothing reached the tab")
+            XCTAssertTrue(recorder.allItems.contains { $0.agentName == "B" && $0.kind == .policyOrSafety })
+
+            let readByB = await engine.handle(RPCRequest(
+                method: .browserExtract,
+                browserExtract: BrowserExtractParams(tabId: tabA, mode: "text"),
+                taskId: b
+            ))
+            XCTAssertTrue(readByB.ok, "reads never wait: \(String(describing: readByB.error))")
+
+            _ = await engine.handle(completeRequest(task: a))
+            let retried = await engine.handle(clickByB)
+            XCTAssertTrue(retried.ok, "free once A is done: \(String(describing: retried.error))")
+            XCTAssertEqual(recorder.count("act"), 1)
+
+            let doneB = await engine.handle(completeRequest(task: b))
+            XCTAssertEqual(doneB.taskSummary?.blocked, 1)
+            XCTAssertEqual(doneB.taskSummary?.agent, "B")
+        }
+    }
+
+    func testWaitingRequestExecutesWhenTheHolderCompletes() async throws {
+        try await withLeaseBrowser { engine, recorder in
+            let a = try await startTask(engine, agent: "A")
+            let b = try await startTask(engine, agent: "B")
+            let tab = try await openTab(on: engine, ownedBy: a)
+            let request = clickRequest(task: b, tab: tab, waitMs: 2_000)
+            let waiting = Task { await engine.handle(request) }
+            await waitForLeaseActivity(recorder, task: b)
+            try await Task.sleep(for: .milliseconds(120))
+            XCTAssertEqual(recorder.count("act"), 0)
+            _ = await engine.handle(completeRequest(task: a))
+            let response = await waiting.value
+            XCTAssertTrue(response.ok, "\(String(describing: response.error))")
+            XCTAssertEqual(recorder.count("act"), 1)
+        }
+    }
+
+    func testWaitingRequestTimesOutWhenTheHolderRemains() async throws {
+        try await withLeaseBrowser { engine, recorder in
+            let a = try await startTask(engine, agent: "A")
+            let b = try await startTask(engine, agent: "B")
+            let tab = try await openTab(on: engine, ownedBy: a)
+            let start = ContinuousClock.now
+            let response = await engine.handle(clickRequest(task: b, tab: tab, waitMs: 120))
+            XCTAssertEqual(response.error?.code, "TARGET_BUSY")
+            XCTAssertTrue(response.error?.message.contains(a) == true)
+            XCTAssertGreaterThanOrEqual(ContinuousClock.now - start, .milliseconds(120))
+            XCTAssertEqual(recorder.count("act"), 0)
+        }
+    }
+
+    func testKillSwitchAbortsLeaseWait() async throws {
+        try await assertSafetyAbortsWait { $0.tripKillSwitch(true) }
+    }
+
+    func testPausingAbortsLeaseWait() async throws {
+        try await assertSafetyAbortsWait { $0.setGovernancePolicy(.paused) }
+    }
+
+    private func assertSafetyAbortsWait(_ block: (UseMacEngineService) -> Void) async throws {
+        try await withLeaseBrowser { engine, recorder in
+            let a = try await startTask(engine, agent: "A")
+            let b = try await startTask(engine, agent: "B")
+            let tab = try await openTab(on: engine, ownedBy: a)
+            let request = clickRequest(task: b, tab: tab, waitMs: 5_000)
+            let waiting = Task { await engine.handle(request) }
+            await waitForLeaseActivity(recorder, task: b)
+            let started = ContinuousClock.now
+            block(engine)
+            let response = await waiting.value
+            XCTAssertEqual(response.error?.code, "POLICY_BLOCKED")
+            XCTAssertLessThan(ContinuousClock.now - started, .milliseconds(200))
+            XCTAssertEqual(recorder.count("act"), 0)
+        }
+    }
+
+    func testWaitingRequestsAcquireTheSameLeaseInFIFOOrder() async throws {
+        try await withLeaseBrowser { engine, recorder in
+            let a = try await startTask(engine, agent: "A")
+            let b = try await startTask(engine, agent: "B")
+            let c = try await startTask(engine, agent: "C")
+            let tab = try await openTab(on: engine, ownedBy: a)
+            let requestB = clickRequest(task: b, tab: tab, waitMs: 2_000)
+            let requestC = clickRequest(task: c, tab: tab, waitMs: 2_000)
+            let waitingB = Task { await engine.handle(requestB) }
+            await waitForLeaseActivity(recorder, task: b)
+            let waitingC = Task { await engine.handle(requestC) }
+            await waitForLeaseActivity(recorder, task: c)
+
+            _ = await engine.handle(completeRequest(task: a))
+            let responseB = await waitingB.value
+            XCTAssertTrue(responseB.ok, "\(String(describing: responseB.error))")
+            XCTAssertEqual(recorder.count("act"), 1, "C cannot act until B completes.")
+            _ = await engine.handle(completeRequest(task: b))
+            let responseC = await waitingC.value
+            XCTAssertTrue(responseC.ok, "\(String(describing: responseC.error))")
+            XCTAssertEqual(recorder.count("act"), 2)
+        }
     }
 }

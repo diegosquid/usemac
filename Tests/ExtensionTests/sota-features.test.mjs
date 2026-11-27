@@ -787,7 +787,11 @@ test("browser_open auto-dismisses high-confidence cookie overlays and executes i
   const sb = createBackgroundSandbox({
     tabs: [{ id: 1, windowId: 1, url: "https://example.com/", active: true }],
     windows: [{ id: 1, focused: true }],
-    cdp: (tabId, method, params) => host.cdp(tabId, method, params)
+    cdp: (tabId, method, params) => {
+      // The sandbox replaces its blank tab; the fixture DOM already represents the shop page.
+      if (method === "Runtime.evaluate" && params.expression === 'location.replace("https://shop.example.com/")') return {};
+      return host.cdp(tabId, method, params);
+    }
   });
   t.after(() => sb.dispose());
 

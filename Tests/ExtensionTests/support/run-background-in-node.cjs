@@ -96,8 +96,10 @@ class LoopbackWebSocket extends NativeWebSocket {
 globalThis.chrome = chromeStub;
 globalThis.self = globalThis;
 globalThis.WebSocket = LoopbackWebSocket;
-globalThis.importScripts = (file) => {
-  vm.runInThisContext(fs.readFileSync(path.join(extensionDir, file), "utf8"), { filename: file });
+globalThis.importScripts = (...files) => {
+  for (const file of files) {
+    vm.runInThisContext(fs.readFileSync(path.join(extensionDir, file), "utf8"), { filename: file });
+  }
 };
 
 vm.runInThisContext(fs.readFileSync(path.join(extensionDir, "background.js"), "utf8"), { filename: "background.js" });

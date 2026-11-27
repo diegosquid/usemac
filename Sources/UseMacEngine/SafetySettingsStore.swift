@@ -56,6 +56,10 @@ public final class SafetySettingsStore {
             deniedSites: defaults.stringArray(forKey: RuleKey.deniedSites),
             allowedApps: defaults.stringArray(forKey: RuleKey.allowedApps),
             allowedSites: defaults.stringArray(forKey: RuleKey.allowedSites),
+            askApps: defaults.stringArray(forKey: RuleKey.askApps),
+            askSites: defaults.stringArray(forKey: RuleKey.askSites),
+            readOnlyApps: defaults.stringArray(forKey: RuleKey.readOnlyApps),
+            readOnlySites: defaults.stringArray(forKey: RuleKey.readOnlySites),
             recordTypedText: defaults.bool(forKey: AuditLogSettings.recordTypedTextKey)
         )
     }
@@ -67,7 +71,8 @@ public final class SafetySettingsStore {
     /// - A matching seal: the saved values.
     /// - No marker and no key: seals the saved values with a new key, Debug capture and Record typed text off
     ///   (`firstSealState`). The rules stay as saved: a stricter list the user made must not get looser.
-    /// - A matching seal in the first format: the same, with the saved Debug capture kept (`.upgraded`).
+    /// - A matching seal in an older format: keep the saved safety state and original rules; discard fields
+    ///   introduced later that weren't covered by that seal (`.upgraded`).
     /// - Anything else: `tamperFallback` (Paused, Debug capture off), Record typed text off and the default rules,
     ///   sealed again so the next launch is clean.
     public func load() -> Launch {
@@ -94,14 +99,21 @@ public final class SafetySettingsStore {
         case .upgraded:
             start = current.state
             next = current
+            // Neither older seal covered these keys, even if they were present in UserDefaults.
+            next.askApps = nil
+            next.askSites = nil
+            next.readOnlyApps = nil
+            next.readOnlySites = nil
         case .tampered:
             start = current.state.tamperFallback
             next = current.with(state: start).withDefaultRules
         }
         // Record typed text wasn't sealed before version 2, and can't be trusted after a failed check.
-        next.recordTypedText = false
+        if check != .upgraded || marker != SafetySeal.v2Version {
+            next.recordTypedText = false
+        }
         let sealed = save(next)
-        return Launch(state: start, rules: next.rules, recordsTypedText: false, check: check, sealed: sealed)
+        return Launch(state: start, rules: next.rules, recordsTypedText: next.recordTypedText, check: check, sealed: sealed)
     }
 
     private func readKey() -> SafetySealKeyRead {
@@ -199,6 +211,10 @@ public final class SafetySettingsStore {
         write(values.deniedSites, forKey: RuleKey.deniedSites)
         write(values.allowedApps, forKey: RuleKey.allowedApps)
         write(values.allowedSites, forKey: RuleKey.allowedSites)
+        write(values.askApps, forKey: RuleKey.askApps)
+        write(values.askSites, forKey: RuleKey.askSites)
+        write(values.readOnlyApps, forKey: RuleKey.readOnlyApps)
+        write(values.readOnlySites, forKey: RuleKey.readOnlySites)
         defaults.set(values.recordTypedText, forKey: AuditLogSettings.recordTypedTextKey)
     }
 

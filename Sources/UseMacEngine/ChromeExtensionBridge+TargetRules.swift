@@ -21,14 +21,20 @@ extension ChromeExtensionBridge {
         )
     }
 
-    /// TARGET_BLOCKED before anything is sent, or nil to send the command. Blocked when Chrome itself is denied,
-    /// when `url` (a page to open) is on a blocked site, or when the tab the command would run on is.
-    /// `checksTab` false skips the tab lookup (a command that opens a new tab or lists profile downloads).
-    ///
-    /// With site rules this fails closed: when the lookup times out or fails, or the tab's URL is not known yet,
-    /// the command is refused too, since checking the result's URL afterwards is too late for an act. Without any
-    /// site rule there is no lookup at all.
-    func targetRulesPreflight(profile: String?, tabId: Int?, url: String? = nil, checksTab: Bool = true) async -> BridgeResponse? {
+    static func targetReadOnlyResponse(_ message: String, tabId: Int? = nil, profileName: String? = nil) -> BridgeResponse {
+        BridgeResponse(
+            ok: false,
+            tabId: tabId,
+            profileName: profileName,
+            error: RPCErrorPayload(code: "POLICY_BLOCKED", message: message, hint: TargetRules.stopHint)
+        )
+    }
+
+    /// Checks the destination URL (if given) and the tab a command would use. Reads still work on Read-only
+    /// sites. `checksTab` false is for commands that do not act on an existing tab, such as opening a new tab.
+    func targetRulesPreflight(
+        profile: String?, tabId: Int?, url: String? = nil, checksTab: Bool = true, isMutating: Bool = false
+    ) async -> BridgeResponse? {
         let rules = TargetRulesStore.shared.rules
         if rules.blocksBrowser {
             return Self.targetBlockedResponse(TargetRules.blockedBrowserMessage)
@@ -36,20 +42,99 @@ extension ChromeExtensionBridge {
         if let url, rules.blocksURL(url) {
             return Self.targetBlockedResponse(TargetRules.blockedSiteMessage(host: TargetRules.host(ofURL: url)))
         }
-        guard checksTab, rules.hasSiteRules else { return nil }
+        if isMutating, rules.effectiveSitePolicy(url: url) == .readOnly {
+            return Self.targetReadOnlyResponse(TargetRules.readOnlySiteMessage(host: TargetRules.host(ofURL: url)))
+        }
+        guard checksTab, rules.hasSiteRules || (isMutating && !rules.readOnlySites.isEmpty) else { return nil }
 
-        // Fast path: when targeting an explicit tabId and the extension pushes live `tab_url` events,
-        // consult the in-memory `profile -> tabId -> url` cache without an all-tabs WS round-trip.
-        if let requestedTabId = tabId,
-           let cached = liveCachedTabURL(profileQuery: profile, tabId: requestedTabId) {
-            let trimmed = cached.url.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                guard rules.blocksURL(trimmed) else { return nil }
-                return Self.targetBlockedResponse(
-                    TargetRules.blockedSiteMessage(host: nil),
-                    tabId: requestedTabId,
-                    profileName: cached.profileName
-                )
+        let tab = await lookupRulesTab(profile: profile, tabId: tabId, requiresTab: false)
+        if let failure = tab.failure { return failure }
+        switch rules.effectiveSitePolicy(url: tab.url) {
+        case .block:
+            return Self.targetBlockedResponse(TargetRules.blockedSiteMessage(host: nil), tabId: tab.tabId, profileName: tab.profile)
+        case .readOnly where isMutating:
+            return Self.targetReadOnlyResponse(
+                TargetRules.readOnlySiteMessage(host: TargetRules.host(ofURL: tab.url)),
+                tabId: tab.tabId,
+                profileName: tab.profile
+            )
+        default:
+            return nil
+        }
+    }
+
+    /// Resolves the tab and any navigation destinations a mutating command could reach. Unknown tab URLs
+    /// fail closed when site rules apply. The caller can use the resolved tab ID and profile to keep the
+    /// command on the tab it checked rather than resolving a default tab again after approval.
+    public func resolveGovernedTabSitePolicy(
+        profile: String?, tabId: Int?, candidateURLs: [String] = []
+    ) async -> (policy: TargetRules.AccessPolicy, host: String?, resolvedTabId: Int?, resolvedProfile: String?, failure: BridgeResponse?) {
+        let result = await governedSiteDecision(profile: profile, tabId: tabId, candidateURLs: candidateURLs, checksTab: true)
+        return (result.policy, result.site?.host, result.tabId, result.profile, result.failure)
+    }
+
+    struct GovernedSiteDecision {
+        var policy: TargetRules.AccessPolicy = .allow
+        var site: TargetRules.Site?
+        var tabId: Int?
+        var profile: String?
+        var failure: BridgeResponse?
+    }
+
+    // An explicit new-tab open has no current tab to look up; it checks its URL and inline destinations.
+    func governedSiteDecision(
+        profile: String?, tabId: Int?, candidateURLs: [String], checksTab: Bool
+    ) async -> GovernedSiteDecision {
+        let rules = TargetRulesStore.shared.rules
+        var result = GovernedSiteDecision(tabId: tabId, profile: profile)
+        guard rules.hasGovernedSiteRules else { return result }
+        if rules.blocksBrowser {
+            result.policy = .block
+            result.failure = Self.targetBlockedResponse(TargetRules.blockedBrowserMessage, tabId: tabId, profileName: profile)
+            return result
+        }
+
+        func consider(_ url: String) {
+            let policy = rules.effectiveSitePolicy(url: url)
+            let combined = result.policy.combined(with: policy)
+            guard combined != result.policy else { return }
+            result.policy = combined
+            result.site = TargetRules.site(ofURL: url.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        for url in candidateURLs { consider(url) }
+        let candidateBlocked = result.policy == .block
+        if checksTab, !candidateBlocked {
+            let tab = await lookupRulesTab(profile: profile, tabId: tabId, requiresTab: true)
+            result.tabId = tab.tabId
+            result.profile = tab.profile
+            result.failure = tab.failure
+            if let url = tab.url { consider(url) }
+        } else if !candidateBlocked,
+                  !candidateURLs.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            result.failure = Self.targetBlockedResponse(
+                TargetRules.unconfirmedSiteMessage(reason: "the destination address is not known yet"),
+                tabId: tabId,
+                profileName: profile
+            )
+        }
+        if result.policy == .block {
+            result.failure = Self.targetBlockedResponse(
+                TargetRules.blockedSiteMessage(host: candidateBlocked ? result.site?.host : nil),
+                tabId: result.tabId,
+                profileName: result.profile
+            )
+        }
+        return result
+    }
+
+    private func lookupRulesTab(
+        profile: String?, tabId: Int?, requiresTab: Bool
+    ) async -> (url: String?, tabId: Int?, profile: String?, failure: BridgeResponse?) {
+        // The extension's live URL events avoid an all-tabs round trip for an explicit tab.
+        if let tabId, let cached = liveCachedTabURL(profileQuery: profile, tabId: tabId) {
+            if let url = Self.confirmedTabURL(cached.url, requiresTab: requiresTab) {
+                return (url, tabId, cached.profileName, nil)
             }
         }
 
@@ -57,34 +142,45 @@ extension ChromeExtensionBridge {
         let listing = await unfilteredTabs(profile: profile, timeoutSeconds: timeout)
         guard listing.ok else {
             if let code = listing.error?.code, Self.targetRulesUnreachableCodes.contains(code) {
-                return listing
+                return (nil, tabId, listing.profileName ?? profile, listing)
             }
             let reason = listing.error?.code == "EXTENSION_TIMEOUT" ? "the tab lookup timed out" : "the tab lookup failed"
-            return Self.targetBlockedResponse(TargetRules.unconfirmedSiteMessage(reason: reason), tabId: tabId)
+            return (nil, tabId, listing.profileName ?? profile, Self.targetBlockedResponse(
+                TargetRules.unconfirmedSiteMessage(reason: reason), tabId: tabId
+            ))
         }
+        let resolvedProfile = listing.profileName ?? profile
         guard let tabs = listing.tabs else {
-            return Self.targetBlockedResponse(
-                TargetRules.unconfirmedSiteMessage(reason: "Chrome did not list its tabs"),
-                tabId: tabId
-            )
+            return (nil, tabId, resolvedProfile, Self.targetBlockedResponse(
+                TargetRules.unconfirmedSiteMessage(reason: "Chrome did not list its tabs"), tabId: tabId
+            ))
         }
-        // No such tab, or no UseMac tab to fall back to: the extension refuses the command on its own.
         guard let target = Self.commandTargetTab(requested: tabId, lastTabId: listing.tabId, in: tabs) else {
+            // Reads preserve the extension's own error if their requested or fallback tab does not exist.
+            let failure = requiresTab ? Self.targetBlockedResponse(
+                TargetRules.unconfirmedSiteMessage(reason: "Chrome did not find the target tab"),
+                tabId: tabId, profileName: resolvedProfile
+            ) : nil
+            return (nil, tabId, resolvedProfile, failure)
+        }
+        guard let url = Self.confirmedTabURL(target.url, requiresTab: requiresTab) else {
+            return (nil, target.tabId, resolvedProfile, Self.targetBlockedResponse(
+                TargetRules.unconfirmedSiteMessage(reason: "the tab's address is not known yet"),
+                tabId: target.tabId, profileName: resolvedProfile
+            ))
+        }
+        return (url, target.tabId, resolvedProfile, nil)
+    }
+
+    private static func confirmedTabURL(_ raw: String, requiresTab: Bool) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        guard requiresTab else { return text }
+        guard let url = URL(string: text, encodingInvalidCharacters: false), let scheme = url.scheme else { return nil }
+        if ["http", "https", "ws", "wss"].contains(scheme.lowercased()), TargetRules.host(ofURL: text) == nil {
             return nil
         }
-        if target.url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return Self.targetBlockedResponse(
-                TargetRules.unconfirmedSiteMessage(reason: "the tab's address is not known yet"),
-                tabId: target.tabId,
-                profileName: listing.profileName
-            )
-        }
-        guard rules.blocksURL(target.url) else { return nil }
-        return Self.targetBlockedResponse(
-            TargetRules.blockedSiteMessage(host: nil),
-            tabId: target.tabId,
-            profileName: listing.profileName
-        )
+        return text
     }
 
     /// vision_query reads a Chrome tab when it names one, or names no app while Chrome is connected

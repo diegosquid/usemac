@@ -17,6 +17,10 @@ public struct SavedSafetySettings: Equatable, Sendable {
     public var deniedSites: [String]?
     public var allowedApps: [String]?
     public var allowedSites: [String]?
+    public var askApps: [String]?
+    public var askSites: [String]?
+    public var readOnlyApps: [String]?
+    public var readOnlySites: [String]?
     /// Whether History keeps typed text and page scripts (`AuditLogSettings.recordsTypedText`).
     public var recordTypedText: Bool
 
@@ -30,6 +34,10 @@ public struct SavedSafetySettings: Equatable, Sendable {
         deniedSites: [String]? = nil,
         allowedApps: [String]? = nil,
         allowedSites: [String]? = nil,
+        askApps: [String]? = nil,
+        askSites: [String]? = nil,
+        readOnlyApps: [String]? = nil,
+        readOnlySites: [String]? = nil,
         recordTypedText: Bool = false
     ) {
         self.policy = policy
@@ -41,6 +49,10 @@ public struct SavedSafetySettings: Equatable, Sendable {
         self.deniedSites = deniedSites
         self.allowedApps = allowedApps
         self.allowedSites = allowedSites
+        self.askApps = askApps
+        self.askSites = askSites
+        self.readOnlyApps = readOnlyApps
+        self.readOnlySites = readOnlySites
         self.recordTypedText = recordTypedText
     }
 
@@ -62,6 +74,10 @@ public struct SavedSafetySettings: Equatable, Sendable {
         next.deniedSites = deniedSites
         next.allowedApps = allowedApps
         next.allowedSites = allowedSites
+        next.askApps = askApps
+        next.askSites = askSites
+        next.readOnlyApps = readOnlyApps
+        next.readOnlySites = readOnlySites
         next.recordTypedText = recordTypedText
         return next
     }
@@ -74,7 +90,11 @@ public struct SavedSafetySettings: Equatable, Sendable {
             deniedApps: deniedApps ?? base.deniedApps,
             deniedSites: deniedSites ?? base.deniedSites,
             allowedApps: allowedApps ?? base.allowedApps,
-            allowedSites: allowedSites ?? base.allowedSites
+            allowedSites: allowedSites ?? base.allowedSites,
+            askApps: askApps ?? base.askApps,
+            askSites: askSites ?? base.askSites,
+            readOnlyApps: readOnlyApps ?? base.readOnlyApps,
+            readOnlySites: readOnlySites ?? base.readOnlySites
         ).normalized()
     }
 
@@ -87,6 +107,10 @@ public struct SavedSafetySettings: Equatable, Sendable {
         next.deniedSites = cleaned.deniedSites
         next.allowedApps = cleaned.allowedApps
         next.allowedSites = cleaned.allowedSites
+        next.askApps = cleaned.askApps
+        next.askSites = cleaned.askSites
+        next.readOnlyApps = cleaned.readOnlyApps
+        next.readOnlySites = cleaned.readOnlySites
         return next
     }
 
@@ -98,6 +122,10 @@ public struct SavedSafetySettings: Equatable, Sendable {
         next.deniedSites = nil
         next.allowedApps = nil
         next.allowedSites = nil
+        next.askApps = nil
+        next.askSites = nil
+        next.readOnlyApps = nil
+        next.readOnlySites = nil
         return next
     }
 
@@ -202,9 +230,8 @@ public enum SafetySealCheck: Equatable, Sendable {
     case verified
     /// No marker and no key: a new install, or the first launch of a version that seals. UseMac seals now.
     case firstSeal
-    /// A matching seal in the first format (`SafetySeal.legacyVersion`), which covered only the mode, the Emergency
-    /// stop and Debug capture. UseMac keeps those and the rules as saved, turns Record typed text off, and seals
-    /// everything in the current format.
+    /// A matching seal in an older format. UseMac keeps the saved safety state and original rules, then seals
+    /// them in the current format. Record typed text is kept only if it was sealed.
     case upgraded
     /// The values may have been changed outside UseMac. UseMac starts from `StartupSafetyState.tamperFallback`.
     case tampered(SafetySealProblem)
@@ -221,9 +248,10 @@ public enum SafetySealCheck: Equatable, Sendable {
 /// settings (`defaults write`) and relaunch UseMac. With it, values UseMac didn't write fail the check and UseMac
 /// starts paused. Only `SafetySettingsStore` writes the settings and the seal.
 public enum SafetySeal {
-    /// What the marker holds while the settings are sealed in this format. Version 2 adds the app and site rules
-    /// and Record typed text.
-    public static let version = 2
+    /// The current format, including the Ask and Read-only app and site rules.
+    public static let version = 3
+    /// The format that first sealed the allow/block rules and Record typed text.
+    public static let v2Version = 2
     /// The first format: the mode, the mode to resume to, the Emergency stop and Debug capture. A seal in it still
     /// opens once, to move to `version` (`SafetySealCheck.upgraded`).
     public static let legacyVersion = 1
@@ -231,7 +259,16 @@ public enum SafetySeal {
     /// The bytes the seal covers. Every value has its name, every string its length and every list its count, so no
     /// two sets of values encode the same way. Changing this format changes every seal: it needs a new `version`.
     public static func canonicalEncoding(of saved: SavedSafetySettings, generation: UInt64) -> Data {
-        var text = "UseMac safety seal v\(version)\n"
+        rulesEncoding(of: saved, generation: generation, format: version)
+    }
+
+    /// The second format's bytes, only to open a seal made before version 3.
+    static func v2Encoding(of saved: SavedSafetySettings, generation: UInt64) -> Data {
+        rulesEncoding(of: saved, generation: generation, format: v2Version)
+    }
+
+    private static func rulesEncoding(of saved: SavedSafetySettings, generation: UInt64, format: Int) -> Data {
+        var text = "UseMac safety seal v\(format)\n"
         text += field("policy", saved.policy)
         text += field("policyBeforePause", saved.policyBeforePause)
         text += "killSwitchTripped=\(saved.killSwitchTripped ? 1 : 0)\n"
@@ -241,6 +278,12 @@ public enum SafetySeal {
         text += list("deniedSites", saved.deniedSites)
         text += list("allowedApps", saved.allowedApps)
         text += list("allowedSites", saved.allowedSites)
+        if format == version {
+            text += list("askApps", saved.askApps)
+            text += list("askSites", saved.askSites)
+            text += list("readOnlyApps", saved.readOnlyApps)
+            text += list("readOnlySites", saved.readOnlySites)
+        }
         text += "recordTypedText=\(saved.recordTypedText ? 1 : 0)\n"
         text += "generation=\(generation)\n"
         return Data(text.utf8)
@@ -272,6 +315,11 @@ public enum SafetySeal {
         sealCode(canonicalEncoding(of: saved, generation: secret.generation), key: secret.key)
     }
 
+    /// A seal in the second format, for tests of the move to `version`.
+    static func v2Seal(_ saved: SavedSafetySettings, with secret: SafetySealSecret) -> String {
+        sealCode(v2Encoding(of: saved, generation: secret.generation), key: secret.key)
+    }
+
     /// A seal in the first format, for tests of the move to `version`.
     static func legacySeal(_ saved: SavedSafetySettings, with secret: SafetySealSecret) -> String {
         sealCode(legacyEncoding(of: saved, generation: secret.generation), key: secret.key)
@@ -284,6 +332,10 @@ public enum SafetySeal {
     /// Whether `seal` is the seal for `saved` (compared in constant time).
     public static func isValid(_ seal: String?, for saved: SavedSafetySettings, with secret: SafetySealSecret) -> Bool {
         matches(seal, canonicalEncoding(of: saved, generation: secret.generation), key: secret.key)
+    }
+
+    static func isValidV2(_ seal: String?, for saved: SavedSafetySettings, with secret: SafetySealSecret) -> Bool {
+        matches(seal, v2Encoding(of: saved, generation: secret.generation), key: secret.key)
     }
 
     static func isValidLegacy(_ seal: String?, for saved: SavedSafetySettings, with secret: SafetySealSecret) -> Bool {
@@ -306,7 +358,7 @@ public enum SafetySeal {
             case .unreadable: return .tampered(.keyUnreadable)
             }
         }
-        guard marker == version || marker == legacyVersion else { return .tampered(.unknownVersion) }
+        guard marker == version || marker == v2Version || marker == legacyVersion else { return .tampered(.unknownVersion) }
         switch key {
         case .none: return .tampered(.keyMissing)
         case .invalid: return .tampered(.keyInvalid)
@@ -315,6 +367,9 @@ public enum SafetySeal {
             guard seal != nil else { return .tampered(.sealMissing) }
             if marker == legacyVersion {
                 return isValidLegacy(seal, for: saved, with: secret) ? .upgraded : .tampered(.sealMismatch)
+            }
+            if marker == v2Version {
+                return isValidV2(seal, for: saved, with: secret) ? .upgraded : .tampered(.sealMismatch)
             }
             return isValid(seal, for: saved, with: secret) ? .verified : .tampered(.sealMismatch)
         }
@@ -380,7 +435,7 @@ public struct SafetySealNotice: Equatable, Sendable {
                 : "Couldn't seal the safety settings: the Keychain didn't save the seal key. UseMac tries again at the next change."
         case .upgraded:
             return sealed
-                ? "Sealed the safety settings with the app and site rules and Record typed text (turned off)"
+                ? "Upgraded the safety seal to include the Ask and Read-only app and site rules"
                 : "Couldn't reseal the safety settings: the Keychain didn't save the seal key. UseMac tries again at the next change."
         case .tampered(let problem):
             let lead = problem == .keyUnreadable

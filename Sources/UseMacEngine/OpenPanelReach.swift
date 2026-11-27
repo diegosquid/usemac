@@ -67,6 +67,15 @@ enum OpenPanelReach {
         isFrontmost
     }
 
+    static func saveBackgroundMessage(appName: String) -> String {
+        "UseMac cannot confirm the destination folder in \(appName)'s save panel in the background. "
+            + "Go to Folder (⌘⇧G) needs the app in front. Use \"foreground\": true or \"foregroundFallback\": true."
+    }
+
+    static func isSavePanelNameField(role: String?, subrole: String?, editable: Bool) -> Bool {
+        role == "AXTextField" && subrole != "AXSearchField" && editable
+    }
+
     static func goToFolderFailureMessage(fileName: String, detectedField: Bool) -> String {
         if detectedField {
             return "Go to Folder appeared, but the file picker stayed open without confirming \(fileName)."
