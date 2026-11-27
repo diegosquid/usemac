@@ -1934,7 +1934,7 @@ public struct LiveActivityItem: Codable, Equatable, Identifiable, Sendable {
     public var taskTabIds: [Int]?
     /// The agent or client of the task the item belongs to, shown on its preview card.
     public var agentName: String?
-    /// The task the item belongs to, when UseMac could tell. The preview gives each task's cards one color.
+    /// The task the item belongs to, when UseMac could tell.
     public var taskId: String?
 
     public init(

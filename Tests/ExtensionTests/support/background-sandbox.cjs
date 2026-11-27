@@ -74,6 +74,9 @@ function createBackgroundSandbox(options = {}) {
   const tabs = new Map();
   const windows = new Map();
   const groups = new Map();
+  // Saved groups outlive their window when its last tab closes. Ungrouping instead
+  // removes their saved entry too (the distinction the real Chrome UI exposes).
+  const savedGroups = new Map();
   const attached = new Set();
   let nextTabId = 900;
   let nextWindowId = 90;
@@ -98,6 +101,7 @@ function createBackgroundSandbox(options = {}) {
   }
   for (const g of options.groups || []) {
     groups.set(g.id, { id: g.id, windowId: g.windowId ?? 1, title: g.title ?? "", color: g.color || "grey", collapsed: false });
+    savedGroups.set(g.id, clone(groups.get(g.id)));
   }
   for (const w of options.windows || []) {
     windows.set(w.id, { id: w.id, focused: Boolean(w.focused), type: "normal", state: w.state || "normal" });
@@ -126,9 +130,12 @@ function createBackgroundSandbox(options = {}) {
   }
 
   // Like Chrome, a group that loses its last tab is gone.
-  function dropEmptyGroups() {
+  function dropEmptyGroups(preserveSaved = false) {
     for (const id of Array.from(groups.keys())) {
-      if (!Array.from(tabs.values()).some((t) => t.groupId === id)) groups.delete(id);
+      if (!Array.from(tabs.values()).some((t) => t.groupId === id)) {
+        groups.delete(id);
+        if (!preserveSaved) savedGroups.delete(id);
+      }
     }
   }
 
@@ -235,10 +242,17 @@ function createBackgroundSandbox(options = {}) {
       },
       remove: async (id) => {
         record("tabs.remove", id);
-        getTabOrThrow(id);
+        const tab = getTabOrThrow(id);
+        const closesWindow = Array.from(tabs.values()).filter((t) => t.windowId === tab.windowId).length === 1;
         tabs.delete(id);
-        dropEmptyGroups();
+        dropEmptyGroups(closesWindow);
         tabsRemoved.emit(id, {});
+      },
+      ungroup: async (tabIds) => {
+        record("tabs.ungroup", tabIds);
+        await apiDelay("tabs.ungroup");
+        for (const id of Array.isArray(tabIds) ? tabIds : [tabIds]) getTabOrThrow(id).groupId = -1;
+        dropEmptyGroups();
       },
       query: async (query = {}) => {
         return Array.from(tabs.values())
@@ -265,6 +279,7 @@ function createBackgroundSandbox(options = {}) {
           id = nextGroupId++;
           const windowId = createProperties?.windowId ?? getTabOrThrow(tabIds[0]).windowId;
           groups.set(id, { id, windowId, title: "", color: "grey", collapsed: false });
+          savedGroups.set(id, clone(groups.get(id)));
         } else if (!groups.has(id)) {
           throw new Error(`No group with id: ${id}.`);
         }
@@ -298,6 +313,7 @@ function createBackgroundSandbox(options = {}) {
         await apiDelay("tabGroups.update");
         if (!groups.has(id)) throw new Error(`No group with id: ${id}.`);
         Object.assign(groups.get(id), props);
+        savedGroups.set(id, clone(groups.get(id)));
         return clone(groups.get(id));
       }
     },
@@ -403,6 +419,7 @@ function createBackgroundSandbox(options = {}) {
     tabs,
     windows,
     groups,
+    savedGroups,
     attached,
     canvasDraws,
     drawImageCalls,

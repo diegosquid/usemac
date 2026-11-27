@@ -80,54 +80,6 @@ final class PreviewDeckShuffleTests: XCTestCase {
         XCTAssertEqual(PreviewDeckFocus.shuffled(["a", "b"], to: "a"), ["a", "b"])
         XCTAssertEqual(PreviewDeckFocus.shuffled(["a", "b"], to: "z"), ["a", "b"])
     }
-}
-
-final class PreviewTaskColorsTests: XCTestCase {
-    func testTwoSessionsOfTheSameAgentGetTwoColors() {
-        let one = PreviewTaskColors.key(taskId: "t1", cardId: "tab:1")
-        let two = PreviewTaskColors.key(taskId: "t2", cardId: "tab:2")
-        let slots = PreviewTaskColors.reconcile([:], keys: [one, two])
-        XCTAssertNotEqual(slots[one], slots[two])
-    }
-
-    func testATasksCardsShareItsColor() {
-        let first = PreviewTaskColors.key(taskId: "t1", cardId: "tab:1")
-        let second = PreviewTaskColors.key(taskId: "t1", cardId: "tab:2")
-        XCTAssertEqual(first, second)
-        let slots = PreviewTaskColors.reconcile([:], keys: [first, "card:x", second])
-        XCTAssertEqual(slots.count, 2)
-    }
-
-    func testCardsWithoutATaskGetTheirOwnColor() {
-        let a = PreviewTaskColors.key(taskId: nil, cardId: "app:10")
-        let b = PreviewTaskColors.key(taskId: "", cardId: "app:11")
-        XCTAssertNotEqual(a, b)
-        let slots = PreviewTaskColors.reconcile([:], keys: [a, b])
-        XCTAssertNotEqual(slots[a], slots[b])
-    }
-
-    func testColorsGoInOrderOfArrivalAndStayPut() {
-        var slots = PreviewTaskColors.reconcile([:], keys: ["task:a"])
-        slots = PreviewTaskColors.reconcile(slots, keys: ["task:b", "task:a"])
-        XCTAssertEqual(slots["task:a"], 0)
-        XCTAssertEqual(slots["task:b"], 1)
-    }
-
-    func testAFinishedTaskGivesItsColorBack() {
-        var slots = PreviewTaskColors.reconcile([:], keys: ["task:a", "task:b", "task:c"])
-        slots = PreviewTaskColors.reconcile(slots, keys: ["task:a", "task:c"])
-        XCTAssertNil(slots["task:b"])
-        slots = PreviewTaskColors.reconcile(slots, keys: ["task:a", "task:c", "task:d"])
-        XCTAssertEqual(slots["task:d"], 1)
-        XCTAssertEqual(slots["task:c"], 2)
-    }
-
-    func testMoreTasksThanColorsStillGetOne() {
-        let keys = (0..<(PreviewTaskColors.paletteSize + 2)).map { "task:\($0)" }
-        let slots = PreviewTaskColors.reconcile([:], keys: keys)
-        XCTAssertEqual(slots.count, keys.count)
-        XCTAssertTrue(slots.values.allSatisfy { (0..<PreviewTaskColors.paletteSize).contains($0) })
-    }
 
     // MARK: One card per id
 

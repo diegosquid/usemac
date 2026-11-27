@@ -11,11 +11,6 @@ struct DeckShuffleState {
 }
 
 extension HUDSessionCard {
-    /// The key the card's color goes by (PreviewTaskColors).
-    var colorKey: String {
-        PreviewTaskColors.key(taskId: taskId, cardId: id)
-    }
-
     /// The same card under a new id (a tab that was still opening got its real one), with its task, steps and stack
     /// history kept.
     func carryingDeckState(of existing: HUDSessionCard) -> HUDSessionCard {
@@ -40,21 +35,15 @@ extension HUDSessionCard {
     }
 }
 
-/// The live preview's stack: cards behind the front one take turns in front (PreviewDeckFocus.shuffleTarget), and each
-/// task's cards share a color (PreviewTaskColors).
+/// The live preview's stack: cards behind the front one take turns in front (PreviewDeckFocus.shuffleTarget).
 extension AppState {
     /// How often the shuffle checks whether another card should come forward.
     static let deckShuffleTickNs: UInt64 = 1_000_000_000
     /// The front card's dip before it goes to the back.
     static let deckDipNs: UInt64 = 170_000_000
 
-    /// The palette slot of a card's task.
-    func taskColorSlot(for card: HUDSessionCard) -> Int? {
-        hudTaskColorSlots[card.colorKey]
-    }
-
     /// Called whenever the deck changes: a new front starts its time in front and the old one remembers when it left,
-    /// colors follow the tasks in the deck, and the shuffle runs while there is a card behind the front.
+    /// and the shuffle runs while there is a card behind the front.
     func deckDidChange(from oldDeck: [HUDSessionCard]) {
         let oldFront = oldDeck.first?.id
         let newFront = hudDeck.first?.id
@@ -66,11 +55,6 @@ extension AppState {
             if let oldFront, let idx = hudDeck.firstIndex(where: { $0.id == oldFront }) {
                 hudDeck[idx].lastShownDate = now
             }
-        }
-
-        let slots = PreviewTaskColors.reconcile(hudTaskColorSlots, keys: hudDeck.map(\.colorKey))
-        if slots != hudTaskColorSlots {
-            hudTaskColorSlots = slots
         }
 
         if hudDeck.count > 1 {

@@ -220,7 +220,7 @@ extension UseMacEngineService {
 }
 
 /// The agent and task of the request being handled. Every live activity item the request emits carries them, so its
-/// preview card shows which agent is working there and takes its task's color.
+/// preview card shows which agent is working there.
 enum TaskActivityContext {
     @TaskLocal static var agentName: String?
     @TaskLocal static var taskId: String?
