@@ -265,6 +265,7 @@ final class TaskScopeTests: XCTestCase {
             extensionPort: 0,
             bridgeKeyDirectory: keyDir
         )
+        service.ownedTabCleanupDelayNs = 150_000_000
         service.chromeBridge.start()
         defer { service.chromeBridge.stop() }
         let port = await waitForListeningPort(of: service.chromeBridge)

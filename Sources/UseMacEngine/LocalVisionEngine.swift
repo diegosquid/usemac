@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreML
 import Darwin
 import Foundation
 import ImageIO
@@ -320,13 +321,22 @@ public final class LocalVisionEngine: @unchecked Sendable {
     ) -> CGImage? {
         let imgW = image.width
         let imgH = image.height
-        guard imgW > 0, imgH > 0, rect.width > 0, rect.height > 0 else { return nil }
+        guard imgW > 0, imgH > 0,
+              rect.x.isFinite, rect.y.isFinite, rect.width.isFinite, rect.height.isFinite,
+              padding.isFinite,
+              rect.width > 0, rect.height > 0 else { return nil }
 
         let pad = max(0.0, padding)
-        let x0 = max(0, min(imgW - 1, Int(floor(rect.x - pad))))
-        let y0 = max(0, min(imgH - 1, Int(floor(rect.y - pad))))
-        let x1 = max(x0 + 1, min(imgW, Int(ceil(rect.x + rect.width + pad))))
-        let y1 = max(y0 + 1, min(imgH, Int(ceil(rect.y + rect.height + pad))))
+        let maxW = Double(imgW)
+        let maxH = Double(imgH)
+        let fx0 = min(Double(imgW - 1), max(0.0, floor(rect.x - pad)))
+        let fy0 = min(Double(imgH - 1), max(0.0, floor(rect.y - pad)))
+        let fx1 = min(maxW, max(fx0 + 1.0, ceil(rect.x + rect.width + pad)))
+        let fy1 = min(maxH, max(fy0 + 1.0, ceil(rect.y + rect.height + pad)))
+        let x0 = Int(fx0)
+        let y0 = Int(fy0)
+        let x1 = Int(fx1)
+        let y1 = Int(fy1)
         let cropW = x1 - x0
         let cropH = y1 - y0
         guard cropW >= 1, cropH >= 1 else { return nil }
@@ -549,25 +559,48 @@ public final class LocalVisionEngine: @unchecked Sendable {
 
     // MARK: - Native Apple Vision OCR (Neural Engine, ~5-25 ms, 0 MB)
 
-    public static func recognizeText(
+    /// True in CI or virtualized macOS guests (`kern.hv_vmm_present != 0`) where Apple Vision's default
+    /// ANE/E5RT hardware pipeline can stall indefinitely; pinning Vision to the CPU compute device avoids hangs.
+    public static let prefersCPUComputeDevice: Bool = {
+        if ProcessInfo.processInfo.environment["CI"] != nil {
+            return true
+        }
+        var isVM: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("kern.hv_vmm_present", &isVM, &size, nil, 0) == 0, isVM != 0 {
+            return true
+        }
+        return false
+    }()
+
+    public static func recognizeTextDetailed(
         in cgImage: CGImage,
         viewportWidth: Double,
         viewportHeight: Double,
-        fast: Bool = false
-    ) -> [VisionDetection] {
+        fast: Bool = false,
+        forceCPU: Bool = LocalVisionEngine.prefersCPUComputeDevice
+    ) -> (detections: [VisionDetection], error: String?) {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = fast ? .fast : .accurate
         request.usesLanguageCorrection = !fast
         request.recognitionLanguages = ["pt-BR", "en-US"]
+        if forceCPU,
+           let devices = try? request.supportedComputeStageDevices[.main],
+           let cpuDevice = devices.first(where: {
+               if case .cpu = $0 { return true }
+               return false
+           }) {
+            request.setComputeDevice(cpuDevice, for: .main)
+        }
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         do {
             try handler.perform([request])
         } catch {
-            return []
+            return ([], error.localizedDescription)
         }
 
-        guard let observations = request.results else { return [] }
+        guard let observations = request.results else { return ([], nil) }
         var detections: [VisionDetection] = []
         detections.reserveCapacity(observations.count)
 
@@ -591,7 +624,21 @@ public final class LocalVisionEngine: @unchecked Sendable {
                 source: "apple-vision-ocr"
             ))
         }
-        return detections
+        return (detections, nil)
+    }
+
+    public static func recognizeText(
+        in cgImage: CGImage,
+        viewportWidth: Double,
+        viewportHeight: Double,
+        fast: Bool = false
+    ) -> [VisionDetection] {
+        recognizeTextDetailed(
+            in: cgImage,
+            viewportWidth: viewportWidth,
+            viewportHeight: viewportHeight,
+            fast: fast
+        ).detections
     }
 
     /// Dirty-rect cropped Apple Vision OCR (~5–15 ms on Apple Neural Engine).
@@ -663,7 +710,17 @@ public final class LocalVisionEngine: @unchecked Sendable {
             viewportHeight: windowBounds.height,
             fast: true
         )
-        let sorted = sortInReadingOrder(raw).prefix(maxElements)
+        return ocrElementNodes(fromDetections: raw, windowBounds: windowBounds, maxElements: maxElements)
+    }
+
+    /// Pure deterministic conversion from Vision detections to `@v1..@vN` `ElementNode` entries in global coordinates.
+    public static func ocrElementNodes(
+        fromDetections detections: [VisionDetection],
+        windowBounds: ScreenRect,
+        maxElements: Int = 80
+    ) -> [ElementNode] {
+        guard windowBounds.width > 0, windowBounds.height > 0, maxElements > 0 else { return [] }
+        let sorted = sortInReadingOrder(detections).prefix(maxElements)
         return sorted.enumerated().map { idx, det in
             let local = det.frame ?? ScreenRect(x: det.x, y: det.y, width: 1, height: 1)
             let globalFrame = ScreenRect(
@@ -759,11 +816,41 @@ public final class LocalVisionEngine: @unchecked Sendable {
     ) async -> VisionQueryResult {
         await Task.detached(priority: .userInitiated) {
             let data = try? Data(contentsOf: URL(fileURLWithPath: imagePath))
-            let cgImage = data.flatMap { Self.decodeCGImage(fromJPEG: $0) }
-            let rawDetections = cgImage.map {
-                Self.recognizeText(in: $0, viewportWidth: viewportWidth, viewportHeight: viewportHeight)
-            } ?? []
-            let detections = Self.sortInReadingOrder(rawDetections)
+            guard let cgImage = data.flatMap({ Self.decodeCGImage(fromJPEG: $0) }) else {
+                let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+                return VisionQueryResult(
+                    mode: mode,
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: (latencyMs * 100).rounded() / 100,
+                    answer: "Apple Vision OCR could not decode the captured image.",
+                    verified: nil,
+                    blockingDetected: false,
+                    detections: [],
+                    imagePath: imagePath
+                )
+            }
+            let detailed = Self.recognizeTextDetailed(
+                in: cgImage,
+                viewportWidth: viewportWidth,
+                viewportHeight: viewportHeight,
+                fast: Self.prefersCPUComputeDevice
+            )
+            if let ocrError = detailed.error {
+                let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+                return VisionQueryResult(
+                    mode: mode,
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: (latencyMs * 100).rounded() / 100,
+                    answer: "Apple Vision OCR failed: \(ocrError)",
+                    verified: nil,
+                    blockingDetected: false,
+                    detections: [],
+                    imagePath: imagePath
+                )
+            }
+            let detections = Self.sortInReadingOrder(detailed.detections)
             let latencyMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
             if mode == "ocr" || mode == "describe" {

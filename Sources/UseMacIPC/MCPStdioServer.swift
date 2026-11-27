@@ -749,11 +749,16 @@ public final class MCPStdioServer: @unchecked Sendable {
                 let rawQuality = try optionalNumber(arguments, key: "quality")
                 returnImageContent = try optionalBool(arguments, key: "returnImageContent") ?? true
 
+                if let q = rawQuality, (!q.isFinite || q <= 0) {
+                    throw ArgumentValidationError(message: "Invalid 'quality': expected a finite positive number.")
+                }
                 let isBrowser = (tabId != nil || profile != nil || elementId != nil || selector != nil || fullPage == true) && app == nil
                 if isBrowser {
                     let browserQuality: Int = {
                         guard let q = rawQuality else { return 84 }
-                        return q <= 1.0 ? max(30, min(100, Int((q * 100.0).rounded()))) : max(30, min(100, Int(q.rounded())))
+                        let scaled = q <= 1.0 ? (q * 100.0) : q
+                        let clamped = min(100.0, max(30.0, scaled.rounded()))
+                        return Int(clamped)
                     }()
                     let params = BrowserScreenshotParams(
                         profile: profile,

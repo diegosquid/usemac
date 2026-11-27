@@ -60,6 +60,7 @@ const state = {
   tabQueues: new Map(), // tabId -> Promise
   cancelGeneration: 0,
   tabCancelGeneration: new Map(), // tabId -> number
+  cancelledRequestIds: new Set(), // bounded set of requestIds cancelled individually on timeout
   lastTabId: null,
   lastDownloadId: null,
   lastDownloadAt: 0,
@@ -204,8 +205,10 @@ function getOrCreateTabSession(tabId) {
       lastChildFrames: [], // cached visible child frames from latest discovery
       lastSnapshot: null, // { url, elementsById: Map<id, ElementNode>, tablesHash, textHash, timestampMs }
       networkPending: new Map(), // requestId -> { requestId, url, method, resourceType, timestampMs }
-      networkRing: [], // last 25 XHR/Fetch JSON responses
+      networkRing: [], // last 25 XHR/Fetch JSON responses for the current document
       networkErrors: [], // recent 4xx/5xx or failed XHR/Fetch responses
+      documentId: 1,
+      topLoaderId: null,
       navigating: false,
       previewDebounceTimer: null,
       url: "",
@@ -246,15 +249,19 @@ function getTabCancelGen(tabId) {
   return state.tabCancelGeneration.get(tabId) || 0;
 }
 
-function createCancelToken(tabId, globalGenOverride = null, tabGenOverride = null) {
+function createCancelToken(tabId, globalGenOverride = null, tabGenOverride = null, requestId = null) {
   return {
     globalGen: globalGenOverride != null ? globalGenOverride : state.cancelGeneration,
-    tabGen: tabGenOverride != null ? tabGenOverride : (tabId != null ? getTabCancelGen(tabId) : 0)
+    tabGen: tabGenOverride != null ? tabGenOverride : (tabId != null ? getTabCancelGen(tabId) : 0),
+    requestId: typeof requestId === "string" && requestId ? requestId : null
   };
 }
 
 function isCancelled(tabId, cancelToken) {
   if (!cancelToken) return false;
+  if (cancelToken.requestId && state.cancelledRequestIds.has(cancelToken.requestId)) {
+    return true;
+  }
   if (state.cancelGeneration > cancelToken.globalGen) {
     return true;
   }
@@ -281,7 +288,17 @@ async function sleepCancellable(ms, tabId, cancelToken) {
   }
 }
 
-function handleCancel(targetTabId = null) {
+function handleCancel(targetTabId = null, requestId = null) {
+  if (typeof requestId === "string" && requestId) {
+    state.cancelledRequestIds.add(requestId);
+    if (state.cancelledRequestIds.size > 128) {
+      const oldest = state.cancelledRequestIds.values().next().value;
+      if (oldest != null) state.cancelledRequestIds.delete(oldest);
+    }
+    if (targetTabId == null) {
+      return Promise.resolve();
+    }
+  }
   if (targetTabId != null && typeof targetTabId !== "number") {
     return Promise.resolve();
   }
@@ -631,7 +648,7 @@ function connectWS(force = false) {
     }
 
     if (msg.type === "cancel") {
-      handleCancel(msg.tabId ?? null);
+      handleCancel(msg.tabId ?? null, msg.requestId ?? null);
       return;
     }
 
@@ -732,6 +749,8 @@ function clearSessionFrameState(session) {
   session.networkPending?.clear();
   session.networkRing = [];
   session.networkErrors = [];
+  session.documentId = (session.documentId || 0) + 1;
+  session.topLoaderId = null;
   session.navigating = false;
   if (session.previewDebounceTimer) {
     clearTimeout(session.previewDebounceTimer);
@@ -1266,6 +1285,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
   if ((method === "Page.frameStartedNavigating" || method === "Page.frameStartedLoading") && !source.sessionId) {
     session.navigating = true;
+    sendWS({ type: "tab_url", tabId: source.tabId, loading: true });
     return;
   }
   if (method === "Page.loadEventFired" && !source.sessionId) {
@@ -1274,7 +1294,20 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
   if (method === "Page.frameNavigated" && !source.sessionId && params?.frame && !params.frame.parentId) {
     session.navigating = false;
+    const nextLoaderId = params.frame.loaderId || null;
+    if (!nextLoaderId || nextLoaderId !== session.topLoaderId) {
+      session.topLoaderId = nextLoaderId;
+      session.documentId = (session.documentId || 0) + 1;
+      session.networkRing = [];
+      session.networkPending.clear();
+    }
     if (params.frame.url) session.url = params.frame.url;
+    sendWS({
+      type: "tab_url",
+      tabId: source.tabId,
+      url: params.frame.url || session.url || "",
+      loading: false
+    });
     return;
   }
   if (method === "Network.requestWillBeSent" && !source.sessionId) {
@@ -1335,6 +1368,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           status,
           contentType,
           requestId: reqId,
+          documentId: session.documentId,
           timestampMs: now,
           bodyLoaded: false,
           body: null
@@ -1433,7 +1467,14 @@ chrome.tabs.onCreated?.addListener((tab) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const session = state.tabSessions.get(tabId);
   if (session && (changeInfo.url || changeInfo.title || tab)) {
-    session.url = tab?.url || changeInfo.url || session.url;
+    const prevUrl = session.url || "";
+    const nextUrl = tab?.url || changeInfo.url || session.url;
+    if (changeInfo.url && prevUrl && nextUrl.split("#")[0] !== prevUrl.split("#")[0]) {
+      session.documentId = (session.documentId || 0) + 1;
+      session.networkRing = [];
+      session.networkPending.clear();
+    }
+    session.url = nextUrl;
     session.title = tab?.title || changeInfo.title || session.title;
   }
   if (session && changeInfo?.status === "loading") {
@@ -1441,7 +1482,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   } else if (session && changeInfo?.status === "complete") {
     session.navigating = false;
   }
-  if (changeInfo.url || changeInfo.title || changeInfo.status === "complete") {
+  if (changeInfo.url || changeInfo.title || changeInfo.status === "loading" || changeInfo.status === "complete") {
+    const loading = changeInfo.status === "loading"
+      ? true
+      : (changeInfo.status === "complete" ? false : undefined);
     sendWS({
       type: "tab_url",
       tabId,
@@ -1449,7 +1493,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       url: tab?.url || changeInfo.url || "",
       pendingUrl: tab?.pendingUrl || null,
       title: tab?.title || changeInfo.title || "",
-      active: typeof tab?.active === "boolean" ? tab.active : undefined
+      active: typeof tab?.active === "boolean" ? tab.active : undefined,
+      loading
     });
   }
   if (session?.attached && changeInfo?.status === "complete") {
@@ -6153,6 +6198,7 @@ async function extractNetworkResponses(tabId, { urlFilter = null, maxChars = 160
   const session = getOrCreateTabSession(tabId);
   const filterLower = typeof urlFilter === "string" ? urlFilter.trim().toLowerCase() : "";
   const matching = (session.networkRing || [])
+    .filter((entry) => entry.documentId == null || entry.documentId === session.documentId)
     .filter((entry) => !filterLower || String(entry.url || "").toLowerCase().includes(filterLower))
     .slice()
     .reverse(); // newest first
@@ -7853,7 +7899,7 @@ function dispatchDaemonRequest(req) {
 
   if (req.command === "open") {
     const reqTabGen = req.tabId != null ? getTabCancelGen(req.tabId) : null;
-    const cancelToken = createCancelToken(req.tabId ?? null, reqGlobalGen, reqTabGen);
+    const cancelToken = createCancelToken(req.tabId ?? null, reqGlobalGen, reqTabGen, req.id);
     enqueueOpenCommand(async () => {
       if (isCancelled(req.tabId ?? null, cancelToken)) {
         sendCancelledResponse(req, req.tabId ?? null);

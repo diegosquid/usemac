@@ -79,8 +79,10 @@ public final class SkillStore: @unchecked Sendable {
             runCount: existing?.runCount ?? 0,
             lastSuccessAtMs: existing?.lastSuccessAtMs
         )
-        records[cleanName] = record
-        try persistLocked()
+        var candidate = records
+        candidate[cleanName] = record
+        try persistLocked(candidate)
+        records = candidate
         return record
     }
 
@@ -98,8 +100,10 @@ public final class SkillStore: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
-        records[cleanName] = normalized
-        try persistLocked()
+        var candidate = records
+        candidate[cleanName] = normalized
+        try persistLocked(candidate)
+        records = candidate
         return normalized
     }
 
@@ -117,10 +121,12 @@ public final class SkillStore: @unchecked Sendable {
         guard !cleanName.isEmpty else { return false }
         lock.lock()
         defer { lock.unlock() }
-        guard records.removeValue(forKey: cleanName) != nil else {
+        var candidate = records
+        guard candidate.removeValue(forKey: cleanName) != nil else {
             return false
         }
-        try persistLocked()
+        try persistLocked(candidate)
+        records = candidate
         return true
     }
 
@@ -173,8 +179,10 @@ public final class SkillStore: @unchecked Sendable {
         if success {
             existing.lastSuccessAtMs = nowMs
         }
-        records[cleanName] = existing
-        try? persistLocked()
+        var candidate = records
+        candidate[cleanName] = existing
+        try? persistLocked(candidate)
+        records = candidate
         return existing
     }
 
@@ -335,10 +343,10 @@ public final class SkillStore: @unchecked Sendable {
         return map
     }
 
-    private func persistLocked() throws {
+    private func persistLocked(_ snapshot: [String: SkillRecord]) throws {
         let dir = storageURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let sorted = records.values.sorted {
+        let sorted = snapshot.values.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
         let encoder = JSONEncoder()

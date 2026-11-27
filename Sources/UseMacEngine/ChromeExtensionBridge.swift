@@ -165,6 +165,12 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let title: String?
         let active: Bool?
         let removed: Bool?
+        let loading: Bool?
+    }
+
+    private struct CachedTabURL {
+        var url: String
+        var loading: Bool
     }
 
     /// Single-pass decoder for incoming WebSocket messages (avoids decoding JSON twice per message).
@@ -352,10 +358,17 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private struct CancelWireMessage: Encodable {
         let type = "cancel"
         let tabId: Int?
+        let requestId: String?
+
+        init(tabId: Int?, requestId: String? = nil) {
+            self.tabId = tabId
+            self.requestId = requestId
+        }
 
         private enum CodingKeys: String, CodingKey {
             case type
             case tabId
+            case requestId
         }
 
         func encode(to encoder: Encoder) throws {
@@ -365,6 +378,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
                 try container.encode(tabId, forKey: .tabId)
             } else {
                 try container.encodeNil(forKey: .tabId)
+            }
+            if let requestId {
+                try container.encode(requestId, forKey: .requestId)
             }
         }
     }
@@ -485,7 +501,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     private static let maxUnreadySessions = 8
     private static let challengeTimeoutSeconds: UInt64 = 10
-    private static let maxActTimeoutSeconds: UInt64 = 120
+    private static let maxActTimeoutSeconds: TimeInterval = 120.0
     private static let notPairedMessage = "A Chrome profile is connected but not paired. Open the UseMac extension popup and paste the pairing key from UseMac → Settings → General → Chrome Extension."
 
     private let configuredPort: UInt16
@@ -502,8 +518,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var pendingRequests: [String: PendingRequest] = [:]
     private var cachedFramesByTab: [String: CachedBrowserFrame] = [:]
     private var latestCachedFrame: CachedBrowserFrame?
-    /// Live `lowercased(profileName) -> [tabId: url]` cache populated by `tab_url` push events and `tabs`/`open` responses.
-    private var tabUrlsByProfile: [String: [Int: String]] = [:]
+    /// Live `lowercased(profileName) -> [tabId: CachedTabURL]` cache populated by `tab_url` push events and `tabs`/`open` responses.
+    private var tabUrlsByProfile: [String: [Int: CachedTabURL]] = [:]
     /// Lowercased profile names whose active session has pushed at least one `tab_url` event.
     private var tabUrlPushProfiles: Set<String> = []
     private let originLog = ExtensionOriginLog()
@@ -511,7 +527,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     public let bundledExtension: BundledChromeExtension?
 
     private var _listeningPort: UInt16 = 0
-    private var _baseCommandTimeoutSeconds: UInt64 = 15
+    private var _baseCommandTimeoutSeconds: TimeInterval = 15.0
     private var _onBrowserFrame: (@Sendable (_ tabId: Int?, _ jpegData: Data, _ viewportWidth: Int, _ viewportHeight: Int, _ profileName: String, _ title: String) -> Void)?
     private var _onBrowserCursor: (@Sendable (BrowserCursorEvent) -> Void)?
     private var _onBrowserStreamStopped: (@Sendable (_ profileName: String, _ tabId: Int?) -> Void)?
@@ -520,7 +536,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private var _onPairingStateChanged: (@Sendable () -> Void)?
     private var _onTabStreamEnded: (@Sendable (_ profileName: String, _ tabId: Int, _ reason: String?) -> Void)?
 
-    internal var baseCommandTimeoutSeconds: UInt64 {
+    internal var baseCommandTimeoutSeconds: TimeInterval {
         get {
             lock.lock()
             defer { lock.unlock() }
@@ -1020,12 +1036,16 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             }
         }
         let hasInlineSteps = !(params.steps?.isEmpty ?? true)
-        let timeoutSec: UInt64? = hasInlineSteps ? computeStepsTimeoutSeconds(params.steps ?? []) : nil
+        let timeoutSec: TimeInterval? = hasInlineSteps ? computeStepsTimeoutSeconds(params.steps ?? []) : nil
+        if let existingTabId = params.tabId {
+            invalidateCachedTabURL(profileQuery: params.profile, tabId: existingTabId)
+        }
         return await sendCommand(
             profileQuery: params.profile,
             timeoutSeconds: timeoutSec,
             sendCancelOnTimeout: hasInlineSteps,
-            cancelTabId: params.tabId
+            cancelTabId: params.tabId,
+            cancelByRequestId: params.tabId == nil
         ) { requestId in
             OpenWireCommand(
                 id: requestId,
@@ -1043,7 +1063,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
     }
 
-    private func computeStepsTimeoutSeconds(_ steps: [ActionStep]) -> UInt64 {
+    private func computeStepsTimeoutSeconds(_ steps: [ActionStep]) -> TimeInterval {
         let totalWaitMs: UInt64 = steps.reduce(0) { partial, step in
             guard step.action == .wait, let ms = step.durationMs, ms > 0 else {
                 return partial
@@ -1051,31 +1071,45 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             let (sum, overflow) = partial.addingReportingOverflow(UInt64(ms))
             return overflow ? UInt64.max : sum
         }
-        let waitSeconds: UInt64
-        if totalWaitMs == 0 {
-            waitSeconds = 0
-        } else if totalWaitMs >= Self.maxActTimeoutSeconds * 1000 {
-            waitSeconds = Self.maxActTimeoutSeconds
-        } else {
-            waitSeconds = (totalWaitMs + 999) / 1000
-        }
-        let base = baseCommandTimeoutSeconds
-        let (combined, overflow) = base.addingReportingOverflow(waitSeconds)
-        return min(Self.maxActTimeoutSeconds, overflow ? Self.maxActTimeoutSeconds : combined)
+        let waitSeconds = min(Self.maxActTimeoutSeconds, Double(totalWaitMs) / 1000.0)
+        return min(Self.maxActTimeoutSeconds, baseCommandTimeoutSeconds + waitSeconds)
     }
 
-    /// Returns the live cached URL for `tabId` in the matched profile when that session pushes `tab_url` events.
-    /// Returns nil on cache miss or for older extensions that do not push `tab_url` updates.
+    /// Invalidates cached URL authorization for `tabId` (or all tabs in the matched profile when `tabId` is nil)
+    /// when a navigation is initiated, forcing a live lookup until the destination document commits.
+    func invalidateCachedTabURL(profileQuery: String?, tabId: Int?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let session = resolveSessionLocked(profileQuery: profileQuery) else { return }
+        let key = session.profileName.lowercased()
+        if let tabId {
+            if var entry = tabUrlsByProfile[key]?[tabId] {
+                entry.loading = true
+                tabUrlsByProfile[key]?[tabId] = entry
+            }
+        } else if var map = tabUrlsByProfile[key] {
+            for (tid, var entry) in map {
+                entry.loading = true
+                map[tid] = entry
+            }
+            tabUrlsByProfile[key] = map
+        }
+    }
+
+    /// Returns the live cached URL for `tabId` in the matched profile when that session pushes `tab_url` events
+    /// and the tab is not mid-navigation (`loading == false`). Returns nil on cache miss, while navigating, or
+    /// for older extensions that do not push `tab_url` updates.
     func liveCachedTabURL(profileQuery: String?, tabId: Int) -> (url: String, profileName: String)? {
         lock.lock()
         defer { lock.unlock() }
         guard let session = resolveSessionLocked(profileQuery: profileQuery) else { return nil }
         let key = session.profileName.lowercased()
         guard tabUrlPushProfiles.contains(key),
-              let url = tabUrlsByProfile[key]?[tabId] else {
+              let entry = tabUrlsByProfile[key]?[tabId],
+              !entry.loading else {
             return nil
         }
-        return (url, session.profileName)
+        return (entry.url, session.profileName)
     }
 
     /// Snapshot of cached `tabId -> url` entries for the matched profile (diagnostics & tests).
@@ -1083,7 +1117,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let session = resolveSessionLocked(profileQuery: profileQuery) else { return [:] }
-        return tabUrlsByProfile[session.profileName.lowercased()] ?? [:]
+        return (tabUrlsByProfile[session.profileName.lowercased()] ?? [:]).mapValues(\.url)
     }
 
     /// The freshest cached frame for the tab or profile, never one of a page the user's rules block.
@@ -1137,7 +1171,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     /// Every tab, blocked ones included: only the rules check reads it, to find the tab a command would run on.
-    func unfilteredTabs(profile: String?, timeoutSeconds: UInt64) async -> BridgeResponse {
+    func unfilteredTabs(profile: String?, timeoutSeconds: TimeInterval) async -> BridgeResponse {
         await sendCommand(profileQuery: profile, timeoutSeconds: timeoutSeconds) { requestId in
             TabsWireCommand(id: requestId, query: nil)
         }
@@ -1167,7 +1201,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
             return blocked
         }
-        let timeoutSec: UInt64 = (params.scanHorizontal == true || params.scanVertical == true) ? 30 : 18
+        let timeoutSec: TimeInterval = (params.scanHorizontal == true || params.scanVertical == true) ? 30.0 : 18.0
         return await sendCommand(profileQuery: params.profile, timeoutSeconds: timeoutSec) { requestId in
             ExtractWireCommand(
                 id: requestId,
@@ -1212,6 +1246,9 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         }
         if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
             return blocked
+        }
+        if params.steps.contains(where: { $0.action == .openURL || $0.action == .navigate }) {
+            invalidateCachedTabURL(profileQuery: params.profile, tabId: params.tabId)
         }
         let timeoutSec = computeStepsTimeoutSeconds(params.steps)
 
@@ -1592,9 +1629,14 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         guard let tabId = payload.tabId else { return }
         if payload.removed == true {
             tabUrlsByProfile[profileKey]?.removeValue(forKey: tabId)
+        } else if payload.loading == true {
+            let resolved = (payload.pendingUrl?.isEmpty == false ? payload.pendingUrl : payload.url)
+                ?? tabUrlsByProfile[profileKey]?[tabId]?.url
+                ?? ""
+            tabUrlsByProfile[profileKey, default: [:]][tabId] = CachedTabURL(url: resolved, loading: true)
         } else {
             let resolved = (payload.url?.isEmpty == false ? payload.url : payload.pendingUrl) ?? ""
-            tabUrlsByProfile[profileKey, default: [:]][tabId] = resolved
+            tabUrlsByProfile[profileKey, default: [:]][tabId] = CachedTabURL(url: resolved, loading: false)
         }
     }
 
@@ -1928,13 +1970,13 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         if let listedTabs = payload.tabs {
             var map = tabUrlsByProfile[sessionProfileKey] ?? [:]
             for tab in listedTabs {
-                map[tab.tabId] = tab.url
+                map[tab.tabId] = CachedTabURL(url: tab.url, loading: tab.status == "loading")
             }
             tabUrlsByProfile[sessionProfileKey] = map
         } else if let respTabId = payload.tabId,
                   let respUrl = payload.url ?? payload.extractResult?.url,
                   !respUrl.isEmpty {
-            tabUrlsByProfile[sessionProfileKey, default: [:]][respTabId] = respUrl
+            tabUrlsByProfile[sessionProfileKey, default: [:]][respTabId] = CachedTabURL(url: respUrl, loading: false)
         }
         lock.unlock()
 
@@ -1946,6 +1988,27 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         ) {
             completePendingRequest(id: payload.id, sessionId: sessionId, response: blocked)
             return
+        }
+
+        // For network extraction under active site rules, drop any response entry whose URL is blocked.
+        var filteredExtractResult = payload.extractResult
+        if var ext = filteredExtractResult,
+           ext.mode.lowercased() == "network",
+           let rawJSON = ext.jsonResult,
+           TargetRulesStore.shared.rules.hasSiteRules,
+           let data = rawJSON.data(using: .utf8),
+           let items = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            let rules = TargetRulesStore.shared.rules
+            let allowedItems = items.filter { item in
+                guard let itemUrl = item["url"] as? String, !itemUrl.isEmpty else { return true }
+                return !rules.blocksURL(itemUrl)
+            }
+            if allowedItems.count != items.count,
+               let cleanData = try? JSONSerialization.data(withJSONObject: allowedItems),
+               let cleanStr = String(data: cleanData, encoding: .utf8) {
+                ext.jsonResult = cleanStr
+                filteredExtractResult = ext
+            }
         }
 
         var resolvedSnapshot = payload.snapshot
@@ -1996,7 +2059,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             url: payload.url,
             title: payload.title,
             tabs: payload.tabs,
-            extractResult: payload.extractResult,
+            extractResult: filteredExtractResult,
             screenshot: resolvedScreenshot,
             snapshot: resolvedSnapshot,
             actionResult: payload.actionResult,
@@ -2056,9 +2119,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
     private func sendCommand<Command: Encodable>(
         profileQuery: String?,
-        timeoutSeconds: UInt64? = nil,
+        timeoutSeconds: TimeInterval? = nil,
         sendCancelOnTimeout: Bool = false,
         cancelTabId: Int? = nil,
+        cancelByRequestId: Bool = false,
         targetSessionId: String? = nil,
         buildCommand: (String) -> Command
     ) async -> BridgeResponse {
@@ -2113,15 +2177,17 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
             let connection = session.connection
             let sessionId = session.id
+            let sleepNs = UInt64(max(0.01, effectiveTimeout) * 1_000_000_000.0)
             let timeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: effectiveTimeout * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: sleepNs)
                 guard !Task.isCancelled else { return }
                 self?.handleCommandTimeout(
                     requestId: requestId,
                     sessionId: sessionId,
                     timeoutSeconds: effectiveTimeout,
                     sendCancel: sendCancelOnTimeout,
-                    cancelTabId: cancelTabId
+                    cancelTabId: cancelTabId,
+                    cancelByRequestId: cancelByRequestId
                 )
             }
             pendingRequests[requestId] = PendingRequest(
@@ -2138,9 +2204,10 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     private func handleCommandTimeout(
         requestId: String,
         sessionId: String,
-        timeoutSeconds: UInt64,
+        timeoutSeconds: TimeInterval,
         sendCancel: Bool,
-        cancelTabId: Int?
+        cancelTabId: Int?,
+        cancelByRequestId: Bool
     ) {
         lock.lock()
         let entry = pendingRequests.removeValue(forKey: requestId)
@@ -2154,14 +2221,20 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
 
         guard let entry else { return }
         if let cancelConnection {
-            sendEncodable(CancelWireMessage(tabId: cancelTabId), on: cancelConnection)
+            sendEncodable(
+                CancelWireMessage(tabId: cancelTabId, requestId: cancelByRequestId ? requestId : nil),
+                on: cancelConnection
+            )
         }
         entry.timeoutTask.cancel()
+        let timeoutLabel = timeoutSeconds.rounded() == timeoutSeconds
+            ? "\(Int(timeoutSeconds))s"
+            : String(format: "%.2fs", timeoutSeconds)
         entry.continuation.resume(returning: BridgeResponse(
             ok: false,
             error: RPCErrorPayload(
                 code: "EXTENSION_TIMEOUT",
-                message: "Chrome extension did not respond within \(timeoutSeconds)s"
+                message: "Chrome extension did not respond within \(timeoutLabel)"
             )
         ))
     }

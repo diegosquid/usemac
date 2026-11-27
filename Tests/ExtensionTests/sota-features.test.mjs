@@ -1061,6 +1061,7 @@ test("tab-indicator.js caches the 9.5KB bootstrap once per contextId and sends t
   pages.attach(sb);
   sb.eval("TAB_INDICATOR_TIMING.leaseMs = 1000");
   t.after(async () => {
+    pages.dispose();
     await sb.call("stopStreamingAndDetach", TAB, false).catch(() => {});
     sb.dispose();
   });
@@ -1083,4 +1084,56 @@ test("tab-indicator.js caches the 9.5KB bootstrap once per contextId and sends t
   for (let i = 1; i < fnSizes.length; i++) {
     assert.ok(fnSizes[i] < 250, `subsequent call #${i} should use tiny fast dispatcher (got ${fnSizes[i]} bytes)`);
   }
+});
+
+test("networkRing clears across top-frame navigation and per-request cancel leaves other tabs attached", async (t) => {
+  const bodies = {
+    "req-old": JSON.stringify({ secret: "from-page-1" }),
+    "req-new": JSON.stringify({ ok: "from-page-2" })
+  };
+  const sb = createBackgroundSandbox({
+    tabs: [
+      { id: TAB, windowId: 1, url: "https://page1.example/a", active: true },
+      { id: TAB + 1, windowId: 1, url: "https://other.example/", active: false }
+    ],
+    windows: [{ id: 1, focused: true }],
+    cdp: (tabId, method, params) => {
+      if (method === "Network.getResponseBody") {
+        return { body: bodies[params.requestId] || "{}", base64Encoded: false };
+      }
+      return undefined;
+    }
+  });
+  t.after(() => sb.dispose());
+
+  // Attach both tabs
+  await sb.request({ type: "request", id: nextId(), command: "observe", tabId: TAB });
+  await sb.request({ type: "request", id: nextId(), command: "observe", tabId: TAB + 1 });
+  assert.equal(sb.attached.has(TAB), true);
+  assert.equal(sb.attached.has(TAB + 1), true);
+
+  // Capture a JSON response on page 1
+  sb.debuggerEvent(TAB, "Network.requestWillBeSent", { requestId: "req-old", type: "Fetch", request: { url: "https://page1.example/api/secret", method: "GET" } });
+  sb.debuggerEvent(TAB, "Network.responseReceived", { requestId: "req-old", type: "Fetch", response: { url: "https://page1.example/api/secret", status: 200, mimeType: "application/json", headers: { "content-type": "application/json" } } });
+
+  // Top-frame navigation to page 2 must clear page 1's network ring and emit loading: false tab_url
+  sb.debuggerEvent(TAB, "Page.frameStartedNavigating", {});
+  sb.debuggerEvent(TAB, "Page.frameNavigated", { frame: { id: "top", loaderId: "loader-2", url: "https://page2.example/b" } });
+  sb.debuggerEvent(TAB, "Network.requestWillBeSent", { requestId: "req-new", type: "Fetch", request: { url: "https://page2.example/api/public", method: "GET" } });
+  sb.debuggerEvent(TAB, "Network.responseReceived", { requestId: "req-new", type: "Fetch", response: { url: "https://page2.example/api/public", status: 200, mimeType: "application/json", headers: { "content-type": "application/json" } } });
+
+  const ext = (await sb.request({ type: "request", id: nextId(), command: "extract", tabId: TAB, mode: "network" })).response;
+  assert.equal(ext.ok, true);
+  const items = JSON.parse(ext.extractResult.jsonResult);
+  assert.equal(items.length, 1, `expected only page-2 responses, got ${JSON.stringify(items)}`);
+  assert.equal(items[0].url, "https://page2.example/api/public");
+  assert.ok(sb.sent.some((f) => f.type === "tab_url" && f.tabId === TAB && f.loading === true));
+  assert.ok(sb.sent.some((f) => f.type === "tab_url" && f.tabId === TAB && f.loading === false && f.url === "https://page2.example/b"));
+
+  // Per-request cancel (tabId: null, requestId: "req-x") does NOT detach other tabs or bump global cancelGeneration
+  const genBefore = sb.eval("state.cancelGeneration");
+  await sb.deliver({ type: "cancel", tabId: null, requestId: "timed-out-open-1" });
+  assert.equal(sb.eval("state.cancelGeneration"), genBefore);
+  assert.equal(sb.attached.has(TAB), true);
+  assert.equal(sb.attached.has(TAB + 1), true);
 });

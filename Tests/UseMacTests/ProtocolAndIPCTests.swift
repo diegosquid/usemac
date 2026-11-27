@@ -1284,8 +1284,8 @@ final class ProtocolAndIPCTests: XCTestCase {
         let pairingKey = try XCTUnwrap(bridge.pairingKeyText().flatMap(BridgeKey.init(text:)))
 
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 3
-        config.timeoutIntervalForResource = 3
+        config.timeoutIntervalForRequest = 0.5
+        config.timeoutIntervalForResource = 0.5
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 

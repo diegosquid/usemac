@@ -153,11 +153,11 @@ extension RPCRequest {
         return copy
     }
 
-    /// True when the request changes what another agent sees in a window or tab: `act` and `browser_act` (unless they
-    /// only wait), `browser_open` on an existing tab, and `browser_extract` in `eval` mode. Observe, screenshot,
-    /// other extracts and vision only read, so they never wait for another task.
+    /// True when the request changes what another agent sees in a window or tab: `act`, `browser_act` (unless they
+    /// only wait), `browser_open` on an existing tab, `browser_extract` in `eval` mode, mutating `app_menu`, and
+    /// `skill_run`. Observe, screenshot, other extracts and vision only read, so they never wait for another task.
     public var actsOnTarget: Bool {
-        let onlyWaits: ([ActionStep]) -> Bool = { steps in steps.allSatisfy { $0.action == .wait || $0.action == .waitFor } }
+        let onlyWaits: ([ActionStep]) -> Bool = { steps in steps.allSatisfy { $0.action == .wait || $0.action == .waitFor || $0.action == .assert } }
         switch method {
         case .act:
             return act.map { !onlyWaits($0.steps) } ?? false
@@ -167,6 +167,10 @@ extension RPCRequest {
             return browserOpen?.tabId != nil
         case .browserExtract:
             return browserExtract.map { $0.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "eval" } ?? false
+        case .appMenu:
+            return appMenu?.menuPath?.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } == true
+        case .skillRun:
+            return skillRun != nil
         default:
             return false
         }

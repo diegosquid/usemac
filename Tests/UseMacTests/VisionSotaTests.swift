@@ -1,8 +1,9 @@
-import AppKit
 import CoreGraphics
+import CoreText
 import Foundation
 import XCTest
 @testable import UseMacEngine
+@testable import UseMacIPC
 @testable import UseMacProtocol
 
 /// Tests for Wave 2B SOTA vision/engine/bridge deliverables:
@@ -60,23 +61,24 @@ final class VisionSotaTests: XCTestCase {
             ctx.fill(CGRect(x: rect.x, y: quartzY, width: rect.w, height: rect.h))
         }
 
-        // Draw crisp black text using NSGraphicsContext flipped to top-left origin
+        // Draw crisp black text using pure CoreText directly on the CGContext (thread-safe & headless-CI safe, zero AppKit).
         if !texts.isEmpty {
-            let nsCtx = NSGraphicsContext(cgContext: ctx, flipped: true)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = nsCtx
-            ctx.saveGState()
-            ctx.translateBy(x: 0, y: CGFloat(height))
-            ctx.scaleBy(x: 1, y: -1)
+            let black = CGColor(colorSpace: colorSpace, components: [0, 0, 0, 1])!
+            ctx.textMatrix = .identity
             for item in texts {
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.boldSystemFont(ofSize: item.fontSize),
-                    .foregroundColor: NSColor.black
+                let font = CTFontCreateWithName("Helvetica-Bold" as CFString, item.fontSize, nil)
+                let attrs: [CFString: Any] = [
+                    kCTFontAttributeName: font,
+                    kCTForegroundColorAttributeName: black
                 ]
-                (item.string as NSString).draw(at: NSPoint(x: item.x, y: item.y), withAttributes: attrs)
+                let attrStr = CFAttributedStringCreate(kCFAllocatorDefault, item.string as CFString, attrs as CFDictionary)!
+                let line = CTLineCreateWithAttributedString(attrStr)
+                let ascent = CTFontGetAscent(font)
+                // Convert top-left origin y to Quartz bottom-left baseline y
+                let baselineY = CGFloat(height) - item.y - ascent
+                ctx.textPosition = CGPoint(x: item.x, y: baselineY)
+                CTLineDraw(line, ctx)
             }
-            ctx.restoreGState()
-            NSGraphicsContext.restoreGraphicsState()
         }
 
         guard let cgImage = ctx.makeImage(),
@@ -153,6 +155,25 @@ final class VisionSotaTests: XCTestCase {
         let scaledCG = try XCTUnwrap(LocalVisionEngine.decodeCGImage(fromJPEG: scaledData))
         XCTAssertEqual(scaledCG.width, 400)
         XCTAssertEqual(scaledCG.height, 250)
+
+        // Extreme and non-finite coordinates clamp safely without trapping on Int conversion.
+        XCTAssertNil(LocalVisionEngine.cropJPEG(
+            fromJPEG: img,
+            rect: ScreenRect(x: .nan, y: 0, width: 100, height: 100)
+        ))
+        XCTAssertNil(LocalVisionEngine.cropJPEG(
+            fromJPEG: img,
+            rect: ScreenRect(x: 0, y: .infinity, width: 100, height: 100)
+        ))
+        let clampedHuge = try XCTUnwrap(LocalVisionEngine.cropJPEG(
+            fromJPEG: img,
+            rect: ScreenRect(x: -1e12, y: -1e12, width: 1e13, height: 1e13),
+            padding: 24,
+            maxDimension: 200
+        ))
+        let clampedCG = try XCTUnwrap(LocalVisionEngine.decodeCGImage(fromJPEG: clampedHuge))
+        XCTAssertEqual(clampedCG.width, 200)
+        XCTAssertEqual(clampedCG.height, 125)
     }
 
     // MARK: - 2. Negation-Safe Verification (EN + PT)
@@ -203,19 +224,39 @@ final class VisionSotaTests: XCTestCase {
             ]
         )
 
-        // Cropped OCR on top-left region reads ALPHA SUBMIT without OMEGA CANCEL
+        // Pure deterministic @vN fusion (no Vision runtime required)
+        let windowBounds = ScreenRect(x: 100, y: 200, width: 800, height: 400)
+        let syntheticNodes = LocalVisionEngine.ocrElementNodes(
+            fromDetections: [
+                VisionDetection(label: "OMEGA CANCEL", x: 580, y: 315, frame: ScreenRect(x: 480, y: 300, width: 200, height: 30), confidence: 0.99, source: "test"),
+                VisionDetection(label: "ALPHA SUBMIT", x: 140, y: 55, frame: ScreenRect(x: 40, y: 40, width: 200, height: 30), confidence: 0.99, source: "test")
+            ],
+            windowBounds: windowBounds
+        )
+        XCTAssertEqual(syntheticNodes.count, 2)
+        guard syntheticNodes.count == 2 else { return }
+        XCTAssertEqual(syntheticNodes[0].id, "@v1")
+        XCTAssertEqual(syntheticNodes[0].title, "ALPHA SUBMIT")
+        XCTAssertEqual(syntheticNodes[0].frame.x, 140)
+        XCTAssertEqual(syntheticNodes[0].frame.y, 240)
+        XCTAssertEqual(syntheticNodes[1].id, "@v2")
+        XCTAssertEqual(syntheticNodes[1].title, "OMEGA CANCEL")
+        XCTAssertEqual(syntheticNodes[1].frame.x, 580)
+        XCTAssertEqual(syntheticNodes[1].frame.y, 500)
+
+        // Cropped OCR on top-left region reads ALPHA SUBMIT without OMEGA CANCEL (fast/CPU-safe in CI VMs)
         let topLeftOCR = LocalVisionEngine.recognizeText(
             inJPEG: jpeg,
-            region: ScreenRect(x: 20, y: 20, width: 340, height: 100),
-            fast: false
+            region: ScreenRect(x: 20, y: 20, width: 360, height: 110),
+            fast: true
         )
         XCTAssertTrue(topLeftOCR.text.uppercased().contains("ALPHA"), "Expected ALPHA in cropped OCR, got: \(topLeftOCR.text)")
         XCTAssertFalse(topLeftOCR.text.uppercased().contains("OMEGA"), "Did not expect OMEGA in top-left crop, got: \(topLeftOCR.text)")
 
-        // @vN OCR fusion produces clickable ElementNodes offset into global windowBounds
-        let windowBounds = ScreenRect(x: 100, y: 200, width: 800, height: 400)
+        // @vN OCR fusion from real image produces clickable ElementNodes offset into global windowBounds
         let nodes = LocalVisionEngine.ocrElementNodes(fromJPEG: jpeg, windowBounds: windowBounds)
         XCTAssertGreaterThanOrEqual(nodes.count, 2, "Expected OCR nodes for both labels, got: \(nodes)")
+        guard nodes.count >= 2 else { return }
         XCTAssertEqual(nodes[0].id, "@v1")
         XCTAssertEqual(nodes[1].id, "@v2")
         XCTAssertEqual(nodes[0].role, "AXStaticText")
@@ -232,6 +273,13 @@ final class VisionSotaTests: XCTestCase {
         XCTAssertEqual(negPass.verified, true, negPass.answer)
         let negFail = await engine.query(mode: "verify", query: "No ALPHA button visible", imagePath: tmpPath, viewportWidth: 800, viewportHeight: 400)
         XCTAssertEqual(negFail.verified, false, negFail.answer)
+
+        // Corrupt/unreadable image must return indeterminate (verified == nil), NEVER falsely verifying absence!
+        let corruptPath = NSTemporaryDirectory() + "usemac-vision-corrupt-\(UUID().uuidString).jpg"
+        try Data("not-a-jpeg".utf8).write(to: URL(fileURLWithPath: corruptPath))
+        defer { try? FileManager.default.removeItem(atPath: corruptPath) }
+        let corruptVerify = await engine.query(mode: "verify", query: "No error banner visible", imagePath: corruptPath, viewportWidth: 800, viewportHeight: 400)
+        XCTAssertNil(corruptVerify.verified, "Unreadable image must not verify a negated assertion as true: \(corruptVerify.answer)")
     }
 
     // MARK: - 4. Zero-Ceremony Piggybacked Task Lifecycle
@@ -814,5 +862,227 @@ final class VisionSotaTests: XCTestCase {
             ))
             XCTAssertEqual(blockedMenu.error?.code, "TARGET_BLOCKED")
         }
+    }
+
+    // MARK: - 8. Astra Review Security & Correctness Regression Tests
+
+    func testReadOnlyBlocksAutoDismissAndRedirectDoesNotRunInlineSteps() async throws {
+        TargetRulesStore.shared.update(TargetRules(deniedSites: ["vault.example"]), persist: false)
+        let keyDir = makeTemporaryBridgeKeyDirectory()
+        defer { try? FileManager.default.removeItem(at: keyDir) }
+
+        let service = UseMacEngineService(
+            socketPath: "/tmp/usemac-ut-sec-\(UUID().uuidString.prefix(8)).sock",
+            extensionPort: 0,
+            bridgeKeyDirectory: keyDir
+        )
+        service.chromeBridge.baseCommandTimeoutSeconds = 0.5
+        service.chromeBridge.start()
+        defer { service.chromeBridge.stop() }
+
+        let port = await waitForListeningPort(of: service.chromeBridge)
+        let key = try XCTUnwrap(service.bridgePairingKeyText().flatMap(BridgeKey.init(text:)))
+        let wsTask = try await connectAuthenticatedMockExtension(port: port, key: key, profileName: "SecProf", tabCount: 1)
+        defer { wsTask.cancel(with: .goingAway, reason: nil) }
+        let ready = await waitForBridgeCondition { service.chromeBridge.connectedProfiles().first?.profileName == "SecProf" }
+        XCTAssertTrue(ready)
+
+        let recorded = RecordedCommands()
+        let responder = Task {
+            while !Task.isCancelled {
+                guard let obj = try? await receiveBridgeJSON(from: wsTask) else { break }
+                guard (obj["type"] as? String) == "request", let id = obj["id"] as? String,
+                      let command = obj["command"] as? String else { continue }
+                recorded.append(obj)
+                if command == "open" {
+                    // Simulate server-side redirect from allowed shortener to blocked vault.example
+                    try? await sendBridgeJSON([
+                        "type": "response",
+                        "id": id,
+                        "ok": true,
+                        "tabId": 91,
+                        "profileName": "SecProf",
+                        "url": "https://vault.example/login",
+                        "title": "Vault"
+                    ], on: wsTask)
+                } else if command == "tabs" {
+                    try? await sendBridgeJSON([
+                        "type": "response",
+                        "id": id,
+                        "ok": true,
+                        "profileName": "SecProf",
+                        "tabs": [
+                            ["tabId": 10, "title": "Vault", "url": "https://vault.example/secret", "active": true, "usemac": true]
+                        ]
+                    ], on: wsTask)
+                } else {
+                    try? await sendBridgeJSON(["type": "response", "id": id, "ok": true, "tabId": 91, "profileName": "SecProf"], on: wsTask)
+                }
+            }
+        }
+        defer { responder.cancel() }
+
+        // 1. ReadOnly blocks browser_open(autoDismissOverlays: true) and browser_batch(autoDismissOverlays: true)
+        service.setGovernancePolicy(.readOnly)
+        let roOpen = await service.handle(RPCRequest(
+            method: .browserOpen,
+            browserOpen: BrowserOpenParams(url: "https://ok.example/", profile: "SecProf", autoDismissOverlays: true)
+        ))
+        XCTAssertEqual(roOpen.error?.code, "POLICY_BLOCKED")
+
+        let roBatch = await service.handle(RPCRequest(
+            method: .browserBatch,
+            browserBatch: BrowserBatchParams(profile: "SecProf", urls: ["https://ok.example/"], autoDismissOverlays: true)
+        ))
+        XCTAssertEqual(roBatch.error?.code, "POLICY_BLOCKED")
+        XCTAssertEqual(recorded.names, [])
+
+        // 2. Under site rules, browser_open strips autoDismissOverlays & inline steps from `open`,
+        // catches the redirect to blocked vault.example, and never sends any follow-up `act`.
+        service.setGovernancePolicy(.autonomous)
+        let redirOpen = await service.handle(RPCRequest(
+            method: .browserOpen,
+            browserOpen: BrowserOpenParams(
+                url: "https://short.example/go",
+                profile: "SecProf",
+                steps: [ActionStep(action: .click, elementId: "@b1")],
+                autoDismissOverlays: true
+            )
+        ))
+        XCTAssertEqual(redirOpen.error?.code, "TARGET_BLOCKED")
+        XCTAssertEqual(recorded.names, ["open"])
+        XCTAssertNil(recorded.all.first?["steps"], "Inline steps must not be forwarded in open when site rules are active")
+        XCTAssertNil(recorded.all.first?["autoDismissOverlays"], "autoDismissOverlays must not fire before destination URL passes TargetRules")
+
+        // 3. `tab_url` with `loading: true` invalidates cached allowed URL and forces a live `tabs` lookup.
+        try await sendBridgeJSON(["type": "tab_url", "tabId": 10, "url": "https://safe.example/app", "loading": false], on: wsTask)
+        let cachedSafe = await waitForBridgeCondition {
+            service.chromeBridge.liveCachedTabURL(profileQuery: "SecProf", tabId: 10)?.url == "https://safe.example/app"
+        }
+        XCTAssertTrue(cachedSafe)
+        try await sendBridgeJSON(["type": "tab_url", "tabId": 10, "url": "https://safe.example/app", "loading": true], on: wsTask)
+        let invalidated = await waitForBridgeCondition {
+            service.chromeBridge.liveCachedTabURL(profileQuery: "SecProf", tabId: 10) == nil
+        }
+        XCTAssertTrue(invalidated)
+
+        recorded.reset()
+        let duringNav = await service.chromeBridge.observe(BrowserObserveParams(profile: "SecProf", tabId: 10))
+        XCTAssertEqual(duringNav.error?.code, "TARGET_BLOCKED")
+        XCTAssertEqual(recorded.names, ["tabs"], "Loading tab must bypass cache and run live tabs preflight")
+    }
+
+    func testSkillRunHonorsTaskIsolationAndLeaseAndAuditRedactsPiggyback() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usemac-ut-skill-iso-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let keyDir = makeTemporaryBridgeKeyDirectory()
+        defer { try? FileManager.default.removeItem(at: keyDir) }
+
+        let store = SkillStore(storageURL: tempDir.appendingPathComponent("skills.json"))
+        let service = UseMacEngineService(
+            socketPath: "/tmp/usemac-ut-skill-iso-\(UUID().uuidString.prefix(8)).sock",
+            extensionPort: 0,
+            bridgeKeyDirectory: keyDir,
+            skillStore: store
+        )
+        service.chromeBridge.baseCommandTimeoutSeconds = 0.5
+        service.chromeBridge.start()
+        defer { service.chromeBridge.stop() }
+
+        let port = await waitForListeningPort(of: service.chromeBridge)
+        let key = try XCTUnwrap(service.bridgePairingKeyText().flatMap(BridgeKey.init(text:)))
+        let wsTask = try await connectAuthenticatedMockExtension(port: port, key: key, profileName: "IsoProf", tabCount: 2)
+        defer { wsTask.cancel(with: .goingAway, reason: nil) }
+        let ready = await waitForBridgeCondition { service.chromeBridge.connectedProfiles().first?.profileName == "IsoProf" }
+        XCTAssertTrue(ready)
+
+        let recorded = RecordedCommands()
+        let responder = Task {
+            while !Task.isCancelled {
+                guard let obj = try? await receiveBridgeJSON(from: wsTask) else { break }
+                if await answerTabsLookup(obj, on: wsTask, profileName: "IsoProf") { continue }
+                guard (obj["type"] as? String) == "request", let id = obj["id"] as? String else { continue }
+                recorded.append(obj)
+                try? await sendBridgeJSON([
+                    "type": "response",
+                    "id": id,
+                    "ok": true,
+                    "tabId": obj["tabId"] as? Int ?? 101,
+                    "profileName": "IsoProf",
+                    "url": "https://app.example/",
+                    "actionResult": [
+                        "success": true,
+                        "totalLatencyMs": 1.0,
+                        "stepResults": [["index": 0, "action": "setValue", "success": true, "mechanism": "cdp", "latencyMs": 1.0]]
+                    ]
+                ], on: wsTask)
+            }
+        }
+        defer { responder.cancel() }
+
+        _ = try store.save(SkillSaveParams(
+            name: "fill-secret",
+            target: "browser",
+            steps: [ActionStep(action: .setValue, selector: "#pw", text: "{{secret}}")]
+        ))
+
+        // Task A owns tab 101; Task B owns tab 202.
+        let startA = await service.handle(RPCRequest(method: .taskStart, taskStart: TaskStartParams(summary: "Task A")))
+        let startB = await service.handle(RPCRequest(method: .taskStart, taskStart: TaskStartParams(summary: "Task B")))
+        let taskA = try XCTUnwrap(startA.taskId)
+        let taskB = try XCTUnwrap(startB.taskId)
+        service.taskTabs.recordOpenedTab(101, taskId: taskA, profile: "IsoProf")
+        service.taskTabs.recordOpenedTab(202, taskId: taskB, profile: "IsoProf")
+
+        // Running browser skill without explicit tabId as Task A must route to Task A's tab 101!
+        recorded.reset()
+        let runA = await service.handle(RPCRequest(
+            method: .skillRun,
+            skillRun: SkillRunParams(name: "fill-secret", params: ["secret": "hunter2-secret-value"], profile: "IsoProf"),
+            taskId: taskA
+        ))
+        XCTAssertTrue(runA.ok, String(describing: runA.error))
+        XCTAssertEqual(recorded.all.last?["tabId"] as? Int, 101, "skill_run must scope to its own task's last tab")
+
+        // Task B attempting to run the skill on Task A's leased tab 101 must fail with TARGET_BUSY!
+        let runBOnA = await service.handle(RPCRequest(
+            method: .skillRun,
+            skillRun: SkillRunParams(name: "fill-secret", params: ["secret": "other-secret-value"], profile: "IsoProf", tabId: 101),
+            taskId: taskB
+        ))
+        XCTAssertEqual(runBOnA.error?.code, "TARGET_BUSY")
+
+        // Piggybacked taskStart/taskComplete summaries that repeat a typed secret are scrubbed in audit logs.
+        let secret = "SuperSecretToken98765"
+        _ = await service.handle(RPCRequest(
+            method: .browserOpen,
+            browserOpen: BrowserOpenParams(
+                url: "https://app.example/",
+                profile: "IsoProf",
+                steps: [ActionStep(action: .type, text: secret)]
+            ),
+            taskStart: TaskStartParams(summary: "Typing \(secret) now"),
+            taskComplete: TaskCompleteParams(summary: "Done typing \(secret)")
+        ))
+        let audits = service.recentAuditEntries(limit: 20)
+        XCTAssertFalse(audits.contains { $0.summary.contains(secret) }, "Piggybacked taskStart/taskComplete must scrub secrets: \(audits.map(\.summary))")
+
+        // MCPTaskScope reconciles returned taskId/taskSummary even when the main piggybacked operation fails!
+        let mcpScope = MCPTaskScope()
+        let failedStartReq = RPCRequest(method: .browserObserve, taskStart: TaskStartParams(summary: "failing op"))
+        var failedStartResp = RPCResponse.failure(id: "1", code: "EXTENSION_NOT_CONNECTED", message: "offline")
+        failedStartResp.taskId = "task-failed-1"
+        mcpScope.record(failedStartReq, response: failedStartResp)
+        XCTAssertEqual(mcpScope.currentTaskId(), "task-failed-1")
+
+        let failedCompleteReq = RPCRequest(method: .browserObserve, taskComplete: TaskCompleteParams(summary: "done"), taskId: "task-failed-1")
+        var failedCompleteResp = RPCResponse.failure(id: "2", code: "EXTENSION_NOT_CONNECTED", message: "offline")
+        failedCompleteResp.taskId = "task-failed-1"
+        failedCompleteResp.taskSummary = TaskSummary(taskId: "task-failed-1")
+        mcpScope.record(failedCompleteReq, response: failedCompleteResp)
+        XCTAssertNil(mcpScope.currentTaskId())
     }
 }

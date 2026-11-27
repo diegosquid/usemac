@@ -289,10 +289,19 @@ class FakePage {
     this.bindings = new Set();
     this.nextContextId = tabId * 100;
     this.calls = [];
+    this.timers = new Set();
     this.navigate();
   }
 
+  dispose() {
+    for (const timer of this.timers) {
+      clearTimeout(timer);
+    }
+    this.timers.clear();
+  }
+
   navigate() {
+    this.dispose();
     this.document = new FakeDocument();
     this.world = null;
     this.frameId = `frame-${this.tabId}`;
@@ -320,12 +329,25 @@ class FakePage {
   ensureWorld() {
     if (!this.world) {
       const doc = this.document;
+      const timers = this.timers;
+      const trackedSetTimeout = (cb, ms, ...args) => {
+        const id = setTimeout(() => {
+          timers.delete(id);
+          cb(...args);
+        }, ms);
+        timers.add(id);
+        return id;
+      };
+      const trackedClearTimeout = (id) => {
+        timers.delete(id);
+        clearTimeout(id);
+      };
       const world = {
         document: doc,
         MutationObserver: FakeMutationObserver,
-        setTimeout,
-        clearTimeout,
-        requestAnimationFrame: (cb) => setTimeout(cb, 1),
+        setTimeout: trackedSetTimeout,
+        clearTimeout: trackedClearTimeout,
+        requestAnimationFrame: (cb) => trackedSetTimeout(cb, 1),
         queueMicrotask,
         console
       };
@@ -405,6 +427,12 @@ function createFakePages(fallback = () => undefined) {
     cdp(tabId, method, params) {
       const handled = pageFor(tabId).handle(method, params);
       return handled === undefined ? fallback(tabId, method, params) : handled;
+    },
+    /** Clears all pending page timers so Node exits immediately after tests finish. */
+    dispose() {
+      for (const page of pages.values()) {
+        page.dispose();
+      }
     },
     /** A top-level navigation: a new document, announced like Chrome does. */
     navigate(tabId) {

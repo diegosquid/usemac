@@ -69,21 +69,23 @@ final class MCPTaskScope: @unchecked Sendable {
     }
 
     /// Notes a finished request: `task_start` (or piggybacked `taskStart`) opens a task on this connection,
-    /// `task_complete` (or piggybacked `taskComplete`) closes it.
+    /// `task_complete` (or piggybacked `taskComplete`) closes it. Reconciles returned task IDs and summaries even
+    /// when a piggybacked main operation fails, because the daemon still applies the lifecycle change.
     func record(_ request: RPCRequest, response: RPCResponse, now: Date = Date()) {
-        guard response.ok else { return }
         let startsTask = request.method == .taskStart || request.taskStart != nil
         let completesTask = request.method == .taskComplete || request.taskComplete != nil
         guard startsTask || completesTask else { return }
 
         lock.lock(); defer { lock.unlock() }
         if startsTask && !completesTask {
-            if let taskId = response.taskId {
+            if let taskId = response.taskId, (response.ok || request.taskStart != nil) {
                 openTasks[taskId] = now
             }
         } else if completesTask {
-            if let taskId = response.taskId ?? request.taskComplete?.taskId ?? request.taskId {
-                openTasks.removeValue(forKey: taskId)
+            if response.ok || response.taskSummary != nil {
+                if let taskId = response.taskSummary?.taskId ?? response.taskId ?? request.taskComplete?.taskId ?? request.taskId {
+                    openTasks.removeValue(forKey: taskId)
+                }
             }
         }
     }

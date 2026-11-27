@@ -489,12 +489,67 @@ public final class UnixSocketServer: @unchecked Sendable {
         }
     }
 
+    private static let maxConcurrentRequestsPerClient = 16
+
+    private final class ClientTaskRegistry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tasks: [UUID: Task<Void, Never>] = [:]
+        private var cancelled = false
+
+        func register(_ id: UUID, task: Task<Void, Never>) {
+            lock.lock()
+            let shouldCancel = cancelled
+            if !shouldCancel {
+                tasks[id] = task
+            }
+            lock.unlock()
+            if shouldCancel {
+                task.cancel()
+            }
+        }
+
+        func remove(_ id: UUID) {
+            lock.lock()
+            tasks.removeValue(forKey: id)
+            lock.unlock()
+        }
+
+        func cancelAll() {
+            lock.lock()
+            cancelled = true
+            let all = Array(tasks.values)
+            tasks.removeAll()
+            lock.unlock()
+            for task in all {
+                task.cancel()
+            }
+        }
+    }
+
+    private static func requiresOrderedExecution(_ request: RPCRequest) -> Bool {
+        if request.actsOnTarget || request.taskStart != nil || request.taskComplete != nil {
+            return true
+        }
+        switch request.method {
+        case .taskStart, .taskComplete, .setPolicy, .pairApp, .skillSave, .browserOpen, .browserBatch, .browserReloadExtension:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func handleClient(clientFd: Int32) {
         let replyQueue = DispatchQueue(label: "app.usemac.ipc.server.reply.\(clientFd)", qos: .userInteractive)
         let inFlightGroup = DispatchGroup()
+        let concurrencyLimit = DispatchSemaphore(value: Self.maxConcurrentRequestsPerClient)
+        let taskRegistry = ClientTaskRegistry()
         let writeFailed = AtomicFlag()
+        var orderedTail: Task<Void, Never>?
 
         defer {
+            if writeFailed.value || !isRunning {
+                taskRegistry.cancelAll()
+            }
             inFlightGroup.wait()
             replyQueue.sync {}
             unregisterAndCloseClient(clientFd)
@@ -508,6 +563,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                 guard let self, self.isRunning, !writeFailed.value else { return }
                 if !self.writeAll(fd: clientFd, data: encoded) {
                     writeFailed.set(true)
+                    taskRegistry.cancelAll()
                     Darwin.shutdown(clientFd, SHUT_RDWR)
                 }
             }
@@ -553,11 +609,27 @@ public final class UnixSocketServer: @unchecked Sendable {
                         do {
                             let request = try decoder.decode(RPCRequest.self, from: lineData)
                             let svc = service
+                            let ordered = Self.requiresOrderedExecution(request)
+                            let previousOrdered = ordered ? orderedTail : nil
+                            let taskId = UUID()
+                            concurrencyLimit.wait()
                             inFlightGroup.enter()
-                            Task {
-                                defer { inFlightGroup.leave() }
+                            let task = Task {
+                                defer {
+                                    taskRegistry.remove(taskId)
+                                    inFlightGroup.leave()
+                                    concurrencyLimit.signal()
+                                }
+                                if let previousOrdered {
+                                    _ = await previousOrdered.value
+                                }
+                                guard !Task.isCancelled, !writeFailed.value else { return }
                                 let response = await svc.handle(request)
                                 sendResponse(response)
+                            }
+                            taskRegistry.register(taskId, task: task)
+                            if ordered {
+                                orderedTail = task
                             }
                         } catch {
                             let failure = RPCResponse.failure(

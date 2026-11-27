@@ -256,7 +256,7 @@ final class IPCHardeningTests: XCTestCase {
 
     func testReadTimeoutIsNotClampedByEnsureConnected() throws {
         let socketPath = makeTempSocketPath(prefix: "usemac-ht-clamp")
-        let stub = StubService(delayMs: 900)
+        let stub = StubService(delayMs: 350)
         let server = UnixSocketServer(socketPath: socketPath, service: stub)
         try server.start()
         defer {
@@ -264,7 +264,7 @@ final class IPCHardeningTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: socketPath)
         }
 
-        let client = UnixSocketClient(socketPath: socketPath, timeoutMs: 5000, keepAlive: true)
+        let client = UnixSocketClient(socketPath: socketPath, timeoutMs: 3000, keepAlive: true)
         defer { client.close() }
 
         XCTAssertTrue(client.ensureConnected())
@@ -276,7 +276,7 @@ final class IPCHardeningTests: XCTestCase {
 
     func testPerRequestTimeoutOverrideAndRecovery() throws {
         let socketPath = makeTempSocketPath(prefix: "usemac-ht-override")
-        let stub = StubService(delayMs: 900)
+        let stub = StubService(delayMs: 350)
         let server = UnixSocketServer(socketPath: socketPath, service: stub)
         try server.start()
         defer {
@@ -284,11 +284,11 @@ final class IPCHardeningTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: socketPath)
         }
 
-        let client = UnixSocketClient(socketPath: socketPath, timeoutMs: 5000, keepAlive: true)
+        let client = UnixSocketClient(socketPath: socketPath, timeoutMs: 3000, keepAlive: true)
         defer { client.close() }
 
         do {
-            _ = try client.send(RPCRequest(method: .ping), timeoutMs: 200)
+            _ = try client.send(RPCRequest(method: .ping), timeoutMs: 100)
             XCTFail("Expected short per-request timeout to throw .timeout")
         } catch let error as UnixSocketClientError {
             guard case .timeout = error else {

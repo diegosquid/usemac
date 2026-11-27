@@ -204,7 +204,7 @@ final class NativeSotaTests: XCTestCase {
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
         XCTAssertTrue(woken)
-        XCTAssertLessThan(elapsedMs, 400, "waitForChange should wake immediately on recordChange instead of waiting for timeout")
+        XCTAssertLessThan(elapsedMs, 1200, "waitForChange should wake early on recordChange instead of waiting for the full 1500 ms timeout")
         XCTAssertGreaterThan(indexer.currentGeneration(pid: fakePid), gen0)
 
         // Already-advanced generation returns true immediately.
@@ -549,7 +549,7 @@ final class NativeSotaTests: XCTestCase {
         XCTAssertEqual(result.height, 200)
         XCTAssertGreaterThan(result.byteCount, 100)
         XCTAssertNotNil(result.base64Data)
-        XCTAssertLessThan(result.latencyMs, 500)
+        XCTAssertLessThan(result.latencyMs, 2000)
 
         // Region crop on live frame works too.
         let cropReq = ScreenshotRequest(

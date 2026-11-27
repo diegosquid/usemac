@@ -7,7 +7,7 @@ import UseMacProtocol
 extension ChromeExtensionBridge {
     /// How long the tab lookup before a command may take (capped by the bridge's base timeout). The extension
     /// answers it in milliseconds.
-    static let targetRulesLookupTimeoutSeconds: UInt64 = 2
+    static let targetRulesLookupTimeoutSeconds: TimeInterval = 2.0
 
     /// Lookup failures where the command itself could not be sent either, so its own error is the answer.
     static let targetRulesUnreachableCodes: Set<String> = ["EXTENSION_NOT_CONNECTED", "EXTENSION_NOT_PAIRED"]
@@ -53,7 +53,7 @@ extension ChromeExtensionBridge {
             }
         }
 
-        let timeout = min(Self.targetRulesLookupTimeoutSeconds, max(1, baseCommandTimeoutSeconds))
+        let timeout = min(Self.targetRulesLookupTimeoutSeconds, max(0.05, baseCommandTimeoutSeconds))
         let listing = await unfilteredTabs(profile: profile, timeoutSeconds: timeout)
         guard listing.ok else {
             if let code = listing.error?.code, Self.targetRulesUnreachableCodes.contains(code) {

@@ -44,7 +44,10 @@ function withSandbox(t, { fallback = () => undefined, timing = {} } = {}) {
   });
   pages.attach(sb);
   for (const [key, value] of Object.entries(timing)) sb.eval(`TAB_INDICATOR_TIMING.${key} = ${Number(value)}`);
-  t.after(() => sb.dispose());
+  t.after(() => {
+    pages.dispose();
+    sb.dispose();
+  });
   return { sb, pages };
 }
 

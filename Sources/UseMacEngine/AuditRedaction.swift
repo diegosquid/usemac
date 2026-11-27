@@ -14,14 +14,20 @@ extension RPCRequest {
         (namedTaskId ?? taskStart?.taskId, namedTabId)
     }
 
-    /// Text this request carries that the audit log must not copy: typed and set values, and page scripts.
+    /// Text this request carries that the audit log must not copy: typed and set values, skill params, and page scripts.
     var auditSecrets: [String] {
-        let steps = (act?.steps ?? []) + (browserAct?.steps ?? [])
+        let steps = (act?.steps ?? [])
+            + (browserAct?.steps ?? [])
+            + (browserOpen?.steps ?? [])
+            + (skillSave?.steps ?? [])
         var secrets = steps
             .filter { $0.action == .type || $0.action == .setValue }
             .compactMap(\.text)
         for step in steps where step.action == .fillForm {
             secrets.append(contentsOf: (step.fields ?? []).compactMap(\.value))
+        }
+        if let skillParams = skillRun?.params {
+            secrets.append(contentsOf: skillParams.values)
         }
         if let expression = browserExtract?.expression {
             secrets.append(expression)

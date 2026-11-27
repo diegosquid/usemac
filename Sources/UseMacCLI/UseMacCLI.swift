@@ -285,7 +285,7 @@ struct UseMacCLI {
             case "vision":
                 return try await handleVision(args: rest, options: options)
             case "skill":
-                if let first = rest.first, first.hasPrefix("-") {
+                if rest.isEmpty || (rest.first?.hasPrefix("-") == true) {
                     return try handleInstallSkill(args: rest, options: options)
                 }
                 return try await handleSkill(args: rest, options: options)
@@ -3395,6 +3395,9 @@ struct UseMacCLI {
         let stampedSkill = rawSkill
             .replacingOccurrences(of: "{{USEMAC_BIN}}", with: resolvedBin)
             .replacingOccurrences(of: "{{USEMAC_SOCKET}}", with: options.socketPath)
+        let stampedReference = loadSkillReferenceTemplate(execURL: execURL)?
+            .replacingOccurrences(of: "{{USEMAC_BIN}}", with: resolvedBin)
+            .replacingOccurrences(of: "{{USEMAC_SOCKET}}", with: options.socketPath)
 
         var targetSkillRoots: [URL] = []
         let fm = FileManager.default
@@ -3460,6 +3463,37 @@ struct UseMacCLI {
             let reportedStatus = dryRun ? "would be \(status)" : status
             results.append(InstallSkillTargetResult(path: destFile.path, status: reportedStatus))
 
+            // Keep references/REFERENCE.md in sync alongside SKILL.md whenever the skill itself was installed/updated/up-to-date.
+            if let stampedReference,
+               status == "installed" || status == "updated" || status == "replaced" || status == "up to date" {
+                let refDir = destDir.appendingPathComponent("references", isDirectory: true)
+                let refFile = refDir.appendingPathComponent("REFERENCE.md", isDirectory: false)
+                let refStatus: String
+                if isSymbolicLink(atPath: refDir.path) || isSymbolicLink(atPath: refFile.path) {
+                    refStatus = "skipped (symlink)"
+                } else if !fm.fileExists(atPath: refFile.path) {
+                    refStatus = "installed"
+                    if !dryRun {
+                        try fm.createDirectory(at: refDir, withIntermediateDirectories: true)
+                        try stampedReference.write(to: refFile, atomically: true, encoding: .utf8)
+                    }
+                } else {
+                    let existingRef = try? String(contentsOf: refFile, encoding: .utf8)
+                    if existingRef == stampedReference {
+                        refStatus = "up to date"
+                    } else {
+                        refStatus = "updated"
+                        if !dryRun {
+                            try stampedReference.write(to: refFile, atomically: true, encoding: .utf8)
+                        }
+                    }
+                }
+                results.append(InstallSkillTargetResult(
+                    path: refFile.path,
+                    status: dryRun ? "would be \(refStatus)" : refStatus
+                ))
+            }
+
             let legacyDir = root.appendingPathComponent("macuse", isDirectory: true) // Legacy skill folder from the old product name.
             let legacyFile = legacyDir.appendingPathComponent("SKILL.md", isDirectory: false)
             if !isSymbolicLink(atPath: legacyDir.path),
@@ -3520,6 +3554,24 @@ struct UseMacCLI {
         guard let content else { return false }
         let lines = content.components(separatedBy: .newlines).prefix(10)
         return lines.contains { $0.trimmingCharacters(in: .whitespaces) == "name: macuse" } // Legacy skill folder from the old product name.
+    }
+
+    private static func loadSkillReferenceTemplate(execURL: URL) -> String? {
+        // 1. Inside UseMac.app/Contents/Helpers/usemac -> ../Resources/agent/skills/usemac/references/REFERENCE.md
+        let bundledRef = execURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/agent/skills/usemac/references/REFERENCE.md")
+        if let content = try? String(contentsOf: bundledRef, encoding: .utf8), !content.isEmpty {
+            return content
+        }
+        // 2. Repo-relative fallback during local CLI development
+        let cwdRef = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(".agents/skills/usemac/references/REFERENCE.md")
+        if let content = try? String(contentsOf: cwdRef, encoding: .utf8), !content.isEmpty {
+            return content
+        }
+        return nil
     }
 
     private static func loadSkillMarkdownTemplate(execURL: URL) -> String {

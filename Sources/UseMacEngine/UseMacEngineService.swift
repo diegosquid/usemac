@@ -41,8 +41,15 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
     /// Last full screenshot JPEG per target key (`native:<pid>`, `browser:<profile>:<tabId>`) for `diffCrop`.
     private var lastScreenshotJPEGByTarget: [String: Data] = [:]
     private var lastScreenshotKeyOrder: [String] = []
-    /// Last OCR-fused `@vN` element nodes per app PID so native `act` / `highlight` can target them.
-    private var ocrNodesByPid: [Int32: [String: ElementNode]] = [:]
+    /// Last OCR-fused `@vN` element nodes per app PID (bound to windowId + AX generation) so native `act` can target them safely.
+    private struct OCRSnapshotRecord {
+        let windowId: UInt32?
+        let generation: UInt64
+        let nodes: [String: ElementNode]
+    }
+    private var ocrNodesByPid: [Int32: OCRSnapshotRecord] = [:]
+    /// Delay before closing a completed task's owned Chrome tabs (1.8 s in production; overridable in tests).
+    internal var ownedTabCleanupDelayNs: UInt64 = 1_800_000_000
     private static let capturePruneInterval: TimeInterval = 60
     private static let captureRetentionSeconds: TimeInterval = 1800
     private static let capturePruneQueue = DispatchQueue(label: "app.usemac.capture-prune", qos: .utility)
@@ -278,15 +285,16 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                bounds.width > 300,
                bounds.height > 200 {
                 let ocrNodes: [ElementNode]
+                let currentGen = axIndexer.currentGeneration(pid: app.pid)
                 if snapshot.fromHotCache {
-                    ocrNodes = cachedOCRNodes(forPid: app.pid)
+                    ocrNodes = cachedOCRNodes(forPid: app.pid, windowId: app.windowId, generation: currentGen)
                 } else {
                     ocrNodes = await fuseOCRElements(
                         app: app,
                         windowBounds: bounds,
                         existingScreenshotPath: capturedShot?.path
                     )
-                    storeOCRNodes(ocrNodes, pid: app.pid)
+                    storeOCRNodes(ocrNodes, pid: app.pid, windowId: app.windowId, generation: currentGen)
                 }
                 if !ocrNodes.isEmpty {
                     snapshot.elements.append(contentsOf: ocrNodes)
@@ -376,9 +384,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
-            // Resolve any `@vN` OCR-fused element references to their global frame centers so native act can click them.
+            // Resolve any `@vN` OCR-fused element references strictly against the effective step app, window, and generation.
             let preResolvedApp = workspaceMonitor.resolveApp(query: actReq.app)
-            let effectiveActReq = resolveOCRElementTargets(in: actReq, pid: preResolvedApp?.pid)
+            let effectiveActReq = resolveOCRElementTargets(in: actReq, defaultApp: preResolvedApp)
 
             let actPerms = currentPermissions(promptAccessibility: false)
             let beforeNativeCG: CGImage? = {
@@ -509,6 +517,17 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                         source: vr.backend,
                         latencyMs: vr.latencyMs
                     )
+                }
+            }
+
+            if actHasMutating {
+                if let mutatedPid = targetApp?.pid ?? preResolvedApp?.pid {
+                    invalidateOCRNodes(forPid: mutatedPid)
+                }
+                for stepApp in actReq.steps.compactMap(\.app) {
+                    if let stepPid = workspaceMonitor.resolveApp(query: stepApp)?.pid {
+                        invalidateOCRNodes(forPid: stepPid)
+                    }
                 }
             }
 
@@ -910,8 +929,10 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 params.steps = normalizedSteps
             }
 
-            let openHasSensitive = (params.steps ?? []).contains { isSensitiveStepForPolicy($0) }
-            let openHasMutating = (params.steps ?? []).contains { isMutatingStepForPolicy($0) }
+            let requestedSteps = params.steps ?? []
+            let requestedAutoDismiss = params.autoDismissOverlays == true
+            let openHasSensitive = requestedSteps.contains { isSensitiveStepForPolicy($0) }
+            let openHasMutating = requestedSteps.contains { isMutatingStepForPolicy($0) } || requestedAutoDismiss
             if let blockReason = killSwitch.isBlocked(forSensitiveAction: openHasSensitive, isMutatingAction: openHasMutating) {
                 response = blockedPolicyResponse(
                     request: request,
@@ -924,11 +945,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 break
             }
 
-            if openHasSensitive, let steps = params.steps {
+            if openHasSensitive, !requestedSteps.isEmpty {
                 let syntheticAct = RPCRequest(
                     id: request.id,
                     method: .browserAct,
-                    browserAct: BrowserActParams(profile: params.profile, tabId: params.tabId, steps: steps),
+                    browserAct: BrowserActParams(profile: params.profile, tabId: params.tabId, steps: requestedSteps),
                     taskId: request.namedTaskId
                 )
                 if let refusal = await approvalRefusal(for: syntheticAct, startNs: startNs, browserAct: syntheticAct.browserAct) {
@@ -948,8 +969,17 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 browserProfile: targetProfile
             ))
 
-            let bridgeResp = await chromeBridge.open(params)
-            let latencyMs = elapsedMs(since: startNs)
+            // When site rules are active, never dispatch overlay clicks or inline steps inside `open` before the
+            // committed redirect destination URL has passed TargetRules on the daemon side.
+            let deferMutationsForSiteRules = TargetRulesStore.shared.rules.hasSiteRules
+                && (requestedAutoDismiss || !requestedSteps.isEmpty)
+            var wireOpenParams = params
+            if deferMutationsForSiteRules {
+                wireOpenParams.steps = nil
+                wireOpenParams.autoDismissOverlays = nil
+            }
+
+            let bridgeResp = await chromeBridge.open(wireOpenParams)
             let resolvedProfile = bridgeResp.profileName ?? params.profile ?? "Browser"
             let resolvedLabel = "Chrome (\(resolvedProfile))"
             if bridgeResp.ok {
@@ -957,39 +987,112 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 if params.tabId == nil, let openedTabId = bridgeResp.tabId {
                     taskTabs.recordOpenedTab(openedTabId, taskId: request.namedTaskId, profile: params.profile)
                 }
-                if let stepCount = bridgeResp.actionResult?.stepResults.count, stepCount > 0 {
-                    incrementActionCount(by: stepCount)
+
+                var finalSnapshot = bridgeResp.snapshot ?? bridgeResp.actionResult?.observation
+                var finalActionResult = bridgeResp.actionResult
+                var finalScreenshot = bridgeResp.screenshot
+                var finalUrl = bridgeResp.url
+                var finalTitle = bridgeResp.title
+                var followUpFailure: (code: String, message: String)?
+
+                // Governed follow-up act: runs when (a) mutations were deferred until after redirect verification, or
+                // (b) a legacy extension returned ok for `open` while silently ignoring inline `steps`.
+                let legacySkippedSteps = !deferMutationsForSiteRules && !requestedSteps.isEmpty && bridgeResp.actionResult == nil
+                if bridgeResp.restricted != true && (deferMutationsForSiteRules || legacySkippedSteps) {
+                    var followUpSteps: [ActionStep] = []
+                    if deferMutationsForSiteRules && requestedAutoDismiss,
+                       let ov = bridgeResp.snapshot?.pageState?.blockingOverlay {
+                        if let closeId = ov.closeElementId, !closeId.isEmpty {
+                            followUpSteps.append(ActionStep(action: .click, elementId: closeId, optional: true))
+                        } else if let cx = ov.closeX, let cy = ov.closeY, cx.isFinite, cy.isFinite {
+                            followUpSteps.append(ActionStep(action: .click, x: cx, y: cy, optional: true))
+                        }
+                    }
+                    followUpSteps.append(contentsOf: requestedSteps)
+
+                    if !followUpSteps.isEmpty {
+                        if let targetTabId = bridgeResp.tabId ?? params.tabId {
+                            let actResp = await chromeBridge.act(BrowserActParams(
+                                profile: bridgeResp.profileName ?? params.profile,
+                                tabId: targetTabId,
+                                steps: followUpSteps,
+                                stopOnError: true,
+                                returnObservation: true,
+                                returnDiffOnly: params.returnDiffOnly ?? false,
+                                observationMode: params.observationMode
+                            ))
+                            if actResp.ok {
+                                finalActionResult = actResp.actionResult
+                                finalSnapshot = actResp.snapshot ?? actResp.actionResult?.observation ?? finalSnapshot
+                                finalScreenshot = actResp.screenshot ?? finalScreenshot
+                                finalUrl = actResp.url ?? finalUrl
+                                finalTitle = actResp.title ?? finalTitle
+                            } else {
+                                followUpFailure = (
+                                    code: actResp.error?.code ?? "BROWSER_ACT_FAILED",
+                                    message: actResp.error?.message ?? "Failed to execute inline browser_open steps"
+                                )
+                            }
+                        } else {
+                            followUpFailure = (
+                                code: "BROWSER_OPEN_FAILED",
+                                message: "Extension opened the page without returning a tabId to execute the requested inline steps."
+                            )
+                        }
+                    }
                 }
-                appendAudit(
-                    method: request.method.rawValue,
-                    targetApp: resolvedLabel,
-                    summary: "Opened \(bridgeResp.url ?? params.url)",
-                    latencyMs: latencyMs,
-                    success: true
-                )
-                emitLiveActivity(LiveActivityItem(
-                    kind: .actionComplete,
-                    appName: resolvedLabel,
-                    windowTitle: bridgeResp.title,
-                    title: "Opened \(bridgeResp.title ?? params.url)",
-                    subtitle: bridgeResp.url,
-                    latencyMs: latencyMs,
-                    success: true,
-                    isInProgress: false,
-                    browserTabId: bridgeResp.tabId,
-                    browserProfile: resolvedProfile
-                ))
-                response = .success(
-                    id: request.id,
-                    latencyMs: latencyMs,
-                    snapshot: bridgeResp.snapshot ?? bridgeResp.actionResult?.observation,
-                    actionResult: bridgeResp.actionResult,
-                    screenshot: bridgeResp.screenshot,
-                    browserTabId: bridgeResp.tabId,
-                    browserUrl: bridgeResp.url,
-                    browserTitle: bridgeResp.title
-                )
+
+                let latencyMs = elapsedMs(since: startNs)
+                if let failure = followUpFailure {
+                    appendAudit(method: request.method.rawValue, targetApp: resolvedLabel, summary: failure.message, latencyMs: latencyMs, success: false)
+                    emitLiveActivity(LiveActivityItem(
+                        kind: .actionComplete,
+                        appName: resolvedLabel,
+                        title: ActivityCaption.hostOrText(params.url).map { "Couldn't complete \($0)" } ?? "Couldn't run page steps",
+                        subtitle: ActivityCaption.reason(errorCode: failure.code, message: failure.message, inBrowser: true) ?? failure.message,
+                        latencyMs: latencyMs,
+                        success: false,
+                        isInProgress: false,
+                        browserTabId: bridgeResp.tabId,
+                        browserProfile: resolvedProfile
+                    ))
+                    response = .failure(id: request.id, code: failure.code, message: failure.message, latencyMs: latencyMs)
+                } else {
+                    if let stepCount = finalActionResult?.stepResults.count, stepCount > 0 {
+                        incrementActionCount(by: stepCount)
+                    }
+                    appendAudit(
+                        method: request.method.rawValue,
+                        targetApp: resolvedLabel,
+                        summary: "Opened \(finalUrl ?? params.url)",
+                        latencyMs: latencyMs,
+                        success: true
+                    )
+                    emitLiveActivity(LiveActivityItem(
+                        kind: .actionComplete,
+                        appName: resolvedLabel,
+                        windowTitle: finalTitle,
+                        title: "Opened \(finalTitle ?? params.url)",
+                        subtitle: finalUrl,
+                        latencyMs: latencyMs,
+                        success: true,
+                        isInProgress: false,
+                        browserTabId: bridgeResp.tabId,
+                        browserProfile: resolvedProfile
+                    ))
+                    response = .success(
+                        id: request.id,
+                        latencyMs: latencyMs,
+                        snapshot: finalSnapshot,
+                        actionResult: finalActionResult,
+                        screenshot: finalScreenshot,
+                        browserTabId: bridgeResp.tabId,
+                        browserUrl: finalUrl,
+                        browserTitle: finalTitle
+                    )
+                }
             } else {
+                let latencyMs = elapsedMs(since: startNs)
                 let code = bridgeResp.error?.code ?? "BROWSER_OPEN_FAILED"
                 let message = bridgeResp.error?.message ?? "Failed to open URL in Chrome"
                 appendAudit(method: request.method.rawValue, targetApp: resolvedLabel, summary: message, latencyMs: latencyMs, success: false)
@@ -1826,8 +1929,11 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             return connected.isEmpty ? [] : connected.map { Optional($0) }
         }()
         guard !profiles.isEmpty else { return }
+        let delayNs = self.ownedTabCleanupDelayNs
         Task { [chromeBridge, taskTabs] in
-            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            if delayNs > 0 {
+                try? await Task.sleep(nanoseconds: delayNs)
+            }
             // Built now, not at task_complete: a tab another task opened in the meantime stays open, also with
             // extensions that predate closeTabIds and go by keepTabIds alone.
             let keep = Set(keepTabIds).union(taskTabs.protectedTabIds()).sorted()
@@ -2091,18 +2197,20 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             if let node = axIndexer.node(for: elementId, pid: targetApp.pid) {
                 foundNode = node
                 owner = targetApp.pid
-            } else if elementId.hasPrefix("@v"), let node = lookupOCRNode(elementId, pid: targetApp.pid) {
+            } else if elementId.hasPrefix("@v"),
+                      let node = lookupOCRNode(
+                        elementId,
+                        pid: targetApp.pid,
+                        windowId: targetApp.windowId,
+                        generation: axIndexer.currentGeneration(pid: targetApp.pid)
+                      ) {
                 foundNode = node
                 owner = targetApp.pid
             }
         }
-        if foundNode == nil, let cached = axIndexer.node(for: elementId) {
+        if foundNode == nil, !elementId.hasPrefix("@v"), let cached = axIndexer.node(for: elementId) {
             foundNode = cached.node
             owner = cached.pid
-        }
-        if foundNode == nil, elementId.hasPrefix("@v"), let ocrMatch = lookupAnyOCRNode(elementId) {
-            foundNode = ocrMatch.node
-            owner = ocrMatch.pid
         }
         guard let node = foundNode else {
             return nil
@@ -2652,8 +2760,9 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         let batchMode = (params.mode ?? "observe").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let extractMode = (params.extractMode ?? "auto").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let isEvalMode = (batchMode == "extract" && extractMode == "eval")
+        let isMutatingBatch = isEvalMode || params.autoDismissOverlays == true
 
-        if let blockReason = killSwitch.isBlocked(forSensitiveAction: isEvalMode, isMutatingAction: isEvalMode) {
+        if let blockReason = killSwitch.isBlocked(forSensitiveAction: isEvalMode, isMutatingAction: isMutatingBatch) {
             return blockedPolicyResponse(
                 request: request,
                 startNs: startNs,
@@ -2678,6 +2787,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         let profile = params.profile
         let maxElements = params.maxElements
         let autoDismiss = params.autoDismissOverlays
+        let deferDismissForSiteRules = rules.hasSiteRules && autoDismiss == true
         let closeAfter = params.closeAfter == true
         let bridge = self.chromeBridge
         let taskTabs = self.taskTabs
@@ -2685,8 +2795,14 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         var indexedResults: [(Int, BrowserBatchItemResult, Int?)] = []
         indexedResults.reserveCapacity(params.urls.count)
 
+        let maxBatchConcurrency = 3
+        let urls = params.urls
+
         await withTaskGroup(of: (Int, BrowserBatchItemResult, Int?).self) { group in
-            for (index, rawUrl) in params.urls.enumerated() {
+            var nextIndex = 0
+
+            func enqueueItem(at index: Int) {
+                let rawUrl = urls[index]
                 group.addTask {
                     let itemStart = DispatchTime.now().uptimeNanoseconds
                     func itemElapsed() -> Double {
@@ -2724,8 +2840,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                         newTab: true,
                         stream: false,
                         taskId: taskId,
-                        autoDismissOverlays: autoDismiss,
-                        observationMode: batchMode == "extract" ? ObservationMode.none : nil
+                        autoDismissOverlays: deferDismissForSiteRules ? nil : autoDismiss,
+                        observationMode: (batchMode == "extract" && !deferDismissForSiteRules) ? ObservationMode.none : nil
                     ))
                     guard openResp.ok, let openedTabId = openResp.tabId else {
                         let code = openResp.error?.code ?? "BROWSER_OPEN_FAILED"
@@ -2736,13 +2852,37 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                             success: false,
                             error: "\(code): \(message)",
                             latencyMs: itemElapsed()
-                        ), nil)
+                        ), openResp.tabId)
                     }
 
                     if !closeAfter {
                         taskTabs.recordOpenedTab(openedTabId, taskId: taskId, profile: profile)
                     }
                     let resolvedProf = openResp.profileName ?? profile
+                    var effectiveSnapshot = openResp.snapshot
+
+                    // When site rules are active, dismiss overlays only after the landed redirect URL passed TargetRules.
+                    if deferDismissForSiteRules,
+                       openResp.restricted != true,
+                       let ov = openResp.snapshot?.pageState?.blockingOverlay {
+                        var dismissStep: ActionStep?
+                        if let closeId = ov.closeElementId, !closeId.isEmpty {
+                            dismissStep = ActionStep(action: .click, elementId: closeId, optional: true)
+                        } else if let cx = ov.closeX, let cy = ov.closeY, cx.isFinite, cy.isFinite {
+                            dismissStep = ActionStep(action: .click, x: cx, y: cy, optional: true)
+                        }
+                        if let step = dismissStep {
+                            let dismissResp = await bridge.act(BrowserActParams(
+                                profile: resolvedProf,
+                                tabId: openedTabId,
+                                steps: [step],
+                                returnObservation: batchMode != "extract"
+                            ))
+                            if dismissResp.ok, let refreshed = dismissResp.snapshot ?? dismissResp.actionResult?.observation {
+                                effectiveSnapshot = refreshed
+                            }
+                        }
+                    }
 
                     if batchMode == "extract" {
                         let extResp = await bridge.extract(BrowserExtractParams(
@@ -2770,7 +2910,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                             ), openedTabId)
                         }
                     } else {
-                        var snap = openResp.snapshot
+                        var snap = effectiveSnapshot
                         if snap == nil {
                             let obsResp = await bridge.observe(BrowserObserveParams(
                                 profile: resolvedProf,
@@ -2801,8 +2941,18 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
                 }
             }
 
+            let initialCount = min(maxBatchConcurrency, urls.count)
+            while nextIndex < initialCount {
+                enqueueItem(at: nextIndex)
+                nextIndex += 1
+            }
+
             for await item in group {
                 indexedResults.append(item)
+                if nextIndex < urls.count {
+                    enqueueItem(at: nextIndex)
+                    nextIndex += 1
+                }
             }
         }
 
@@ -2897,26 +3047,38 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         }
     }
 
-    private func handleSkillRun(_ request: RPCRequest, startNs: UInt64) async -> RPCResponse {
+    struct PreparedSkillRun {
+        let params: SkillRunParams
+        let skill: SkillRecord
+        let targetKind: String
+        let delegatedRequest: RPCRequest
+    }
+
+    enum PreparedSkillOutcome {
+        case success(PreparedSkillRun)
+        case failure(RPCResponse)
+    }
+
+    func prepareSkillRun(_ request: RPCRequest, startNs: UInt64) -> PreparedSkillOutcome {
         guard let params = request.skillRun else {
             let latencyMs = elapsedMs(since: startNs)
-            return .failure(id: request.id, code: "INVALID_REQUEST", message: "Missing skillRun payload", latencyMs: latencyMs)
+            return .failure(.failure(id: request.id, code: "INVALID_REQUEST", message: "Missing skillRun payload", latencyMs: latencyMs))
         }
         if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: false) {
-            return blockedPolicyResponse(
+            return .failure(blockedPolicyResponse(
                 request: request,
                 startNs: startNs,
                 targetApp: params.app ?? params.profile,
                 activityTitle: "Skill run blocked",
                 reason: blockReason
-            )
+            ))
         }
 
         guard let skill = skillStore.get(name: params.name) else {
             let latencyMs = elapsedMs(since: startNs)
             let msg = SkillStoreError.notFound(params.name).localizedDescription
             appendAudit(method: request.method.rawValue, targetApp: params.app, summary: msg, latencyMs: latencyMs, success: false)
-            return .failure(id: request.id, code: "SKILL_NOT_FOUND", message: msg, latencyMs: latencyMs)
+            return .failure(.failure(id: request.id, code: "SKILL_NOT_FOUND", message: msg, latencyMs: latencyMs))
         }
 
         let interpolatedSteps = SkillStore.interpolate(steps: skill.steps, with: params.params ?? [:])
@@ -2925,7 +3087,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             let latencyMs = elapsedMs(since: startNs)
             let msg = "Missing skill parameter(s) for '\(skill.name)': \(missingParams.joined(separator: ", "))."
             appendAudit(method: request.method.rawValue, targetApp: params.app ?? skill.app, summary: msg, latencyMs: latencyMs, success: false)
-            return .failure(id: request.id, code: "INVALID_REQUEST", message: msg, latencyMs: latencyMs)
+            return .failure(.failure(id: request.id, code: "INVALID_REQUEST", message: msg, latencyMs: latencyMs))
         }
 
         let targetKind: String = {
@@ -2944,7 +3106,6 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             return "native"
         }()
 
-        // Execute through the exact same governed act / browser_act path (GovernancePolicy, TargetRules, Ask mode, URL/upload checks).
         let delegatedRequest: RPCRequest
         if targetKind == "browser" {
             delegatedRequest = RPCRequest(
@@ -2977,12 +3138,27 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             )
         }
 
-        let execResp = await handleRequest(delegatedRequest)
+        return .success(PreparedSkillRun(
+            params: params,
+            skill: skill,
+            targetKind: targetKind,
+            delegatedRequest: delegatedRequest
+        ))
+    }
+
+    func finalizeSkillRun(
+        request: RPCRequest,
+        prepared: PreparedSkillRun,
+        execResp: RPCResponse,
+        startNs: UInt64
+    ) -> RPCResponse {
         let latencyMs = elapsedMs(since: startNs)
         if !execResp.ok {
             return execResp
         }
 
+        let skill = prepared.skill
+        let params = prepared.params
         let actionResult = execResp.actionResult
         let succeeded = actionResult?.success ?? true
         let updatedSkill = skillStore.recordRun(name: skill.name, success: succeeded)
@@ -3005,7 +3181,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         )
         appendAudit(
             method: request.method.rawValue,
-            targetApp: params.app ?? skill.app ?? params.profile ?? targetKind,
+            targetApp: params.app ?? skill.app ?? params.profile ?? prepared.targetKind,
             summary: "Ran skill '\(skill.name)': \(succeeded ? "ok" : (driftMessage ?? "failed"))",
             latencyMs: latencyMs,
             success: succeeded
@@ -3021,6 +3197,16 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             browserTitle: execResp.browserTitle,
             skillResult: skillResult
         )
+    }
+
+    private func handleSkillRun(_ request: RPCRequest, startNs: UInt64) async -> RPCResponse {
+        switch prepareSkillRun(request, startNs: startNs) {
+        case .failure(let errorResponse):
+            return errorResponse
+        case .success(let prepared):
+            let execResp = await handleRequest(prepared.delegatedRequest)
+            return finalizeSkillRun(request: request, prepared: prepared, execResp: execResp, startNs: startNs)
+        }
     }
 
     // MARK: - Tiered Verification, Dirty-Rect Cropping, AX+OCR Fusion, Filtering
@@ -3077,11 +3263,30 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
            min(cgImage.width, cgImage.height) >= LocalVisionEngine.minimumImageSide {
             let ocrStartNs = DispatchTime.now().uptimeNanoseconds
             let ocr = await Task.detached(priority: .userInitiated) {
-                LocalVisionEngine.recognizeText(in: cgImage, region: nil, fast: false)
+                LocalVisionEngine.recognizeTextDetailed(
+                    in: cgImage,
+                    viewportWidth: Double(cgImage.width),
+                    viewportHeight: Double(cgImage.height),
+                    fast: false
+                )
             }.value
-            let combinedText = [corpus, ocr.text].filter { !$0.isEmpty }.joined(separator: " | ")
-            let check = LocalVisionEngine.verifyAssertion(assertion, againstOCRText: combinedText)
             let ocrMs = (elapsedMs(since: ocrStartNs) * 100).rounded() / 100
+            if let ocrError = ocr.error {
+                return VisionQueryResult(
+                    mode: "verify",
+                    backend: "apple-vision-ocr",
+                    modelId: nil,
+                    latencyMs: ocrMs,
+                    answer: "Apple Vision OCR failed (\(ocrError)); verification is indeterminate.",
+                    verified: nil,
+                    blockingDetected: false,
+                    detections: [],
+                    imagePath: snapshot?.screenshotPath
+                )
+            }
+            let ocrText = ocr.detections.map(\.label).joined(separator: " | ")
+            let combinedText = [corpus, ocrText].filter { !$0.isEmpty }.joined(separator: " | ")
+            let check = LocalVisionEngine.verifyAssertion(assertion, againstOCRText: combinedText)
             return VisionQueryResult(
                 mode: "verify",
                 backend: "apple-vision-ocr",
@@ -3227,7 +3432,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         }.value
     }
 
-    private func storeOCRNodes(_ nodes: [ElementNode], pid: Int32) {
+    private func storeOCRNodes(_ nodes: [ElementNode], pid: Int32, windowId: UInt32?, generation: UInt64) {
         var map: [String: ElementNode] = [:]
         for node in nodes {
             map[node.id] = node
@@ -3236,55 +3441,71 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         if map.isEmpty {
             ocrNodesByPid.removeValue(forKey: pid)
         } else {
-            ocrNodesByPid[pid] = map
+            ocrNodesByPid[pid] = OCRSnapshotRecord(windowId: windowId, generation: generation, nodes: map)
         }
         stateLock.unlock()
     }
 
-    private func cachedOCRNodes(forPid pid: Int32) -> [ElementNode] {
+    private func invalidateOCRNodes(forPid pid: Int32) {
         stateLock.lock()
-        let values = ocrNodesByPid[pid].map { Array($0.values) } ?? []
+        ocrNodesByPid.removeValue(forKey: pid)
         stateLock.unlock()
-        return values.sorted { lhs, rhs in
+    }
+
+    private func cachedOCRNodes(forPid pid: Int32, windowId: UInt32?, generation: UInt64) -> [ElementNode] {
+        stateLock.lock()
+        let record = ocrNodesByPid[pid]
+        stateLock.unlock()
+        guard let record else { return [] }
+        if let recWin = record.windowId, let curWin = windowId, recWin != curWin {
+            return []
+        }
+        guard record.generation == generation else { return [] }
+        return Array(record.nodes.values).sorted { lhs, rhs in
             let lNum = Int(lhs.id.dropFirst(2)) ?? Int.max
             let rNum = Int(rhs.id.dropFirst(2)) ?? Int.max
             return lNum < rNum
         }
     }
 
-    private func lookupOCRNode(_ id: String, pid: Int32) -> ElementNode? {
+    private func lookupOCRNode(_ id: String, pid: Int32, windowId: UInt32?, generation: UInt64) -> ElementNode? {
         stateLock.lock()
-        defer { stateLock.unlock() }
-        return ocrNodesByPid[pid]?[id]
-    }
-
-    private func lookupAnyOCRNode(_ id: String) -> (pid: Int32, node: ElementNode)? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        for (pid, map) in ocrNodesByPid {
-            if let node = map[id] {
-                return (pid, node)
-            }
+        let record = ocrNodesByPid[pid]
+        stateLock.unlock()
+        guard let record else { return nil }
+        if let recWin = record.windowId, let curWin = windowId, recWin != curWin {
+            return nil
         }
-        return nil
+        guard record.generation == generation else { return nil }
+        return record.nodes[id]
     }
 
-    private func resolveOCRElementTargets(in request: BatchActionRequest, pid: Int32?) -> BatchActionRequest {
+    private func resolveOCRElementTargets(in request: BatchActionRequest, defaultApp: AppDescriptor?) -> BatchActionRequest {
         guard request.steps.contains(where: { $0.elementId?.hasPrefix("@v") == true && $0.x == nil && $0.y == nil }) else {
             return request
         }
         var copy = request
+        var activeApp = defaultApp
         for idx in copy.steps.indices {
+            if let stepAppQuery = copy.steps[idx].app,
+               !stepAppQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                activeApp = workspaceMonitor.resolveApp(query: stepAppQuery)
+            }
             guard let id = copy.steps[idx].elementId, id.hasPrefix("@v"),
                   copy.steps[idx].x == nil, copy.steps[idx].y == nil else {
                 continue
             }
-            let node = pid.flatMap { lookupOCRNode(id, pid: $0) } ?? lookupAnyOCRNode(id)?.node
-            if let node {
+            guard let target = activeApp, target.pid > 0 else {
+                continue
+            }
+            let currentGen = axIndexer.currentGeneration(pid: target.pid)
+            if let node = lookupOCRNode(id, pid: target.pid, windowId: target.windowId, generation: currentGen) {
                 copy.steps[idx].x = node.frame.centerX
                 copy.steps[idx].y = node.frame.centerY
                 copy.steps[idx].elementId = nil
             }
+            // If no valid OCR ref exists for this app/window/generation, leave `@vN` untouched so
+            // ActionExecutor fails cleanly as stale instead of substituting coordinates from another app.
         }
         return copy
     }

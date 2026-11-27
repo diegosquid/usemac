@@ -27,7 +27,7 @@ final class AskModeTaskGrantTests: XCTestCase {
         let service = UseMacEngineService(socketPath: "/tmp/usemac-ask-task-\(UUID().uuidString.prefix(8)).sock", extensionPort: 0)
         service.setGovernancePolicy(.ask)
         let broker = service.approvals
-        broker.timeoutInterval = 0.5
+        broker.timeoutInterval = 0.15
 
         let started = await service.handle(RPCRequest(method: .taskStart, taskStart: TaskStartParams(summary: "ask grant")))
         let taskId = try XCTUnwrap(started.taskId)

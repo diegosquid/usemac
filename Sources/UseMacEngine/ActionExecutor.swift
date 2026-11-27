@@ -242,45 +242,47 @@ public final class ActionExecutor: @unchecked Sendable {
                 )
             }
 
-            // Opt-in foregroundFallback: escalate inside the same batch if a background attempt failed with
-            // TARGET_NOT_FRONTMOST or produced effect == .none on a non-responsive window, provided user is idle.
+            // Opt-in foregroundFallback: escalate inside the same batch ONLY when background input was
+            // demonstrably NOT delivered (e.g. TARGET_NOT_FRONTMOST). Never replay an already-sent
+            // click/type/shortcut/upload solely because AX observed no visible change; instead mark
+            // the effect as unverified so callers never suffer duplicate submissions or double typing.
             if request.foregroundFallback == true,
                request.foreground != true,
                burst == nil,
                let target = currentApp,
-               target.pid > 0,
-               Self.shouldEscalateToForeground(step: step, outcome: outcome, targetPid: target.pid) {
-                switch await beginForegroundBurst(targetApp: target, waitForIdleMs: request.waitForIdleMs) {
-                case .success(let started):
-                    burst = started
-                    onLiveActivity?(LiveActivityItem(
-                        kind: .actionStep,
-                        appName: target.name,
-                        appPid: target.pid,
-                        bundleId: target.bundleId,
-                        windowTitle: target.windowTitle,
-                        windowBounds: target.windowBounds,
-                        title: "Borrowing the screen",
-                        subtitle: "\(target.name) needed focus for this step",
-                        mechanism: "foreground-fallback",
-                        success: true,
-                        isInProgress: true
-                    ))
-                    var fgStep = step
-                    fgStep.preferBackground = false
-                    outcome = await executeStep(
-                        fgStep,
-                        targetApp: currentApp,
-                        measureEffect: true,
-                        onOverlayEvent: onOverlayEvent
-                    )
-                case .failure(let refusal):
-                    if !outcome.success {
+               target.pid > 0 {
+                if Self.shouldEscalateToForeground(step: step, outcome: outcome, targetPid: target.pid) {
+                    switch await beginForegroundBurst(targetApp: target, waitForIdleMs: request.waitForIdleMs) {
+                    case .success(let started):
+                        burst = started
+                        onLiveActivity?(LiveActivityItem(
+                            kind: .actionStep,
+                            appName: target.name,
+                            appPid: target.pid,
+                            bundleId: target.bundleId,
+                            windowTitle: target.windowTitle,
+                            windowBounds: target.windowBounds,
+                            title: "Borrowing the screen",
+                            subtitle: "\(target.name) needed focus for this step",
+                            mechanism: "foreground-fallback",
+                            success: true,
+                            isInProgress: true
+                        ))
+                        var fgStep = step
+                        fgStep.preferBackground = false
+                        outcome = await executeStep(
+                            fgStep,
+                            targetApp: currentApp,
+                            measureEffect: true,
+                            onOverlayEvent: onOverlayEvent
+                        )
+                    case .failure(let refusal):
                         outcome.message = "\(outcome.message ?? "Background action failed.") Foreground fallback unavailable: \(refusal.message)"
-                    } else {
-                        let baseWarn = outcome.warning ?? "No visible effect in background."
-                        outcome.warning = "\(baseWarn) Foreground fallback skipped: \(refusal.message)"
                     }
+                } else if outcome.success && outcome.effect == ActionEffect.none && outcome.mechanism != "ax-scrollbar" {
+                    outcome.effect = .unverified
+                    let baseWarn = outcome.warning ?? "Background input was sent, but AX did not observe a UI change."
+                    outcome.warning = "\(baseWarn) Skipped foreground replay to avoid executing the action twice."
                 }
             }
 
@@ -410,25 +412,12 @@ public final class ActionExecutor: @unchecked Sendable {
     }
 
     private static func shouldEscalateToForeground(step: ActionStep, outcome: StepOutcome, targetPid: pid_t) -> Bool {
-        if !outcome.success && outcome.errorCode == "TARGET_NOT_FRONTMOST" {
-            return true
-        }
-        guard outcome.success && outcome.effect == ActionEffect.none else {
+        // Only escalate when input was demonstrably NOT sent. Replaying a succeeded click,
+        // typing, shortcut, or upload because AX saw no change risks duplicate side effects.
+        guard !outcome.success else {
             return false
         }
-        // Do not steal focus just because a scrollbar is already at the top/bottom edge.
-        if outcome.mechanism == "ax-scrollbar" {
-            return false
-        }
-        switch step.action {
-        case .click, .doubleClick, .rightClick, .type, .pressKey, .setValue, .scroll, .axAction, .uploadFile:
-            let wasBackground = outcome.mechanism.contains("pid")
-                || outcome.mechanism.hasPrefix("ax-")
-                || !WindowResolver.isFrontmost(pid: targetPid)
-            return wasBackground
-        default:
-            return false
-        }
+        return outcome.errorCode == "TARGET_NOT_FRONTMOST"
     }
 
     private struct StepOutcome {
@@ -2530,6 +2519,16 @@ public final class ActionExecutor: @unchecked Sendable {
         var lastNode: ElementNode?
 
         for (fieldIdx, field) in fields.enumerated() {
+            if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: true) {
+                let hint = ExecutionModeNotice.agentHint(policy: killSwitch.policy, killSwitchTripped: killSwitch.isTripped)
+                return StepOutcome(
+                    success: false,
+                    mechanism: "blocked",
+                    message: hint.map { "\(blockReason) \($0)" } ?? blockReason,
+                    node: lastNode,
+                    errorCode: "POLICY_BLOCKED"
+                )
+            }
             let fieldDesc = field.label ?? field.elementId ?? field.match.map(Self.describe) ?? "field #\(fieldIdx + 1)"
             let fieldMatch: ElementMatch? = {
                 if let m = field.match, !m.isEmpty { return m }
@@ -2641,6 +2640,16 @@ public final class ActionExecutor: @unchecked Sendable {
         }
 
         if let submitMatch = step.submitMatch, !submitMatch.isEmpty {
+            if let blockReason = killSwitch.isBlocked(forSensitiveAction: false, isMutatingAction: true) {
+                let hint = ExecutionModeNotice.agentHint(policy: killSwitch.policy, killSwitchTripped: killSwitch.isTripped)
+                return StepOutcome(
+                    success: false,
+                    mechanism: "blocked",
+                    message: hint.map { "\(blockReason) \($0)" } ?? blockReason,
+                    node: lastNode,
+                    errorCode: "POLICY_BLOCKED"
+                )
+            }
             let submitStep = ActionStep(
                 action: .click,
                 preferBackground: step.preferBackground,
