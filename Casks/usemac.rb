@@ -1,6 +1,6 @@
 cask "usemac" do
-  version "0.10.0"
-  sha256 "74ed67a5a1a486d5f7646560a351ef262512fd642d4e40774b0368bcb31cc70b"
+  version "0.11.0"
+  sha256 "b7dd3b406c0e5362796046d511b56bf38a7d1692bf37408aa9e3c3f25bbcd84a"
 
   url "https://usemac.app/downloads/usemac-#{version}-arm64.dmg"
   name "UseMac"
