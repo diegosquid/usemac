@@ -41,14 +41,67 @@ public enum ExecutionModeNotice {
     }
 
     /// The menu bar icon's tooltip.
-    public static func tooltip(policy: GovernancePolicy, killSwitchTripped: Bool, agentActing: Bool) -> String {
+    public static func tooltip(
+        policy: GovernancePolicy,
+        killSwitchTripped: Bool,
+        agentActing: Bool,
+        activeAgents: [String] = []
+    ) -> String {
         if killSwitchTripped { return "UseMac (Stopped: emergency stop is on)" }
         if policy == .paused { return "UseMac (Paused)" }
         let mode = name(of: policy)
         if agentActing {
-            return policy == .autonomous ? "UseMac (Agent acting)" : "UseMac (Agent acting, mode: \(mode))"
+            let agents = cleanedAgentNames(activeAgents)
+            let activity: String
+            switch agents.count {
+            case 0: activity = "Agent acting"
+            case 1: activity = "\(agents[0]) acting"
+            default: activity = "\(agents.count) agents acting"
+            }
+            return policy == .autonomous ? "UseMac (\(activity))" : "UseMac (\(activity), mode: \(mode))"
         }
         return policy == .autonomous ? "UseMac (Running)" : "UseMac (Mode: \(mode))"
+    }
+
+    /// The status line in the menu bar menu.
+    public static func menuBarStatusLabel(
+        policy: GovernancePolicy,
+        killSwitchTripped: Bool,
+        isServerRunning: Bool,
+        agentActing: Bool,
+        activeAgents: [String],
+        targetAppName: String?
+    ) -> String {
+        if killSwitchTripped { return "Stopped" }
+        if policy == .paused { return "Paused" }
+        guard agentActing else { return isServerRunning ? "Ready" : "Offline" }
+
+        let agents = cleanedAgentNames(activeAgents)
+        let app = targetAppName.flatMap { name -> String? in
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        switch agents.count {
+        case 0:
+            return app.map { "Acting in \($0)" } ?? "Agent active"
+        case 1:
+            let agent = agents[0]
+            if let app, app.caseInsensitiveCompare(agent) != .orderedSame {
+                return "\(agent) · \(app)"
+            }
+            return "\(agent) active"
+        case 2:
+            return "\(agents[0]), \(agents[1]) active"
+        default:
+            return "\(agents.count) agents active (\(agents[0]), \(agents[1])…)"
+        }
+    }
+
+    private static func cleanedAgentNames(_ names: [String]) -> [String] {
+        var seen: Set<String> = []
+        return names
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
     // MARK: - Refusals

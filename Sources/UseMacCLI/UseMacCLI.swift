@@ -35,6 +35,10 @@ struct UseMacCLI {
         var taskId: String? {
             taskFlag ?? ProcessInfo.processInfo.environment["USEMAC_TASK"].flatMap { $0.isEmpty ? nil : $0 }
         }
+        var agentFlag: String?
+        var agentName: String? {
+            agentFlag ?? ProcessInfo.processInfo.environment["USEMAC_AGENT"].flatMap { $0.isEmpty ? nil : $0 }
+        }
     }
 
     private enum CLIError: Error {
@@ -438,12 +442,21 @@ struct UseMacCLI {
                 }
                 options.taskFlag = args[i + 1]
                 i += 2
+            case "--agent":
+                guard i + 1 < args.count else {
+                    throw CLIError.usage("Missing name after --agent.")
+                }
+                options.agentFlag = args[i + 1]
+                i += 2
             default:
                 if arg.hasPrefix("--socket=") {
                     options.socketPath = String(arg.dropFirst("--socket=".count))
                     i += 1
                 } else if arg.hasPrefix("--task=") {
                     options.taskFlag = String(arg.dropFirst("--task=".count))
+                    i += 1
+                } else if arg.hasPrefix("--agent=") {
+                    options.agentFlag = String(arg.dropFirst("--agent=".count))
                     i += 1
                 } else {
                     remaining.append(arg)
@@ -543,6 +556,10 @@ struct UseMacCLI {
         var request = request
         if request.taskId == nil, request.method != .taskStart {
             request.taskId = options.taskId
+        }
+        request.agent = request.agent ?? options.agentName
+        if request.method == .taskStart, request.taskStart?.agent == nil {
+            request.taskStart?.agent = options.agentName
         }
         if options.standalone {
             if isActionMethod(request.method) {
@@ -1875,7 +1892,7 @@ struct UseMacCLI {
             app: parsed.values["--app"],
             summary: summary,
             taskId: options.taskFlag,
-            agent: parsed.values["--agent"]
+            agent: parsed.values["--agent"] ?? options.agentName
         )
         let req = RPCRequest(method: .taskStart, taskStart: params)
         let (res, rttMs, mode) = try await executeRPC(req, options: options)
@@ -2353,6 +2370,7 @@ struct UseMacCLI {
     private static func handleBench(args: [String], options: GlobalOptions) async throws -> Int32 {
         let parsed = try parseAppAndExtras(args: args, valueFlags: ["--iterations", "--app"])
         let iterations = try parseOptionalInt(parsed.values, flag: "--iterations", positive: true) ?? 100
+        let agent = options.agentName
 
         var ephemeralServer: UnixSocketServer?
         let benchSocketPath: String
@@ -2387,13 +2405,13 @@ struct UseMacCLI {
         }
 
         // Warmup connection
-        _ = try client.send(RPCRequest(method: .ping))
+        _ = try client.send(RPCRequest(method: .ping, agent: agent))
 
         // 1. Ping benchmark
         var pingRttsMs: [Double] = []
         pingRttsMs.reserveCapacity(iterations)
         for _ in 0..<iterations {
-            let (res, rttMs) = try client.send(RPCRequest(method: .ping))
+            let (res, rttMs) = try client.send(RPCRequest(method: .ping, agent: agent))
             if res.ok {
                 pingRttsMs.append(rttMs)
             }
@@ -2404,7 +2422,7 @@ struct UseMacCLI {
         var appsRttsMs: [Double] = []
         appsRttsMs.reserveCapacity(20)
         for _ in 0..<20 {
-            let (res, rttMs) = try client.send(RPCRequest(method: .listApps))
+            let (res, rttMs) = try client.send(RPCRequest(method: .listApps, agent: agent))
             if res.ok {
                 appsRttsMs.append(rttMs)
             }
@@ -2417,7 +2435,8 @@ struct UseMacCLI {
         var coldObserveError: String?
         let coldReq = RPCRequest(
             method: .observe,
-            observe: ObserveParams(app: targetApp, useCache: false, includeDiff: false, includeScreenshot: false)
+            observe: ObserveParams(app: targetApp, useCache: false, includeDiff: false, includeScreenshot: false),
+            agent: agent
         )
         let (coldRes, coldRtt) = try client.send(coldReq)
         if coldRes.ok {
@@ -2432,7 +2451,8 @@ struct UseMacCLI {
             for _ in 0..<20 {
                 let warmReq = RPCRequest(
                     method: .observe,
-                    observe: ObserveParams(app: targetApp, useCache: true, includeDiff: true, includeScreenshot: false)
+                    observe: ObserveParams(app: targetApp, useCache: true, includeDiff: true, includeScreenshot: false),
+                    agent: agent
                 )
                 let (warmRes, warmRtt) = try client.send(warmReq)
                 if warmRes.ok {
@@ -2666,6 +2686,7 @@ struct UseMacCLI {
           --standalone        Run in-process without connecting to the UseMac daemon
           --require-daemon    Fail if the UseMac daemon is not reachable
           --task <taskId>     The task ('start' prints it) the request belongs to (default: $USEMAC_TASK)
+          --agent <name>      The agent making the request (default: $USEMAC_AGENT or automatic detection)
 
         Commands:
           ping                                       Test socket and engine latency

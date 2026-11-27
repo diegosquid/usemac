@@ -3,22 +3,25 @@ import XCTest
 
 final class PreviewCardLifecycleTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000_000)
-    private var quietSince: Date { now.addingTimeInterval(-PreviewCardLifecycle.quietSettleSeconds - 1) }
     private var justNow: Date { now.addingTimeInterval(-2) }
 
     // MARK: The sweep
 
     func testGhostCardLeaves() {
-        // A background native card with no picture and a busy dot, untouched for a while: Diego's grey ghost card.
-        let ghost = PreviewCardLifecycle.Card(isBrowser: false, hasPreview: false, isBusy: true, lastActivity: quietSince)
+        let ghost = PreviewCardLifecycle.Card(
+            isBrowser: false, isBusy: true, lastActivity: now.addingTimeInterval(-20)
+        )
         XCTAssertEqual(PreviewCardLifecycle.sweep(ghost, now: now), .remove)
     }
 
-    func testQuietCardWithAPictureStopsTheBusyDot() {
-        let card = PreviewCardLifecycle.Card(isBrowser: false, hasPreview: true, isBusy: true, lastActivity: quietSince)
+    func testPinnedCardStaysButLosesTheBusyDotWhenItTimesOut() {
+        var card = PreviewCardLifecycle.Card(
+            isBrowser: false, isFront: true, hasPreview: true, isBusy: true,
+            lastActivity: now.addingTimeInterval(-60), hasExplicitTask: true, isPinned: true
+        )
         XCTAssertEqual(PreviewCardLifecycle.sweep(card, now: now), .settle)
-        let settled = PreviewCardLifecycle.Card(isBrowser: false, hasPreview: true, isBusy: false, lastActivity: quietSince)
-        XCTAssertEqual(PreviewCardLifecycle.sweep(settled, now: now), .keep)
+        card.isBusy = false
+        XCTAssertEqual(PreviewCardLifecycle.sweep(card, now: now), .keep)
     }
 
     func testRecentlyActiveCardsStay() {
@@ -28,25 +31,57 @@ final class PreviewCardLifecycleTests: XCTestCase {
         XCTAssertEqual(PreviewCardLifecycle.sweep(tab, now: now), .keep)
     }
 
-    func testFrontCardIsLeftToTheTaskEnd() {
-        // An agent thinking for minutes keeps the card the user is watching; task_complete or the idle failsafe ends it.
-        let front = PreviewCardLifecycle.Card(isBrowser: false, isFront: true, hasPreview: false, isBusy: true, lastActivity: quietSince)
-        XCTAssertEqual(PreviewCardLifecycle.sweep(front, now: now), .keep)
+    func testAdHocFrontCardTimesOutAtTwentySecondsEvenWithAPreview() {
+        let front = PreviewCardLifecycle.Card(
+            isBrowser: false, isFront: true, hasPreview: true, isBusy: true, lastActivity: now
+        )
+        XCTAssertEqual(PreviewCardLifecycle.sweep(front, now: now.addingTimeInterval(19)), .keep)
+        XCTAssertEqual(PreviewCardLifecycle.sweep(front, now: now.addingTimeInterval(20)), .remove)
     }
 
-    func testCardOfAnAppThatQuitLeavesEvenInFront() {
-        let quit = PreviewCardLifecycle.Card(isBrowser: false, isFront: true, hasPreview: true, isBusy: true, appRunning: false, lastActivity: justNow)
-        XCTAssertEqual(PreviewCardLifecycle.sweep(quit, now: now), .remove)
+    func testExplicitTaskStaysAtThirtySecondsAndTimesOutAtSixty() {
+        let front = PreviewCardLifecycle.Card(
+            isBrowser: true, isFront: true, hasPreview: true, isBusy: true, lastActivity: now, hasExplicitTask: true
+        )
+        XCTAssertEqual(PreviewCardLifecycle.sweep(front, now: now.addingTimeInterval(30)), .keep)
+        XCTAssertEqual(PreviewCardLifecycle.sweep(front, now: now.addingTimeInterval(60)), .remove)
+        XCTAssertEqual(PreviewCardLifecycle.sweep(front, now: now.addingTimeInterval(61)), .remove)
+    }
+
+    func testCardOfAnAppThatQuitLeavesEvenInFrontAndPinned() {
+        var card = PreviewCardLifecycle.Card(
+            isBrowser: false, isFront: true, hasPreview: true, isCompleted: true,
+            appRunning: false, lastActivity: justNow, isPinned: true
+        )
+        XCTAssertEqual(PreviewCardLifecycle.sweep(card, now: now), .remove)
+        card.isBrowser = true
+        XCTAssertEqual(PreviewCardLifecycle.sweep(card, now: now), .keep)
     }
 
     func testQuietBrowserPlaceholderLeaves() {
-        let placeholder = PreviewCardLifecycle.Card(isBrowser: true, hasPreview: false, isBusy: true, lastActivity: quietSince)
+        let placeholder = PreviewCardLifecycle.Card(
+            isBrowser: true, isBusy: true, lastActivity: now.addingTimeInterval(-60), hasExplicitTask: true
+        )
         XCTAssertEqual(PreviewCardLifecycle.sweep(placeholder, now: now), .remove)
     }
 
-    func testFinishedCardIsLeftToTheCompletionCleanup() {
-        let finished = PreviewCardLifecycle.Card(isBrowser: false, hasPreview: false, isBusy: false, isCompleted: true, lastActivity: quietSince)
+    func testCompletedCardHasFifteenSecondsForCleanupEvenWhenPinned() {
+        let finished = PreviewCardLifecycle.Card(
+            isBrowser: false, isFront: true, isCompleted: true,
+            lastActivity: now.addingTimeInterval(-14), hasExplicitTask: true, isPinned: true
+        )
         XCTAssertEqual(PreviewCardLifecycle.sweep(finished, now: now), .keep)
+        XCTAssertEqual(PreviewCardLifecycle.sweep(finished, now: now.addingTimeInterval(1)), .remove)
+    }
+
+    func testIdleTimeoutHelpersUseTheLastAgentActivityAndTaskType() {
+        XCTAssertEqual(PreviewCardLifecycle.quietSettleSeconds, 60)
+        XCTAssertEqual(PreviewCardLifecycle.idleTimeoutSeconds(hasExplicitTask: false), 20)
+        XCTAssertEqual(PreviewCardLifecycle.idleTimeoutSeconds(hasExplicitTask: true), 60)
+        XCTAssertFalse(PreviewCardLifecycle.isIdleTimedOut(lastAgentActivity: now, hasExplicitTask: false, now: now.addingTimeInterval(19)))
+        XCTAssertTrue(PreviewCardLifecycle.isIdleTimedOut(lastAgentActivity: now, hasExplicitTask: false, now: now.addingTimeInterval(20)))
+        XCTAssertFalse(PreviewCardLifecycle.isIdleTimedOut(lastAgentActivity: now, hasExplicitTask: true, now: now.addingTimeInterval(59)))
+        XCTAssertTrue(PreviewCardLifecycle.isIdleTimedOut(lastAgentActivity: now, hasExplicitTask: true, now: now.addingTimeInterval(60)))
     }
 
     // MARK: task_complete

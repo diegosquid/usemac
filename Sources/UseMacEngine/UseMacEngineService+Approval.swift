@@ -82,7 +82,8 @@ extension UseMacEngineService {
             targetApp: prompt?.target,
             summary: "Approval prompt ignored a click posted by a process (\(who)); only a physical click answers it",
             latencyMs: 0,
-            success: false
+            success: false,
+            agent: prompt?.agentName
         )
     }
 
@@ -119,6 +120,7 @@ extension UseMacEngineService {
     /// The prompt for `request`, or nil when nothing in it is sensitive.
     func approvalRequest(for request: RPCRequest) -> HeldRequest? {
         let taskId = runningNamedTaskId(of: request)
+        let agentName = TaskTabRegistry.cleanAgent(TaskActivityContext.agentName ?? request.agent ?? taskTabs.agent(of: taskId))
         switch request.method {
         case .act:
             guard let act = request.act else { return nil }
@@ -148,7 +150,8 @@ extension UseMacEngineService {
                     kinds: Set(sensitive.map(\.1)),
                     // A task grant is tied to one app; a batch that spans apps is asked about every time.
                     taskId: targets.count == 1 ? taskId : nil,
-                    grantTarget: "app:" + (targets.first ?? mainName.lowercased())
+                    grantTarget: "app:" + (targets.first ?? mainName.lowercased()),
+                    agentName: agentName
                 ),
                 appName: mainApp?.name ?? mainName,
                 appPid: mainApp?.pid,
@@ -168,7 +171,8 @@ extension UseMacEngineService {
                     steps: ApprovalText.capped(sensitive.map { ApprovalText.describe($0.0) }),
                     kinds: Set(sensitive.map(\.1)),
                     taskId: taskId,
-                    grantTarget: "chrome:" + profile.lowercased()
+                    grantTarget: "chrome:" + profile.lowercased(),
+                    agentName: agentName
                 ),
                 appName: "Chrome (\(profile))",
                 browserTabId: params.tabId,
@@ -187,7 +191,8 @@ extension UseMacEngineService {
                     steps: [ApprovalText.describeScript(params.expression)],
                     kinds: [.script],
                     taskId: taskId,
-                    grantTarget: "chrome:" + profile.lowercased()
+                    grantTarget: "chrome:" + profile.lowercased(),
+                    agentName: agentName
                 ),
                 appName: "Chrome (\(profile))",
                 browserTabId: params.tabId,

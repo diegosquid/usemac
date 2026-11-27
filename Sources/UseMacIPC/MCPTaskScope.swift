@@ -32,9 +32,9 @@ final class MCPTaskScope: @unchecked Sendable {
         return id
     }
 
-    /// Stamps the connection's task on a request that names none (`task_start` and piggybacked `taskStart` never:
-    /// they open a new task).
+    /// Stamps the client name on every request and its task on requests that don't name or open one.
     func stamp(_ request: inout RPCRequest, explicitTaskId: String?, now: Date = Date()) {
+        if request.agent == nil { request.agent = clientName }
         guard request.method != .taskStart, request.taskStart == nil else { return }
         if request.taskId == nil {
             request.taskId = explicitTaskId ?? currentTaskId(now: now)

@@ -16,6 +16,7 @@ extension HUDSessionCard {
     func carryingDeckState(of existing: HUDSessionCard) -> HUDSessionCard {
         var card = self
         card.taskId = card.taskId ?? existing.taskId
+        card.agentName = card.agentName ?? existing.agentName
         card.lastStepDate = existing.lastStepDate
         card.lastShownDate = existing.lastShownDate
         card.backgroundStepCount = existing.backgroundStepCount

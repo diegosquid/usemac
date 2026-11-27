@@ -24,6 +24,7 @@ public struct HUDSessionCard: Identifiable {
     public var cursorPoint: CGPoint?
     public var cursorLabel: String?
     public var lastActivityDate: Date
+    public var agentName: String?
     /// The task whose work the card shows, when UseMac could tell.
     public var taskId: String?
     /// When the card's agent last did something there (a step, an observe, a screenshot). Frames don't count.
@@ -49,7 +50,8 @@ public struct HUDSessionCard: Identifiable {
         caption: LiveActivityItem? = nil,
         cursorPoint: CGPoint? = nil,
         cursorLabel: String? = nil,
-        lastActivityDate: Date = Date()
+        lastActivityDate: Date = Date(),
+        agentName: String? = nil
     ) {
         self.id = id
         self.isBrowser = isBrowser
@@ -67,6 +69,7 @@ public struct HUDSessionCard: Identifiable {
         self.cursorPoint = cursorPoint
         self.cursorLabel = cursorLabel
         self.lastActivityDate = lastActivityDate
+        self.agentName = agentName
     }
 }
 
@@ -120,7 +123,7 @@ public final class AppState: ObservableObject {
         static let setupGuideStep = "usemac.onboarding.setupGuideStep"
     }
 
-    private static let browserFrameDecodeQueue = DispatchQueue(
+    private nonisolated static let browserFrameDecodeQueue = DispatchQueue(
         label: "app.usemac.app.browser-frame-decode",
         qos: .userInitiated
     )
@@ -176,14 +179,20 @@ public final class AppState: ObservableObject {
                 hudDeck = PreviewDeckFocus.firstOfEachId(hudDeck, id: \.id)
             }
             deckDidChange(from: oldValue)
+            refreshActiveAgentNames()
         }
     }
     /// True while the pointer is over the preview: the deck doesn't shuffle under it.
     @Published public var isHUDHovered: Bool = false
     /// True for the short dip the front card makes before it goes to the back of the deck.
     @Published public internal(set) var isDeckFrontDipping: Bool = false
-    @Published public var isAgentBusy: Bool = false
-    @Published public var isActivityIndicatorLit: Bool = false
+    @Published public var isAgentBusy: Bool = false {
+        didSet { if oldValue != isAgentBusy { refreshActiveAgentNames() } }
+    }
+    @Published public var isActivityIndicatorLit: Bool = false {
+        didSet { if oldValue != isActivityIndicatorLit { refreshActiveAgentNames() } }
+    }
+    @Published public private(set) var activeAgentNames: [String] = []
     @Published public var activeTargetApp: AppDescriptor?
     @Published public var streamStatus: LiveStreamStatus = .idle
     @Published public var hudCorner: HUDCorner
@@ -193,8 +202,29 @@ public final class AppState: ObservableObject {
     @Published public var isHUDVisible: Bool
     @Published public var autoShowHUDOnActivity: Bool
     @Published public var hasCompletedHUDAction: Bool = false
-    @Published public var latestCaptionItem: LiveActivityItem?
+    @Published public var latestCaptionItem: LiveActivityItem? {
+        didSet { if oldValue != latestCaptionItem { refreshActiveAgentNames() } }
+    }
     public var lastControlTapUptime: TimeInterval = 0
+
+    public var frontAgentName: String? {
+        hudDeck.first?.agentName ?? latestCaptionItem?.agentName ?? activeAgentNames.first
+    }
+
+    func refreshActiveAgentNames() {
+        var candidates = hudDeck.filter { !$0.isCompleted || $0.isBusy }.compactMap(\.agentName)
+        if (isAgentBusy || isActivityIndicatorLit), let name = latestCaptionItem?.agentName {
+            candidates.append(name)
+        }
+        candidates.append(contentsOf: engine.activeAgentNames(activeWithin: PreviewCardLifecycle.taskIdleTimeoutSeconds))
+        var seen: Set<String> = []
+        let names = candidates
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+        if names != activeAgentNames {
+            activeAgentNames = names
+        }
+    }
 
     // Virtual agent cursor & overlay state
     @Published public var highlightedRect: ScreenRect?
@@ -566,35 +596,20 @@ public final class AppState: ObservableObject {
             }
         }
 
-        let decodeQueue = Self.browserFrameDecodeQueue
         engine.chromeBridge.onBrowserFrame = { [weak self] tabId, jpegData, viewportWidth, viewportHeight, profileName, title in
-            decodeQueue.async {
-                let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
-                guard let source = CGImageSourceCreateWithData(jpegData as CFData, options as CFDictionary),
-                      let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-                    return
-                }
-                Task { @MainActor [weak self] in
-                    self?.handleDecodedBrowserFrame(
-                        tabId: tabId,
-                        cgImage: cgImage,
-                        width: viewportWidth,
-                        height: viewportHeight,
-                        profileName: profileName,
-                        title: title
-                    )
-                }
-            }
+            self?.decodeBrowserFrame(
+                tabId: tabId, jpegData: jpegData, width: viewportWidth, height: viewportHeight,
+                profileName: profileName, title: title
+            )
         }
 
         engine.chromeBridge.onBrowserCursor = { [weak self] event in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                let profile = event.profileName ?? self.hudDeck.first(where: { $0.isBrowser })?.browserProfile ?? self.connectedBrowserProfiles.first?.profileName ?? "Chrome"
-                // A cursor only moves on a tab that already has a card; the card itself comes with the tab's first frame.
-                let profileCardId = Self.browserCardId(profile: profile, tabId: event.tabId)
-                guard let cardId = self.browserCardIdForTab(event.tabId)
-                    ?? (self.hudDeck.contains(where: { $0.id == profileCardId }) ? profileCardId : nil) else { return }
+                guard let self, self.isAgentBusy,
+                      let card = self.hudDeck.first(where: {
+                          $0.isBrowser && $0.isBusy && $0.browserTabId == event.tabId
+                      }) else { return }
+                let profile = event.profileName ?? card.browserProfile ?? self.connectedBrowserProfiles.first?.profileName ?? "Chrome"
                 let label: String?
                 switch event.phase {
                 case "click":
@@ -608,17 +623,17 @@ public final class AppState: ObservableObject {
                 }
                 let pt = CGPoint(x: event.x, y: event.y)
                 self.upsertHUDCard(
-                    id: cardId,
+                    id: card.id,
                     isBrowser: true,
                     browserProfile: profile,
                     browserTabId: event.tabId,
-                    title: self.hudDeck.first(where: { $0.id == cardId })?.title ?? "Chrome (\(profile))",
                     cursorPoint: pt,
                     cursorLabel: label,
+                    refreshAgentActivity: false,
                     promote: true
                 )
                 // Another agent's cursor in a background tab only updates that tab's thumbnail.
-                guard self.hudDeck.first?.id == cardId else { return }
+                guard self.hudDeck.first?.id == card.id else { return }
                 if event.phase == "click" {
                     self.virtualClickPulseId = UUID()
                 }
@@ -631,13 +646,10 @@ public final class AppState: ObservableObject {
 
         // A tab whose live stream paused (idle, or another tab took its streaming slot) is still part of the
         // task: keep its card with the last frame instead of dropping it from the deck.
-        engine.chromeBridge.onBrowserStreamPaused = { [weak self] profileName, tabId in
+        engine.chromeBridge.onBrowserStreamPaused = { [weak self] _, tabId in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let idx = self.hudDeck.firstIndex(where: { $0.isBrowser && $0.browserTabId == tabId }) {
-                    self.hudDeck[idx].isBusy = false
-                }
-                self.isBrowserStreamActive = self.hudDeck.contains { $0.isBrowser && $0.isBusy }
+                guard let self, self.hudDeck.first?.browserTabId == tabId else { return }
+                self.isBrowserStreamActive = false
             }
         }
 
@@ -649,12 +661,17 @@ public final class AppState: ObservableObject {
                         ? (self.hudDeck.first(where: { $0.isBrowser && $0.browserTabId == tabId })?.browserProfile ?? self.connectedBrowserProfiles.first?.profileName ?? "Chrome")
                         : profileName
                     let cardId = Self.browserCardId(profile: resolvedProfile, tabId: tabId)
-                    // Keep the sole card briefly only while displaying its frosted completion overlay
-                    let preservingCompletion = self.hasCompletedHUDAction && self.hudDeck.count == 1 && (self.hudDeck.first?.id == cardId || self.hudDeck.first?.browserTabId == tabId)
+                    // Keep the front card while its completion check is visible, even if another agent is busy.
+                    let preservingCompletion = self.hasCompletedHUDAction
+                        && (self.hudDeck.first?.id == cardId || self.hudDeck.first?.browserTabId == tabId)
                     if !preservingCompletion {
                         let beforeCount = self.hudDeck.count
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
-                            self.hudDeck.removeAll { $0.id == cardId || ($0.isBrowser && $0.browserTabId == tabId) }
+                            self.hudDeck.removeAll { card in
+                                let matches = card.id == cardId || (card.isBrowser && card.browserTabId == tabId)
+                                // A stop acknowledgement must not discard a pinned, settled card's last frame.
+                                return matches && !(self.isHUDManuallyPinned && !card.isBusy)
+                            }
                         }
                         if self.hudDeck.count != beforeCount {
                             if self.hudDeck.isEmpty {
@@ -670,7 +687,9 @@ public final class AppState: ObservableObject {
                         }
                     }
                 }
-                self.isBrowserStreamActive = self.hudDeck.contains { $0.isBrowser && $0.isBusy }
+                if tabId == nil || self.hudDeck.first?.browserTabId == tabId {
+                    self.isBrowserStreamActive = false
+                }
                 if !self.showingFrozenBrowserFrame {
                     self.syncLiveStream()
                 }
@@ -718,6 +737,22 @@ public final class AppState: ObservableObject {
         return "browser:\(profile)"
     }
 
+    private nonisolated func decodeBrowserFrame(
+        tabId: Int?, jpegData: Data, width: Int, height: Int, profileName: String, title: String
+    ) {
+        Self.browserFrameDecodeQueue.async { [weak self] in
+            let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+            guard let source = CGImageSourceCreateWithData(jpegData as CFData, options as CFDictionary),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return }
+            Task { @MainActor [weak self] in
+                self?.handleDecodedBrowserFrame(
+                    tabId: tabId, cgImage: cgImage, width: width, height: height,
+                    profileName: profileName, title: title
+                )
+            }
+        }
+    }
+
     private func handleDecodedBrowserFrame(
         tabId: Int?,
         cgImage: CGImage,
@@ -726,51 +761,48 @@ public final class AppState: ObservableObject {
         profileName: String,
         title: String
     ) {
+        guard isAgentBusy, !engine.isKillSwitchTripped(), status.policy != .paused else { return }
         let shownCardId = browserCardIdForTab(tabId)
         let cardId = shownCardId ?? Self.browserCardId(profile: profileName, tabId: tabId)
         let displayTitle = title.isEmpty ? "Chrome (\(profileName))" : title
         let bounds = ScreenRect(x: 0, y: 0, width: Double(width), height: Double(height))
         let aspect = width > 0 && height > 0 ? min(max(CGFloat(width) / CGFloat(height), 0.62), 2.15) : (268.0 / 172.0)
+        let existing = hudDeck.first { $0.id == cardId }
+        let tabActivity = existing == nil ? tabId.flatMap(latestActivityForBrowserFrame) : nil
 
-        // Attach to a pending placeholder card for the same profile without a tab yet, if any, but only when no card
-        // shows this tab already: with several tasks, that placeholder is another task's, and taking it made a
-        // second card under this tab's id.
-        if let tabId,
-           shownCardId == nil,
-           let pendingIdx = hudDeck.firstIndex(where: { $0.isBrowser && $0.browserTabId == nil && $0.browserProfile?.caseInsensitiveCompare(profileName) == .orderedSame }) {
-            let existing = hudDeck[pendingIdx]
-            hudDeck[pendingIdx] = HUDSessionCard(
-                id: cardId,
-                isBrowser: true,
-                browserProfile: profileName,
-                browserTabId: tabId,
-                browserUrl: existing.browserUrl,
-                title: displayTitle,
-                previewImage: cgImage,
-                sourceBounds: bounds,
-                aspectRatio: aspect,
-                isBusy: existing.isBusy,
-                isCompleted: existing.isCompleted,
-                caption: existing.caption,
-                cursorPoint: existing.cursorPoint,
-                cursorLabel: existing.cursorLabel,
-                lastActivityDate: Date()
-            ).carryingDeckState(of: existing)
-        } else {
-            let isNew = !hudDeck.contains(where: { $0.id == cardId })
-            upsertHUDCard(
-                id: cardId,
-                isBrowser: true,
-                browserProfile: profileName,
-                browserTabId: tabId,
-                title: displayTitle,
-                previewImage: cgImage,
-                sourceBounds: bounds,
-                aspectRatio: aspect,
-                isBusy: isNew ? (!status.killSwitchTripped) : nil,
-                promote: isNew
-            )
+        // Only the first frame may replace a pending card, without changing that card's activity or identity.
+        let pendingIndex = tabId != nil && existing == nil
+            ? pendingBrowserFramePlaceholder(profile: profileName, activity: tabActivity)
+            : nil
+        let initialActivity = pendingIndex == nil ? tabActivity : nil
+        if let existing {
+            guard existing.isBusy else { return }
+        } else if pendingIndex == nil {
+            // A first observation or step may precede its frame. Use the real action's identity and clock.
+            guard let activity = initialActivity, !PreviewCardLifecycle.isIdleTimedOut(
+                lastAgentActivity: Date(timeIntervalSince1970: Double(activity.timestampMs) / 1000),
+                hasExplicitTask: activity.taskId != nil,
+                now: Date()
+            ) else { return }
         }
+        upsertHUDCard(
+            id: cardId,
+            isBrowser: true,
+            browserProfile: profileName,
+            browserTabId: tabId,
+            title: displayTitle,
+            previewImage: cgImage,
+            sourceBounds: bounds,
+            aspectRatio: aspect,
+            isBusy: initialActivity.map { _ in true },
+            caption: initialActivity,
+            taskId: initialActivity?.taskId,
+            agentName: initialActivity?.agentName,
+            refreshAgentActivity: false,
+            replacingPlaceholderAt: pendingIndex,
+            promote: initialActivity != nil
+        )
+        if initialActivity != nil { scheduleDeckSweepIfNeeded() }
 
         if hudDeck.first?.id == cardId {
             showingFrozenBrowserFrame = true
@@ -787,10 +819,41 @@ public final class AppState: ObservableObject {
             )
         }
 
-        if autoShowHUDOnActivity && !isHUDVisible && !engine.isKillSwitchTripped() && status.policy != .paused {
+        let recentlyDismissed = lastUserDismissDate.map { Date().timeIntervalSince($0) < 4 } ?? false
+        if autoShowHUDOnActivity && !isHUDVisible && !dismissedDuringActiveRun && !recentlyDismissed {
             showHUD(manual: false)
         }
-        pulseActivityIndicator()
+    }
+
+    private func latestActivityForBrowserFrame(tabId: Int) -> LiveActivityItem? {
+        guard let index = liveActivities.lastIndex(where: {
+            $0.browserTabId == tabId && $0.targetGuessed != true && Self.renewsIdleTimeout($0.kind)
+        }) else { return nil }
+        let activity = liveActivities[index]
+        let finished = liveActivities.dropFirst(index + 1).contains { item in
+            guard item.kind == .taskComplete else { return false }
+            return item.browserTabId == tabId || item.taskTabIds?.contains(tabId) == true
+                || (activity.taskId != nil && activity.taskId == item.taskId)
+        }
+        return finished ? nil : activity
+    }
+
+    private func pendingBrowserFramePlaceholder(profile: String, activity: LiveActivityItem?) -> Int? {
+        let now = Date()
+        let candidates = hudDeck.indices.filter {
+            let card = hudDeck[$0]
+            guard card.isBrowser, card.isBusy, card.browserTabId == nil, let cardProfile = card.browserProfile else {
+                return false
+            }
+            return resolvedBrowserProfile(cardProfile).caseInsensitiveCompare(profile) == .orderedSame
+                && !PreviewCardLifecycle.isIdleTimedOut(
+                    lastAgentActivity: card.lastActivityDate, hasExplicitTask: card.taskId != nil, now: now
+                )
+        }
+        if let activity {
+            return candidates.first { hudDeck[$0].taskId == activity.taskId }
+        }
+        return candidates.count == 1 ? candidates.first : nil
     }
 
     public func startDaemon() {
@@ -860,6 +923,7 @@ public final class AppState: ObservableObject {
             hasEverConnectedAgent = true
             UserDefaults.standard.set(true, forKey: DefaultsKeys.onboardingAgentConnected)
         }
+        refreshActiveAgentNames()
     }
 
     private func persistSafetyPolicy(_ policy: GovernancePolicy, previous: GovernancePolicy) {
@@ -1179,6 +1243,7 @@ public final class AppState: ObservableObject {
     }
 
     public func hideHUD(userInitiated: Bool = true) {
+        let hadExplicitTask = hudDeck.contains { $0.taskId != nil && $0.isBusy }
         hudAutoHideTask?.cancel()
         hudAutoHideTask = nil
         isHUDManuallyPinned = false
@@ -1192,6 +1257,13 @@ public final class AppState: ObservableObject {
         }
         engine.chromeBridge.stopActiveStreams()
         hudDeck.removeAll()
+        if !userInitiated || !isAgentBusy {
+            clearActivityIndicator()
+        }
+        if userInitiated && isAgentBusy && taskIdleSettleTask == nil {
+            scheduleTaskIdleSettle(hasExplicitTask: hadExplicitTask)
+        }
+        refreshActiveAgentNames()
         // A hidden panel gets no mouse-exited event: don't leave the next deck paused.
         isHUDHovered = false
         isHUDVisible = false
@@ -1375,9 +1447,15 @@ public final class AppState: ObservableObject {
         cursorPoint: CGPoint? = nil,
         cursorLabel: String? = nil,
         taskId: String? = nil,
+        agentName: String? = nil,
         isStep: Bool = false,
+        refreshAgentActivity: Bool = true,
+        replacingPlaceholderAt pendingIdx: Int? = nil,
         promote: Bool
     ) {
+        let trimmedAgent = agentName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let agent = trimmedAgent.flatMap { $0.isEmpty ? nil : $0 }
+        let activityDate = refreshAgentActivity ? Date() : nil
         // Agent activity never takes the front from a card that is still working: the deck's shuffle brings the
         // other cards forward in turn (PreviewDeckFocus.shuffleTarget).
         let frontYields = PreviewDeckFocus.frontYieldsToActivity(deckFront)
@@ -1397,7 +1475,8 @@ public final class AppState: ObservableObject {
             if let caption { card.caption = caption }
             if let cursorPoint { card.cursorPoint = cursorPoint }
             if let cursorLabel { card.cursorLabel = cursorLabel }
-            card.lastActivityDate = Date()
+            if let agent { card.agentName = agent }
+            if let activityDate { card.lastActivityDate = activityDate }
             card.recordDeckActivity(taskId: taskId, isStep: isStep, isFront: existingIdx == 0)
 
             if canPromote && existingIdx > 0 {
@@ -1409,10 +1488,7 @@ public final class AppState: ObservableObject {
             } else {
                 hudDeck[existingIdx] = card
             }
-        } else if isBrowser,
-                  let browserTabId,
-                  !hudDeck.contains(where: { $0.isBrowser && $0.browserTabId == browserTabId }),
-                  let pendingIdx = pendingBrowserPlaceholderIndex(profile: browserProfile, taskId: taskId) {
+        } else if let pendingIdx {
             let existing = hudDeck[pendingIdx]
             var upgraded = HUDSessionCard(
                 id: id,
@@ -1430,7 +1506,8 @@ public final class AppState: ObservableObject {
                 caption: caption ?? existing.caption,
                 cursorPoint: cursorPoint ?? existing.cursorPoint,
                 cursorLabel: cursorLabel ?? existing.cursorLabel,
-                lastActivityDate: Date()
+                lastActivityDate: activityDate ?? existing.lastActivityDate,
+                agentName: agent
             ).carryingDeckState(of: existing)
             upgraded.recordDeckActivity(taskId: taskId, isStep: isStep, isFront: pendingIdx == 0)
             if canPromote && pendingIdx > 0 {
@@ -1462,7 +1539,10 @@ public final class AppState: ObservableObject {
                 caption: caption,
                 cursorPoint: cursorPoint,
                 cursorLabel: cursorLabel,
-                lastActivityDate: Date()
+                lastActivityDate: activityDate
+                    ?? caption.map { Date(timeIntervalSince1970: Double($0.timestampMs) / 1000) }
+                    ?? .distantPast,
+                agentName: agent
             )
             newCard.recordDeckActivity(taskId: taskId, isStep: isStep, isFront: frontYields)
             // A new card only takes the front when the front card yields; otherwise it joins the stack behind it.
@@ -1493,24 +1573,6 @@ public final class AppState: ObservableObject {
         )
     }
 
-    /// The placeholder card (a tab still opening) a tab's first activity takes over: one of the same profile, and of
-    /// the same task when one is, so two tasks opening tabs at once don't swap placeholders.
-    private func pendingBrowserPlaceholderIndex(profile: String?, taskId: String?) -> Int? {
-        let candidates = hudDeck.indices.filter { idx in
-            let card = hudDeck[idx]
-            return card.isBrowser && card.browserTabId == nil && (
-                profile == nil ||
-                card.browserProfile == nil ||
-                card.browserProfile?.caseInsensitiveCompare("Browser") == .orderedSame ||
-                card.browserProfile?.caseInsensitiveCompare(profile!) == .orderedSame
-            )
-        }
-        if let taskId, !taskId.isEmpty, let sameTask = candidates.first(where: { hudDeck[$0].taskId == taskId }) {
-            return sameTask
-        }
-        return candidates.first
-    }
-
     /// Keeps the deck at `maxDeckCards` by dropping the cards that have been quiet longest, never the front one.
     private func trimDeckToLimit() {
         while hudDeck.count > Self.maxDeckCards,
@@ -1528,7 +1590,7 @@ public final class AppState: ObservableObject {
             return
         }
 
-        isAgentBusy = front.isBusy
+        isAgentBusy = hudDeck.contains(where: \.isBusy)
         hasCompletedHUDAction = front.isCompleted && !status.killSwitchTripped
         latestCaptionItem = front.caption
         virtualAgentPoint = front.cursorPoint
@@ -1660,20 +1722,39 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func scheduleTaskIdleSettle() {
+    private func scheduleTaskIdleSettle(hasExplicitTask: Bool) {
         taskIdleSettleTask?.cancel()
+        let timeout = PreviewCardLifecycle.idleTimeoutSeconds(hasExplicitTask: hasExplicitTask)
         taskIdleSettleTask = Task { @MainActor [weak self] in
-            // Generous 5-minute anti-zombie failsafe: never close or fake completion while an LLM
-            // is thinking between steps; only quietly clean up if an agent crashes/forgets task_complete.
-            try? await Task.sleep(nanoseconds: 300_000_000_000)
+            try? await Task.sleep(for: .seconds(timeout))
             guard !Task.isCancelled, let self else { return }
-            guard !self.isHUDManuallyPinned else { return }
-            self.isAgentBusy = false
-            self.hasCompletedHUDAction = false
-            if self.isHUDVisible && !self.status.killSwitchTripped {
-                self.hideHUD(userInitiated: false)
-            }
+            self.settleIdleActivity()
         }
+    }
+
+    public func settleIdleActivity() {
+        taskIdleSettleTask?.cancel()
+        taskIdleSettleTask = nil
+        captionClearTask?.cancel()
+        captionClearTask = nil
+        isAgentBusy = false
+        hasCompletedHUDAction = false
+        latestCaptionItem = nil
+        clearActivityIndicator()
+        clearOverlay()
+        if !isHUDManuallyPinned && !status.killSwitchTripped {
+            hideHUD(userInitiated: false)
+        } else {
+            for idx in hudDeck.indices {
+                hudDeck[idx].isBusy = false
+                hudDeck[idx].caption = nil
+                hudDeck[idx].cursorPoint = nil
+                hudDeck[idx].cursorLabel = nil
+            }
+            isBrowserStreamActive = false
+            engine.chromeBridge.stopActiveStreams()
+        }
+        refreshActiveAgentNames()
     }
 
     public func clearLiveActivities() {
@@ -1774,6 +1855,15 @@ public final class AppState: ObservableObject {
 
     // MARK: - Live Activity Stream Handling
 
+    private static func renewsIdleTimeout(_ kind: LiveActivityKind) -> Bool {
+        switch kind {
+        case .taskStart, .actionStart, .actionStep, .actionComplete, .observe, .screenshot:
+            return true
+        case .taskComplete, .highlight, .policyOrSafety:
+            return false
+        }
+    }
+
     private func handleLiveActivity(_ item: LiveActivityItem) {
         liveActivities.append(item)
         if liveActivities.count > 80 {
@@ -1782,6 +1872,20 @@ public final class AppState: ObservableObject {
         // Golden rule: the preview only shows UseMac's tabs and apps an agent named. Work on a guessed target (no app
         // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
         guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
+        let canAct = !engine.isKillSwitchTripped() && status.policy != .paused
+        if Self.renewsIdleTimeout(item.kind) && canAct {
+            isAgentBusy = true
+            if item.kind == .taskStart {
+                dismissedDuringActiveRun = false
+                lastUserDismissDate = nil
+            }
+            hudAutoHideTask?.cancel()
+            hudAutoHideTask = nil
+            scheduleTaskIdleSettle(
+                hasExplicitTask: item.taskId != nil || hudDeck.contains { $0.taskId != nil && $0.isBusy }
+            )
+            pulseActivityIndicator()
+        }
 
         // A profile-wide observation isn't another browser tab. Show its caption on the task's existing card,
         // if there is one, without creating a placeholder, starting the HUD, or moving a card to the front.
@@ -1791,8 +1895,17 @@ public final class AppState: ObservableObject {
                     tabId: card.browserTabId, profile: card.browserProfile, taskId: card.taskId
                 )
             }) {
-                hudDeck[index].caption = item
+                let card = hudDeck[index]
+                upsertHUDCard(
+                    id: card.id,
+                    isBrowser: true,
+                    isBusy: canAct,
+                    caption: item,
+                    agentName: item.agentName,
+                    promote: false
+                )
                 if index == 0 {
+                    hasCompletedHUDAction = false
                     latestCaptionItem = item
                     scheduleCaptionClearIfIdle()
                 }
@@ -1810,49 +1923,22 @@ public final class AppState: ObservableObject {
         )
 
         switch item.kind {
-        case .taskStart:
-            if !engine.isKillSwitchTripped() && status.policy != .paused {
-                // Explicit task session start: open preview once and keep it steady across all iterations
-                // until explicit task_complete is called.
-                isAgentBusy = true
+        case .taskStart, .actionStart, .actionStep, .actionComplete, .observe, .screenshot:
+            if canAct && !isBackgroundActivity {
                 hasCompletedHUDAction = false
-                isHUDManuallyPinned = false
-                dismissedDuringActiveRun = false
-                lastUserDismissDate = nil
-                hudAutoHideTask?.cancel()
-                hudAutoHideTask = nil
-                scheduleTaskIdleSettle()
-                pulseActivityIndicator()
-            }
-        case .actionStart, .actionStep, .actionComplete, .observe, .screenshot:
-            if !engine.isKillSwitchTripped() && status.policy != .paused {
-                // Keep steady calm active rim across multi-step LLM turns until explicit task_complete.
-                isAgentBusy = true
-                hasCompletedHUDAction = false
-                isHUDManuallyPinned = false
-                hudAutoHideTask?.cancel()
-                hudAutoHideTask = nil
-                scheduleTaskIdleSettle()
-                pulseActivityIndicator()
             }
         case .taskComplete:
-            taskIdleSettleTask?.cancel()
-            taskIdleSettleTask = nil
-            isAgentBusy = false
-            hasCompletedHUDAction = item.success && !engine.isKillSwitchTripped()
-            pulseActivityIndicator()
-            if hasCompletedHUDAction {
-                scheduleCompletionAutoClose(delaySeconds: 1.85)
-            }
+            break
         case .policyOrSafety:
-            if engine.isKillSwitchTripped() || status.policy == .paused || !item.success {
+            if !canAct || (!item.success && !hudDeck.contains(where: \.isBusy)) {
                 taskIdleSettleTask?.cancel()
+                taskIdleSettleTask = nil
                 isAgentBusy = false
                 hasCompletedHUDAction = false
                 clearActivityIndicator()
             }
         case .highlight:
-            if !engine.isKillSwitchTripped() && status.policy != .paused {
+            if canAct {
                 pulseActivityIndicator()
             }
         }
@@ -1905,8 +1991,10 @@ public final class AppState: ObservableObject {
             cardProfile = prof
             cardId = browserCardIdForTab(item.browserTabId) ?? Self.browserCardId(profile: prof, tabId: item.browserTabId)
         } else if let resolvedTarget = resolveTargetApp(from: item), resolvedTarget.pid > 0 {
-            // Drop any empty browser placeholder created by a generic task_start before targeting a native app
-            hudDeck.removeAll { $0.isBrowser && $0.browserTabId == nil && $0.previewImage == nil }
+            // A generic task_start may have made a browser placeholder before this task named a native app.
+            hudDeck.removeAll {
+                $0.isBrowser && $0.browserTabId == nil && $0.previewImage == nil && $0.taskId == item.taskId
+            }
             cardAppDescriptor = resolvedTarget
             // Work in a background card's app must not switch the large preview's stream away from the front card.
             if !isBackgroundActivity {
@@ -1944,8 +2032,14 @@ public final class AppState: ObservableObject {
         if item.kind == .taskComplete, let finishedTabs = item.taskTabIds.map(Set.init) {
             // UseMac knows which task finished: only its tabs' cards (and a native app it named) are done. The cards of
             // other agents' running tasks stay as they are.
+            let finishedAt = Date()
             for idx in hudDeck.indices {
                 let card = hudDeck[idx]
+                if let finishedTask = item.taskId, let cardTask = card.taskId {
+                    guard finishedTask == cardTask else { continue }
+                    markHUDCardCompleted(at: idx, with: item, finishedAt: finishedAt)
+                    continue
+                }
                 let isFinishedTasks = PreviewCardLifecycle.taskCompleteFinishes(
                     isBrowser: card.isBrowser,
                     browserTabId: card.browserTabId,
@@ -1955,15 +2049,19 @@ public final class AppState: ObservableObject {
                     finishedAppPid: item.appPid
                 )
                 if isFinishedTasks {
-                    hudDeck[idx].isBusy = false
-                    hudDeck[idx].isCompleted = item.success && !engine.isKillSwitchTripped()
-                    hudDeck[idx].caption = item
+                    markHUDCardCompleted(at: idx, with: item, finishedAt: finishedAt)
                 }
             }
-            syncFrontCardToUI()
         } else if item.kind == .taskComplete {
+            let finishedAt = Date()
             var matchedAny = false
             for idx in hudDeck.indices {
+                if let finishedTask = item.taskId, let cardTask = hudDeck[idx].taskId {
+                    guard finishedTask == cardTask else { continue }
+                    markHUDCardCompleted(at: idx, with: item, finishedAt: finishedAt)
+                    matchedAny = true
+                    continue
+                }
                 let matchBrowser: Bool = {
                     guard hudDeck[idx].isBrowser else { return false }
                     if let targetTab = item.browserTabId, hudDeck[idx].browserTabId != targetTab {
@@ -1983,18 +2081,13 @@ public final class AppState: ObservableObject {
                     return item.browserProfile == nil && item.browserTabId == nil
                 }()
                 if matchBrowser || matchNative || (item.browserTabId == nil && item.appPid == nil && idx == 0) {
-                    hudDeck[idx].isBusy = false
-                    hudDeck[idx].isCompleted = item.success && !engine.isKillSwitchTripped()
-                    hudDeck[idx].caption = item
+                    markHUDCardCompleted(at: idx, with: item, finishedAt: finishedAt)
                     matchedAny = true
                 }
             }
-            if !matchedAny, !hudDeck.isEmpty {
-                hudDeck[0].isBusy = false
-                hudDeck[0].isCompleted = item.success && !engine.isKillSwitchTripped()
-                hudDeck[0].caption = item
+            if !matchedAny, let front = hudDeck.first, item.taskId == nil || front.taskId == nil {
+                markHUDCardCompleted(at: 0, with: item, finishedAt: finishedAt)
             }
-            syncFrontCardToUI()
         } else if let cardId {
             let busyState: Bool? = {
                 switch item.kind {
@@ -2043,6 +2136,26 @@ public final class AppState: ObservableObject {
                 namesTab: item.browserTabId != nil,
                 success: item.success
             ) else {
+                // A frame can precede the engine's observation/step. Reuse that real frame once
+                // the named tab has live activity instead of constructing an empty card.
+                if canAct, Self.renewsIdleTimeout(item.kind), let tabId = item.browserTabId, let profile = cardProfile {
+                    if let index = pendingBrowserFramePlaceholder(profile: profile, activity: item) {
+                        upsertHUDCard(
+                            id: hudDeck[index].id, isBrowser: true, caption: item,
+                            agentName: item.agentName, promote: false
+                        )
+                    }
+                    let isStreaming = engine.chromeBridge.connectedProfiles().contains {
+                        $0.streamingTabId == tabId && $0.profileName.caseInsensitiveCompare(profile) == .orderedSame
+                    }
+                    if isStreaming, let frame = engine.chromeBridge.latestFrame(profileQuery: profile, tabId: tabId),
+                       frame.tabId == tabId, frame.profileName.caseInsensitiveCompare(profile) == .orderedSame {
+                        decodeBrowserFrame(
+                            tabId: tabId, jpegData: frame.jpegData, width: frame.viewportWidth,
+                            height: frame.viewportHeight, profileName: frame.profileName, title: frame.title
+                        )
+                    }
+                }
                 return
             }
             upsertHUDCard(
@@ -2057,6 +2170,7 @@ public final class AppState: ObservableObject {
                 isCompleted: completedState,
                 caption: item,
                 taskId: item.taskId,
+                agentName: item.agentName,
                 isStep: [.actionStart, .actionStep, .observe, .screenshot].contains(item.kind),
                 promote: shouldPromote
             )
@@ -2064,6 +2178,25 @@ public final class AppState: ObservableObject {
                 syncFrontCardToUI()
             }
             deckCardDidRecordActivity(cardId: cardId)
+        }
+
+        if item.kind == .taskComplete {
+            syncFrontCardToUI()
+            if hudDeck.isEmpty {
+                hasCompletedHUDAction = item.success && !engine.isKillSwitchTripped()
+            }
+            if isAgentBusy {
+                scheduleTaskIdleSettle(hasExplicitTask: hudDeck.contains { $0.taskId != nil && $0.isBusy })
+            } else {
+                taskIdleSettleTask?.cancel()
+                taskIdleSettleTask = nil
+                scheduleCaptionClearIfIdle(delaySeconds: Self.activityIndicatorHoldSeconds)
+            }
+            pulseActivityIndicator()
+            if item.success && !engine.isKillSwitchTripped() {
+                // Keep the final menu-bar pulse visible even when the preview's check would close sooner.
+                scheduleCompletionAutoClose(delaySeconds: isAgentBusy ? 1.85 : Self.activityIndicatorHoldSeconds)
+            }
         }
 
         let hasStreamTarget = (pairedApp != nil || activeTargetApp != nil || hudStreamMode == .fullDisplay || isBrowserStreamActive || showingFrozenBrowserFrame || !hudDeck.isEmpty)
@@ -2088,6 +2221,16 @@ public final class AppState: ObservableObject {
         if item.kind == .taskComplete {
             dismissedDuringActiveRun = false
         }
+    }
+
+    private func markHUDCardCompleted(at index: Int, with item: LiveActivityItem, finishedAt: Date) {
+        var card = hudDeck[index]
+        card.isBusy = false
+        card.isCompleted = item.success && !engine.isKillSwitchTripped()
+        card.lastActivityDate = finishedAt
+        card.caption = item
+        card.agentName = card.agentName ?? item.agentName
+        hudDeck[index] = card
     }
 
     private func friendlyActionLabel(for item: LiveActivityItem) -> String? {
@@ -2134,12 +2277,14 @@ public final class AppState: ObservableObject {
         return prefixes.contains(where: { item.title.hasPrefix($0) })
     }
 
+    private static let activityIndicatorHoldSeconds: TimeInterval = 2.5
+
     private func pulseActivityIndicator() {
         activityIndicatorHoldTask?.cancel()
         isActivityIndicatorLit = true
         guard !isAgentBusy else { return }
         activityIndicatorHoldTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            try? await Task.sleep(for: .seconds(Self.activityIndicatorHoldSeconds))
             guard !Task.isCancelled, let self else { return }
             if !self.isAgentBusy {
                 self.isActivityIndicatorLit = false
@@ -2147,17 +2292,17 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func clearActivityIndicator() {
+    func clearActivityIndicator() {
         activityIndicatorHoldTask?.cancel()
         activityIndicatorHoldTask = nil
         isActivityIndicatorLit = false
     }
 
-    private func scheduleCaptionClearIfIdle() {
+    private func scheduleCaptionClearIfIdle(delaySeconds: TimeInterval = 2) {
         captionClearTask?.cancel()
         guard !isAgentBusy, let currentId = latestCaptionItem?.id else { return }
         captionClearTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(for: .seconds(delaySeconds))
             guard !Task.isCancelled, let self else { return }
             if !self.isAgentBusy && self.latestCaptionItem?.id == currentId {
                 self.latestCaptionItem = nil

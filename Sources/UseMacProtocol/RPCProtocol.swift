@@ -107,6 +107,8 @@ public struct RPCRequest: Codable, Sendable {
     public var browserReloadExtension: BrowserReloadExtensionParams?
     public var reportPrepare: ReportPrepareParams?
     public var debugCapture: DebugCaptureParams?
+    /// The caller's agent or client name, independent of whether a task is open.
+    public var agent: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -136,7 +138,8 @@ public struct RPCRequest: Codable, Sendable {
         taskId: String? = nil,
         browserReloadExtension: BrowserReloadExtensionParams? = nil,
         reportPrepare: ReportPrepareParams? = nil,
-        debugCapture: DebugCaptureParams? = nil
+        debugCapture: DebugCaptureParams? = nil,
+        agent: String? = nil
     ) {
         self.id = id
         self.method = method
@@ -166,6 +169,7 @@ public struct RPCRequest: Codable, Sendable {
         self.browserReloadExtension = browserReloadExtension
         self.reportPrepare = reportPrepare
         self.debugCapture = debugCapture
+        self.agent = agent
     }
 
     public init(from decoder: Decoder) throws {
@@ -198,6 +202,7 @@ public struct RPCRequest: Codable, Sendable {
         self.browserReloadExtension = try c.decodeIfPresent(BrowserReloadExtensionParams.self, forKey: .browserReloadExtension)
         self.reportPrepare = try c.decodeIfPresent(ReportPrepareParams.self, forKey: .reportPrepare)
         self.debugCapture = try c.decodeIfPresent(DebugCaptureParams.self, forKey: .debugCapture)
+        self.agent = try c.decodeIfPresent(String.self, forKey: .agent)
     }
 }
 

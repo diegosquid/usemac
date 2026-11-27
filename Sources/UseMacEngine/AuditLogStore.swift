@@ -49,6 +49,8 @@ public struct AuditLogQuery: Equatable, Sendable {
     public var limit: Int?
     public var sinceMs: Int64?
     public var taskId: String?
+    /// Exact agent name.
+    public var agent: String?
     /// Exact `targetApp`.
     public var app: String?
     /// `true` for entries that succeeded, `false` for failures.
@@ -62,7 +64,8 @@ public struct AuditLogQuery: Equatable, Sendable {
         taskId: String? = nil,
         app: String? = nil,
         success: Bool? = nil,
-        kinds: Set<AuditEntryKind>? = nil
+        kinds: Set<AuditEntryKind>? = nil,
+        agent: String? = nil
     ) {
         self.limit = limit
         self.sinceMs = sinceMs
@@ -70,16 +73,18 @@ public struct AuditLogQuery: Equatable, Sendable {
         self.app = app
         self.success = success
         self.kinds = kinds
+        self.agent = agent
     }
 
     /// The query an `audit_log` request asks for.
     public init(_ params: AuditLogParams) {
-        self.init(limit: params.resolvedLimit, sinceMs: params.sinceMs, taskId: params.resolvedTaskId)
+        self.init(limit: params.resolvedLimit, sinceMs: params.sinceMs, taskId: params.resolvedTaskId, agent: params.resolvedAgent)
     }
 
     public func matches(_ entry: AuditEntry) -> Bool {
         if let sinceMs, entry.timestampMs < sinceMs { return false }
         if let taskId, entry.taskId != taskId { return false }
+        if let agent, entry.agent != agent { return false }
         if let app, entry.targetApp != app { return false }
         if let success, entry.success != success { return false }
         if let kinds, !kinds.contains(AuditEntryKind(entry)) { return false }
@@ -198,13 +203,14 @@ public final class AuditLogStore: @unchecked Sendable {
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             formatter.timeZone = .current
-            var lines = ["time,timestampMs,taskId,method,app,result,latencyMs,summary,id"]
+            var lines = ["time,timestampMs,taskId,agent,method,app,result,latencyMs,summary,id"]
             for entry in chronological {
                 let time = formatter.string(from: Date(timeIntervalSince1970: Double(entry.timestampMs) / 1000))
                 let cells = [
                     time,
                     String(entry.timestampMs),
                     entry.taskId ?? "",
+                    entry.agent ?? "",
                     entry.method,
                     entry.targetApp ?? "",
                     entry.success ? "ok" : "failed",

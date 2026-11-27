@@ -1874,7 +1874,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             response = .success(id: request.id, latencyMs: latencyMs, visionResult: result)
 
         case .taskStart:
-            let params = request.taskStart ?? TaskStartParams()
+            var params = request.taskStart ?? TaskStartParams()
+            if params.agent == nil { params.agent = request.agent }
             let taskId = startTaskInline(params, explicitTaskId: nil)
             let latencyMs = elapsedMs(since: startNs)
             response = .success(id: request.id, latencyMs: latencyMs, status: currentStatus(), taskId: taskId)
@@ -2540,7 +2541,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
         summary: String,
         latencyMs: Double,
         success: Bool,
-        taskId: String? = nil
+        taskId: String? = nil,
+        agent: String? = nil
     ) {
         let request = AuditRequestContext.request
         let hint = request?.auditTaskHint
@@ -2551,7 +2553,8 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             summary: AuditRedactor.scrub(summary, secrets: request?.auditSecrets ?? []),
             latencyMs: latencyMs,
             success: success,
-            taskId: taskId ?? taskTabs.resolve(taskId: hint?.taskId, tabId: hint?.tabId)
+            taskId: taskId ?? taskTabs.resolve(taskId: hint?.taskId, tabId: hint?.tabId),
+            agent: TaskTabRegistry.cleanAgent(agent ?? TaskActivityContext.agentName ?? request?.taskStart?.agent ?? request?.agent)
         )
 
         stateLock.lock()
@@ -2590,13 +2593,15 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             ? params.summary!.trimmingCharacters(in: .whitespacesAndNewlines)
             : "Working…"
         let taskId = taskTabs.start(taskId: params.taskId ?? explicitTaskId, agent: params.agent)
+        let agent = TaskActivityContext.agentName ?? taskTabs.agent(of: taskId)
         appendAudit(
             method: RPCMethod.taskStart.rawValue,
             targetApp: targetName,
             summary: summaryText,
             latencyMs: 0,
             success: true,
-            taskId: taskId
+            taskId: taskId,
+            agent: agent
         )
         emitLiveActivity(LiveActivityItem(
             kind: .taskStart,
@@ -2609,7 +2614,7 @@ public final class UseMacEngineService: UseMacServiceProtocol, @unchecked Sendab
             isInProgress: true,
             browserTabId: params.tabId,
             browserProfile: resolvedProfile,
-            agentName: TaskTabRegistry.cleanAgent(params.agent),
+            agentName: agent,
             taskId: taskId
         ))
         return taskId

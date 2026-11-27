@@ -10,9 +10,13 @@ import Foundation
 /// - nothing dropped the card of an app that quit.
 /// These rules keep the deck honest; `AppState` applies them.
 public enum PreviewCardLifecycle {
-    /// A card that is not in front and has had no activity for this long stops showing the busy dot. Agents usually
-    /// act every few seconds; this is well past an agent thinking between steps.
-    public static let quietSettleSeconds: TimeInterval = 90
+    /// Inactivity limits for standalone actions and explicitly started tasks.
+    public static let adHocIdleTimeoutSeconds: TimeInterval = 20
+    public static let taskIdleTimeoutSeconds: TimeInterval = 60
+    /// Drop a completed card if the normal completion cleanup never ran.
+    public static let completedCardFailsafeSeconds: TimeInterval = 15
+    /// Legacy name for the explicit task's inactivity limit.
+    public static let quietSettleSeconds: TimeInterval = taskIdleTimeoutSeconds
     /// How often a background native card's still picture may be refreshed while its agent works.
     public static let stillRefreshSeconds: TimeInterval = 4
     /// How soon a card that has no picture yet may try again (its window may only just have opened).
@@ -27,7 +31,10 @@ public enum PreviewCardLifecycle {
         public var isCompleted: Bool
         /// For a native card, whether its app is still running (always true for browser cards).
         public var appRunning: Bool
+        /// The last agent activity, or the completion time for a completed card.
         public var lastActivity: Date
+        public var hasExplicitTask: Bool = false
+        public var isPinned: Bool = false
 
         public init(
             isBrowser: Bool,
@@ -36,7 +43,9 @@ public enum PreviewCardLifecycle {
             isBusy: Bool = false,
             isCompleted: Bool = false,
             appRunning: Bool = true,
-            lastActivity: Date
+            lastActivity: Date,
+            hasExplicitTask: Bool = false,
+            isPinned: Bool = false
         ) {
             self.isBrowser = isBrowser
             self.isFront = isFront
@@ -45,6 +54,8 @@ public enum PreviewCardLifecycle {
             self.isCompleted = isCompleted
             self.appRunning = appRunning
             self.lastActivity = lastActivity
+            self.hasExplicitTask = hasExplicitTask
+            self.isPinned = isPinned
         }
     }
 
@@ -56,15 +67,27 @@ public enum PreviewCardLifecycle {
         case remove
     }
 
-    /// The periodic check of one card.
-    /// - The card of an app that quit leaves, even in front: its window is gone.
-    /// - A quiet card in front is left to the task's own end (`task_complete`, or the preview's idle failsafe).
-    /// - A quiet background card without a picture leaves (a grey placeholder with nothing to show); one with a
-    ///   picture stays but stops showing the busy dot.
+    public static func idleTimeoutSeconds(hasExplicitTask: Bool) -> TimeInterval {
+        hasExplicitTask ? taskIdleTimeoutSeconds : adHocIdleTimeoutSeconds
+    }
+
+    public static func isIdleTimedOut(lastAgentActivity: Date, hasExplicitTask: Bool, now: Date) -> Bool {
+        now.timeIntervalSince(lastAgentActivity) >= idleTimeoutSeconds(hasExplicitTask: hasExplicitTask)
+    }
+
+    /// Expire idle cards even in front. User-pinned cards stay but lose their busy dot.
+    /// Completed cards and cards whose native app has quit can be removed even when pinned.
     public static func sweep(_ card: Card, now: Date) -> Verdict {
         if !card.isBrowser && !card.appRunning { return .remove }
-        guard !card.isFront, now.timeIntervalSince(card.lastActivity) >= quietSettleSeconds else { return .keep }
-        if !card.hasPreview && !card.isCompleted { return .remove }
+
+        let elapsed = now.timeIntervalSince(card.lastActivity)
+        if card.isCompleted {
+            return elapsed >= completedCardFailsafeSeconds ? .remove : .keep
+        }
+
+        let timeout = idleTimeoutSeconds(hasExplicitTask: card.hasExplicitTask)
+        guard elapsed >= timeout else { return .keep }
+        guard card.isPinned else { return .remove }
         return card.isBusy ? .settle : .keep
     }
 

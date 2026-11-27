@@ -539,6 +539,7 @@ public final class UnixSocketServer: @unchecked Sendable {
     }
 
     private func handleClient(clientFd: Int32) {
+        let peerAgent = PeerProcessIdentifier.resolveAgentName(forSocketFd: clientFd)
         let replyQueue = DispatchQueue(label: "app.usemac.ipc.server.reply.\(clientFd)", qos: .userInteractive)
         let inFlightGroup = DispatchGroup()
         let concurrencyLimit = DispatchSemaphore(value: Self.maxConcurrentRequestsPerClient)
@@ -607,7 +608,11 @@ public final class UnixSocketServer: @unchecked Sendable {
                     }
                     if !lineData.isEmpty {
                         do {
-                            let request = try decoder.decode(RPCRequest.self, from: lineData)
+                            var decoded = try decoder.decode(RPCRequest.self, from: lineData)
+                            if decoded.agent?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                                decoded.agent = peerAgent
+                            }
+                            let request = decoded
                             let svc = service
                             let ordered = Self.requiresOrderedExecution(request)
                             let previousOrdered = ordered ? orderedTail : nil

@@ -14,7 +14,7 @@ struct DeckHygieneState {
 /// an app that quit) leave the deck.
 extension AppState {
     /// How often the deck is checked while it has cards.
-    static let deckSweepIntervalNs: UInt64 = 10_000_000_000
+    static let deckSweepIntervalNs: UInt64 = 5_000_000_000
 
     /// Called after an activity updated a card.
     func deckCardDidRecordActivity(cardId: String) {
@@ -108,7 +108,9 @@ extension AppState {
                     isBusy: card.isBusy,
                     isCompleted: card.isCompleted,
                     appRunning: appRunning,
-                    lastActivity: card.lastActivityDate
+                    lastActivity: card.lastActivityDate,
+                    hasExplicitTask: card.taskId != nil,
+                    isPinned: isHUDManuallyPinned
                 ),
                 now: now
             )
@@ -120,9 +122,18 @@ extension AppState {
         }
         guard !removedIds.isEmpty || !settledIds.isEmpty else { return }
 
-        let frontChanged = hudDeck.first.map { removedIds.contains($0.id) } ?? false
+        let frontChanged = hudDeck.first.map { removedIds.contains($0.id) || settledIds.contains($0.id) } ?? false
+        for card in hudDeck where card.isBrowser && (removedIds.contains(card.id) || settledIds.contains(card.id)) {
+            // A pending card has no stream; a nil tab ID would stop every stream for that profile.
+            if let tabId = card.browserTabId {
+                engine.chromeBridge.stopStream(profileQuery: card.browserProfile, tabId: tabId)
+            }
+        }
         for idx in hudDeck.indices where settledIds.contains(hudDeck[idx].id) {
             hudDeck[idx].isBusy = false
+            hudDeck[idx].caption = nil
+            hudDeck[idx].cursorPoint = nil
+            hudDeck[idx].cursorLabel = nil
         }
         if !removedIds.isEmpty {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
@@ -132,12 +143,18 @@ extension AppState {
                 deckHygiene.stillAttempts[id] = nil
             }
         }
-        if hudDeck.isEmpty {
-            if !isHUDManuallyPinned && isHUDVisible && !status.killSwitchTripped {
-                hideHUD(userInitiated: false)
+        let hasBusyCards = hudDeck.contains(where: \.isBusy)
+        if hudDeck.isEmpty || (!settledIds.isEmpty && !hasBusyCards) {
+            settleIdleActivity()
+        } else {
+            isAgentBusy = hasBusyCards
+            if !hasBusyCards {
+                clearActivityIndicator()
             }
-        } else if frontChanged {
-            syncFrontCardToUI()
+            if frontChanged {
+                syncFrontCardToUI()
+            }
         }
+        refreshActiveAgentNames()
     }
 }

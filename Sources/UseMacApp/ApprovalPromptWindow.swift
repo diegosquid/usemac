@@ -269,6 +269,21 @@ struct ApprovalPromptView: View {
                     .foregroundStyle(remaining <= 10 ? ApprovalPalette.amber : ApprovalPalette.whisper)
             }
 
+            if let agent = prompt.agentName?.trimmingCharacters(in: .whitespacesAndNewlines), !agent.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(agent)
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(ApprovalPalette.ink)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(ApprovalPalette.softPillBg, in: Capsule())
+                .help(agent)
+            }
+
             Text(prompt.target)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(ApprovalPalette.softIcon)

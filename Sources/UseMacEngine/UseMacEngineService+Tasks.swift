@@ -10,16 +10,25 @@ import UseMacProtocol
 /// inline (stamping `taskId` onto the response), and any non-`task_complete` request may carry `taskComplete` to
 /// finish the task right after the request executes (attaching `taskSummary` onto the response).
 extension UseMacEngineService {
+    public func activeAgentNames(activeWithin seconds: TimeInterval = 60) -> [String] {
+        taskTabs.activeAgentNames(activeWithin: seconds)
+    }
+
     public func handle(_ request: RPCRequest) async -> RPCResponse {
         // Wrap the entire lifecycle (including piggybacked taskStart/taskComplete) in AuditRequestContext
         // so task summaries that echo typed values or skill params are scrubbed when text recording is off.
         await AuditRequestContext.$request.withValue(request) {
             var workingRequest = request
             var startedTaskId: String?
+            let taskStartAgent = TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent)
+            let requestAgent = TaskTabRegistry.cleanAgent(workingRequest.agent)
 
             // Zero-ceremony piggybacked task_start on any non-taskStart request.
-            if workingRequest.method != .taskStart, let inlineStart = workingRequest.taskStart {
-                let taskId = startTaskInline(inlineStart, explicitTaskId: workingRequest.taskId)
+            if workingRequest.method != .taskStart, var inlineStart = workingRequest.taskStart {
+                inlineStart.agent = inlineStart.agent ?? requestAgent
+                let taskId = TaskActivityContext.$agentName.withValue(taskStartAgent ?? requestAgent) {
+                    startTaskInline(inlineStart, explicitTaskId: workingRequest.taskId)
+                }
                 startedTaskId = taskId
                 workingRequest.taskId = taskId
                 if workingRequest.method == .browserOpen, workingRequest.browserOpen?.taskId == nil {
@@ -29,15 +38,7 @@ extension UseMacEngineService {
 
             let scope = taskTabs.scope(workingRequest)
             let effectiveTaskId = scope.taskId ?? startedTaskId
-            let agent: String? = {
-                if workingRequest.method == .taskStart {
-                    return TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent)
-                }
-                if let inlineAgent = TaskTabRegistry.cleanAgent(workingRequest.taskStart?.agent) {
-                    return inlineAgent
-                }
-                return taskTabs.agent(of: effectiveTaskId)
-            }()
+            let agent = taskStartAgent ?? taskTabs.agent(of: effectiveTaskId) ?? requestAgent
 
             var response = await AuditRequestContext.$request.withValue(workingRequest) {
                 await TaskActivityContext.$agentName.withValue(agent) {

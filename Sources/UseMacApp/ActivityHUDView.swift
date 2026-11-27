@@ -166,11 +166,11 @@ private struct WhisperIconButton: View {
     }
 }
 
-// MARK: - Collapsed Micro-Pill (164 x 34)
+// MARK: - Collapsed Micro-Pill (196 x 34)
 
 /// Size of the collapsed pill. ActivityHUDController sizes the panel with the same values. The pill only shows what is
 /// happening: stopping and resuming are in the UseMac menu and on ⌘⇧⎋.
-let hudCollapsedPillSize = CGSize(width: 164, height: 34)
+let hudCollapsedPillSize = CGSize(width: 196, height: 34)
 
 private struct CollapsedMicroPill: View {
     @ObservedObject var appState: AppState
@@ -194,6 +194,7 @@ private struct CollapsedMicroPill: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .help(headline)
 
             HStack(spacing: 0) {
                 WhisperIconButton(
@@ -241,8 +242,9 @@ private struct CollapsedMicroPill: View {
 
     private var headline: String {
         if appState.status.killSwitchTripped { return "Stopped" }
-        if let caption = appState.latestCaptionItem { return caption.title }
-        return videoSink.sourceName
+        let baseTitle = appState.latestCaptionItem?.title ?? videoSink.sourceName
+        guard let agent = appState.frontAgentName else { return baseTitle }
+        return "\(agent) · \(baseTitle)"
     }
 
     private var expandSymbol: String {
@@ -429,11 +431,14 @@ private struct FramelessLivePiPCard: View {
     @State private var innerRippleScale: CGFloat = 0.20
     @State private var innerRippleOpacity: Double = 0.0
 
+    private var isFrontBusy: Bool {
+        !appState.status.killSwitchTripped && (appState.hudDeck.first?.isBusy ?? appState.isAgentBusy)
+    }
+
     var body: some View {
         let cardShape = RoundedRectangle(cornerRadius: 12, style: .continuous)
         let isStopped = appState.status.killSwitchTripped
-        let isBusy = appState.isAgentBusy && !isStopped
-        let isCompleted = appState.hasCompletedHUDAction && !isStopped && !isBusy
+        let isCompleted = appState.hasCompletedHUDAction && !isStopped && !isFrontBusy
 
         ZStack {
             Color.white
@@ -611,6 +616,15 @@ private struct FramelessLivePiPCard: View {
                     .padding(.horizontal, 16)
                     .offset(y: completionReveal ? 0 : 5)
                     .opacity(completionReveal ? 1.0 : 0.0)
+
+                if let agent = appState.frontAgentName {
+                    Text("by \(agent)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(MinimalHUDPalette.softIcon)
+                        .lineLimit(1)
+                        .padding(.horizontal, 16)
+                        .opacity(completionReveal ? 1.0 : 0.0)
+                }
             }
         }
     }
@@ -622,13 +636,30 @@ private struct FramelessLivePiPCard: View {
             if isHovering { return 1.0 }
             if isCompleted { return 0.0 }
             if !videoSink.hasReceivedFrame { return 0.55 }
-            if !appState.isAgentBusy { return 0.80 }
+            if !isFrontBusy { return 0.80 }
             return 0.0
         }()
-        let controlsInteractive = isHovering || (!isCompleted && (!videoSink.hasReceivedFrame || !appState.isAgentBusy))
+        let controlsInteractive = isHovering || (!isCompleted && (!videoSink.hasReceivedFrame || !isFrontBusy))
 
         return VStack(spacing: 0) {
             HStack(spacing: 2) {
+                if !isCompleted, let agent = appState.frontAgentName {
+                    HStack(spacing: 4) {
+                        Image(systemName: "cpu")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(isFrontBusy ? MinimalHUDPalette.liveGreen : MinimalHUDPalette.softIcon)
+                        Text(agent)
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(MinimalHUDPalette.ink)
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.90), in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.black.opacity(0.06), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.10), radius: 3, x: 0, y: 1)
+                    .help(agent)
+                }
                 Spacer(minLength: 0)
 
                 HStack(spacing: 1) {
@@ -684,7 +715,7 @@ private struct FramelessLivePiPCard: View {
         let mark = ActivityCaption.mark(
             isInProgress: caption.isInProgress,
             success: caption.success,
-            agentBusy: appState.isAgentBusy,
+            agentBusy: isFrontBusy,
             stopped: appState.status.killSwitchTripped
         )
         let reason = mark == .failed ? caption.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines) : nil
@@ -704,8 +735,7 @@ private struct FramelessLivePiPCard: View {
                     .frame(width: 4.5, height: 4.5)
             }
 
-            // The agent working here, when its task named one (several agents can share the preview).
-            if let agent = caption.agentName {
+            if let agent = caption.agentName, agent != appState.frontAgentName {
                 Text(agent)
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(MinimalHUDPalette.ink)
