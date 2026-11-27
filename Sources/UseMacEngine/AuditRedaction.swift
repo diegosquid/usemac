@@ -38,9 +38,9 @@ extension RPCRequest {
 
 /// Keeps the audit log from becoming a copy of what the user typed. By default typed text, set values and
 /// `eval` sources are kept only as their length, and URLs lose their credentials and secret-looking query
-/// values. Turning on "Record typed text" (`AuditLogSettings.recordsTypedText`) keeps the text; URLs are
-/// always cleaned.
-enum AuditRedactor {
+/// values. Turning on "Record typed text" (`AuditLogSettings.recordsTypedText`) keeps ordinary text, but
+/// explicit credentials and other recognizable sensitive data are still redacted.
+public enum AuditRedactor {
     /// Shorter strings are not scrubbed from free text (error messages), where they would match ordinary words.
     static let minimumScrubLength = 4
     static let maxStepsDescribed = 8
@@ -54,7 +54,7 @@ enum AuditRedactor {
                 out = out.replacingOccurrences(of: secret, with: "[\(lengthLabel(secret))]")
             }
         }
-        return redactURLs(in: out)
+        return scrubSensitivePatterns(in: redactURLs(in: out))
     }
 
     /// `type (14 chars), pressKey cmd+s, click` for an act or browser_act batch.
@@ -107,6 +107,173 @@ enum AuditRedactor {
             return "Vision ocr [\(backend)]: read \(lengthLabel(answer))"
         }
         return "Vision \(mode) [\(backend)]: \(answer.prefix(80))"
+    }
+
+    // MARK: - Sensitive patterns
+
+    private static let pemPattern = try! NSRegularExpression(
+        pattern: #"-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----(?:[\s\S]*?-----END \1-----|[^\r\n]*)"#
+    )
+    private static let bearerPattern = try! NSRegularExpression(
+        pattern: #"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/\-]{8,}=*"#
+    )
+    private static let jwtPattern = try! NSRegularExpression(
+        pattern: #"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"#
+    )
+    private static let tokenPattern = try! NSRegularExpression(pattern: [
+        #"sk-(?:ant-)?[A-Za-z0-9_-]{12,}"#,
+        #"[pr]k_(?:live|test)_[A-Za-z0-9]{12,}"#,
+        #"gh[pousr]_[A-Za-z0-9]{20,}"#,
+        #"github_pat_[A-Za-z0-9_]{20,}"#,
+        #"glpat-[A-Za-z0-9_-]{16,}"#,
+        #"xox[baprs]-[A-Za-z0-9-]{12,}"#,
+        #"AKIA[0-9A-Z]{16}"#,
+        #"AIza[0-9A-Za-z_-]{20,}"#,
+        #"umk_[A-Za-z0-9_-]{12,}"#
+    ].joined(separator: "|"))
+    private static let cookieHeaderPattern = try! NSRegularExpression(pattern: #"(?i)\b(cookie\h*:\h*)[^\r\n]+"#)
+    private static let inlineSecretPattern = try! NSRegularExpression(pattern: [
+        #"(?i)(?<![\w])(["']?(password|passwd|pwd|secret|api_key|apikey|access_token|refresh_token|auth_token|client_secret|private_key|authorization|cookie)["']?\h*[:=]\h*)"#,
+        // These markers may already appear in persisted logs or in a URL just redacted by scrub(_:secrets:recordText:).
+        #"(?:(\*\*\*|(?:Bearer\h+)?\[redacted(?:-[a-z]+)?\]|\[\d+ chars?\])(?=[\s&#;,()"'\]<>]|$)|"#,
+        #"("(?:\\.|[^"\\\r\n])*(?:"|(?=[\r\n]|$))|'(?:\\.|[^'\\\r\n])*(?:'|(?=[\r\n]|$))|"#,
+        #"(?:Bearer|Basic)\h+[^\s"'&#;,()\]<>]+|[^\s"'&#;,()\]<>]+))"#
+    ].joined())
+    private static let emailOutsideURLPattern = try! NSRegularExpression(
+        pattern: urlPattern.pattern + #"|([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"#
+    )
+    private static let documentPattern = try! NSRegularExpression(
+        pattern: #"(?<![0-9])(?:[0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2}|[0-9]{3}-[0-9]{2}-[0-9]{4})(?![0-9])"#
+    )
+    private static let cardPattern = try! NSRegularExpression(
+        pattern: #"[0-9]+(?:[ -][0-9]+)*"#
+    )
+
+    /// Removes recognizable credentials and personal data even when recording typed text is enabled.
+    public static func scrubSensitivePatterns(in text: String) -> String {
+        var out = pemPattern.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "[redacted-key]")
+        // Cookie headers can contain several semicolon-separated values on the same line.
+        out = cookieHeaderPattern.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: "$1[redacted]")
+        out = replacingMatches(in: out, of: inlineSecretPattern) { match, source in
+            guard match.range(at: 3).location == NSNotFound else { return nil }
+            let value = source.substring(with: match.range(at: 4))
+            let key = source.substring(with: match.range(at: 2))
+            let prefix = source.substring(with: match.range(at: 1))
+            return key.lowercased() == "authorization" && value.lowercased().hasPrefix("bearer ")
+                ? prefix + "Bearer [redacted]"
+                : prefix + "[redacted]"
+        }
+        for (pattern, replacement) in [
+            (bearerPattern, "Bearer [redacted]"),
+            (jwtPattern, "[redacted-jwt]"),
+            (tokenPattern, "[redacted-token]"),
+            (documentPattern, "[redacted-id]")
+        ] {
+            out = pattern.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: replacement)
+        }
+        out = replacingMatches(in: out, of: emailOutsideURLPattern) { match, _ in
+            match.range(at: 1).location == NSNotFound ? nil : "[redacted-email]"
+        }
+        return replacingMatches(in: out, of: cardPattern) { match, source in
+            redactCards(in: source.substring(with: match.range))
+        }
+    }
+
+    private static func redactCards(in text: String) -> String? {
+        guard text.utf8.count >= 13 else { return nil }
+        let groups = text.split { $0 == " " || $0 == "-" }
+        var ranges: [Range<String.Index>] = []
+        var start = groups.startIndex
+        while start < groups.endIndex {
+            var digitCount = 0
+            var validEnd: Int?
+            // Try at digit-group boundaries: an adjacent number must not hide a valid card,
+            // but we should never redact part of an uninterrupted longer number.
+            for end in start..<groups.endIndex {
+                digitCount += groups[end].utf8.count
+                if digitCount > 19 { break }
+                if digitCount >= 13, passesLuhn(text[groups[start].startIndex..<groups[end].endIndex]) {
+                    validEnd = end
+                }
+            }
+            if let validEnd {
+                ranges.append(groups[start].startIndex..<groups[validEnd].endIndex)
+                start = validEnd + 1
+            } else {
+                start += 1
+            }
+        }
+        guard !ranges.isEmpty else { return nil }
+        var result = text
+        for range in ranges.reversed() { result.replaceSubrange(range, with: "[redacted-card]") }
+        return result
+    }
+
+    private static func passesLuhn(_ candidate: Substring) -> Bool {
+        let digits = candidate.compactMap(\.wholeNumberValue)
+        var sum = 0
+        for (index, digit) in digits.reversed().enumerated() {
+            let value = index.isMultiple(of: 2) ? digit : digit * 2
+            sum += value > 9 ? value - 9 : value
+        }
+        return sum.isMultiple(of: 10)
+    }
+
+    // MARK: - Session titles
+
+    private static let titleHostPattern = try! NSRegularExpression(
+        pattern: #"\A(?:[\p{L}\p{M}\p{N}._-]+|\[[0-9A-Fa-f:.]+\])\z"#
+    )
+    private static let quotedTitlePattern = try! NSRegularExpression(
+        pattern: #""((?:\\.|[^"\\])*)"|(?<![\p{L}\p{N}])'((?:\\.|[^'\\])*)'(?![\p{L}\p{N}])"#
+    )
+    private static let localPathPattern = try! NSRegularExpression(
+        pattern: #"(?<![\w/])(?:/Users/|~/)(?:\\[ \t]|[^\s"'<>|,;()])+"#
+    )
+    private static let sensitiveBasenameFragments = [".env", "id_rsa", "id_ed25519", "credential", "secret", "token", ".pem", ".key", "[redacted"]
+    private static let genericTitles = ["working…", "working...", "task started", "task completed"]
+
+    /// Reduces task summaries (including legacy ones) to a single, safe display line.
+    public static func sanitizeTitle(_ raw: String, maxLength: Int = 72) -> String? {
+        guard maxLength > 0 else { return nil }
+        var title = replacingMatches(in: raw, of: urlPattern) { match, source in
+            let url = source.substring(with: match.range).trimmingCharacters(in: CharacterSet(charactersIn: ",;!?()"))
+            guard let host = URLComponents(string: url)?.host, !host.isEmpty,
+                  titleHostPattern.firstMatch(in: host, range: NSRange(host.startIndex..., in: host)) != nil else {
+                return "[url]"
+            }
+            return host
+        }
+        title = scrubSensitivePatterns(in: title)
+        title = replacingMatches(in: title, of: quotedTitlePattern) { match, source in
+            let content = match.range(at: 1).location == NSNotFound ? match.range(at: 2) : match.range(at: 1)
+            return source.substring(with: content).count >= 16 ? #""[redacted]""# : nil
+        }
+        title = replacingMatches(in: title, of: localPathPattern) { match, source in
+            let path = source.substring(with: match.range)
+            let components = path.split(separator: "/")
+            guard let basename = components.last, !path.hasPrefix("/Users/") || components.count > 2 else { return "[path]" }
+            let normalized = basename.lowercased()
+            if sensitiveBasenameFragments.contains(where: { normalized.contains($0) }) { return "[path]" }
+            return "…/\(basename.replacingOccurrences(of: #"\ "#, with: " "))"
+        }
+        title = title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard !title.isEmpty, !genericTitles.contains(title.lowercased()) else { return nil }
+        return title.count > maxLength ? String(title.prefix(maxLength - 1)) + "…" : title
+    }
+
+    private static func replacingMatches(
+        in text: String, of pattern: NSRegularExpression, with replacement: (NSTextCheckingResult, NSString) -> String?
+    ) -> String {
+        let source = text as NSString
+        let matches = pattern.matches(in: text, range: NSRange(location: 0, length: source.length))
+        guard !matches.isEmpty else { return text }
+        let result = NSMutableString(string: text)
+        for match in matches.reversed() {
+            guard let value = replacement(match, source) else { continue }
+            result.replaceCharacters(in: match.range, with: value)
+        }
+        return result as String
     }
 
     // MARK: - URLs

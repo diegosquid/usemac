@@ -4,8 +4,7 @@ import UniformTypeIdentifiers
 import UseMacEngine
 import UseMacProtocol
 
-/// Settings → History: the audit log kept on disk, filtered by result, task and app, with an export. Repeated
-/// entries fold into one row with a count (`AuditLogFolding`), and actions stand apart from observations.
+/// Settings → History: filter and export the audit log, or open a session to see its folded entries.
 struct AuditLogView: View {
     @ObservedObject var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
@@ -13,15 +12,15 @@ struct AuditLogView: View {
 
     @State private var resultFilter: ResultFilter = .all
     @State private var taskFilter: String?
+    @State private var agentFilter: String?
     @State private var appFilter: String?
     /// Off hides observations, so the list shows what agents changed, plus task and settings events.
     @State private var showsObservations = true
-    /// The most recent entries with no filter: the source of the task and app menus.
+    /// The most recent entries with no filter: the source of the agent and app menus.
     @State private var recent: [AuditEntry] = []
-    /// What the list shows: `recent`, or the persisted log read again with the filters.
-    @State private var shown: [AuditEntry] = []
-    /// `shown` with repeats folded: one row per run.
-    @State private var runs: [AuditEntryRun] = []
+    @State private var shownCount = 0
+    @State private var sessions: [AuditSession] = []
+    @State private var expandedSessions: Set<String> = []
     /// Folded runs opened to show each entry, by run id.
     @State private var expandedRuns: Set<String> = []
     @State private var hasLoaded = false
@@ -49,6 +48,7 @@ struct AuditLogView: View {
     private struct LoadKey: Equatable {
         var result: ResultFilter
         var task: String?
+        var agent: String?
         var app: String?
         var showsObservations: Bool
         var retention: Int
@@ -56,7 +56,7 @@ struct AuditLogView: View {
     }
 
     private var isFiltered: Bool {
-        resultFilter != .all || taskFilter != nil || appFilter != nil || !showsObservations
+        resultFilter != .all || taskFilter != nil || agentFilter != nil || appFilter != nil || !showsObservations
     }
 
     private var filterQuery: AuditLogQuery {
@@ -65,7 +65,8 @@ struct AuditLogView: View {
             taskId: taskFilter,
             app: appFilter,
             success: resultFilter.success,
-            kinds: showsObservations ? nil : [.action, .other]
+            kinds: showsObservations ? nil : [.action, .other],
+            agent: agentFilter
         )
     }
 
@@ -80,30 +81,29 @@ struct AuditLogView: View {
             filterBar
                 .frame(maxWidth: 640, alignment: .leading)
                 .padding(.horizontal, 34)
-                .padding(.bottom, 16)
 
-            if shown.isEmpty {
+            if let taskFilter {
+                taskFilterChip(taskFilter)
+                    .padding(.horizontal, 34)
+                    .padding(.top, 8)
+            }
+
+            if sessions.isEmpty {
                 emptyState
             } else {
                 ScrollView(showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        entryList
-                        if shown.count >= Self.displayLimit {
-                            Text("Showing the \(Self.displayLimit) most recent entries. Export to get all of them.")
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(.tertiary)
-                                .padding(.horizontal, 4)
-                        }
-                    }
-                    .frame(maxWidth: 640, alignment: .leading)
-                    .padding(.horizontal, 34)
-                    .padding(.bottom, 34)
+                    sessionList
+                        .frame(maxWidth: 640, alignment: .leading)
+                        .padding(.horizontal, 34)
+                        .padding(.top, 16)
+                        .padding(.bottom, 34)
                 }
             }
         }
         .task(id: LoadKey(
             result: resultFilter,
             task: taskFilter,
+            agent: agentFilter,
             app: appFilter,
             showsObservations: showsObservations,
             retention: retentionDays,
@@ -121,9 +121,10 @@ struct AuditLogView: View {
                 Text("History")
                     .font(.system(size: 20, weight: .semibold))
                     .tracking(-0.4)
-                Text("Every observation and action, kept for \(Self.durationLabel(retentionDays)) on this Mac.")
+                Text("Grouped by session, kept for \(Self.durationLabel(retentionDays)) on this Mac.")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer(minLength: 12)
@@ -132,7 +133,27 @@ struct AuditLogView: View {
                 Text(exportStatus)
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: 130, alignment: .trailing)
+                    .help(exportStatus)
                     .transition(.opacity)
+            }
+
+            if sessions.count > 1 {
+                let allExpanded = sessions.allSatisfy { expandedSessions.contains($0.id) }
+                Button(allExpanded ? "Collapse all" : "Expand all") {
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        if allExpanded {
+                            expandedSessions.subtract(sessions.map(\.id))
+                        } else {
+                            expandedSessions.formUnion(sessions.map(\.id))
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .fixedSize()
             }
 
             Menu {
@@ -151,23 +172,43 @@ struct AuditLogView: View {
     }
 
     private var filterBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                resultControl
+                observationsSwitch
+                Spacer(minLength: 8)
+                scopeMenus
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    resultControl
+                    observationsSwitch
+                }
+                HStack {
+                    Spacer(minLength: 8)
+                    scopeMenus
+                }
+            }
+        }
+    }
+
+    private var resultControl: some View {
+        CodexSegmentedControl(
+            selection: $resultFilter,
+            options: ResultFilter.allCases.map { CodexSegmentOption(value: $0, label: $0.rawValue) }
+        )
+        .fixedSize()
+    }
+
+    private var scopeMenus: some View {
         HStack(spacing: 10) {
-            CodexSegmentedControl(
-                selection: $resultFilter,
-                options: ResultFilter.allCases.map { CodexSegmentOption(value: $0, label: $0.rawValue) }
-            )
-
-            observationsSwitch
-
-            Spacer(minLength: 8)
-
             filterMenu(
-                title: taskFilter ?? "All tasks",
-                symbol: "number",
-                allLabel: "All tasks",
-                values: Self.distinct(recent.compactMap(\.taskId)),
-                selection: $taskFilter,
-                accessibilityLabel: "Filter by task"
+                title: agentFilter ?? "All agents",
+                symbol: "cpu",
+                allLabel: "All agents",
+                values: Self.distinct(recent.compactMap(\.agent)),
+                selection: $agentFilter,
+                accessibilityLabel: "Filter by agent"
             )
 
             filterMenu(
@@ -226,59 +267,288 @@ struct AuditLogView: View {
         .menuStyle(.borderlessButton)
         .fixedSize()
         .foregroundStyle(selection.wrappedValue == nil ? .secondary : .primary)
+        .help(title)
         .accessibilityLabel(accessibilityLabel)
         .accessibilityValue(selection.wrappedValue ?? allLabel)
     }
 
-    // MARK: - List
+    private func taskFilterChip(_ taskId: String) -> some View {
+        HStack(spacing: 6) {
+            Text("# \(taskId)")
+                .font(.system(size: 11, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(taskId)
 
-    /// A folded run, or one entry of a run opened under it.
-    private enum ListItem: Identifiable {
-        case run(AuditEntryRun)
-        case member(AuditEntry, isLast: Bool)
+            Button {
+                taskFilter = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.plain)
+            .help("Clear task filter")
+            .accessibilityLabel("Clear task filter")
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(UseMacTheme.subtleFill(colorScheme), in: Capsule())
+        .frame(maxWidth: 640, alignment: .leading)
+    }
 
-        var id: String {
-            switch self {
-            case .run(let run): return "run-\(run.id)"
-            case .member(let entry, _): return "entry-\(entry.id)"
+    // MARK: - Sessions
+
+    private var sessionList: some View {
+        LazyVStack(alignment: .leading, spacing: 10) {
+            ForEach(sessions) { session in
+                sessionCard(session)
+            }
+            if shownCount >= Self.displayLimit {
+                Text("Showing the \(Self.displayLimit) most recent entries. Export to get all of them.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
             }
         }
     }
 
-    private var listItems: [ListItem] {
-        var items: [ListItem] = []
-        items.reserveCapacity(runs.count)
-        for run in runs {
-            items.append(.run(run))
-            guard run.isFolded, expandedRuns.contains(run.id) else { continue }
-            for (index, entry) in run.entries.enumerated() {
-                items.append(.member(entry, isLast: index == run.count - 1))
-            }
-        }
-        return items
-    }
-
-    private var entryList: some View {
-        LazyVStack(spacing: 0) {
-            ForEach(Array(listItems.enumerated()), id: \.element.id) { index, item in
-                switch item {
-                case .run(let run):
-                    if index > 0 {
-                        InsetDivider(leading: 52)
-                    }
-                    row(run)
-                case .member(let entry, let isLast):
-                    memberRow(entry, isLast: isLast)
-                }
+    private func sessionCard(_ session: AuditSession) -> some View {
+        let isExpanded = expandedSessions.contains(session.id)
+        return VStack(spacing: 0) {
+            sessionHeader(session, isExpanded: isExpanded)
+            if isExpanded {
+                InsetDivider(leading: 0)
+                sessionRuns(session)
             }
         }
         .codexCardElevation(colorScheme, cornerRadius: 14)
     }
 
+    private func sessionHeader(_ session: AuditSession, isExpanded: Bool) -> some View {
+        let expansionLabel = isExpanded ? "Collapse session" : "Expand session"
+        return HStack(spacing: 12) {
+            sessionStatusBadge(session)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(session.title)
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(session.title)
+                    agentBadge(session)
+                }
+
+                HStack(spacing: 6) {
+                    Text(session.summaryLine)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(session.summaryLine)
+                    if session.durationMs >= 1000 {
+                        Text("· \(Self.formatDuration(session.durationMs))")
+                            .font(.system(size: 11.5))
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                            .fixedSize()
+                    }
+                    if let taskId = session.taskId {
+                        taskBadge(taskId)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            sessionTiming(session, isExpanded: isExpanded)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+        .onTapGesture { toggleSession(session.id) }
+        .accessibilityAction(named: Text(expansionLabel)) { toggleSession(session.id) }
+        .contextMenu {
+            Button(expansionLabel) { toggleSession(session.id) }
+            Divider()
+            Button("Copy session title") { Self.copy(session.title) }
+            if let agent = session.agentName {
+                Button("Show only \(agent)") { filterByAgent(agent, in: session) }
+            }
+            if let taskId = session.taskId {
+                Button("Copy task ID") { Self.copy(taskId) }
+                Button("Show only this task") { taskFilter = taskId }
+            }
+            if let app = session.primaryApp {
+                Button("Show only \(app)") {
+                    appFilter = session.entries.lazy.compactMap(\.targetApp).first {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines) == app
+                    } ?? app
+                }
+            }
+        }
+    }
+
+    private func sessionStatusBadge(_ session: AuditSession) -> some View {
+        let symbol: String
+        let tint: AnyShapeStyle
+        let fill: Color
+        if session.hasFailures {
+            symbol = "exclamationmark.triangle.fill"
+            tint = AnyShapeStyle(UseMacTheme.statusRed)
+            fill = UseMacTheme.statusRed.opacity(colorScheme == .dark ? 0.20 : 0.12)
+        } else if session.actionCount > 0 {
+            symbol = session.isCompleted ? "checkmark.circle.fill" : "bolt.fill"
+            tint = AnyShapeStyle(UseMacTheme.accentActive)
+            fill = UseMacTheme.accentActive.opacity(colorScheme == .dark ? 0.22 : 0.12)
+        } else {
+            symbol = session.observationCount > 0 ? "eye" : "gearshape"
+            tint = AnyShapeStyle(.secondary)
+            fill = UseMacTheme.subtleFill(colorScheme)
+        }
+        return Image(systemName: symbol)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: 26, height: 26)
+            .background(fill, in: RoundedRectangle(cornerRadius: 7.5, style: .continuous))
+            .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func agentBadge(_ session: AuditSession) -> some View {
+        if let agent = session.agentName {
+            Button {
+                filterByAgent(agent, in: session)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 8.5))
+                    Text(agent)
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(UseMacTheme.accentActive.opacity(colorScheme == .dark ? 0.18 : 0.10), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(colorScheme == .dark ? AnyShapeStyle(UseMacTheme.accentActive) : AnyShapeStyle(.primary))
+            .frame(maxWidth: 128)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Show only \(agent)")
+        } else {
+            Text("Unknown agent")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+                .fixedSize()
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(UseMacTheme.subtleFill(colorScheme), in: Capsule())
+        }
+    }
+
+    private func taskBadge(_ taskId: String) -> some View {
+        Button {
+            taskFilter = taskId
+        } label: {
+            Text(taskId)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1.5)
+                .background(UseMacTheme.subtleFill(colorScheme), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: 85)
+        .fixedSize(horizontal: true, vertical: false)
+        .help("Show only this task: \(taskId)")
+    }
+
+    private func sessionTiming(_ session: AuditSession, isExpanded: Bool) -> some View {
+        let time = session.totalCount > 1
+            ? Self.formatRange(session.firstTimestampMs, session.lastTimestampMs)
+            : Self.formatTimestamp(session.lastTimestampMs)
+        return VStack(alignment: .trailing, spacing: 4) {
+            Text(time)
+                .font(.system(size: 11.5, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(time)
+
+            Button {
+                toggleSession(session.id)
+            } label: {
+                HStack(spacing: 4) {
+                    Text("\(session.totalCount) \(session.totalCount == 1 ? "log" : "logs")")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .monospacedDigit()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(UseMacTheme.subtleFill(colorScheme), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse session" : "Expand session")
+            .accessibilityValue("\(session.totalCount) \(session.totalCount == 1 ? "log" : "logs")")
+        }
+        .frame(maxWidth: 175, alignment: .trailing)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func filterByAgent(_ agent: String, in session: AuditSession) {
+        // The session trims display names, but the query matches the original metadata exactly.
+        agentFilter = session.entries.lazy.compactMap(\.agent).first {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines) == agent
+        } ?? agent
+    }
+
+    private func toggleSession(_ id: String) {
+        withAnimation(.easeOut(duration: 0.16)) {
+            if expandedSessions.contains(id) {
+                expandedSessions.remove(id)
+            } else {
+                expandedSessions.insert(id)
+            }
+        }
+    }
+
+    // MARK: - Entries inside a session
+
+    private func sessionRuns(_ session: AuditSession) -> some View {
+        LazyVStack(spacing: 0) {
+            ForEach(session.runs) { run in
+                if run.id != session.runs.first?.id {
+                    InsetDivider(leading: 48)
+                }
+                row(run)
+                if run.isFolded && expandedRuns.contains(run.id) {
+                    ForEach(run.entries) { entry in
+                        memberRow(entry, isLast: entry.id == run.id)
+                    }
+                }
+            }
+        }
+        .background(UseMacTheme.codeBackground(colorScheme).opacity(0.55))
+    }
+
     private func row(_ run: AuditEntryRun) -> some View {
         let entry = run.representative
+        let safeSummary = AuditRedactor.scrubSensitivePatterns(in: entry.summary)
         let isExpanded = run.isFolded && expandedRuns.contains(run.id)
         let isObservation = run.kind == .observation
+        let time = run.isFolded
+            ? Self.formatRange(run.firstTimestampMs, run.lastTimestampMs)
+            : Self.formatTimestamp(entry.timestampMs)
         return HStack(alignment: .center, spacing: 12) {
             kindBadge(run.kind, method: entry.method, success: entry.success)
 
@@ -294,49 +564,37 @@ struct AuditLogView: View {
                         Text(entry.method)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.tertiary)
-                    }
-                    if let taskId = entry.taskId {
-                        Button {
-                            taskFilter = taskId
-                        } label: {
-                            Text(taskId)
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1.5)
-                                .background(UseMacTheme.subtleFill(colorScheme), in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .help("Show only this task")
+                            .lineLimit(1)
                     }
                 }
 
-                Text(entry.summary)
+                Text(safeSummary)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .truncationMode(.tail)
-                    .help(entry.summary)
+                    .help(safeSummary)
             }
-
-            Spacer(minLength: 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 3) {
-                Text(run.isFolded
-                    ? Self.formatRange(run.firstTimestampMs, run.lastTimestampMs)
-                    : Self.formatTimestamp(entry.timestampMs))
+                Text(time)
                     .font(.system(size: 11.5, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .monospacedDigit()
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(time)
                 if run.isFolded {
                     countButton(run, isExpanded: isExpanded)
                 }
             }
+            .frame(maxWidth: 175, alignment: .trailing)
+            .fixedSize(horizontal: true, vertical: false)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 12)
-        .padding(.bottom, isExpanded ? 6 : 12)
+        .padding(.horizontal, 16)
+        .padding(.top, 9)
+        .padding(.bottom, isExpanded ? 4 : 9)
         .contentShape(Rectangle())
         .onTapGesture {
             if run.isFolded { toggleExpansion(run) }
@@ -346,7 +604,10 @@ struct AuditLogView: View {
                 Button(isExpanded ? "Hide entries" : "Show each entry") { toggleExpansion(run) }
                 Divider()
             }
-            Button("Copy summary") { Self.copy(entry.summary) }
+            Button("Copy summary") { Self.copy(safeSummary) }
+            if let agent = entry.agent, !agent.isEmpty {
+                Button("Show only \(agent)") { agentFilter = agent }
+            }
             if let taskId = entry.taskId {
                 Button("Copy task ID") { Self.copy(taskId) }
                 Button("Show only this task") { taskFilter = taskId }
@@ -379,7 +640,7 @@ struct AuditLogView: View {
         return Image(systemName: Self.symbol(for: kind, method: method))
             .font(.system(size: 10.5, weight: kind == .observation ? .regular : .semibold))
             .foregroundStyle(tint.map(AnyShapeStyle.init) ?? AnyShapeStyle(kind == .observation ? .tertiary : .secondary))
-            .frame(width: 22, height: 22)
+            .frame(width: 20, height: 20)
             .background(fill, in: shape)
             .help(Self.kindHelp(kind))
             .accessibilityElement()
@@ -419,8 +680,8 @@ struct AuditLogView: View {
         .font(.system(size: 11, design: .monospaced))
         .monospacedDigit()
         .foregroundStyle(.tertiary)
-        .padding(.leading, 52)
-        .padding(.trailing, 18)
+        .padding(.leading, 48)
+        .padding(.trailing, 16)
         .padding(.vertical, 1.5)
         .padding(.bottom, isLast ? 10 : 0)
         .contextMenu {
@@ -446,7 +707,9 @@ struct AuditLogView: View {
                 .foregroundStyle(.secondary)
             if hasLoaded {
                 Text(isFiltered
-                    ? (showsObservations ? "Try another task, app or result." : "Try another task, app or result, or show observations.")
+                    ? (showsObservations
+                        ? "Try changing or clearing a filter."
+                        : "Try changing a filter or showing observations.")
                     : "Observations and actions your agents run will appear here.")
                     .font(.system(size: 12.5))
                     .foregroundStyle(.tertiary)
@@ -454,6 +717,7 @@ struct AuditLogView: View {
                     Button("Clear filters") {
                         resultFilter = .all
                         taskFilter = nil
+                        agentFilter = nil
                         appFilter = nil
                         showsObservations = true
                     }
@@ -469,30 +733,27 @@ struct AuditLogView: View {
     // MARK: - Loading and export
 
     private func reload() async {
-        guard let store = appState.engine.auditStore else {
-            // No log on disk (it is always there in the app): filter what is in memory.
-            recent = appState.auditEntries
-            shown = filterQuery.apply(to: appState.auditEntries)
-            runs = AuditLogFolding.fold(shown)
-            hasLoaded = true
-            return
-        }
+        let store = appState.engine.auditStore
         // New entries arrive in bursts while an agent works: read the files once the burst settles.
-        if hasLoaded {
+        if store != nil && hasLoaded {
             try? await Task.sleep(nanoseconds: 200_000_000)
-            if Task.isCancelled { return }
         }
+        guard !Task.isCancelled else { return }
+        let memoryEntries = store == nil ? appState.auditEntries : []
         let limit = Self.displayLimit
         let query = isFiltered ? filterQuery : nil
         let loaded = await Task.detached(priority: .userInitiated) {
-            let recent = store.entries(matching: AuditLogQuery(limit: limit))
-            let shown = query.map { store.entries(matching: $0) } ?? recent
-            return (recent, shown, AuditLogFolding.fold(shown))
+            let recent = store?.entries(matching: AuditLogQuery(limit: limit)) ?? memoryEntries
+            let shown = query.map { store?.entries(matching: $0) ?? $0.apply(to: memoryEntries) } ?? recent
+            return (recent: recent, count: shown.count, sessions: AuditLogSessionGrouper.group(shown))
         }.value
-        if Task.isCancelled { return }
-        recent = loaded.0
-        shown = loaded.1
-        runs = loaded.2
+        guard !Task.isCancelled else { return }
+        recent = loaded.recent
+        shownCount = loaded.count
+        sessions = loaded.sessions
+        if taskFilter != nil, sessions.count == 1 {
+            expandedSessions.insert(sessions[0].id)
+        }
         hasLoaded = true
     }
 
@@ -547,6 +808,14 @@ struct AuditLogView: View {
         case 1: return "1 day"
         default: return "\(days) days"
         }
+    }
+
+    private static func formatDuration(_ ms: Int64) -> String {
+        let seconds = ms / 1000
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m \(seconds % 60)s" }
+        return String(format: "%lldh %02lldm", minutes / 60, minutes % 60)
     }
 
     /// Values in first-seen order (newest first), without repeats.
@@ -734,7 +1003,7 @@ struct AuditLogSettingsGroup: View {
 
             InsetDivider(leading: 18)
 
-            row(title: "Audit log", subtitle: "Filter by task, app and result, or export it as JSON Lines or CSV.") {
+            row(title: "Audit log", subtitle: "Filter by agent, app and result, or export it as JSON Lines or CSV.") {
                 HStack(spacing: 8) {
                     Button("Show in Finder") { revealInFinder() }
                         .buttonStyle(SubtleOutlineButtonStyle())

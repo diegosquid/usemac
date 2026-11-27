@@ -1083,6 +1083,7 @@ public final class MCPStdioServer: @unchecked Sendable {
             }
 
             try applyPiggybackedTaskLifecycle(&rpcRequest, arguments: arguments)
+            if rpcRequest.agent == nil { rpcRequest.agent = taskScope.clientName }
             taskScope.stamp(&rpcRequest, explicitTaskId: try optionalString(arguments, key: "taskId"))
         } catch let error as ArgumentValidationError {
             return MCPResponse.failure(

@@ -32,6 +32,7 @@ public struct ApprovalPrompt: Sendable, Equatable, Identifiable {
     public let kinds: Set<ApprovalKind>
     /// The task the request named itself; only then can the user allow the rest of the task.
     public let taskId: String?
+    public let agentName: String?
     public let createdAt: Date
     /// When the request is denied with APPROVAL_TIMEOUT: its arrival plus the timeout, so a queued prompt shows what
     /// is left. A prompt that reaches the screen with less than `minimumVisibleSeconds` left gets that long.
@@ -88,14 +89,16 @@ public final class ApprovalBroker: @unchecked Sendable {
         /// What a task grant is tied to (the app, or the Chrome profile), so allowing ⌘S in TextEdit doesn't allow
         /// it everywhere.
         public var grantTarget: String
+        public var agentName: String?
 
-        public init(method: String, target: String, steps: [String], kinds: Set<ApprovalKind>, taskId: String?, grantTarget: String) {
+        public init(method: String, target: String, steps: [String], kinds: Set<ApprovalKind>, taskId: String?, grantTarget: String, agentName: String? = nil) {
             self.method = method
             self.target = target
             self.steps = steps
             self.kinds = kinds
             self.taskId = taskId
             self.grantTarget = grantTarget
+            self.agentName = agentName
         }
     }
 
@@ -179,6 +182,7 @@ public final class ApprovalBroker: @unchecked Sendable {
             steps: request.steps,
             kinds: request.kinds,
             taskId: request.taskId,
+            agentName: request.agentName,
             createdAt: now,
             deadline: now.addingTimeInterval(timeout),
             waitingBehind: 0

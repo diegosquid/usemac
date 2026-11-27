@@ -66,6 +66,97 @@ final class ExecutionModeNoticeTests: XCTestCase {
         XCTAssertTrue(ExecutionModeNotice.tooltip(policy: .readOnly, killSwitchTripped: true, agentActing: false).contains("emergency stop"))
     }
 
+    func testTooltipNamesOneAgentAfterTrimmingAndDeduplicating() {
+        let agents = [" ", " Codex\n", "Codex"]
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .autonomous, killSwitchTripped: false, agentActing: true, activeAgents: agents),
+            "UseMac (Codex acting)"
+        )
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .ask, killSwitchTripped: false, agentActing: true, activeAgents: agents),
+            "UseMac (Codex acting, mode: Ask)"
+        )
+    }
+
+    func testTooltipCountsMultipleAgentsAfterTrimmingAndDeduplicating() {
+        let agents = [" Codex", "", "Claude ", "Codex"]
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .autonomous, killSwitchTripped: false, agentActing: true, activeAgents: agents),
+            "UseMac (2 agents acting)"
+        )
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .confirmSensitive, killSwitchTripped: false, agentActing: true, activeAgents: agents),
+            "UseMac (2 agents acting, mode: Block sensitive)"
+        )
+    }
+
+    func testTooltipKeepsLegacyTextForBlankNamesAndIgnoresNamesWhenNotActing() {
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .ask, killSwitchTripped: false, agentActing: true, activeAgents: [" ", "\n"]),
+            "UseMac (Agent acting, mode: Ask)"
+        )
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .autonomous, killSwitchTripped: false, agentActing: false, activeAgents: ["Codex"]),
+            "UseMac (Running)"
+        )
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .paused, killSwitchTripped: false, agentActing: true, activeAgents: ["Codex"]),
+            "UseMac (Paused)"
+        )
+        XCTAssertEqual(
+            ExecutionModeNotice.tooltip(policy: .paused, killSwitchTripped: true, agentActing: true, activeAgents: ["Codex"]),
+            "UseMac (Stopped: emergency stop is on)"
+        )
+    }
+
+    private func menuStatus(
+        policy: GovernancePolicy = .autonomous,
+        stopped: Bool = false,
+        running: Bool = true,
+        acting: Bool = true,
+        agents: [String] = [],
+        app: String? = nil
+    ) -> String {
+        ExecutionModeNotice.menuBarStatusLabel(
+            policy: policy, killSwitchTripped: stopped, isServerRunning: running,
+            agentActing: acting, activeAgents: agents, targetAppName: app
+        )
+    }
+
+    func testMenuStatusPrioritizesStopThenPauseOverActivity() {
+        XCTAssertEqual(menuStatus(policy: .paused, stopped: true, agents: ["Codex"], app: "Finder"), "Stopped")
+        XCTAssertEqual(menuStatus(policy: .paused, agents: ["Codex"], app: "Finder"), "Paused")
+    }
+
+    func testMenuStatusWithoutAgentNamesUsesTheAppOrGenericActivity() {
+        XCTAssertEqual(menuStatus(), "Agent active")
+        XCTAssertEqual(menuStatus(agents: [" ", "\n"], app: " \t"), "Agent active")
+        XCTAssertEqual(menuStatus(running: false, app: " Finder\n"), "Acting in Finder")
+    }
+
+    func testMenuStatusNamesOneAgentAndIncludesADifferentApp() {
+        XCTAssertEqual(menuStatus(agents: [" Codex", "", "Codex "], app: " Finder "), "Codex · Finder")
+        XCTAssertEqual(menuStatus(agents: ["Codex"], app: " CODEX\n"), "Codex active")
+        XCTAssertEqual(menuStatus(agents: ["Codex"]), "Codex active")
+    }
+
+    func testMenuStatusNamesTwoAgentsInOrderRegardlessOfTheApp() {
+        let agents = [" Codex", "Claude ", "", "Codex"]
+        XCTAssertEqual(menuStatus(agents: agents, app: "Finder"), "Codex, Claude active")
+        XCTAssertEqual(menuStatus(agents: agents), "Codex, Claude active")
+    }
+
+    func testMenuStatusCountsThreeOrMoreAgentsAndListsTheFirstTwo() {
+        let agents = [" Codex ", "Claude", "Gemini", " Claude", " "]
+        XCTAssertEqual(menuStatus(agents: agents, app: "Finder"), "3 agents active (Codex, Claude…)")
+        XCTAssertEqual(menuStatus(agents: agents + ["Cursor"]), "4 agents active (Codex, Claude…)")
+    }
+
+    func testMenuStatusWithoutActivityReflectsWhetherTheServerIsRunning() {
+        XCTAssertEqual(menuStatus(policy: .readOnly, acting: false, agents: ["Codex"], app: "Finder"), "Ready")
+        XCTAssertEqual(menuStatus(running: false, acting: false), "Offline")
+    }
+
     // MARK: - Hints
 
     func testAHintExactlyWhenSomethingBlocksAgents() {

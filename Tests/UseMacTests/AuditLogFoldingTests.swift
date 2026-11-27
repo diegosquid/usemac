@@ -10,7 +10,8 @@ private func entry(
     method: String = "browser_tabs",
     app: String? = "Chrome (Diego)",
     success: Bool = true,
-    taskId: String? = "task-0cbf8bf6"
+    taskId: String? = "task-0cbf8bf6",
+    agent: String? = nil
 ) -> AuditEntry {
     AuditEntry(
         timestampMs: 1_764_115_303_000 + second * 1000,
@@ -19,7 +20,8 @@ private func entry(
         summary: summary,
         latencyMs: 3,
         success: success,
-        taskId: taskId
+        taskId: taskId,
+        agent: agent
     )
 }
 
@@ -86,6 +88,17 @@ final class AuditLogFoldingTests: XCTestCase {
             entry(at: 2, taskId: "task-a"),
             entry(at: 1, taskId: "task-a"),
             entry(at: 0, taskId: nil)
+        ]
+
+        XCTAssertEqual(AuditLogFolding.fold(newestFirst).map(\.count), [1, 2, 1])
+    }
+
+    func testDifferentAgentsDoNotFold() {
+        let newestFirst = [
+            entry(at: 3, agent: "Claude Code"),
+            entry(at: 2, agent: "Codex"),
+            entry(at: 1, agent: "Codex"),
+            entry(at: 0)
         ]
 
         XCTAssertEqual(AuditLogFolding.fold(newestFirst).map(\.count), [1, 2, 1])

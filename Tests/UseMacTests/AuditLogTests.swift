@@ -14,7 +14,8 @@ private func entry(
     method: String = "observe",
     app: String? = "TextEdit",
     success: Bool = true,
-    taskId: String? = nil
+    taskId: String? = nil,
+    agent: String? = nil
 ) -> AuditEntry {
     AuditEntry(
         timestampMs: Int64(date.timeIntervalSince1970 * 1000),
@@ -23,7 +24,8 @@ private func entry(
         summary: summary,
         latencyMs: 1.5,
         success: success,
-        taskId: taskId
+        taskId: taskId,
+        agent: agent
     )
 }
 
@@ -91,6 +93,35 @@ final class AuditLogStoreTests: XCTestCase {
         XCTAssertEqual(store.entries(matching: AuditLogQuery(limit: 1)).map(\.summary), ["no task"])
     }
 
+    func testAgentPersistsAndCanBeFilteredAfterReopening() {
+        let store = AuditLogStore(directory: directory, retentionDays: { 30 })
+        let codex = entry("Codex observation", taskId: "shared-task", agent: "Codex")
+        store.append(codex)
+        store.append(entry("Claude observation", taskId: "shared-task", agent: "Claude Code"))
+        store.append(entry("Unattributed observation"))
+        store.flush()
+
+        let reopened = AuditLogStore(directory: directory, retentionDays: { 30 })
+        XCTAssertEqual(reopened.entries(matching: AuditLogQuery(agent: "Codex")), [codex])
+        XCTAssertTrue(reopened.entries(matching: AuditLogQuery(agent: "codex")).isEmpty)
+        XCTAssertEqual(reopened.entries(matching: AuditLogQuery(AuditLogParams(agent: "  Codex\n"))), [codex])
+        XCTAssertEqual(reopened.entries(matching: AuditLogQuery(AuditLogParams(agent: " \n"))).count, 3)
+    }
+
+    func testLegacyJSONLDecodesWithoutAnAgent() throws {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let line = """
+        {"id":"legacy","timestampMs":\(now),"method":"observe","summary":"Old observation","latencyMs":1,"success":true}
+        """
+        let store = AuditLogStore(directory: directory, retentionDays: { 30 })
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data((line + "\n").utf8).write(to: store.fileURL(forTimestampMs: now))
+        let legacy = try XCTUnwrap(store.entries(matching: AuditLogQuery()).first)
+        XCTAssertEqual(legacy.id, "legacy")
+        XCTAssertNil(legacy.agent)
+        XCTAssertTrue(store.entries(matching: AuditLogQuery(agent: "Codex")).isEmpty)
+    }
+
     func testRetentionDeletesOnlyOldDayFiles() throws {
         let writer = AuditLogStore(directory: directory, retentionDays: { 365 })
         let now = Date()
@@ -127,18 +158,19 @@ final class AuditLogStoreTests: XCTestCase {
 
     func testCSVExportEscapesCellsAndDefusesFormulas() throws {
         let rows = [
-            entry("=HYPERLINK(\"x\")", app: "Chrome (Work, Main)", taskId: "task-1"),
+            entry("=HYPERLINK(\"x\")", app: "Chrome (Work, Main)", taskId: "task-1", agent: "Codex, reviewer"),
             entry("line one\nline two", success: false)
         ]
         let csv = try XCTUnwrap(String(data: AuditLogStore.export(rows, as: .csv), encoding: .utf8))
         let lines = csv.components(separatedBy: "\r\n")
-        XCTAssertEqual(lines[0], "time,timestampMs,taskId,method,app,result,latencyMs,summary,id")
+        XCTAssertEqual(lines[0], "time,timestampMs,taskId,agent,method,app,result,latencyMs,summary,id")
+        XCTAssertTrue(lines[1].contains(",,,observe,"), "no task or agent leaves two empty cells")
         XCTAssertTrue(lines[1].contains(",failed,1.50,\"line one\nline two\","), "oldest first; newlines are quoted: \(lines[1])")
-        XCTAssertTrue(csv.contains(",task-1,observe,\"Chrome (Work, Main)\",ok,1.50,\"'=HYPERLINK(\"\"x\"\")\","), csv)
+        XCTAssertTrue(csv.contains(",task-1,\"Codex, reviewer\",observe,\"Chrome (Work, Main)\",ok,1.50,\"'=HYPERLINK(\"\"x\"\")\","), csv)
     }
 
     func testJSONLExportRoundTrips() throws {
-        let rows = [entry("second", at: Date().addingTimeInterval(1), taskId: "t"), entry("first")]
+        let rows = [entry("second", at: Date().addingTimeInterval(1), taskId: "t", agent: "Codex"), entry("first")]
         let lines = String(decoding: AuditLogStore.export(rows, as: .jsonl), as: UTF8.self).split(separator: "\n")
         let decoded = try lines.map { try JSONDecoder().decode(AuditEntry.self, from: Data($0.utf8)) }
         XCTAssertEqual(decoded, Array(rows.reversed()))

@@ -66,12 +66,13 @@ public struct AuditEntryRun: Identifiable, Equatable, Sendable {
 /// Folds runs of repeated audit entries for display. An agent polling `browser_tabs` twice a second would
 /// otherwise fill History with identical rows. Display only: the log on disk and its export keep every entry.
 public enum AuditLogFolding {
-    /// Whether two entries say the same thing: same app, method, task, result and summary. Time, latency and id
+    /// Whether two entries say the same thing: same agent, app, method, task, result and summary. Time, latency and id
     /// don't count. A failure never folds with a success.
     public static func sameEvent(_ lhs: AuditEntry, _ rhs: AuditEntry) -> Bool {
         lhs.success == rhs.success
             && lhs.method == rhs.method
             && lhs.taskId == rhs.taskId
+            && lhs.agent == rhs.agent
             && lhs.targetApp == rhs.targetApp
             && lhs.summary == rhs.summary
     }

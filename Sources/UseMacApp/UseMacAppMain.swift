@@ -118,17 +118,13 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
     }
 
     private func observeStatusUpdates() {
-        appState.$status
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                guard let self else { return }
-                self.updateStatusIcon()
-                self.statusHeaderItem?.attributedTitle = self.makeStatusHeaderAttributedTitle()
-            }
-            .store(in: &cancellables)
-
-        appState.$isActivityIndicatorLit
-            .removeDuplicates()
+        Publishers.CombineLatest4(
+            appState.$status,
+            appState.$isActivityIndicatorLit.removeDuplicates(),
+            appState.$activeAgentNames.removeDuplicates(),
+            appState.$activeTargetApp.map { $0?.name }.removeDuplicates()
+        )
+            .combineLatest(appState.$isServerRunning.removeDuplicates())
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self else { return }
@@ -148,7 +144,12 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
         let active = acting && badge == .none
         button.image = Self.makeMenuBarIcon(badge: badge, active: active)
         button.imagePosition = .imageOnly
-        button.toolTip = ExecutionModeNotice.tooltip(policy: policy, killSwitchTripped: tripped, agentActing: acting)
+        button.toolTip = ExecutionModeNotice.tooltip(
+            policy: policy,
+            killSwitchTripped: tripped,
+            agentActing: acting,
+            activeAgents: appState.activeAgentNames
+        )
     }
 
     private static func makeMenuBarIcon(badge: ExecutionModeNotice.Badge, active: Bool) -> NSImage {
@@ -264,28 +265,23 @@ public final class UseMacAppDelegate: NSObject, NSApplicationDelegate, NSMenuDel
 
     private func makeStatusHeaderAttributedTitle() -> NSAttributedString {
         let dotColor: NSColor
-        let label: String
-
         if appState.status.killSwitchTripped {
             dotColor = .systemRed
-            label = "Stopped"
         } else if appState.status.policy == .paused {
             dotColor = .systemOrange
-            label = "Paused"
         } else if appState.isActivityIndicatorLit {
             dotColor = NSColor(srgbRed: 0.231, green: 0.549, blue: 0.961, alpha: 1.0)
-            if let appName = appState.activeTargetApp?.name, !appName.isEmpty {
-                label = "Acting in \(appName)"
-            } else {
-                label = "Agent active"
-            }
-        } else if appState.isServerRunning {
-            dotColor = .systemGreen
-            label = "Ready"
         } else {
-            dotColor = .systemRed
-            label = "Offline"
+            dotColor = appState.isServerRunning ? .systemGreen : .systemRed
         }
+        let label = ExecutionModeNotice.menuBarStatusLabel(
+            policy: appState.status.policy,
+            killSwitchTripped: appState.status.killSwitchTripped,
+            isServerRunning: appState.isServerRunning,
+            agentActing: appState.isActivityIndicatorLit,
+            activeAgents: appState.activeAgentNames,
+            targetAppName: appState.activeTargetApp?.name
+        )
 
         let result = NSMutableAttributedString(
             string: "●  ",

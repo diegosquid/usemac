@@ -8,14 +8,17 @@ public struct AuditLogParams: Codable, Equatable, Sendable {
     public var sinceMs: Int64?
     /// Only entries of this task (the `taskId` from `task_start`).
     public var taskId: String?
+    /// Only entries from this agent (exact name).
+    public var agent: String?
 
     public static let defaultLimit = 50
     public static let maxLimit = 1000
 
-    public init(limit: Int? = nil, sinceMs: Int64? = nil, taskId: String? = nil) {
+    public init(limit: Int? = nil, sinceMs: Int64? = nil, taskId: String? = nil, agent: String? = nil) {
         self.limit = limit
         self.sinceMs = sinceMs
         self.taskId = taskId
+        self.agent = agent
     }
 
     /// The limit to apply: the default when omitted, clamped to 1...maxLimit.
@@ -26,6 +29,12 @@ public struct AuditLogParams: Codable, Equatable, Sendable {
     /// The task filter, or nil when it is missing or blank.
     public var resolvedTaskId: String? {
         guard let trimmed = taskId?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    /// The agent filter, or nil when it is missing or blank.
+    public var resolvedAgent: String? {
+        guard let trimmed = agent?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
         return trimmed
     }
 

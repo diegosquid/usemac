@@ -120,6 +120,24 @@ public final class TaskTabRegistry: @unchecked Sendable {
         return tasks[taskId]?.agent
     }
 
+    /// Distinct names of running agents active within the given interval, most recently active first.
+    public func activeAgentNames(activeWithin seconds: TimeInterval, now: Date = Date()) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        expire(now: now)
+        let recent = tasks.values.sorted { lhs, rhs in
+            if lhs.lastActivityAt == rhs.lastActivityAt {
+                return (lhs.agent ?? "") < (rhs.agent ?? "")
+            }
+            return lhs.lastActivityAt > rhs.lastActivityAt
+        }
+        var seen: Set<String> = []
+        return recent.compactMap { task in
+            guard now.timeIntervalSince(task.lastActivityAt) < seconds,
+                  let agent = task.agent, seen.insert(agent).inserted else { return nil }
+            return agent
+        }
+    }
+
     /// Leases the windows and tabs an acting request works in for its task, or names the running task that holds one
     /// of them. A request of no task (no `taskId`, and UseMac can't tell its task) is never refused, so callers that
     /// don't use tasks work as before. One with a `taskId` that names no running task is refused but leases nothing.
