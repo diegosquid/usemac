@@ -24,7 +24,7 @@ public struct HUDSessionCard: Identifiable {
     public var cursorPoint: CGPoint?
     public var cursorLabel: String?
     public var lastActivityDate: Date
-    /// The task whose work the card shows, when UseMac could tell. Its cards share the task's color.
+    /// The task whose work the card shows, when UseMac could tell.
     public var taskId: String?
     /// When the card's agent last did something there (a step, an observe, a screenshot). Frames don't count.
     public var lastStepDate: Date?
@@ -178,8 +178,6 @@ public final class AppState: ObservableObject {
             deckDidChange(from: oldValue)
         }
     }
-    /// Palette slot of each task in the deck (PreviewTaskColors), by `PreviewTaskColors.key`.
-    @Published public internal(set) var hudTaskColorSlots: [String: Int] = [:]
     /// True while the pointer is over the preview: the deck doesn't shuffle under it.
     @Published public var isHUDHovered: Bool = false
     /// True for the short dip the front card makes before it goes to the back of the deck.

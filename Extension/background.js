@@ -7310,6 +7310,14 @@ async function handleCloseOwnedTabsCommand(req) {
     if (focused?.focused) focusedWindowId = focused.id;
   } catch (_) {}
   const activeDownloads = await queryActiveDownloads();
+  const keepReason = (tab) => {
+    if (keep.has(tab.id)) return "asked to keep";
+    if (tab.active && tab.windowId === focusedWindowId) return "the user is looking at it";
+    if (!activeDownloads) return "download status unavailable";
+    const observed = new Map(activeDownloads.map((download) => [download.id, download]));
+    for (const download of state.downloads.values()) observed.set(download.id, download);
+    return hasRunningDownloadFrom(tab, Array.from(observed.values())) ? "a download is still running" : null;
+  };
 
   for (const tabId of owned) {
     const tab = await getTabOrNull(tabId);
@@ -7318,22 +7326,35 @@ async function handleCloseOwnedTabsCommand(req) {
       continue;
     }
     if (only && !only.has(tabId)) continue;
-    let reason = null;
-    if (keep.has(tabId)) reason = "asked to keep";
-    else if (tab.active && tab.windowId === focusedWindowId) reason = "the user is looking at it";
-    else if (!activeDownloads) reason = "download status unavailable";
-    else {
-      // onCreated/onChanged can arrive while tabs.get is pending; don't yield again before removing.
-      const observed = new Map(activeDownloads.map((download) => [download.id, download]));
-      for (const download of state.downloads.values()) observed.set(download.id, download);
-      if (hasRunningDownloadFrom(tab, Array.from(observed.values()))) reason = "a download is still running";
-    }
+    let reason = keepReason(tab);
     if (reason) {
       kept.push({ tabId, title: tab.title || "", reason });
       continue;
     }
     try {
-      await chrome.tabs.remove(tabId);
+      await withUsemacGroupLock(async () => {
+        const current = await chrome.tabs.get(tabId);
+        reason = keepReason(current);
+        if (reason) return;
+        if (current.groupId != null && current.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+          const group = await chrome.tabGroups.get(current.groupId);
+          if (group.title === USEMAC_GROUP_TITLE) {
+            // Closing the last tab of a WINDOW archives its group in Chrome's Saved Tab Groups.
+            // Those closed groups are invisible to tabGroups.query, so folding open groups never
+            // removes them. Ungroup our closing tab first: an empty group is then deleted, not saved.
+            // Never ungroup a tab the user moved into a group of their own.
+            await chrome.tabs.ungroup([tabId]);
+          }
+        }
+        // Downloads/user activation may arrive during the async group operations. Check again and
+        // don't yield between this final decision and remove. The group lock also excludes regrouping.
+        reason = keepReason(await chrome.tabs.get(tabId));
+        if (!reason) await chrome.tabs.remove(tabId);
+      });
+      if (reason) {
+        kept.push({ tabId, title: tab.title || "", reason });
+        continue;
+      }
       owned.delete(tabId);
       closed.push({ tabId, title: tab.title || "" });
     } catch (err) {

@@ -6,6 +6,14 @@ All notable changes to UseMac are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Neutral live preview:** removed the per-task color bands and tinted cards. The preview keeps its card stack and automatic task switching, without extra space above the picture.
+
+### Fixed
+
+- **Saved Chrome groups:** finishing a task in its own window no longer leaves another closed UseMac group on the bookmarks bar. Cleanup ungroups its tabs before closing them, while still preserving kept tabs, visible tabs, other tasks' tabs and active downloads.
+
 ## [0.9.0-beta.1] - 2026-11-26
 
 ### Added

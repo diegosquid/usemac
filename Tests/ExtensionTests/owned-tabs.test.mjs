@@ -92,6 +92,58 @@ test("a tab closed by the user is forgotten", async (t) => {
   assert.deepEqual(response.keptTabs, []);
 });
 
+test("finishing tasks in their own windows does not accumulate closed saved UseMac groups", async (t) => {
+  const sb = withSandbox(t, {
+    tabs: [{ id: 751, windowId: 1, url: "https://example.com/", active: true }],
+    windows: [{ id: 1, focused: true }]
+  });
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const owned = await openTab(sb, { newWindow: true });
+    const { response } = await sb.request({ type: "request", id: nextId(), command: "close_owned_tabs", closeTabIds: [owned] });
+    assert.deepEqual(response.closedTabs.map((tab) => tab.tabId), [owned]);
+    assert.equal(sb.savedGroups.size, 0, "no closed saved group left on the bookmarks bar");
+    assert.equal(sb.tabs.has(751), true, "the user's original tab stays open");
+  }
+});
+
+test("cleanup does not ungroup an owned tab moved into the user's group", async (t) => {
+  const sb = withSandbox(t, {
+    tabs: [
+      { id: 761, windowId: 1, url: "https://example.com/", groupId: 81 },
+      { id: 762, windowId: 1, url: "https://example.com/user", groupId: 81, active: true }
+    ],
+    groups: [{ id: 81, windowId: 1, title: "Work", color: "red" }],
+    session: { usemacOwnedTabIds: [761] }
+  });
+  await sb.request({ type: "request", id: nextId(), command: "close_owned_tabs" });
+  assert.equal(sb.callsTo("tabs.ungroup").length, 0);
+  assert.equal(sb.tabs.get(762).groupId, 81);
+});
+
+test("a failed ungroup keeps the tab for retry instead of saving another closed group", async (t) => {
+  const sb = withSandbox(t, { tabs: [{ id: 771, windowId: 1, url: "https://example.com/", active: true }] });
+  const owned = await openTab(sb, { newWindow: true });
+  sb.chrome.tabs.ungroup = async () => { throw new Error("Tabs cannot be edited right now"); };
+  const { response } = await sb.request({ type: "request", id: nextId(), command: "close_owned_tabs" });
+  assert.deepEqual(response.closedTabs, []);
+  assert.equal(response.keptTabs[0].tabId, owned);
+  assert.equal(sb.callsTo("tabs.remove").length, 0);
+});
+
+test("a download starting during ungroup keeps the tab open", async (t) => {
+  const sb = withSandbox(t, { tabs: [{ id: 781, windowId: 1, url: "https://example.com/", active: true }] });
+  const owned = await openTab(sb, { newWindow: true });
+  const ungroup = sb.chrome.tabs.ungroup;
+  sb.chrome.tabs.ungroup = async (ids) => {
+    await ungroup(ids);
+    sb.downloads.create({ id: 1, url: PAGE + "/download", state: "in_progress" });
+  };
+  const { response } = await sb.request({ type: "request", id: nextId(), command: "close_owned_tabs" });
+  assert.deepEqual(response.closedTabs, []);
+  assert.deepEqual(response.keptTabs.map(({ tabId, reason }) => [tabId, reason]), [[owned, "a download is still running"]]);
+  assert.equal(sb.callsTo("tabs.remove").length, 0);
+});
+
 test("the tab list marks UseMac's own tabs, never the user's", async (t) => {
   const sb = withSandbox(t, {
     tabs: [{ id: 801, windowId: 1, url: "https://forum.example.com/weekend", active: true }],

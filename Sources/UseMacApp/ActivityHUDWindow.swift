@@ -172,7 +172,6 @@ public final class ActivityHUDController {
             isLarge: appState.isHUDLarge,
             stackBehindCount: initialBehind,
             peekStep: peekStep,
-            tagHeight: appState.isHUDCollapsed || appState.hudDeck.isEmpty ? 0 : hudTagHeight,
             collapsedSize: collapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
@@ -391,7 +390,6 @@ public final class ActivityHUDController {
             isLarge: appState.isHUDLarge,
             stackBehindCount: behind,
             peekStep: peekStep,
-            tagHeight: appState.isHUDCollapsed || appState.hudDeck.isEmpty ? 0 : hudTagHeight,
             collapsedSize: collapsedSize,
             regularPiPSize: regularPiPSize,
             largePiPSize: largePiPSize
@@ -417,7 +415,6 @@ public final class ActivityHUDController {
         isLarge: Bool,
         stackBehindCount: Int,
         peekStep: CGFloat,
-        tagHeight: CGFloat,
         collapsedSize: NSSize,
         regularPiPSize: NSSize,
         largePiPSize: NSSize
@@ -426,8 +423,8 @@ public final class ActivityHUDController {
             return collapsedSize
         }
         let baseSize = isLarge ? largePiPSize : regularPiPSize
-        // The cards behind show an edge each, and the front card's task tag sits above its picture.
-        let extraHeight = CGFloat(max(stackBehindCount, 0)) * peekStep + tagHeight
+        // The cards behind show an edge each; the front picture keeps its original size.
+        let extraHeight = CGFloat(max(stackBehindCount, 0)) * peekStep
         return NSSize(width: baseSize.width, height: baseSize.height + extraHeight)
     }
 
