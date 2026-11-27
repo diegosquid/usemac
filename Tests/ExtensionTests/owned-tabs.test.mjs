@@ -103,3 +103,100 @@ test("the tab list marks UseMac's own tabs, never the user's", async (t) => {
   assert.equal(byId[owned].usemac, true);
   assert.equal(byId[801].usemac, undefined);
 });
+
+const DOWNLOAD_TAB = 851;
+const DOWNLOAD_PAGE = "https://app.example.com/reports";
+
+function withOwnedDownloadTab(t, url = DOWNLOAD_PAGE, options = {}) {
+  return withSandbox(t, {
+    tabs: [{ id: DOWNLOAD_TAB, windowId: 1, url }],
+    session: { usemacOwnedTabIds: [DOWNLOAD_TAB] },
+    ...options
+  });
+}
+
+function closeOwned(sb) {
+  return sb.request({ type: "request", id: nextId(), command: "close_owned_tabs" });
+}
+
+async function assertDownloadKeepsTab(sb) {
+  const { response } = await closeOwned(sb);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.closedTabs, []);
+  assert.deepEqual(response.keptTabs.map(({ tabId, reason }) => [tabId, reason]), [
+    [DOWNLOAD_TAB, "a download is still running"]
+  ]);
+  assert.equal(sb.callsTo("tabs.remove").length, 0);
+}
+
+test("close_owned_tabs keeps a tab with a download redirected from its origin to a CDN", async (t) => {
+  const sb = withOwnedDownloadTab(t);
+  sb.downloads.create({
+    id: 1,
+    url: "https://app.example.com/download",
+    finalUrl: "https://cdn.example.net/report?signature=abc",
+    state: "in_progress"
+  });
+  await assertDownloadKeepsTab(sb);
+  assert.deepEqual(sb.callsTo("downloads.search").map(({ args: [query] }) => query), [{ state: "in_progress" }]);
+});
+
+test("close_owned_tabs finds an active Blob download after a service-worker restart", async (t) => {
+  const downloadStore = new Map();
+  const first = withOwnedDownloadTab(t, DOWNLOAD_PAGE, { downloadStore });
+  first.downloads.create({ id: 1, url: "blob:https://app.example.com/report", state: "in_progress" });
+  first.dispose();
+
+  const cold = withOwnedDownloadTab(t, DOWNLOAD_PAGE, { downloadStore, session: first.session });
+  assert.equal(cold.eval("state.downloads.size"), 0);
+  await assertDownloadKeepsTab(cold);
+  assert.deepEqual(cold.callsTo("downloads.search").map(({ args: [query] }) => query), [{ state: "in_progress" }]);
+});
+
+test("close_owned_tabs rechecks downloads created while tabs.get is pending", async (t) => {
+  let downloadCreated = false;
+  let sb;
+  sb = withOwnedDownloadTab(t, DOWNLOAD_PAGE, {
+    apiDelayMs: (api) => {
+      if (api !== "tabs.get" || downloadCreated) return 0;
+      downloadCreated = true;
+      assert.equal(sb.callsTo("downloads.search").length, 1);
+      sb.downloads.create({ id: 1, url: "https://app.example.com/download", state: "in_progress" });
+      return 10;
+    }
+  });
+  await assertDownloadKeepsTab(sb);
+  assert.equal(downloadCreated, true);
+});
+
+test("close_owned_tabs does not match a download and a tab solely on opaque origins", async (t) => {
+  const sb = withOwnedDownloadTab(t, "data:text/html,local");
+  sb.downloads.create({
+    id: 1, url: "blob:null/other-document", referrer: "data:text/html,other", state: "in_progress"
+  });
+  const { response } = await closeOwned(sb);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.closedTabs.map(({ tabId }) => tabId), [DOWNLOAD_TAB]);
+  assert.deepEqual(response.keptTabs, []);
+});
+
+test("close_owned_tabs keeps candidate tabs when the download status query fails", async (t) => {
+  const sb = withOwnedDownloadTab(t, DOWNLOAD_PAGE, {
+    downloadSearch: () => { throw new Error("downloads service unavailable"); }
+  });
+  const { response } = await closeOwned(sb);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.closedTabs, []);
+  assert.deepEqual(response.keptTabs.map(({ tabId, reason }) => [tabId, reason]), [
+    [DOWNLOAD_TAB, "download status unavailable"]
+  ]);
+  assert.equal(sb.callsTo("tabs.remove").length, 0);
+});
+
+test("close_owned_tabs uses the Page download association even without a matching origin", async (t) => {
+  const sb = withOwnedDownloadTab(t);
+  const url = "https://cdn.example.net/report";
+  sb.debuggerEvent(DOWNLOAD_TAB, "Page.downloadWillBegin", { url, suggestedFilename: "report.csv" });
+  sb.downloads.create({ id: 1, url, state: "in_progress" });
+  await assertDownloadKeepsTab(sb);
+});

@@ -71,7 +71,7 @@ extension RPCRequest {
         switch method {
         case .browserOpen: return browserOpen?.tabId
         case .browserObserve: return browserObserve?.tabId
-        case .browserExtract: return browserExtract?.tabId
+        case .browserExtract: return browserExtract?.isDownloads == true ? nil : browserExtract?.tabId
         case .browserScreenshot: return browserScreenshot?.tabId
         case .browserAct: return browserAct?.tabId
         case .visionQuery: return visionQuery?.tabId
@@ -106,7 +106,7 @@ extension RPCRequest {
         case .browserObserve, .browserScreenshot, .browserAct:
             return true
         case .browserExtract:
-            return browserExtract.map { $0.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "downloads" } ?? true
+            return browserExtract?.isDownloads != true
         case .browserOpen:
             guard let open = browserOpen else { return false }
             return open.newTab == false && open.newWindow != true
@@ -166,7 +166,7 @@ extension RPCRequest {
         case .browserOpen:
             return browserOpen?.tabId != nil
         case .browserExtract:
-            return browserExtract.map { $0.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "eval" } ?? false
+            return browserExtract?.normalizedMode == "eval"
         case .appMenu:
             return appMenu?.menuPath?.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } == true
         case .skillRun:
@@ -182,7 +182,7 @@ extension RPCRequest {
         case .browserObserve, .browserScreenshot, .visionQuery:
             return true
         case .browserExtract:
-            return browserExtract.map { $0.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "eval" } ?? true
+            return browserExtract?.normalizedMode != "eval"
         default:
             return false
         }

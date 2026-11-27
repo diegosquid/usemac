@@ -1537,7 +1537,7 @@ struct UseMacCLI {
         if let downloads = ext.downloads {
             print("--- RECENT DOWNLOADS (\(downloads.count)) ---")
             for dl in downloads {
-                print("  • [\(dl.state)] \(dl.filename)")
+                print("  • \(dl.formattedStatus)")
             }
         }
         return 0
@@ -2694,7 +2694,8 @@ struct UseMacCLI {
           browser observe [--profile <n>] [--tab <id>] [--filter-role <r>] [--filter-text <t>] [--max-elements <n>] [--screenshot] [--no-text] [--no-tables]
                                                      Inspect DOM (including cross-origin iframes and Shadow DOM), tables, text, and overlays (@b1..@bN)
           browser extract [auto|tables|text|kpis|network|eval|downloads] [--profile <n>] [--tab <id>] [--selector <css>] [--url-filter <q>] [--expr <js>] [--scan-horizontal] [--scan-vertical] [--max-chars <n>]
-                                                     Extract tables/ARIA grids, KPIs, text, network JSON, JS, or downloads
+                                                     Extract tables/ARIA grids, KPIs, text, network JSON, or JS.
+                                                     Downloads lists files per Chrome profile in downloads (not jsonResult); not supported in browser batch.
           browser batch <url1> [<url2> ...] [--profile <n>] [--mode observe|extract] [--auto-dismiss] [--close-after]
                                                      Open and observe/extract multiple URLs in parallel Chrome tabs
           browser screenshot [--profile <n>] [--tab <id>] [--selector <css>] [--element <@bID>] [--full-page] [--diff-crop] [--width <px>] [--height <px>] [--quality <n>]
@@ -3038,17 +3039,17 @@ struct UseMacCLI {
             )
         case "browser extract":
             return CommandHelp(
-                usage: ["usemac browser extract [auto|tables|text|kpis|eval|downloads] [--profile <name>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]"],
-                summary: "Extract structured data from a tab. auto, tables, text and kpis only read; downloads lists files downloaded during the UseMac session; eval runs JavaScript in the page (autonomous mode, or Ask mode once the user allows it; logged).",
+                usage: ["usemac browser extract [auto|tables|text|kpis|network|eval|downloads] [--profile <name>] [--tab <id>] [--selector <css>] [--expr <js>] [--scan-horizontal] [--max-chars <n>]"],
+                summary: "Extract structured data from a tab. auto, tables, text, kpis and network only read; eval runs JavaScript in the page (autonomous mode, or Ask mode once the user allows it; logged). Downloads lists recent UseMac downloads per Chrome profile and is not supported in browser batch.",
                 flags: [
-                    ("--tab <id>", "Tab to read"),
+                    ("--tab <id>", "Tab to read (not used in downloads mode)"),
                     ("--selector <css>", "Scope extraction to one container"),
                     ("--expr <js>", "Expression for eval mode"),
                     ("--scan-horizontal", "Scroll wide virtualized grids horizontally and merge all columns"),
                     ("--max-chars <n>", "Output limit (default 16000)")
                 ],
-                examples: ["usemac browser extract tables --tab 123 --scan-horizontal"],
-                json: "BrowserExtractResult {mode, tabId, url, tablesMarkdown, rowCount, columnCount, text, jsonResult, downloads, latencyMs}"
+                examples: ["usemac browser extract tables --tab 123 --scan-horizontal", "usemac browser extract downloads --profile Work"],
+                json: "BrowserExtractResult {mode, tabId, url, tablesMarkdown, rowCount, columnCount, text, jsonResult, downloads, latencyMs}. Downloads mode returns the downloads array, not jsonResult."
             )
         case "browser screenshot":
             return CommandHelp(

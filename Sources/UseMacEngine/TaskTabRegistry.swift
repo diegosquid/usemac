@@ -172,6 +172,13 @@ public final class TaskTabRegistry: @unchecked Sendable {
         }
         tasks[owner]?.lastActivityAt = now
         guard request.fallsBackToLastTab else {
+            if request.method == .browserExtract, request.browserExtract?.isDownloads == true,
+               Self.clean(request.namedProfile) == nil,
+               let lastProfile = tasks[owner]?.recentTabs.last(where: { $0.profile != nil })?.profile {
+                var copy = request
+                copy.browserExtract?.profile = lastProfile
+                return Scope(request: copy, taskId: owner, filledTabId: nil)
+            }
             return Scope(request: request, taskId: owner, filledTabId: nil)
         }
         let wantedProfile = Self.clean(request.namedProfile)

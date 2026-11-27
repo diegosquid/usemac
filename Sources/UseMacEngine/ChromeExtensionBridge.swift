@@ -305,7 +305,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let url: String?
         let title: String?
         let tabs: [BrowserTabInfo]?
-        let extractResult: BrowserExtractResult?
+        let extractResult: WireExtractResult?
         let snapshot: WindowSnapshot?
         let screenshotBase64: String?
         let screenshotWidth: Int?
@@ -318,6 +318,65 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
         let restricted: Bool?
         let closedTabs: [OwnedTabOutcome]?
         let keptTabs: [OwnedTabOutcome]?
+    }
+
+    private struct WireExtractResult: Decodable {
+        let mode: String
+        let tabId: Int?
+        let url: String?
+        let title: String?
+        let latencyMs: Double
+        let tablesMarkdown: String?
+        let rowCount: Int?
+        let columnCount: Int?
+        let scannedHorizontalSteps: Int?
+        let text: String?
+        let jsonResult: String?
+        let downloads: [WireDownloadItem]?
+
+        var isDownloads: Bool { mode.lowercased() == "downloads" }
+
+        func publicResult(rules: TargetRules) -> BrowserExtractResult {
+            if isDownloads {
+                let visible = (downloads ?? []).filter {
+                    ChromeExtensionBridge.targetRulesPermitDownload(urls: [$0.url, $0.originalUrl, $0.referrer], rules: rules)
+                }
+                return BrowserExtractResult(mode: mode, latencyMs: latencyMs, downloads: visible.map(\.publicInfo))
+            }
+            return BrowserExtractResult(
+                mode: mode, tabId: tabId, url: url, title: title, latencyMs: latencyMs,
+                tablesMarkdown: tablesMarkdown, rowCount: rowCount, columnCount: columnCount,
+                scannedHorizontalSteps: scannedHorizontalSteps, text: text, jsonResult: jsonResult
+            )
+        }
+    }
+
+    private struct WireDownloadItem: Decodable {
+        let id: Int
+        let filename: String
+        let url: String?
+        let originalUrl: String?
+        let referrer: String?
+        let state: String
+        let bytesReceived: Int?
+        let totalBytes: Int?
+        let mime: String?
+        let startTime: String?
+        let error: String?
+
+        var publicInfo: BrowserDownloadInfo {
+            BrowserDownloadInfo(
+                id: id,
+                filename: filename,
+                url: TargetRules.sanitizeDownloadURL(url ?? originalUrl),
+                state: state,
+                bytesReceived: bytesReceived.flatMap { $0 >= 0 ? $0 : nil },
+                totalBytes: totalBytes.flatMap { $0 >= 0 ? $0 : nil },
+                mime: mime,
+                startTime: startTime,
+                error: error
+            )
+        }
     }
 
     private struct PairingRequiredWireMessage: Encodable {
@@ -1198,15 +1257,17 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     public func extract(_ params: BrowserExtractParams) async -> BridgeResponse {
-        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: params.tabId) {
+        let mode = params.normalizedMode
+        let tabId = params.isDownloads ? nil : params.tabId
+        if let blocked = await targetRulesPreflight(profile: params.profile, tabId: tabId, checksTab: !params.isDownloads) {
             return blocked
         }
         let timeoutSec: TimeInterval = (params.scanHorizontal == true || params.scanVertical == true) ? 30.0 : 18.0
         return await sendCommand(profileQuery: params.profile, timeoutSeconds: timeoutSec) { requestId in
             ExtractWireCommand(
                 id: requestId,
-                tabId: params.tabId,
-                mode: params.mode,
+                tabId: tabId,
+                mode: mode,
                 selector: params.selector,
                 expression: params.expression,
                 scanHorizontal: params.scanHorizontal ?? false,
@@ -1610,8 +1671,19 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             handleTabUrl(payload, sessionId: sessionId)
 
         case .response(let payload):
-            guard let payload else { return }
-            handleResponse(payload, sessionId: sessionId)
+            if let payload {
+                handleResponse(payload, sessionId: sessionId)
+            } else if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let id = object["id"] as? String, !id.isEmpty {
+                completePendingRequest(
+                    id: id,
+                    sessionId: sessionId,
+                    response: BridgeResponse(
+                        ok: false,
+                        error: RPCErrorPayload(code: "INVALID_REQUEST", message: "Invalid extension response payload.")
+                    )
+                )
+            }
 
         case .unknown:
             break
@@ -1959,6 +2031,8 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
     }
 
     private func handleResponse(_ payload: ResponsePayload, sessionId: String) {
+        let downloadsExtract = payload.extractResult.flatMap { $0.isDownloads ? $0 : nil }
+        let pageURL = downloadsExtract == nil ? (payload.url ?? payload.extractResult?.url) : nil
         lock.lock()
         guard let session = sessions[sessionId],
               session.isReady,
@@ -1967,48 +2041,79 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             return
         }
         let sessionProfileKey = (payload.profileName?.isEmpty == false ? payload.profileName! : session.profileName).lowercased()
-        if let listedTabs = payload.tabs {
-            var map = tabUrlsByProfile[sessionProfileKey] ?? [:]
-            for tab in listedTabs {
-                map[tab.tabId] = CachedTabURL(url: tab.url, loading: tab.status == "loading")
+        if downloadsExtract == nil {
+            if let listedTabs = payload.tabs {
+                var map = tabUrlsByProfile[sessionProfileKey] ?? [:]
+                for tab in listedTabs {
+                    map[tab.tabId] = CachedTabURL(url: tab.url, loading: tab.status == "loading")
+                }
+                tabUrlsByProfile[sessionProfileKey] = map
+            } else if let tabId = payload.tabId, let pageURL, !pageURL.isEmpty {
+                tabUrlsByProfile[sessionProfileKey, default: [:]][tabId] = CachedTabURL(url: pageURL, loading: false)
             }
-            tabUrlsByProfile[sessionProfileKey] = map
-        } else if let respTabId = payload.tabId,
-                  let respUrl = payload.url ?? payload.extractResult?.url,
-                  !respUrl.isEmpty {
-            tabUrlsByProfile[sessionProfileKey, default: [:]][respTabId] = CachedTabURL(url: respUrl, loading: false)
         }
         lock.unlock()
 
         // A result from a page the user's rules block is dropped before its screenshot is written or cached.
+        let rules = TargetRulesStore.shared.rules
         if let blocked = Self.targetRulesResultRefusal(
-            url: payload.url ?? payload.extractResult?.url,
-            tabId: payload.tabId,
-            profileName: payload.profileName
+            url: pageURL,
+            tabId: downloadsExtract == nil ? payload.tabId : nil,
+            profileName: payload.profileName,
+            rules: rules
         ) {
             completePendingRequest(id: payload.id, sessionId: sessionId, response: blocked)
             return
         }
 
+        if let downloadsExtract {
+            // A profile-level result never returns or caches tab-scoped data, even from an older extension.
+            let response = BridgeResponse(
+                ok: payload.ok,
+                profileName: payload.profileName,
+                extractResult: downloadsExtract.publicResult(rules: rules),
+                error: payload.error
+            )
+            completePendingRequest(id: payload.id, sessionId: sessionId, response: response)
+            return
+        }
+
         // For network extraction under active site rules, drop any response entry whose URL is blocked.
-        var filteredExtractResult = payload.extractResult
+        var filteredExtractResult = payload.extractResult?.publicResult(rules: rules)
         if var ext = filteredExtractResult,
            ext.mode.lowercased() == "network",
            let rawJSON = ext.jsonResult,
-           TargetRulesStore.shared.rules.hasSiteRules,
+           rules.hasSiteRules,
            let data = rawJSON.data(using: .utf8),
            let items = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-            let rules = TargetRulesStore.shared.rules
             let allowedItems = items.filter { item in
                 guard let itemUrl = item["url"] as? String, !itemUrl.isEmpty else { return true }
                 return !rules.blocksURL(itemUrl)
             }
-            if allowedItems.count != items.count,
-               let cleanData = try? JSONSerialization.data(withJSONObject: allowedItems),
-               let cleanStr = String(data: cleanData, encoding: .utf8) {
-                ext.jsonResult = cleanStr
-                filteredExtractResult = ext
+            ext.rowCount = allowedItems.count
+            if allowedItems.isEmpty {
+                ext.jsonResult = "[]"
+            } else if allowedItems.count != items.count {
+                if let cleanData = try? JSONSerialization.data(withJSONObject: allowedItems) {
+                    ext.jsonResult = String(decoding: cleanData, as: UTF8.self)
+                } else {
+                    ext.jsonResult = "[]"
+                    ext.rowCount = 0
+                }
             }
+            filteredExtractResult = ext
+        }
+
+        var actionResult = payload.actionResult
+        if var result = actionResult {
+            for index in result.stepResults.indices {
+                guard let path = result.stepResults[index].downloadPath else { continue }
+                let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if ["http://", "https://", "blob:", "data:", "javascript:"].contains(where: trimmed.hasPrefix) {
+                    result.stepResults[index].downloadPath = nil
+                }
+            }
+            actionResult = result
         }
 
         var resolvedSnapshot = payload.snapshot
@@ -2062,7 +2167,7 @@ public final class ChromeExtensionBridge: @unchecked Sendable {
             extractResult: filteredExtractResult,
             screenshot: resolvedScreenshot,
             snapshot: resolvedSnapshot,
-            actionResult: payload.actionResult,
+            actionResult: actionResult,
             error: payload.error,
             windowId: payload.windowId,
             restricted: payload.restricted,

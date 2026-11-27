@@ -1,5 +1,5 @@
 // Loads the real Extension/background.js into an isolated vm context with an in-memory `chrome` API (tabs, windows,
-// tab groups, debugger), so node:test files can drive daemon requests and inspect which chrome.* calls they made.
+// tab groups, debugger, downloads), so node:test files can drive daemon requests and inspect which chrome.* calls they made.
 // Unlike run-background-in-node.cjs (used by the Swift interop tests) nothing here opens a real socket: responses
 // the extension sends to the daemon are captured in `sandbox.sent`.
 "use strict";
@@ -61,6 +61,9 @@ class FakeWebSocket {
  * @param {string} [options.userAgent]
  * @param {Array<object>} [options.groups]  Initial tab groups: { id, windowId, title?, color? } (tabs join with groupId).
  * @param {object} [options.session]  Initial chrome.storage.session contents, as a restarted service worker finds them.
+ * @param {Map<number, object>} [options.downloadStore]  Chrome download records, shareable across worker instances.
+ * @param {(query:object, found:Array<object>) => Array<object>|Promise<Array<object>>} [options.downloadSearch]
+ *   Optional override to delay a search snapshot, change its results or throw.
  * @param {number|((api:string) => number)} [options.apiDelayMs]  Real latency (ms) for tabs.get, tabs.group and the
  *   tabGroups calls, so concurrent callers interleave the way they do against Chrome. Default 0.
  */
@@ -112,6 +115,10 @@ function createBackgroundSandbox(options = {}) {
   const windowsBoundsChanged = makeEvent();
   const debuggerDetached = makeEvent();
   const sessionStore = clone(options.session || {});
+  const downloadStore = options.downloadStore || new Map();
+  const downloadsCreated = makeEvent();
+  const downloadsChanged = makeEvent();
+  const downloadsErased = makeEvent();
 
   async function apiDelay(api) {
     const ms = typeof options.apiDelayMs === "function" ? options.apiDelayMs(api) : options.apiDelayMs || 0;
@@ -191,7 +198,26 @@ function createBackgroundSandbox(options = {}) {
       }
     },
     alarms: { create: () => {}, onAlarm: makeEvent() },
-    downloads: { onCreated: makeEvent(), onChanged: makeEvent(), search: async () => [] },
+    downloads: {
+      onCreated: downloadsCreated,
+      onChanged: downloadsChanged,
+      onErased: downloadsErased,
+      search: async (query = {}) => {
+        record("downloads.search", query);
+        let found = Array.from(downloadStore.values())
+          .filter((item) => query.id == null || item.id === query.id)
+          .filter((item) => query.state == null || item.state === query.state)
+          .filter((item) => !query.startedAfter || Date.parse(item.startTime) > Date.parse(query.startedAfter));
+        const order = query.orderBy?.[0];
+        if (order === "startTime" || order === "-startTime") {
+          const direction = order === "-startTime" ? -1 : 1;
+          found.sort((a, b) => direction * (Date.parse(a.startTime) - Date.parse(b.startTime) || a.id - b.id));
+        }
+        if (query.limit != null) found = found.slice(0, query.limit);
+        const snapshot = found.map(clone);
+        return options.downloadSearch ? options.downloadSearch(clone(query), snapshot) : snapshot;
+      }
+    },
     extension: {
       isAllowedFileSchemeAccess: async () => options.fileAccess === true
     },
@@ -380,6 +406,29 @@ function createBackgroundSandbox(options = {}) {
     attached,
     canvasDraws,
     drawImageCalls,
+    downloadStore,
+
+    /** Browser-side downloads persist in the shared store, but events go only to this worker. */
+    downloads: {
+      create(item) {
+        downloadStore.set(item.id, clone(item));
+        downloadsCreated.emit(clone(item));
+      },
+      change(delta, extraChanges = {}) {
+        const item = { ...(downloadStore.get(delta.id) || { id: delta.id }), ...clone(extraChanges) };
+        for (const [name, change] of Object.entries(delta)) {
+          if (name === "id") continue;
+          if (Object.hasOwn(change, "current")) item[name] = change.current;
+          else delete item[name];
+        }
+        downloadStore.set(delta.id, item);
+        downloadsChanged.emit(clone(delta));
+      },
+      erase(id) {
+        downloadStore.delete(id);
+        downloadsErased.emit(id);
+      }
+    },
 
     /** Calls a top-level function of background.js; plain values come back as outer-realm JSON clones. */
     call(name, ...args) {
@@ -449,9 +498,9 @@ function createBackgroundSandbox(options = {}) {
       vm.runInContext("state.ws.onmessage({ data: __deliverText })", context);
     },
 
-    /** A CDP event from the debugger, as Chrome sends it for the tab's top-level target. */
-    debuggerEvent(tabId, method, params = {}) {
-      chrome.debugger.onEvent.emit({ tabId }, method, params);
+    /** A CDP event from the debugger, either top-level or from a child session. */
+    debuggerEvent(tabId, method, params = {}, sessionId = null) {
+      chrome.debugger.onEvent.emit(sessionId ? { tabId, sessionId } : { tabId }, method, params);
     },
 
     /** Sends a daemon request through the real dispatcher and resolves with the extension's response frame. */

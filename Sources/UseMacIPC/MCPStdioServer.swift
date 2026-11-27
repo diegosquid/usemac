@@ -694,6 +694,14 @@ public final class MCPStdioServer: @unchecked Sendable {
             case "usemac_browser_extract":
                 let profile = try optionalString(arguments, key: "profile")
                 let rawMode = try optionalString(arguments, key: "mode")
+                if rawMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "downloads",
+                   arguments["urls"] != nil {
+                    return toolResultResponse(
+                        id: request.id,
+                        blocks: [.text("Error [INVALID_ARGUMENT]: Downloads are listed per Chrome profile. Omit urls when mode is \"downloads\".")],
+                        isError: true
+                    )
+                }
                 if let urls = try optionalStringArray(arguments, key: "urls"), !urls.isEmpty {
                     let batchMode: String
                     let extractMode: String?
@@ -1571,9 +1579,10 @@ public final class MCPStdioServer: @unchecked Sendable {
     }
 
     private func formatBrowserExtract(_ ext: BrowserExtractResult, fallbackTabId: Int?, fallbackUrl: String?) -> String {
+        let isDownloads = ext.mode.lowercased() == "downloads"
         var lines: [String] = []
         var meta: [String] = ["Browser extract [\(ext.mode)]"]
-        if let tabId = ext.tabId ?? fallbackTabId { meta.append("tabId=\(tabId)") }
+        if !isDownloads, let tabId = ext.tabId ?? fallbackTabId { meta.append("tabId=\(tabId)") }
         if let rows = ext.rowCount, let cols = ext.columnCount, rows > 0 {
             meta.append("\(rows) rows × \(cols) cols")
         }
@@ -1582,7 +1591,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         }
         meta.append(String(format: "(%.1f ms)", ext.latencyMs))
         lines.append(meta.joined(separator: " | "))
-        if let url = ext.url ?? fallbackUrl, !url.isEmpty {
+        if !isDownloads, let url = ext.url ?? fallbackUrl, !url.isEmpty {
             lines.append("URL: \(url)")
         }
         if let tables = ext.tablesMarkdown, !tables.isEmpty {
@@ -1607,8 +1616,7 @@ public final class MCPStdioServer: @unchecked Sendable {
             } else {
                 lines.append("--- RECENT DOWNLOADS (\(downloads.count)) ---")
                 for dl in downloads {
-                    let sizeStr = dl.totalBytes.map { " (\($0) bytes)" } ?? ""
-                    lines.append("  - [\(dl.state)] \(dl.filename)\(sizeStr)")
+                    lines.append("  - \(dl.formattedStatus)")
                 }
             }
         }
@@ -2090,7 +2098,7 @@ public final class MCPStdioServer: @unchecked Sendable {
         ),
         MCPToolDefinition(
             name: "usemac_browser_extract",
-            description: "Extract Chrome tables, KPIs, text, network JSON (urlFilter), downloads, or JS eval (expression); or pass urls for parallel multi-tab batch.",
+            description: "Extract Chrome tables, KPIs, text, network JSON (urlFilter), or JS eval (expression); or pass urls for a parallel multi-tab batch. Downloads mode lists downloads per Chrome profile; do not pass urls.",
             inputSchema: [
                 "type": "object",
                 "properties": [
