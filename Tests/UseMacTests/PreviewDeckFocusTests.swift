@@ -1,5 +1,6 @@
 import XCTest
 @testable import UseMacEngine
+import UseMacProtocol
 
 final class PreviewDeckFocusTests: XCTestCase {
     private let workingTab = PreviewDeckFocus.Front(isBrowser: true, browserTabId: 11, hasPreview: true, isBusy: true)
@@ -91,6 +92,30 @@ final class PreviewDeckFocusTests: XCTestCase {
         XCTAssertFalse(PreviewDeckFocus.activityAddsCard(isBrowser: true, namesTab: false, success: false))
         // Native apps an agent named keep their cards.
         XCTAssertTrue(PreviewDeckFocus.activityAddsCard(isBrowser: false, namesTab: false, success: false))
+    }
+
+    func testDownloadsOnlyUpdatesAnExistingTabOfTheSameTaskAndProfile() throws {
+        let observation = try XCTUnwrap(PreviewDeckFocus.ProfileObservation(LiveActivityItem(
+            kind: .observe, title: "Extracted downloads data", browserProfile: "Work", taskId: "download-task"
+        )))
+        XCTAssertTrue(observation.matchesCard(tabId: 11, profile: "work", taskId: "download-task"))
+        XCTAssertFalse(observation.matchesCard(tabId: nil, profile: "Work", taskId: "download-task"))
+        XCTAssertFalse(observation.matchesCard(tabId: 11, profile: "Personal", taskId: "download-task"))
+        XCTAssertFalse(observation.matchesCard(tabId: 11, profile: "Work", taskId: "another-task"))
+
+        let unscoped = try XCTUnwrap(PreviewDeckFocus.ProfileObservation(LiveActivityItem(
+            kind: .observe, title: "Extracted downloads data", browserProfile: "Work"
+        )))
+        XCTAssertFalse(unscoped.matchesCard(tabId: 11, profile: "Work", taskId: nil))
+    }
+
+    func testOpeningATabAndReadingATabKeepTheirNormalCardRouting() {
+        XCTAssertNil(PreviewDeckFocus.ProfileObservation(LiveActivityItem(
+            kind: .actionStart, title: "Opening page", browserProfile: "Work"
+        )))
+        XCTAssertNil(PreviewDeckFocus.ProfileObservation(LiveActivityItem(
+            kind: .observe, title: "Extracted network data", browserTabId: 11, browserProfile: "Work"
+        )))
     }
 
     func testTargetIsGuessedOnlyWhenNothingNamesAnApp() {

@@ -1,4 +1,5 @@
 import Foundation
+import UseMacProtocol
 
 /// Decides which card the live preview shows large.
 ///
@@ -118,6 +119,26 @@ public enum PreviewDeckFocus {
     public static func activityAddsCard(isBrowser: Bool, namesTab: Bool, success: Bool) -> Bool {
         guard isBrowser else { return true }
         return !namesTab && success
+    }
+
+    /// Downloads and other profile-wide observations have no tab to preview. Only an existing tab of the same
+    /// task and profile can show their status, without changing which card is in front.
+    public struct ProfileObservation {
+        private let taskId: String?
+        public let profile: String
+
+        public init?(_ item: LiveActivityItem) {
+            guard item.kind == .observe, item.browserTabId == nil, let profile = item.browserProfile else {
+                return nil
+            }
+            self.profile = profile
+            taskId = item.taskId
+        }
+
+        public func matchesCard(tabId: Int?, profile: String?, taskId: String?) -> Bool {
+            guard tabId != nil, let observationTask = self.taskId, !observationTask.isEmpty else { return false }
+            return taskId == observationTask && profile?.caseInsensitiveCompare(self.profile) == .orderedSame
+        }
     }
 
     /// True when an activity is another card's work, so it must not drive the large preview (its caption, cursor,

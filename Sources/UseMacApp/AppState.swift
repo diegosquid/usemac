@@ -1785,6 +1785,23 @@ public final class AppState: ObservableObject {
         // named, so the app in front, usually the user's own) stays in the activity log and never reaches it.
         guard PreviewDeckFocus.previewShows(targetGuessed: item.targetGuessed == true) else { return }
 
+        // A profile-wide observation isn't another browser tab. Show its caption on the task's existing card,
+        // if there is one, without creating a placeholder, starting the HUD, or moving a card to the front.
+        if let observation = PreviewDeckFocus.ProfileObservation(item) {
+            if let index = hudDeck.firstIndex(where: { card in
+                card.isBrowser && !card.isCompleted && observation.matchesCard(
+                    tabId: card.browserTabId, profile: card.browserProfile, taskId: card.taskId
+                )
+            }) {
+                hudDeck[index].caption = item
+                if index == 0 {
+                    latestCaptionItem = item
+                    scheduleCaptionClearIfIdle()
+                }
+            }
+            return
+        }
+
         // Another agent's work on a card that is not in front updates that card only: it must not put its caption,
         // cursor or stream target on the large preview of the card the user is watching.
         let isBackgroundActivity = PreviewDeckFocus.isBackgroundActivity(

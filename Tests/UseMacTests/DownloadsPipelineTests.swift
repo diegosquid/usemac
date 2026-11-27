@@ -278,8 +278,11 @@ final class DownloadsPipelineTests: XCTestCase {
             ]
         }) { service in
             service.onLiveActivity = { item in activity.withLock { $0.append(item) } }
+            let started = await service.handle(RPCRequest(method: .taskStart))
+            let taskId = try XCTUnwrap(started.taskId)
             let downloads = await service.handle(RPCRequest(
-                method: .browserExtract, browserExtract: BrowserExtractParams(tabId: 42, mode: "downloads")
+                method: .browserExtract, browserExtract: BrowserExtractParams(tabId: 42, mode: "downloads"),
+                taskId: taskId
             ))
             XCTAssertTrue(downloads.ok, String(describing: downloads.error))
             XCTAssertNil(downloads.browserTabId)
@@ -297,6 +300,9 @@ final class DownloadsPipelineTests: XCTestCase {
             let cards = activity.withLock { $0.filter { $0.title.hasPrefix("Extracted ") } }
             XCTAssertEqual(cards.map(\.subtitle), ["1 download", "2 responses"])
             XCTAssertEqual(cards.map(\.browserTabId), [nil, 42])
+            let downloadsActivity = try XCTUnwrap(cards.first)
+            let observation = try XCTUnwrap(PreviewDeckFocus.ProfileObservation(downloadsActivity))
+            XCTAssertTrue(observation.matchesCard(tabId: 42, profile: downloadsActivity.browserProfile, taskId: taskId))
         }
     }
 
